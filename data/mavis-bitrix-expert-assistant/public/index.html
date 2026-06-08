@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ИИ-ассистент эксперта MAVIS GROUP</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="//api.bitrix24.com/api/v1/"></script>
+  <script src="/config.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div>
+        <h1>ИИ-ассистент эксперта</h1>
+        <p id="user-line" class="muted">Подключаемся к Bitrix24...</p>
+      </div>
+      <div class="actions">
+        <button id="reload" class="secondary">Обновить</button>
+      </div>
+    </header>
+
+    <section class="summary-grid">
+      <div class="summary-card"><span>Мои сделки</span><strong id="count-all">0</strong></div>
+      <div class="summary-card"><span>Без дела</span><strong id="count-no-activity">0</strong></div>
+      <div class="summary-card"><span>Без движения 2+ дня</span><strong id="count-stale">0</strong></div>
+      <div class="summary-card"><span>Нужно проверить</span><strong id="count-check">0</strong></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Мои сделки</h2>
+        <div class="filters">
+          <label>
+            <span>Поиск</span>
+            <input id="search" type="search" placeholder="Компания, услуга, сделка" />
+          </label>
+        </div>
+      </div>
+      <div id="loading" class="muted">Загружаем сделки...</div>
+      <div id="error" class="error hidden"></div>
+      <div class="table-wrap">
+        <table id="deals-table" class="hidden">
+          <thead>
+            <tr>
+              <th>Компания</th>
+              <th>Сделка</th>
+              <th>Услуга</th>
+              <th>Стадия</th>
+              <th>Сумма</th>
+              <th>Дата начала</th>
+              <th>Ответственный</th>
+              <th>Последняя активность</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <dialog id="deal-dialog">
+      <div class="dialog-header">
+        <h2 id="dialog-title">Сделка</h2>
+        <button id="close-dialog" class="icon">×</button>
+      </div>
+      <div id="deal-details"></div>
+      <div class="dialog-actions">
+        <button id="check-handoff" class="primary">Проверить передачу</button>
+        <button id="write-comment" class="secondary hidden">Записать комментарий</button>
+        <button id="create-manager-task" class="secondary hidden">Создать задачу менеджеру</button>
+        <button id="create-expert-task" class="secondary hidden">Создать задачу эксперту</button>
+      </div>
+      <pre id="analysis-result" class="analysis hidden"></pre>
+    </dialog>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

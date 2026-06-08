@@ -1,0 +1,16 @@
+{
+  "name": "mavis-bitrix-expert-assistant",
+  "version": "0.1.0",
+  "description": "Bitrix24 server local app: AI assistant MVP for MAVIS GROUP experts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "helmet": "^7.1.0"
+  }
+}
