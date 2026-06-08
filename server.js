@@ -28,6 +28,8 @@ function parseIdList(value) {
 const config = {
   leaderUserIds: parseIdList(process.env.LEADER_USER_IDS),
   adminUserIds: parseIdList(process.env.ADMIN_USER_IDS),
+  ropUserIds: parseIdList(process.env.ROP_USER_IDS),
+  productionCategoryId: process.env.PRODUCTION_CATEGORY_ID || '',
   maxDeals: Number(process.env.MAX_DEALS || 30),
 };
 

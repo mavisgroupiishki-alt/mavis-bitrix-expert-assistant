@@ -47,3 +47,11 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .analysis { margin: 0 20px 20px; padding: 14px; background: #0f172a; color: #e5e7eb; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
 .install-card { max-width: 720px; margin: 80px auto; background: white; padding: 32px; border-radius: 18px; border: 1px solid var(--line); }
 @media (max-width: 800px) { .summary-grid { grid-template-columns: 1fr 1fr; } #deal-details { grid-template-columns: 1fr; } .topbar, .panel-header { flex-direction: column; } }
+.small-note { margin-top: 6px; font-size: 13px; }
+.warn { color: #9a5a00; font-weight: 600; }
+.row-warn { background: #fff8ea; }
+.table-wrap { overflow-x: auto; }
+#deals-table th, #deals-table td { vertical-align: top; }
+#deals-table th:nth-child(5), #deals-table td:nth-child(5) { min-width: 80px; }
+#deals-table th:nth-child(9), #deals-table td:nth-child(9) { min-width: 180px; }
+#deals-table th:nth-child(11), #deals-table td:nth-child(11) { min-width: 230px; }
