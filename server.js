@@ -41,7 +41,7 @@ app.get('/config.js', (_req, res) => {
 });
 
 // Main app page used as "Путь вашего обработчика" in Bitrix24.
-app.get(['/', '/app'], (_req, res) => {
+app.all(['/', '/app'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
