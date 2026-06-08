@@ -30,7 +30,8 @@ const config = {
   adminUserIds: parseIdList(process.env.ADMIN_USER_IDS),
   ropUserIds: parseIdList(process.env.ROP_USER_IDS),
   productionCategoryId: process.env.PRODUCTION_CATEGORY_ID || '',
-  maxDeals: Number(process.env.MAX_DEALS || 30),
+  maxDeals: Number(process.env.MAX_DEALS || 200),
+  allowRopViewAll: String(process.env.ALLOW_ROP_VIEW_ALL || 'false').toLowerCase() === 'true',
 };
 
 app.get('/health', (_req, res) => {

@@ -14,6 +14,7 @@ const state = {
   companies: new Map(),
   contacts: new Map(),
   activitiesByDeal: new Map(),
+  tasksByDeal: new Map(),
   selectedDeal: null,
   selectedAnalysis: '',
   selectedMissing: [],
@@ -173,7 +174,13 @@ async function loadDeals() {
 
   const filter = {};
   if (APP_CONFIG.productionCategoryId) filter.CATEGORY_ID = APP_CONFIG.productionCategoryId;
-  if (!(state.isAdmin || state.isLeader || state.isRop)) filter.ASSIGNED_BY_ID = state.user.ID;
+
+  // По ТЗ личный кабинет эксперта показывает только его сделки.
+  // Руководители/админы видят все сделки воронки.
+  // РОП по умолчанию НЕ видит все производственные сделки, чтобы не смешивать клиентов экспертов.
+  // Если нужно временно дать РОП общий обзор для теста: ALLOW_ROP_VIEW_ALL=true в Render.
+  const canViewAll = state.isAdmin || state.isLeader || (state.isRop && APP_CONFIG.allowRopViewAll);
+  if (!canViewAll) filter.ASSIGNED_BY_ID = state.user.ID;
 
   const deals = await bxList('crm.deal.list', {
     order: { DATE_MODIFY: 'DESC' },
@@ -185,6 +192,7 @@ async function loadDeals() {
   await hydrateDeals(deals);
   await hydrateStages(deals);
   await hydrateActivities(deals);
+  await hydrateTasks(deals);
   renderDeals();
 }
 
@@ -216,7 +224,15 @@ async function hydrateStages(deals) {
     try {
       const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: entityId }, order: { SORT: 'ASC' } }, 200);
       rows.forEach((row) => {
-        if (row.STATUS_ID) state.stageMap.set(String(row.STATUS_ID), row.NAME || row.STATUS_ID);
+        if (!row.STATUS_ID) return;
+        const statusId = String(row.STATUS_ID);
+        state.stageMap.set(statusId, row.NAME || statusId);
+        // В некоторых порталах Bitrix отдаёт стадии в сделке как C28:WON,
+        // а справочник по воронке — как WON. Сохраняем оба варианта.
+        const m = String(entityId).match(/^DEAL_STAGE_(\d+)$/);
+        if (m && !statusId.startsWith(`C${m[1]}:`)) {
+          state.stageMap.set(`C${m[1]}:${statusId}`, row.NAME || statusId);
+        }
       });
     } catch (_) {}
   }));
@@ -234,6 +250,23 @@ async function hydrateActivities(deals) {
       state.activitiesByDeal.set(String(d.ID), acts);
     } catch (_) {
       state.activitiesByDeal.set(String(d.ID), []);
+    }
+  }));
+}
+
+
+async function hydrateTasks(deals) {
+  state.tasksByDeal.clear();
+  await Promise.all(deals.map(async (d) => {
+    try {
+      const raw = await bxCall('tasks.task.list', {
+        filter: { UF_CRM_TASK: `D_${d.ID}` },
+        select: ['ID','TITLE','STATUS','DEADLINE','CREATED_DATE','CLOSED_DATE','UF_CRM_TASK']
+      });
+      const tasks = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tasks) ? raw.tasks : []);
+      state.tasksByDeal.set(String(d.ID), tasks);
+    } catch (_) {
+      state.tasksByDeal.set(String(d.ID), []);
     }
   }));
 }
@@ -256,12 +289,39 @@ function getService(deal) { return state.fieldMap.service ? val(deal[state.field
 function getStartDate(deal) { return state.fieldMap.startDate ? val(deal[state.fieldMap.startDate]) : ''; }
 function getSalesLink(deal) { return state.fieldMap.salesDealLink ? val(deal[state.fieldMap.salesDealLink]) : ''; }
 function getActivities(dealId) { return state.activitiesByDeal.get(String(dealId)) || []; }
+function getTasks(dealId) { return state.tasksByDeal.get(String(dealId)) || []; }
 function openActivities(dealId) { return getActivities(dealId).filter((a) => String(a.COMPLETED || 'N').toUpperCase() !== 'Y'); }
+function openTasks(dealId) { return getTasks(dealId).filter((t) => !['5','completed','supposedlyCompleted'].includes(String(t.STATUS || t.status || '').toLowerCase()) && !t.CLOSED_DATE && !t.closedDate); }
 function nextActivity(dealId) {
   const open = openActivities(dealId).filter((a) => a.DEADLINE);
   if (!open.length) return null;
   return open.sort((a, b) => new Date(a.DEADLINE) - new Date(b.DEADLINE))[0];
 }
+function nextTask(dealId) {
+  const open = openTasks(dealId).filter((t) => t.DEADLINE || t.deadline);
+  if (!open.length) return null;
+  return open.sort((a, b) => new Date(a.DEADLINE || a.deadline) - new Date(b.DEADLINE || b.deadline))[0];
+}
+function hasNextStep(dealId) { return openActivities(dealId).length > 0 || openTasks(dealId).length > 0; }
+function nextStep(dealId) {
+  const a = nextActivity(dealId);
+  const t = nextTask(dealId);
+  if (!a && !t) return null;
+  if (a && !t) return { kind: 'дело', date: a.DEADLINE, title: a.SUBJECT || '' };
+  if (t && !a) return { kind: 'задача', date: t.DEADLINE || t.deadline, title: t.TITLE || t.title || '' };
+  return new Date(a.DEADLINE) <= new Date(t.DEADLINE || t.deadline)
+    ? { kind: 'дело', date: a.DEADLINE, title: a.SUBJECT || '' }
+    : { kind: 'задача', date: t.DEADLINE || t.deadline, title: t.TITLE || t.title || '' };
+}
+function lastWorkDate(deal) {
+  const dates = [deal.DATE_CREATE];
+  getActivities(deal.ID).forEach((a) => dates.push(a.CREATED, a.DEADLINE));
+  getTasks(deal.ID).forEach((t) => dates.push(t.CREATED_DATE || t.createdDate, t.DEADLINE || t.deadline, t.CLOSED_DATE || t.closedDate));
+  const parsed = dates.map((x) => new Date(x)).filter((d) => !Number.isNaN(d.getTime()));
+  if (!parsed.length) return deal.DATE_MODIFY || deal.DATE_CREATE;
+  return new Date(Math.max(...parsed.map((d) => d.getTime()))).toISOString();
+}
+
 
 function renderDeals() {
   document.getElementById('loading').classList.add('hidden');
@@ -274,9 +334,10 @@ function renderDeals() {
   const filtered = state.deals.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID}`).includes(q));
 
   filtered.forEach((deal) => {
-    const next = nextActivity(deal.ID);
-    const noOpen = openActivities(deal.ID).length === 0;
-    const stale = daysSince(deal.DATE_MODIFY) >= 2;
+    const next = nextStep(deal.ID);
+    const noOpen = !hasNextStep(deal.ID);
+    const lastWork = lastWorkDate(deal);
+    const stale = daysSince(lastWork) >= 2;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(companyName(deal.COMPANY_ID))}</td>
@@ -287,8 +348,8 @@ function renderDeals() {
       <td>${escapeHtml(formatMoney(deal.OPPORTUNITY))}</td>
       <td>${escapeHtml(formatDate(getStartDate(deal)) || '—')}</td>
       <td>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</td>
-      <td>${next ? `${escapeHtml(formatDate(next.DEADLINE))}<br><span class="muted">${escapeHtml(next.SUBJECT || '')}</span>` : '<span class="warn">нет открытого дела</span>'}</td>
-      <td>${escapeHtml(formatDate(deal.DATE_MODIFY) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}</td>
+      <td>${next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
+      <td>${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}</td>
       <td>
         <button class="secondary" data-bx="${deal.ID}">В Bitrix</button>
         <button class="secondary" data-open="${deal.ID}">Открыть</button>
@@ -300,12 +361,21 @@ function renderDeals() {
   });
 
   document.getElementById('count-all').textContent = state.deals.length;
-  document.getElementById('count-no-activity').textContent = state.deals.filter((d) => openActivities(d.ID).length === 0).length;
-  document.getElementById('count-stale').textContent = state.deals.filter((d) => daysSince(d.DATE_MODIFY) >= 2).length;
-  document.getElementById('count-check').textContent = state.deals.filter((d) => !getSalesLink(d)).length || state.deals.length;
-  document.getElementById('category-note').textContent = APP_CONFIG.productionCategoryId
-    ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}`
-    : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render.';
+  document.getElementById('count-no-activity').textContent = state.deals.filter((d) => !hasNextStep(d.ID)).length;
+  document.getElementById('count-stale').textContent = state.deals.filter((d) => daysSince(lastWorkDate(d)) >= 2).length;
+  document.getElementById('count-check').textContent = state.deals.filter((d) => !getSalesLink(d)).length;
+  document.getElementById('deals-title').textContent = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll ? 'Сделки, закреплённые за мной' : 'Мои сделки';
+
+  const roleNote = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll
+    ? 'Режим РОП: общий список экспертов скрыт. Для временного общего просмотра поставь ALLOW_ROP_VIEW_ALL=true.'
+    : state.isAdmin || state.isLeader
+      ? 'Режим руководителя: показаны сделки всех ответственных в выбранной воронке/лимите.'
+      : 'Режим эксперта: показаны только сделки, где текущий пользователь — ответственный.';
+  document.getElementById('category-note').textContent = (APP_CONFIG.productionCategoryId
+    ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}. `
+    : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render. ')
+    + `${roleNote} Загружено не больше MAX_DEALS=${APP_CONFIG.maxDeals || 200}.`;
+
 }
 
 async function openDeal(id) {
@@ -321,7 +391,7 @@ async function openDeal(id) {
 }
 
 function detailHtml(deal) {
-  const next = nextActivity(deal.ID);
+  const next = nextStep(deal.ID);
   const fields = [
     ['Компания', companyName(deal.COMPANY_ID)],
     ['Контакт', contactName(deal.CONTACT_ID)],
@@ -333,7 +403,7 @@ function detailHtml(deal) {
     ['Ответственный', userName(deal.ASSIGNED_BY_ID)],
     ['Кто создал сделку', userName(deal.CREATED_BY_ID)],
     ['Ссылка на сделку отдела продаж', getSalesLink(deal) || '—'],
-    ['Следующее дело', next ? `${formatDate(next.DEADLINE)} — ${next.SUBJECT || ''}` : 'нет открытого дела'],
+    ['Следующее дело/задача', next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'нет открытого дела/задачи'],
   ];
   return fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
 }
@@ -360,9 +430,9 @@ async function checkHandoff() {
   const uncertain = results.filter((r) => r.status === 'uncertain');
   const missing = results.filter((r) => r.status === 'missing');
 
-  const noOpen = openActivities(deal.ID).length === 0;
+  const noOpen = !hasNextStep(deal.ID);
   const technicalMissing = [];
-  if (noOpen) technicalMissing.push({ label: 'нет открытого дела / следующего шага в Bitrix', why: 'сделка может зависнуть без контрольного действия' });
+  if (noOpen) technicalMissing.push({ label: 'нет открытого дела/задачи / следующего шага в Bitrix', why: 'сделка может зависнуть без контрольного действия' });
   if (!getSalesLink(deal)) technicalMissing.push({ label: 'нет ссылки на исходную сделку отдела продаж', why: 'сложнее сверить обещания продаж, КП и договорённости' });
 
   const criticalMisses = missing.filter((r) => CRITICAL_KEYS.has(r.key));
