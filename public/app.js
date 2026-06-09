@@ -114,28 +114,51 @@ function bxCall(method, params = {}) {
 async function bxList(method, params = {}, limit = 200) {
   // limit > 0: return not more than limit items.
   // limit = 0 / null / undefined: load all pages returned by Bitrix.
+  // ВАЖНО: в BX24 JS SDK следующая страница загружается через result.next(callback),
+  // а не через start = result.next(). Предыдущая версия из-за этого брала только первые 50 сделок.
   const normalizedLimit = Number(limit || 0);
   const useLimit = Number.isFinite(normalizedLimit) && normalizedLimit > 0;
   const items = [];
-  let start = 0;
 
-  while (true) {
-    const page = await new Promise((resolve, reject) => {
-      BX24.callMethod(method, { ...params, start }, (result) => {
-        if (result.error()) reject(new Error(`${method}: ${result.error()} ${result.error_description() || ''}`));
-        else resolve({ data: result.data(), next: result.more() ? result.next() : null });
-      });
-    });
+  return new Promise((resolve, reject) => {
+    const handle = (result) => {
+      if (result.error()) {
+        reject(new Error(`${method}: ${result.error()} ${result.error_description() || ''}`));
+        return;
+      }
 
-    const data = Array.isArray(page.data) ? page.data : [];
-    items.push(...data);
+      const data = result.data();
+      if (Array.isArray(data)) items.push(...data);
+      else if (data && Array.isArray(data.items)) items.push(...data.items);
+      else if (data && Array.isArray(data.tasks)) items.push(...data.tasks);
 
-    if (!page.next) break;
-    if (useLimit && items.length >= normalizedLimit) break;
-    start = page.next;
-  }
+      if (useLimit && items.length >= normalizedLimit) {
+        resolve(items.slice(0, normalizedLimit));
+        return;
+      }
 
-  return useLimit ? items.slice(0, normalizedLimit) : items;
+      if (result.more && result.more() && typeof result.next === 'function') {
+        result.next(handle);
+      } else {
+        resolve(useLimit ? items.slice(0, normalizedLimit) : items);
+      }
+    };
+
+    BX24.callMethod(method, params, handle);
+  });
+}
+
+async function mapLimit(items, limit, mapper) {
+  const out = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const current = i++;
+      out[current] = await mapper(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 function normalize(s) { return String(s || '').toLowerCase(); }
@@ -219,36 +242,36 @@ async function hydrateDeals(deals) {
     if (d.COMPANY_ID) companyIds.add(d.COMPANY_ID);
     if (d.CONTACT_ID) contactIds.add(d.CONTACT_ID);
   });
-  await Promise.all([...userIds].map(async (id) => {
+  await mapLimit([...userIds], 8, async (id) => {
     try { const res = await bxCall('user.get', { ID: id }); state.users.set(String(id), Array.isArray(res) ? res[0] : res); } catch (_) {}
-  }));
-  await Promise.all([...companyIds].map(async (id) => {
+  });
+  await mapLimit([...companyIds], 8, async (id) => {
     try { const res = await bxCall('crm.company.get', { id }); state.companies.set(String(id), res); } catch (_) {}
-  }));
-  await Promise.all([...contactIds].map(async (id) => {
+  });
+  await mapLimit([...contactIds], 8, async (id) => {
     try { const res = await bxCall('crm.contact.get', { id }); state.contacts.set(String(id), res); } catch (_) {}
-  }));
+  });
 }
 
 async function hydrateStages(deals) {
   const categoryIds = [...new Set(deals.map((d) => String(d.CATEGORY_ID || '0')))];
   const entityIds = ['DEAL_STAGE', ...categoryIds.filter((id) => id !== '0').map((id) => `DEAL_STAGE_${id}`)];
 
-  await Promise.all(entityIds.map(async (entityId) => {
+  await mapLimit(entityIds, 4, async (entityId) => {
     try {
       const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: entityId }, order: { SORT: 'ASC' } }, 0);
       rows.forEach((row) => saveStageName(entityId, row));
     } catch (_) {}
-  }));
+  });
 
   // Extra fallback for custom deal pipelines. Some portals return custom pipeline
   // stages more reliably through crm.dealcategory.stage.list.
-  await Promise.all(categoryIds.filter((id) => id !== '0').map(async (categoryId) => {
+  await mapLimit(categoryIds.filter((id) => id !== '0'), 4, async (categoryId) => {
     try {
       const rows = await bxList('crm.dealcategory.stage.list', { id: categoryId, order: { SORT: 'ASC' } }, 0);
       rows.forEach((row) => saveStageName(`DEAL_STAGE_${categoryId}`, row));
     } catch (_) {}
-  }));
+  });
 }
 
 function saveStageName(entityId, row) {
@@ -266,7 +289,7 @@ function saveStageName(entityId, row) {
 
 async function hydrateActivities(deals) {
   state.activitiesByDeal.clear();
-  await Promise.all(deals.map(async (d) => {
+  await mapLimit(deals, 6, async (d) => {
     try {
       const acts = await bxList('crm.activity.list', {
         filter: { OWNER_ID: d.ID, OWNER_TYPE_ID: 2 },
@@ -277,13 +300,13 @@ async function hydrateActivities(deals) {
     } catch (_) {
       state.activitiesByDeal.set(String(d.ID), []);
     }
-  }));
+  });
 }
 
 
 async function hydrateTasks(deals) {
   state.tasksByDeal.clear();
-  await Promise.all(deals.map(async (d) => {
+  await mapLimit(deals, 6, async (d) => {
     try {
       const raw = await bxCall('tasks.task.list', {
         filter: { UF_CRM_TASK: `D_${d.ID}` },
@@ -294,13 +317,13 @@ async function hydrateTasks(deals) {
     } catch (_) {
       state.tasksByDeal.set(String(d.ID), []);
     }
-  }));
+  });
 }
 
 
 async function hydrateTimelineComments(deals) {
   state.commentsByDeal.clear();
-  await Promise.all(deals.map(async (d) => {
+  await mapLimit(deals, 6, async (d) => {
     try {
       const comments = await bxList('crm.timeline.comment.list', {
         filter: { ENTITY_ID: d.ID, ENTITY_TYPE: 'deal' },
@@ -310,7 +333,7 @@ async function hydrateTimelineComments(deals) {
     } catch (_) {
       state.commentsByDeal.set(String(d.ID), []);
     }
-  }));
+  });
 }
 
 function getTimelineComments(dealId) { return state.commentsByDeal.get(String(dealId)) || []; }
