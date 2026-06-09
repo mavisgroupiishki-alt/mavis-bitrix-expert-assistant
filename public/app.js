@@ -8,6 +8,7 @@ const state = {
   isRop: false,
   fields: {},
   fieldMap: {},
+  enumMaps: {},
   stageMap: new Map(),
   deals: [],
   users: new Map(),
@@ -22,6 +23,9 @@ const state = {
   selectedMissing: [],
   selectedAudit: null,
   selectedMode: '',
+  detailsLoading: false,
+  detailsLoaded: false,
+  detailsProgress: '',
 };
 
 const REQUIRED_ITEMS = [
@@ -167,18 +171,69 @@ async function mapLimit(items, limit, mapper) {
 
 function normalize(s) { return String(s || '').toLowerCase(); }
 function val(v) { return Array.isArray(v) ? v.join(', ') : (v || ''); }
-
+function fieldLabel(code) {
+  const meta = state.fields && state.fields[code] ? state.fields[code] : {};
+  return meta.title || meta.formLabel || meta.listLabel || meta.name || code || '';
+}
+function buildEnumMaps(fields) {
+  const maps = {};
+  Object.entries(fields || {}).forEach(([code, meta]) => {
+    const items = meta && (meta.items || meta.ITEMS || meta.list || meta.LIST);
+    if (!Array.isArray(items)) return;
+    const map = {};
+    items.forEach((item) => {
+      const id = item.ID ?? item.id ?? item.VALUE_ID ?? item.valueId ?? item.VALUE;
+      const value = item.VALUE ?? item.value ?? item.NAME ?? item.name ?? item.TITLE ?? item.title;
+      if (id !== undefined && value !== undefined) map[String(id)] = String(value);
+    });
+    if (Object.keys(map).length) maps[code] = map;
+  });
+  return maps;
+}
+function resolveFieldValue(code, raw) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  const map = state.enumMaps && state.enumMaps[code];
+  const convertOne = (x) => {
+    if (x === null || x === undefined || x === '') return '';
+    const key = String(x);
+    return map && map[key] ? map[key] : key;
+  };
+  return Array.isArray(raw) ? raw.map(convertOne).filter(Boolean).join(', ') : convertOne(raw);
+}
+function metaText(meta) {
+  if (!meta) return '';
+  // Bitrix в разных порталах отдаёт подписи пользовательских полей в разных свойствах.
+  // Берём все строковые подписи, а не только title/formLabel/listLabel.
+  const parts = [];
+  Object.entries(meta).forEach(([k, v]) => {
+    if (typeof v === 'string') parts.push(`${k} ${v}`);
+    if (Array.isArray(v)) {
+      v.forEach((item) => {
+        if (item && typeof item === 'object') {
+          Object.values(item).forEach((iv) => { if (typeof iv === 'string') parts.push(iv); });
+        }
+      });
+    }
+  });
+  return normalize(parts.join(' '));
+}
 function detectFieldMap(fields) {
   const entries = Object.entries(fields || {});
-  const find = (needles) => {
-    const found = entries.find(([code, meta]) => {
-      const title = normalize(`${code} ${meta.title || ''} ${meta.formLabel || ''} ${meta.listLabel || ''}`);
-      return needles.some((n) => title.includes(n));
+  const find = (needles, exactLabel = null) => {
+    let found = entries.find(([code, meta]) => {
+      const text = metaText(meta) + ' ' + normalize(code);
+      if (exactLabel) {
+        const labels = [meta.title, meta.formLabel, meta.listLabel, meta.name, meta.NAME].filter(Boolean).map((x) => normalize(x).trim());
+        if (labels.some((l) => l === exactLabel)) return true;
+      }
+      return needles.some((n) => text.includes(n));
     });
     return found ? found[0] : null;
   };
   return {
-    service: find(['услуга', 'продукт']),
+    // В производственной карточке поле называется именно “Услуга”. Важно тянуть его из этой карточки,
+    // а не только из товаров связанной продажи. Поэтому сначала ищем точное название поля “Услуга”.
+    service: APP_CONFIG.serviceFieldCode || find(['услуга', 'продукт'], 'услуга'),
     startDate: find(['дата начала', 'начало оказания', 'оказания услуг']),
     salesDealLink: find(['ссылка на сделку отдела продаж', 'сделка отдела продаж', 'отдела продаж']),
   };
@@ -195,6 +250,7 @@ async function init() {
     document.getElementById('user-line').textContent = `Пользователь: ${state.user.NAME || ''} ${state.user.LAST_NAME || ''} · ID ${state.user.ID} · режим: ${state.role}`;
 
     state.fields = await bxCall('crm.deal.fields');
+    state.enumMaps = buildEnumMaps(state.fields);
     state.fieldMap = detectFieldMap(state.fields);
     await loadDeals();
   } catch (e) {
@@ -206,8 +262,15 @@ async function loadDeals() {
   document.getElementById('loading').classList.remove('hidden');
   document.getElementById('deals-table').classList.add('hidden');
   hideError();
+  state.detailsLoaded = false;
+  state.detailsLoading = false;
+  state.detailsProgress = '';
+  state.activitiesByDeal.clear();
+  state.tasksByDeal.clear();
+  state.commentsByDeal.clear();
+  state.auditByDeal.clear();
 
-  const select = ['ID','TITLE','COMPANY_ID','CONTACT_ID','STAGE_ID','CATEGORY_ID','OPPORTUNITY','ASSIGNED_BY_ID','CREATED_BY_ID','DATE_CREATE','DATE_MODIFY','CLOSED'];
+  const select = ['*','UF_*','ID','TITLE','COMPANY_ID','CONTACT_ID','STAGE_ID','CATEGORY_ID','OPPORTUNITY','ASSIGNED_BY_ID','CREATED_BY_ID','DATE_CREATE','DATE_MODIFY','CLOSED'];
   Object.values(state.fieldMap).filter(Boolean).forEach((f) => { if (!select.includes(f)) select.push(f); });
 
   const filter = {};
@@ -228,12 +291,14 @@ async function loadDeals() {
   }, Number(APP_CONFIG.maxDeals || 0));
 
   state.deals = deals;
+
+  // Быстрый первый экран: сначала показываем сделки, пользователей, компании и стадии.
+  // Дела/задачи/комментарии грузятся фоном, иначе 400+ сделок дают 1000+ REST-запросов
+  // и пользователь ждёт несколько минут до появления кабинета.
   await hydrateDeals(deals);
   await hydrateStages(deals);
-  await hydrateActivities(deals);
-  await hydrateTasks(deals);
-  await hydrateTimelineComments(deals);
   renderDeals();
+  backgroundHydrateDealMeta(deals);
 }
 
 async function hydrateDeals(deals) {
@@ -345,6 +410,73 @@ async function hydrateTimelineComments(deals) {
   });
 }
 
+
+async function hydrateDealMeta(d) {
+  const id = String(d.ID);
+  try {
+    const acts = await bxList('crm.activity.list', {
+      filter: { OWNER_ID: d.ID, OWNER_TYPE_ID: 2 },
+      order: { DEADLINE: 'ASC' },
+      select: ['ID','SUBJECT','DESCRIPTION','CREATED','LAST_UPDATED','DEADLINE','TYPE_ID','PROVIDER_ID','COMPLETED']
+    }, 30);
+    state.activitiesByDeal.set(id, acts);
+  } catch (_) {
+    state.activitiesByDeal.set(id, []);
+  }
+
+  try {
+    const raw = await bxCall('tasks.task.list', {
+      filter: { UF_CRM_TASK: `D_${d.ID}` },
+      select: ['ID','TITLE','STATUS','DEADLINE','CREATED_DATE','CHANGED_DATE','CLOSED_DATE','UF_CRM_TASK']
+    });
+    const tasks = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tasks) ? raw.tasks : []);
+    state.tasksByDeal.set(id, tasks);
+  } catch (_) {
+    state.tasksByDeal.set(id, []);
+  }
+
+  try {
+    const comments = await bxList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: d.ID, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' }
+    }, 20);
+    state.commentsByDeal.set(id, comments);
+    const audit = findLatestAudit(comments);
+    if (audit) state.auditByDeal.set(id, audit);
+  } catch (_) {
+    state.commentsByDeal.set(id, []);
+  }
+}
+
+async function ensureDealMeta(dealId) {
+  const id = String(dealId);
+  if (state.activitiesByDeal.has(id) && state.tasksByDeal.has(id) && state.commentsByDeal.has(id)) return;
+  const deal = state.deals.find((d) => String(d.ID) === id) || await bxCall('crm.deal.get', { id });
+  await hydrateDealMeta(deal);
+}
+
+async function backgroundHydrateDealMeta(deals) {
+  state.detailsLoading = true;
+  state.detailsLoaded = false;
+  state.detailsProgress = `Дозагружаем дела, задачи и проверки: 0/${deals.length}`;
+  renderDeals();
+
+  let done = 0;
+  await mapLimit(deals, Number(APP_CONFIG.metaConcurrency || 4), async (d) => {
+    await hydrateDealMeta(d);
+    done += 1;
+    if (done === deals.length || done % 25 === 0) {
+      state.detailsProgress = `Дозагружаем дела, задачи и проверки: ${done}/${deals.length}`;
+      renderDeals();
+    }
+  });
+
+  state.detailsLoading = false;
+  state.detailsLoaded = true;
+  state.detailsProgress = `Дела, задачи и проверки загружены: ${deals.length}/${deals.length}`;
+  renderDeals();
+}
+
 function getTimelineComments(dealId) { return state.commentsByDeal.get(String(dealId)) || []; }
 
 function findLatestAudit(comments) {
@@ -423,9 +555,25 @@ function contactName(id) {
   return `${c.NAME || ''} ${c.LAST_NAME || ''}`.trim() || c.FULL_NAME || `ID ${id}`;
 }
 function stageName(stageId) { return state.stageMap.get(String(stageId)) || stageId || '—'; }
-function getService(deal) { return state.fieldMap.service ? val(deal[state.fieldMap.service]) : ''; }
-function getStartDate(deal) { return state.fieldMap.startDate ? val(deal[state.fieldMap.startDate]) : ''; }
-function getSalesLink(deal) { return state.fieldMap.salesDealLink ? val(deal[state.fieldMap.salesDealLink]) : ''; }
+function getService(deal) {
+  if (!deal) return '';
+  if (state.fieldMap.service && deal[state.fieldMap.service] !== undefined) {
+    const direct = resolveFieldValue(state.fieldMap.service, deal[state.fieldMap.service]);
+    if (direct) return direct;
+  }
+  // Fallback: ищем любое заполненное поле, которое в Bitrix называется “Услуга”.
+  // Это нужно, если crm.deal.fields отдал нестандартную подпись или код поля не совпал при автоопределении.
+  for (const [code, meta] of Object.entries(state.fields || {})) {
+    const labels = [meta.title, meta.formLabel, meta.listLabel, meta.name, meta.NAME].filter(Boolean).map((x) => normalize(x).trim());
+    const looksLikeService = labels.some((l) => l === 'услуга' || l.includes('услуга')) || normalize(code).includes('SERVICE');
+    if (!looksLikeService) continue;
+    const value = resolveFieldValue(code, deal[code]);
+    if (value) return value;
+  }
+  return '';
+}
+function getStartDate(deal) { return state.fieldMap.startDate ? resolveFieldValue(state.fieldMap.startDate, deal[state.fieldMap.startDate]) : ''; }
+function getSalesLink(deal) { return state.fieldMap.salesDealLink ? resolveFieldValue(state.fieldMap.salesDealLink, deal[state.fieldMap.salesDealLink]) : ''; }
 function getActivities(dealId) { return state.activitiesByDeal.get(String(dealId)) || []; }
 function getTasks(dealId) { return state.tasksByDeal.get(String(dealId)) || []; }
 function openActivities(dealId) { return getActivities(dealId).filter((a) => String(a.COMPLETED || 'N').toUpperCase() !== 'Y'); }
@@ -484,12 +632,13 @@ function renderDeals() {
 
   const roleVisibleDeals = getRoleVisibleDeals();
   const filtered = roleVisibleDeals.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID} ${auditLabel(getAudit(d.ID))}`).includes(q));
+  const metaReady = state.detailsLoaded && !state.detailsLoading;
 
   filtered.forEach((deal) => {
-    const next = nextStep(deal.ID);
-    const noOpen = !hasNextStep(deal.ID);
-    const lastWork = lastWorkDate(deal);
-    const stale = daysSince(lastWork) >= 2;
+    const next = metaReady ? nextStep(deal.ID) : null;
+    const noOpen = metaReady ? !hasNextStep(deal.ID) : false;
+    const lastWork = metaReady ? lastWorkDate(deal) : '';
+    const stale = metaReady ? daysSince(lastWork) >= 2 : false;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(companyName(deal.COMPANY_ID))}</td>
@@ -500,9 +649,9 @@ function renderDeals() {
       <td>${escapeHtml(formatMoney(deal.OPPORTUNITY))}</td>
       <td>${escapeHtml(formatDate(getStartDate(deal)) || '—')}</td>
       <td>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</td>
-      <td>${next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
-      <td>${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}</td>
-      <td>${auditHtml(deal.ID)}</td>
+      <td>${!metaReady ? '<span class="muted">загружается...</span>' : next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
+      <td>${!metaReady ? '<span class="muted">загружается...</span>' : `${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}`}</td>
+      <td>${!metaReady ? '<span class="status-chip status-none">загружается...</span>' : auditHtml(deal.ID)}</td>
       <td>
         <button class="secondary" data-bx="${deal.ID}">В Bitrix</button>
         <button class="secondary" data-open="${deal.ID}">Открыть</button>
@@ -515,12 +664,12 @@ function renderDeals() {
 
   const visibleForRole = getRoleVisibleDeals();
   document.getElementById('count-all').textContent = visibleForRole.length;
-  document.getElementById('count-no-activity').textContent = visibleForRole.filter((d) => !hasNextStep(d.ID)).length;
-  document.getElementById('count-stale').textContent = visibleForRole.filter((d) => daysSince(lastWorkDate(d)) >= 2).length;
+  document.getElementById('count-no-activity').textContent = metaReady ? visibleForRole.filter((d) => !hasNextStep(d.ID)).length : '…';
+  document.getElementById('count-stale').textContent = metaReady ? visibleForRole.filter((d) => daysSince(lastWorkDate(d)) >= 2).length : '…';
   const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
   document.getElementById('label-count-all').textContent = isRopOnly ? 'Ошибки передачи' : 'Активные открытые сделки';
   document.getElementById('label-count-check').textContent = isRopOnly ? 'Ошибки передачи' : 'Не проверено';
-  document.getElementById('count-check').textContent = isRopOnly ? visibleForRole.length : visibleForRole.filter((d) => !getAudit(d.ID)).length;
+  document.getElementById('count-check').textContent = metaReady ? (isRopOnly ? visibleForRole.length : visibleForRole.filter((d) => !getAudit(d.ID)).length) : '…';
   document.getElementById('deals-title').textContent = isRopOnly ? 'Ошибки передачи из продаж' : 'Активные сделки';
 
   const roleNote = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll
@@ -534,12 +683,13 @@ function renderDeals() {
   document.getElementById('category-note').textContent = (APP_CONFIG.productionCategoryId
     ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}. `
     : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render. ')
-    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote}`;
+    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote} ${state.detailsProgress || ''}`;
 
 }
 
 async function openDeal(id) {
   const deal = state.deals.find((d) => String(d.ID) === String(id)) || await bxCall('crm.deal.get', { id });
+  await ensureDealMeta(id);
   state.selectedDeal = deal;
   state.selectedAnalysis = '';
   state.selectedMissing = [];

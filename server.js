@@ -34,6 +34,10 @@ const config = {
   maxDeals: Number(process.env.MAX_DEALS || 0),
   excludeClosedDeals: String(process.env.EXCLUDE_CLOSED_DEALS || 'true').toLowerCase() !== 'false',
   allowRopViewAll: String(process.env.ALLOW_ROP_VIEW_ALL || 'false').toLowerCase() === 'true',
+  // Сколько сделок одновременно дозагружать по делам/задачам/комментариям.
+  metaConcurrency: Number(process.env.META_CONCURRENCY || 4),
+  // Если автоопределение поля “Услуга” на портале не сработает, сюда можно вписать код поля UF_CRM_...
+  serviceFieldCode: process.env.SERVICE_FIELD_CODE || '',
 };
 
 app.get('/health', (_req, res) => {
