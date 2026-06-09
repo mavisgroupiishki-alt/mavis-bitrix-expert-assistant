@@ -620,7 +620,9 @@ async function checkHandoff() {
   document.getElementById('create-manager-task').classList.toggle('hidden', !actionItems.length);
   document.getElementById('create-expert-task').classList.remove('hidden');
   document.getElementById('mark-checked').classList.remove('hidden');
+  document.getElementById('create-workplan-tasks').classList.add('hidden');
 }
+
 
 
 function buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing }) {
@@ -886,7 +888,9 @@ async function generateWorkPlan() {
   document.getElementById('create-manager-task').classList.add('hidden');
   document.getElementById('create-expert-task').classList.add('hidden');
   document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.remove('hidden');
 }
+
 
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
@@ -946,16 +950,114 @@ async function createExpertTask() {
   });
 }
 
-async function createTask({ title, responsibleId, description, dealId }) {
-  await bxCall('tasks.task.add', {
-    fields: {
-      TITLE: title,
-      RESPONSIBLE_ID: Number(responsibleId),
-      DESCRIPTION: description,
-      UF_CRM_TASK: [`D_${dealId}`],
-    }
+function deadlineInHours(hours) {
+  const d = new Date(Date.now() + hours * 60 * 60 * 1000);
+  return d.toISOString();
+}
+
+function deadlineTodayEnd() {
+  const d = new Date();
+  d.setHours(18, 0, 0, 0);
+  if (d.getTime() < Date.now()) return deadlineInHours(2);
+  return d.toISOString();
+}
+
+function deadlineTomorrow(hour = 12) {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(hour, 0, 0, 0);
+  return d.toISOString();
+}
+
+function hasOpenTaskWithTitle(dealId, title) {
+  const normalized = normalize(title);
+  return openTasks(dealId).some((t) => normalize(t.TITLE || t.title || '').includes(normalized) || normalized.includes(normalize(t.TITLE || t.title || '')));
+}
+
+function buildWorkPlanTasks(deal) {
+  const audit = getAudit(deal.ID) || state.selectedAudit;
+  const missing = audit ? [...(audit.missing || []), ...(audit.technical || [])] : [];
+  const uncertain = audit ? [...(audit.uncertain || [])] : [];
+  const stage = stageName(deal.STAGE_ID);
+  const service = getService(deal) || 'услуга не указана';
+  const next = nextStep(deal.ID);
+  const tasks = [];
+
+  tasks.push({
+    title: 'Отправить ход работы клиенту',
+    deadline: deadlineInHours(1),
+    description: `Отправить клиенту ход работы по сделке “${deal.TITLE}” (${service}).\n\nЧто зафиксировать клиенту:\n— что делает MAVIS GROUP;\n— что нужно от клиента;\n— какие документы/данные нужны;\n— какие оплаты/пошлины могут понадобиться;\n— следующий контрольный шаг.\n\nЧерновик хода работы:\n${state.selectedAnalysis || ''}`,
   });
-  alert('Задача создана.');
+
+  tasks.push({
+    title: 'Зафиксировать итоги первого/текущего касания в сделке',
+    deadline: deadlineTodayEnd(),
+    description: `Зафиксировать в комментарии сделки итоги касания по услуге “${service}”: документы, оплаты, дедлайны, следующий шаг и риски по срокам.`,
+  });
+
+  if (missing.length || uncertain.length) {
+    tasks.push({
+      title: 'Запросить у клиента недостающие данные/документы',
+      deadline: deadlineTomorrow(12),
+      description: `Запросить и зафиксировать недостающие данные по сделке “${deal.TITLE}”.\n\nНе хватает / нужно подтвердить:\n${[...missing.map((x) => `— ${x}`), ...uncertain.map((x) => `— подтвердить: ${x}`)].join('\n') || '— уточнить перечень документов и данных'}`,
+    });
+  }
+
+  const needsPaymentControl = /пошлин|счет|счёт|оплат|стройдок|техкарт/i.test(`${state.selectedAnalysis || ''} ${missing.join(' ')} ${uncertain.join(' ')}`);
+  if (needsPaymentControl) {
+    tasks.push({
+      title: 'Проверить оплату счетов/пошлин по сделке',
+      deadline: deadlineTomorrow(12),
+      description: `Проверить, какие счета/пошлины/обязательные платежи нужны по сделке “${deal.TITLE}”, зафиксировать дату оплаты или дату обещанной оплаты.`,
+    });
+  }
+
+  if (!next) {
+    tasks.push({
+      title: 'Поставить следующий контрольный шаг по сделке',
+      deadline: deadlineTodayEnd(),
+      description: `В сделке нет открытого дела/задачи. Нужно поставить следующий контрольный шаг по текущей стадии “${stage}”.`,
+    });
+  }
+
+  return tasks.filter((task) => !hasOpenTaskWithTitle(deal.ID, task.title));
+}
+
+async function createWorkPlanTasks() {
+  if (!state.selectedDeal) return;
+  const d = state.selectedDeal;
+  const tasks = buildWorkPlanTasks(d);
+  if (!tasks.length) {
+    alert('Открытые задачи по ходу работы уже есть или новых задач не требуется.');
+    return;
+  }
+  const confirmText = `Будут созданы задачи (${tasks.length}):\n\n${tasks.map((t, i) => `${i + 1}. ${t.title} — дедлайн ${formatDate(t.deadline)}`).join('\n')}\n\nСоздать?`;
+  if (!window.confirm(confirmText)) return;
+  for (const task of tasks) {
+    await createTask({
+      title: task.title,
+      responsibleId: d.ASSIGNED_BY_ID,
+      description: task.description,
+      dealId: d.ID,
+      deadline: task.deadline,
+      silent: true,
+    });
+  }
+  alert(`Создано задач: ${tasks.length}`);
+  await loadDeals();
+  if (state.selectedDeal) openDeal(String(d.ID));
+}
+
+async function createTask({ title, responsibleId, description, dealId, deadline = null, silent = false }) {
+  const fields = {
+    TITLE: title,
+    RESPONSIBLE_ID: Number(responsibleId),
+    DESCRIPTION: description,
+    UF_CRM_TASK: [`D_${dealId}`],
+  };
+  if (deadline) fields.DEADLINE = deadline;
+  await bxCall('tasks.task.add', { fields });
+  if (!silent) alert('Задача создана.');
 }
 
 function openInBitrix(id) {
@@ -1008,6 +1110,7 @@ document.getElementById('generate-workplan').addEventListener('click', generateW
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
+document.getElementById('create-workplan-tasks').addEventListener('click', createWorkPlanTasks);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 
 init();
