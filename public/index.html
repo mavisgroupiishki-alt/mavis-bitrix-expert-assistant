@@ -25,7 +25,7 @@
       <div class="summary-card"><span id="label-count-all">Активные открытые сделки</span><strong id="count-all">0</strong></div>
       <div class="summary-card"><span>Без следующего шага</span><strong id="count-no-activity">0</strong></div>
       <div class="summary-card"><span>Без рабочей активности 2+ дня</span><strong id="count-stale">0</strong></div>
-      <div class="summary-card"><span>Нужно проверить</span><strong id="count-check">0</strong></div>
+      <div class="summary-card"><span id="label-count-check">Не проверено</span><strong id="count-check">0</strong></div>
     </section>
 
     <section class="panel">
@@ -54,6 +54,7 @@
               <th>Ответственный</th>
               <th>Следующее дело</th>
               <th>Последняя активность</th>
+              <th>Проверка передачи</th>
               <th>Действия</th>
             </tr>
           </thead>
@@ -73,6 +74,7 @@
         <button id="write-comment" class="secondary hidden">Записать комментарий</button>
         <button id="create-manager-task" class="secondary hidden">Создать задачу менеджеру</button>
         <button id="create-expert-task" class="secondary hidden">Создать задачу эксперту</button>
+        <button id="mark-checked" class="secondary hidden">Отметить как проверено</button>
       </div>
       <pre id="analysis-result" class="analysis hidden"></pre>
     </dialog>

@@ -55,3 +55,12 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 #deals-table th:nth-child(5), #deals-table td:nth-child(5) { min-width: 80px; }
 #deals-table th:nth-child(9), #deals-table td:nth-child(9) { min-width: 180px; }
 #deals-table th:nth-child(11), #deals-table td:nth-child(11) { min-width: 230px; }
+
+.status-chip { display:inline-block; border-radius:999px; padding:4px 8px; font-size:12px; font-weight:700; }
+.status-ok { background:#ecfdf5; color:#047857; }
+.status-error { background:#fef2f2; color:#b91c1c; }
+.status-partial { background:#fff7ed; color:#9a3412; }
+.status-none { background:#f3f4f6; color:#6b7280; }
+.audit-meta { display:block; margin-top:4px; color:var(--muted); font-size:12px; }
+#deals-table th:nth-child(11), #deals-table td:nth-child(11) { min-width: 180px; }
+#deals-table th:nth-child(12), #deals-table td:nth-child(12) { min-width: 230px; }

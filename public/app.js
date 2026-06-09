@@ -16,9 +16,11 @@ const state = {
   activitiesByDeal: new Map(),
   tasksByDeal: new Map(),
   commentsByDeal: new Map(),
+  auditByDeal: new Map(),
   selectedDeal: null,
   selectedAnalysis: '',
   selectedMissing: [],
+  selectedAudit: null,
 };
 
 const REQUIRED_ITEMS = [
@@ -102,6 +104,7 @@ const REQUIRED_ITEMS = [
 ];
 
 const CRITICAL_KEYS = new Set(['service', 'kp', 'terms', 'email', 'fees', 'specialists']);
+const AUDIT_TAG = 'MAVIS_AI_HANDOFF_AUDIT';
 function bxCall(method, params = {}) {
   return new Promise((resolve, reject) => {
     BX24.callMethod(method, params, (result) => {
@@ -214,8 +217,8 @@ async function loadDeals() {
   // Руководители/админы видят все сделки воронки.
   // РОП по умолчанию НЕ видит все производственные сделки, чтобы не смешивать клиентов экспертов.
   // Если нужно временно дать РОП общий обзор для теста: ALLOW_ROP_VIEW_ALL=true в Render.
-  const canViewAll = state.isAdmin || state.isLeader || (state.isRop && APP_CONFIG.allowRopViewAll);
-  if (!canViewAll) filter.ASSIGNED_BY_ID = state.user.ID;
+  const canViewAllForLoad = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  if (!canViewAllForLoad) filter.ASSIGNED_BY_ID = state.user.ID;
 
   const deals = await bxList('crm.deal.list', {
     order: { DATE_MODIFY: 'DESC' },
@@ -323,13 +326,18 @@ async function hydrateTasks(deals) {
 
 async function hydrateTimelineComments(deals) {
   state.commentsByDeal.clear();
+  state.auditByDeal.clear();
   await mapLimit(deals, 6, async (d) => {
     try {
+      // Берём несколько последних комментариев, чтобы найти служебную метку проверки.
+      // Если брать только 1 комментарий, статус может потеряться из-за более свежего обычного комментария.
       const comments = await bxList('crm.timeline.comment.list', {
         filter: { ENTITY_ID: d.ID, ENTITY_TYPE: 'deal' },
         order: { ID: 'DESC' }
-      }, 1);
+      }, 20);
       state.commentsByDeal.set(String(d.ID), comments);
+      const audit = findLatestAudit(comments);
+      if (audit) state.auditByDeal.set(String(d.ID), audit);
     } catch (_) {
       state.commentsByDeal.set(String(d.ID), []);
     }
@@ -337,6 +345,68 @@ async function hydrateTimelineComments(deals) {
 }
 
 function getTimelineComments(dealId) { return state.commentsByDeal.get(String(dealId)) || []; }
+
+function findLatestAudit(comments) {
+  for (const c of comments || []) {
+    const raw = String(c.COMMENT || c.TEXT || '');
+    const parsed = parseAuditMarker(raw);
+    if (parsed) return parsed;
+  }
+  // Fallback for старые комментарии без JSON-метки.
+  for (const c of comments || []) {
+    const text = stripHtml(String(c.COMMENT || c.TEXT || ''));
+    if (!/ИИ-проверка передачи сделки в производство/i.test(text)) continue;
+    const statusLine = (text.match(/Статус:\s*([^\n]+)/i) || [])[1] || 'проверено';
+    let statusCode = 'partial';
+    if (/есть ошибки/i.test(statusLine)) statusCode = 'error';
+    else if (/готова|достаточ/i.test(statusLine)) statusCode = 'ok';
+    return {
+      version: 0,
+      statusCode,
+      status: statusLine,
+      checkedAt: c.CREATED || c.DATE_CREATE || c.created || '',
+      checkedByName: 'из комментария Bitrix',
+      missing: [],
+      uncertain: [],
+      technical: [],
+      legacy: true,
+    };
+  }
+  return null;
+}
+
+function parseAuditMarker(raw) {
+  const text = String(raw || '');
+  const idx = text.indexOf(`${AUDIT_TAG}:`);
+  if (idx === -1) return null;
+  const jsonPart = text.slice(idx + AUDIT_TAG.length + 1).trim().split(/\n|<br\s*\/?>/i)[0].trim();
+  try {
+    return JSON.parse(jsonPart);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getAudit(dealId) { return state.auditByDeal.get(String(dealId)) || null; }
+function auditLabel(audit) {
+  if (!audit) return 'Не проверено';
+  if (audit.statusCode === 'ok') return 'Проверено — достаточно';
+  if (audit.statusCode === 'error') return 'Есть ошибки передачи';
+  if (audit.statusCode === 'partial') return 'Нужно подтвердить';
+  return audit.status || 'Проверено';
+}
+function auditClass(audit) {
+  if (!audit) return 'status-none';
+  if (audit.statusCode === 'ok') return 'status-ok';
+  if (audit.statusCode === 'error') return 'status-error';
+  if (audit.statusCode === 'partial') return 'status-partial';
+  return 'status-none';
+}
+function auditHtml(dealId) {
+  const audit = getAudit(dealId);
+  const meta = audit && audit.checkedAt ? `${formatDate(audit.checkedAt)}${audit.checkedByName ? ' · ' + audit.checkedByName : ''}` : '';
+  return `<span class="status-chip ${auditClass(audit)}">${escapeHtml(auditLabel(audit))}</span>${meta ? `<span class="audit-meta">${escapeHtml(meta)}</span>` : ''}`;
+}
 
 function userName(id) {
   const u = state.users.get(String(id));
@@ -393,6 +463,16 @@ function lastWorkDate(deal) {
 }
 
 
+
+function getRoleVisibleDeals() {
+  const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
+  if (isRopOnly) return state.deals.filter((d) => {
+    const audit = getAudit(d.ID);
+    return audit && audit.statusCode === 'error';
+  });
+  return state.deals;
+}
+
 function renderDeals() {
   document.getElementById('loading').classList.add('hidden');
   const table = document.getElementById('deals-table');
@@ -401,7 +481,8 @@ function renderDeals() {
   const tbody = table.querySelector('tbody');
   tbody.innerHTML = '';
 
-  const filtered = state.deals.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID}`).includes(q));
+  const roleVisibleDeals = getRoleVisibleDeals();
+  const filtered = roleVisibleDeals.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID} ${auditLabel(getAudit(d.ID))}`).includes(q));
 
   filtered.forEach((deal) => {
     const next = nextStep(deal.ID);
@@ -420,6 +501,7 @@ function renderDeals() {
       <td>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</td>
       <td>${next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
       <td>${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}</td>
+      <td>${auditHtml(deal.ID)}</td>
       <td>
         <button class="secondary" data-bx="${deal.ID}">В Bitrix</button>
         <button class="secondary" data-open="${deal.ID}">Открыть</button>
@@ -430,11 +512,15 @@ function renderDeals() {
     tbody.appendChild(tr);
   });
 
-  document.getElementById('count-all').textContent = state.deals.length;
-  document.getElementById('count-no-activity').textContent = state.deals.filter((d) => !hasNextStep(d.ID)).length;
-  document.getElementById('count-stale').textContent = state.deals.filter((d) => daysSince(lastWorkDate(d)) >= 2).length;
-  document.getElementById('count-check').textContent = state.deals.filter((d) => !getSalesLink(d)).length;
-  document.getElementById('deals-title').textContent = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll ? 'Сделки, закреплённые за мной' : 'Активные сделки';
+  const visibleForRole = getRoleVisibleDeals();
+  document.getElementById('count-all').textContent = visibleForRole.length;
+  document.getElementById('count-no-activity').textContent = visibleForRole.filter((d) => !hasNextStep(d.ID)).length;
+  document.getElementById('count-stale').textContent = visibleForRole.filter((d) => daysSince(lastWorkDate(d)) >= 2).length;
+  const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
+  document.getElementById('label-count-all').textContent = isRopOnly ? 'Ошибки передачи' : 'Активные открытые сделки';
+  document.getElementById('label-count-check').textContent = isRopOnly ? 'Ошибки передачи' : 'Не проверено';
+  document.getElementById('count-check').textContent = isRopOnly ? visibleForRole.length : visibleForRole.filter((d) => !getAudit(d.ID)).length;
+  document.getElementById('deals-title').textContent = isRopOnly ? 'Ошибки передачи из продаж' : 'Активные сделки';
 
   const roleNote = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll
     ? 'Режим РОП: общий список экспертов скрыт. Для временного общего просмотра поставь ALLOW_ROP_VIEW_ALL=true.'
@@ -456,9 +542,10 @@ async function openDeal(id) {
   state.selectedDeal = deal;
   state.selectedAnalysis = '';
   state.selectedMissing = [];
+  state.selectedAudit = null;
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
-  ['write-comment','create-manager-task','create-expert-task'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  ['write-comment','create-manager-task','create-expert-task','mark-checked'].forEach((x) => document.getElementById(x).classList.add('hidden'));
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
   document.getElementById('deal-dialog').showModal();
 }
@@ -476,6 +563,7 @@ function detailHtml(deal) {
     ['Ответственный', userName(deal.ASSIGNED_BY_ID)],
     ['Кто создал сделку', userName(deal.CREATED_BY_ID)],
     ['Ссылка на сделку отдела продаж', getSalesLink(deal) || '—'],
+    ['Проверка передачи', stripHtml(auditLabel(getAudit(deal.ID)))],
     ['Следующее дело/задача', next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'нет открытого дела/задачи'],
   ];
   return fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
@@ -519,6 +607,7 @@ async function checkHandoff() {
   const risks = buildRisks({ missing, uncertain, technicalMissing });
   const actionItems = [...missing.map((r) => r.label), ...uncertain.map((r) => `${r.label} — подтвердить`), ...technicalMissing.map((r) => r.label)];
   state.selectedMissing = actionItems;
+  state.selectedAudit = buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing });
   state.selectedAnalysis = formatAnalysisV3({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId });
 
   const out = document.getElementById('analysis-result');
@@ -527,6 +616,29 @@ async function checkHandoff() {
   document.getElementById('write-comment').classList.remove('hidden');
   document.getElementById('create-manager-task').classList.toggle('hidden', !actionItems.length);
   document.getElementById('create-expert-task').classList.remove('hidden');
+  document.getElementById('mark-checked').classList.remove('hidden');
+}
+
+
+function buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing }) {
+  const statusCode = /есть ошибки/i.test(status) ? 'error' : /частично|подтверд/i.test(status) ? 'partial' : 'ok';
+  return {
+    version: 1,
+    dealId: String(deal.ID),
+    statusCode,
+    status,
+    checkedAt: new Date().toISOString(),
+    checkedById: String(state.user.ID),
+    checkedByName: `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim(),
+    missing: missing.map((x) => x.label),
+    uncertain: uncertain.map((x) => x.label),
+    technical: (technicalMissing || []).map((x) => x.label),
+    foundCount: found.length,
+  };
+}
+
+function auditMarker(audit) {
+  return `\n\n---\nСлужебная метка ассистента: ${AUDIT_TAG}:${JSON.stringify(audit)}`;
 }
 
 async function collectDealContext(id, deal, label) {
@@ -696,9 +808,38 @@ function stripHtml(value) {
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
   await bxCall('crm.timeline.comment.add', {
-    fields: { ENTITY_ID: Number(state.selectedDeal.ID), ENTITY_TYPE: 'deal', COMMENT: state.selectedAnalysis }
+    fields: { ENTITY_ID: Number(state.selectedDeal.ID), ENTITY_TYPE: 'deal', COMMENT: `${state.selectedAnalysis}${state.selectedAudit ? auditMarker(state.selectedAudit) : ''}` }
   });
+  if (state.selectedAudit) state.auditByDeal.set(String(state.selectedDeal.ID), state.selectedAudit);
+  renderDeals();
   alert('Комментарий записан в сделку.');
+}
+
+
+async function markChecked() {
+  if (!state.selectedDeal) return;
+  const d = state.selectedDeal;
+  const audit = {
+    version: 1,
+    dealId: String(d.ID),
+    statusCode: 'ok',
+    status: 'проверено вручную — принято в работу',
+    checkedAt: new Date().toISOString(),
+    checkedById: String(state.user.ID),
+    checkedByName: `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim(),
+    missing: [],
+    uncertain: [],
+    technical: [],
+    foundCount: 0,
+    manual: true,
+  };
+  const comment = `ИИ-проверка передачи сделки в производство\n\nСтатус: проверено вручную — принято в работу.\n\nПользователь отметил передачу как проверенную в кабинете ИИ-ассистента.\n${auditMarker(audit)}`;
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(d.ID), ENTITY_TYPE: 'deal', COMMENT: comment }
+  });
+  state.auditByDeal.set(String(d.ID), audit);
+  renderDeals();
+  alert('Сделка отмечена как проверенная.');
 }
 
 async function createManagerTask() {
@@ -782,5 +923,6 @@ document.getElementById('check-handoff').addEventListener('click', checkHandoff)
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
+document.getElementById('mark-checked').addEventListener('click', markChecked);
 
 init();
