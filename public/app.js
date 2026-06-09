@@ -21,6 +21,7 @@ const state = {
   selectedAnalysis: '',
   selectedMissing: [],
   selectedAudit: null,
+  selectedMode: '',
 };
 
 const REQUIRED_ITEMS = [
@@ -543,6 +544,7 @@ async function openDeal(id) {
   state.selectedAnalysis = '';
   state.selectedMissing = [];
   state.selectedAudit = null;
+  state.selectedMode = '';
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
   ['write-comment','create-manager-task','create-expert-task','mark-checked'].forEach((x) => document.getElementById(x).classList.add('hidden'));
@@ -606,6 +608,7 @@ async function checkHandoff() {
 
   const risks = buildRisks({ missing, uncertain, technicalMissing });
   const actionItems = [...missing.map((r) => r.label), ...uncertain.map((r) => `${r.label} — подтвердить`), ...technicalMissing.map((r) => r.label)];
+  state.selectedMode = 'handoff';
   state.selectedMissing = actionItems;
   state.selectedAudit = buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing });
   state.selectedAnalysis = formatAnalysisV3({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId });
@@ -805,6 +808,86 @@ function stripHtml(value) {
     .trim();
 }
 
+
+function stageWorkPlanAdvice(stage) {
+  const s = normalize(stage);
+  if (/эксперт назначен/.test(s)) return 'провести первое касание, подтвердить состав услуги, документы, оплаты, сроки и следующий шаг';
+  if (/сбор информации/.test(s)) return 'собрать недостающие данные и документы, поставить клиенту понятный дедлайн';
+  if (/заявка подана/.test(s)) return 'контролировать поданную заявку, оплату обязательных счетов и следующий срок реакции';
+  if (/подбор/.test(s)) return 'зафиксировать, кого ищет клиент, кого подбирает MAVIS, и какой дедлайн по специалистам';
+  if (/обучение/.test(s)) return 'контролировать обучение/подготовку специалиста и следующий контрольный срок';
+  if (/передан оформителю/.test(s)) return 'проверить, что оформитель получил все данные, и назначить контроль готовности пакета';
+  if (/документы готовы/.test(s)) return 'сверить готовый пакет, отправить клиенту инструкции по подписи/копиям и зафиксировать дату передачи';
+  if (/выезд|подач/.test(s)) return 'подтвердить дату выезда/подачи, готовность документов, оплат и ответственных лиц';
+  if (/проверка органом/.test(s)) return 'контролировать статус проверки органом и заранее подготовить действия на случай замечаний';
+  if (/устранение замечан/.test(s)) return 'зафиксировать замечания, причину, ответственного и дедлайн устранения';
+  if (/работа с возвратом|возврат/.test(s)) return 'передать ситуацию руководителю, собрать факты из КП, звонков и переписки';
+  return 'зафиксировать текущий статус, следующий шаг, ответственного и дедлайн';
+}
+
+function buildWorkPlanText(deal) {
+  const stage = stageName(deal.STAGE_ID);
+  const service = getService(deal) || 'услуга не указана';
+  const company = companyName(deal.COMPANY_ID);
+  const contact = contactName(deal.CONTACT_ID);
+  const next = nextStep(deal.ID);
+  const audit = getAudit(deal.ID) || state.selectedAudit;
+  const missing = audit ? [...(audit.missing || []), ...(audit.technical || [])] : [];
+  const uncertain = audit ? [...(audit.uncertain || [])] : [];
+  const clientName = contact && contact !== '—' ? contact.split(/\s+/)[0] : '[Имя]';
+  const nextText = next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'следующий шаг в Bitrix не запланирован';
+  const dateStart = formatDate(getStartDate(deal)) || 'не указана';
+  const advice = stageWorkPlanAdvice(stage);
+  const riskBlock = missing.length || uncertain.length
+    ? `\nЧто нужно уточнить/закрыть перед отправкой клиенту:\n${missing.map((x) => `— не хватает: ${x}`).join('\n')}${missing.length && uncertain.length ? '\n' : ''}${uncertain.map((x) => `— подтвердить: ${x}`).join('\n')}`
+    : '\nКритичных пробелов по передаче сделки в текущей проверке не зафиксировано.';
+
+  return `Черновик хода работы по сделке\n\n` +
+    `Компания: ${company}\n` +
+    `Контакт: ${contact}\n` +
+    `Сделка: ${deal.TITLE || ''} / ID ${deal.ID}\n` +
+    `Услуга: ${service}\n` +
+    `Стадия производства: ${stage}\n` +
+    `Дата начала оказания услуг: ${dateStart}\n` +
+    `Ответственный эксперт: ${userName(deal.ASSIGNED_BY_ID)}\n` +
+    `Следующее дело/задача: ${nextText}\n\n` +
+    `Логика текущего этапа:\n— ${advice}.\n\n` +
+    `Что делает MAVIS GROUP:\n` +
+    `— проверяет комплектность данных и документов по услуге;\n` +
+    `— готовит/актуализирует перечень документов и копий;\n` +
+    `— при необходимости заказывает счета, пошлины, техкарты, Стройдок или другие обязательные платежи;\n` +
+    `— контролирует подготовку, подачу/выезд, замечания и фактическое получение результата.\n\n` +
+    `Что нужно от клиента:\n` +
+    `— подтвердить ответственного со стороны клиента;\n` +
+    `— прислать недостающие документы/данные по перечню эксперта;\n` +
+    `— оплатить обязательные счета/пошлины и прислать платёжку, если это применимо;\n` +
+    `— заранее предупредить, если срок по документам или оплате сдвигается.\n` +
+    `${riskBlock}\n\n` +
+    `Черновик сообщения клиенту в мессенджер:\n` +
+    `${clientName}, добрый день! По вашей услуге “${service}” фиксирую ход работы.\n` +
+    `С нашей стороны: проверяем комплектность данных, готовим документы/перечни и контролируем дальнейший этап: ${stage}.\n` +
+    `С вашей стороны сейчас важно: прислать недостающие данные/документы и оплатить обязательные счета/пошлины, если они будут выставлены.\n` +
+    `Следующий контрольный шаг: ${nextText}.\n` +
+    `Если документы или оплата будут задержаны, сроки подачи/получения могут сдвинуться.\n\n` +
+    `Комментарий для карточки сделки:\n` +
+    `Ход работы сформирован ассистентом. Текущий этап: ${stage}. Следующий шаг: ${nextText}. Эксперту нужно подтвердить с клиентом документы, оплаты, дедлайны и зафиксировать итог первого/следующего касания.`;
+}
+
+async function generateWorkPlan() {
+  if (!state.selectedDeal) return;
+  state.selectedMode = 'workplan';
+  state.selectedAudit = null;
+  state.selectedMissing = [];
+  state.selectedAnalysis = buildWorkPlanText(state.selectedDeal);
+  const out = document.getElementById('analysis-result');
+  out.textContent = state.selectedAnalysis;
+  out.classList.remove('hidden');
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.add('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+}
+
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
   await bxCall('crm.timeline.comment.add', {
@@ -812,8 +895,9 @@ async function writeComment() {
   });
   if (state.selectedAudit) state.auditByDeal.set(String(state.selectedDeal.ID), state.selectedAudit);
   renderDeals();
-  alert('Комментарий записан в сделку.');
+  alert(state.selectedMode === 'workplan' ? 'Ход работы записан в комментарий сделки.' : 'Комментарий записан в сделку.');
 }
+
 
 
 async function markChecked() {
@@ -920,6 +1004,7 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 });
 document.getElementById('close-dialog').addEventListener('click', () => document.getElementById('deal-dialog').close());
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
+document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
