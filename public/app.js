@@ -15,6 +15,7 @@ const state = {
   contacts: new Map(),
   activitiesByDeal: new Map(),
   tasksByDeal: new Map(),
+  commentsByDeal: new Map(),
   selectedDeal: null,
   selectedAnalysis: '',
   selectedMissing: [],
@@ -111,20 +112,30 @@ function bxCall(method, params = {}) {
 }
 
 async function bxList(method, params = {}, limit = 200) {
+  // limit > 0: return not more than limit items.
+  // limit = 0 / null / undefined: load all pages returned by Bitrix.
+  const normalizedLimit = Number(limit || 0);
+  const useLimit = Number.isFinite(normalizedLimit) && normalizedLimit > 0;
   const items = [];
   let start = 0;
-  while (items.length < limit) {
+
+  while (true) {
     const page = await new Promise((resolve, reject) => {
       BX24.callMethod(method, { ...params, start }, (result) => {
         if (result.error()) reject(new Error(`${method}: ${result.error()} ${result.error_description() || ''}`));
         else resolve({ data: result.data(), next: result.more() ? result.next() : null });
       });
     });
-    items.push(...(Array.isArray(page.data) ? page.data : []));
+
+    const data = Array.isArray(page.data) ? page.data : [];
+    items.push(...data);
+
     if (!page.next) break;
+    if (useLimit && items.length >= normalizedLimit) break;
     start = page.next;
   }
-  return items.slice(0, limit);
+
+  return useLimit ? items.slice(0, normalizedLimit) : items;
 }
 
 function normalize(s) { return String(s || '').toLowerCase(); }
@@ -169,11 +180,12 @@ async function loadDeals() {
   document.getElementById('deals-table').classList.add('hidden');
   hideError();
 
-  const select = ['ID','TITLE','COMPANY_ID','CONTACT_ID','STAGE_ID','CATEGORY_ID','OPPORTUNITY','ASSIGNED_BY_ID','CREATED_BY_ID','DATE_CREATE','DATE_MODIFY'];
+  const select = ['ID','TITLE','COMPANY_ID','CONTACT_ID','STAGE_ID','CATEGORY_ID','OPPORTUNITY','ASSIGNED_BY_ID','CREATED_BY_ID','DATE_CREATE','DATE_MODIFY','CLOSED'];
   Object.values(state.fieldMap).filter(Boolean).forEach((f) => { if (!select.includes(f)) select.push(f); });
 
   const filter = {};
   if (APP_CONFIG.productionCategoryId) filter.CATEGORY_ID = APP_CONFIG.productionCategoryId;
+  if (APP_CONFIG.excludeClosedDeals !== false) filter.CLOSED = 'N';
 
   // По ТЗ личный кабинет эксперта показывает только его сделки.
   // Руководители/админы видят все сделки воронки.
@@ -186,13 +198,14 @@ async function loadDeals() {
     order: { DATE_MODIFY: 'DESC' },
     filter,
     select,
-  }, Number(APP_CONFIG.maxDeals || 50));
+  }, Number(APP_CONFIG.maxDeals || 0));
 
   state.deals = deals;
   await hydrateDeals(deals);
   await hydrateStages(deals);
   await hydrateActivities(deals);
   await hydrateTasks(deals);
+  await hydrateTimelineComments(deals);
   renderDeals();
 }
 
@@ -220,23 +233,36 @@ async function hydrateDeals(deals) {
 async function hydrateStages(deals) {
   const categoryIds = [...new Set(deals.map((d) => String(d.CATEGORY_ID || '0')))];
   const entityIds = ['DEAL_STAGE', ...categoryIds.filter((id) => id !== '0').map((id) => `DEAL_STAGE_${id}`)];
+
   await Promise.all(entityIds.map(async (entityId) => {
     try {
-      const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: entityId }, order: { SORT: 'ASC' } }, 200);
-      rows.forEach((row) => {
-        if (!row.STATUS_ID) return;
-        const statusId = String(row.STATUS_ID);
-        state.stageMap.set(statusId, row.NAME || statusId);
-        // В некоторых порталах Bitrix отдаёт стадии в сделке как C28:WON,
-        // а справочник по воронке — как WON. Сохраняем оба варианта.
-        const m = String(entityId).match(/^DEAL_STAGE_(\d+)$/);
-        if (m && !statusId.startsWith(`C${m[1]}:`)) {
-          state.stageMap.set(`C${m[1]}:${statusId}`, row.NAME || statusId);
-        }
-      });
+      const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: entityId }, order: { SORT: 'ASC' } }, 0);
+      rows.forEach((row) => saveStageName(entityId, row));
+    } catch (_) {}
+  }));
+
+  // Extra fallback for custom deal pipelines. Some portals return custom pipeline
+  // stages more reliably through crm.dealcategory.stage.list.
+  await Promise.all(categoryIds.filter((id) => id !== '0').map(async (categoryId) => {
+    try {
+      const rows = await bxList('crm.dealcategory.stage.list', { id: categoryId, order: { SORT: 'ASC' } }, 0);
+      rows.forEach((row) => saveStageName(`DEAL_STAGE_${categoryId}`, row));
     } catch (_) {}
   }));
 }
+
+function saveStageName(entityId, row) {
+  if (!row) return;
+  const statusId = String(row.STATUS_ID || row.statusId || row.ID || row.id || '');
+  const name = row.NAME || row.name || row.TITLE || row.title || statusId;
+  if (!statusId) return;
+  state.stageMap.set(statusId, name);
+  const m = String(entityId).match(/^DEAL_STAGE_(\d+)$/);
+  if (m && !statusId.startsWith(`C${m[1]}:`)) {
+    state.stageMap.set(`C${m[1]}:${statusId}`, name);
+  }
+}
+
 
 async function hydrateActivities(deals) {
   state.activitiesByDeal.clear();
@@ -270,6 +296,24 @@ async function hydrateTasks(deals) {
     }
   }));
 }
+
+
+async function hydrateTimelineComments(deals) {
+  state.commentsByDeal.clear();
+  await Promise.all(deals.map(async (d) => {
+    try {
+      const comments = await bxList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: d.ID, ENTITY_TYPE: 'deal' },
+        order: { ID: 'DESC' }
+      }, 1);
+      state.commentsByDeal.set(String(d.ID), comments);
+    } catch (_) {
+      state.commentsByDeal.set(String(d.ID), []);
+    }
+  }));
+}
+
+function getTimelineComments(dealId) { return state.commentsByDeal.get(String(dealId)) || []; }
 
 function userName(id) {
   const u = state.users.get(String(id));
@@ -314,11 +358,14 @@ function nextStep(dealId) {
     : { kind: 'задача', date: t.DEADLINE || t.deadline, title: t.TITLE || t.title || '' };
 }
 function lastWorkDate(deal) {
+  // We intentionally do NOT treat a future deadline as activity.
+  // Working activity = deal creation, activity creation, task creation/closing, manual CRM comments.
   const dates = [deal.DATE_CREATE];
-  getActivities(deal.ID).forEach((a) => dates.push(a.CREATED, a.DEADLINE));
-  getTasks(deal.ID).forEach((t) => dates.push(t.CREATED_DATE || t.createdDate, t.DEADLINE || t.deadline, t.CLOSED_DATE || t.closedDate));
-  const parsed = dates.map((x) => new Date(x)).filter((d) => !Number.isNaN(d.getTime()));
-  if (!parsed.length) return deal.DATE_MODIFY || deal.DATE_CREATE;
+  getActivities(deal.ID).forEach((a) => dates.push(a.CREATED, a.LAST_UPDATED));
+  getTasks(deal.ID).forEach((t) => dates.push(t.CREATED_DATE || t.createdDate, t.CLOSED_DATE || t.closedDate, t.CHANGED_DATE || t.changedDate));
+  getTimelineComments(deal.ID).forEach((c) => dates.push(c.CREATED || c.DATE_CREATE || c.created));
+  const parsed = dates.map((x) => new Date(x)).filter((d) => !Number.isNaN(d.getTime()) && d.getTime() <= Date.now());
+  if (!parsed.length) return deal.DATE_CREATE;
   return new Date(Math.max(...parsed.map((d) => d.getTime()))).toISOString();
 }
 
@@ -364,17 +411,20 @@ function renderDeals() {
   document.getElementById('count-no-activity').textContent = state.deals.filter((d) => !hasNextStep(d.ID)).length;
   document.getElementById('count-stale').textContent = state.deals.filter((d) => daysSince(lastWorkDate(d)) >= 2).length;
   document.getElementById('count-check').textContent = state.deals.filter((d) => !getSalesLink(d)).length;
-  document.getElementById('deals-title').textContent = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll ? 'Сделки, закреплённые за мной' : 'Мои сделки';
+  document.getElementById('deals-title').textContent = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll ? 'Сделки, закреплённые за мной' : 'Активные сделки';
 
   const roleNote = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll
     ? 'Режим РОП: общий список экспертов скрыт. Для временного общего просмотра поставь ALLOW_ROP_VIEW_ALL=true.'
     : state.isAdmin || state.isLeader
-      ? 'Режим руководителя: показаны сделки всех ответственных в выбранной воронке/лимите.'
-      : 'Режим эксперта: показаны только сделки, где текущий пользователь — ответственный.';
+      ? 'Режим руководителя: показаны все открытые сделки выбранной воронки.'
+      : 'Режим эксперта: показаны только открытые сделки, где текущий пользователь — ответственный.';
+  const limitNote = Number(APP_CONFIG.maxDeals || 0) > 0
+    ? `Технический лимит загрузки: MAX_DEALS=${APP_CONFIG.maxDeals}.`
+    : 'Технический лимит не задан: приложение загружает все открытые сделки через пагинацию Bitrix.';
   document.getElementById('category-note').textContent = (APP_CONFIG.productionCategoryId
     ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}. `
     : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render. ')
-    + `${roleNote} Загружено не больше MAX_DEALS=${APP_CONFIG.maxDeals || 200}.`;
+    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote}`;
 
 }
 

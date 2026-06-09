@@ -30,7 +30,9 @@ const config = {
   adminUserIds: parseIdList(process.env.ADMIN_USER_IDS),
   ropUserIds: parseIdList(process.env.ROP_USER_IDS),
   productionCategoryId: process.env.PRODUCTION_CATEGORY_ID || '',
-  maxDeals: Number(process.env.MAX_DEALS || 200),
+  // 0 or empty means: load all active deals via Bitrix pagination.
+  maxDeals: Number(process.env.MAX_DEALS || 0),
+  excludeClosedDeals: String(process.env.EXCLUDE_CLOSED_DEALS || 'true').toLowerCase() !== 'false',
   allowRopViewAll: String(process.env.ALLOW_ROP_VIEW_ALL || 'false').toLowerCase() === 'true',
 };
 
