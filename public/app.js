@@ -1173,6 +1173,60 @@ function buildWorkPlanTasks(deal) {
   return tasks.filter((task) => !hasOpenTaskWithTitle(deal.ID, task.title));
 }
 
+
+async function showDealFields() {
+  if (!state.selectedDeal) return;
+  const id = state.selectedDeal.ID;
+  let fresh = state.selectedDeal;
+  try { fresh = await bxCall('crm.deal.get', { id }); } catch (_) {}
+
+  const lines = [];
+  lines.push('Диагностика полей сделки');
+  lines.push('Сделка ID: ' + id);
+  lines.push('');
+  lines.push('Как пользоваться: найди строку, где значение равно услуге из карточки Bitrix.');
+  lines.push('Например: тест ии / СПК / Аттестация / ISO.');
+  lines.push('Код слева нужно будет добавить в Render как SERVICE_FIELD_CODE.');
+  lines.push('');
+
+  const entries = Object.entries(fresh || {})
+    .filter(([code, raw]) => raw !== null && raw !== undefined && raw !== '' && !(Array.isArray(raw) && !raw.length))
+    .map(([code, raw]) => {
+      const label = fieldLabel(code);
+      const resolved = resolveFieldValue(code, raw);
+      return { code, label, value: resolved || JSON.stringify(raw) };
+    })
+    .filter((x) => String(x.value || '').trim() !== '')
+    .sort((a, b) => {
+      const au = a.code.startsWith('UF_') ? 0 : 1;
+      const bu = b.code.startsWith('UF_') ? 0 : 1;
+      if (au !== bu) return au - bu;
+      return a.code.localeCompare(b.code);
+    });
+
+  const likely = entries.filter((x) => {
+    const txt = normalize([x.code, x.label, x.value].join(' '));
+    return txt.includes('услуг') || txt.includes('спк') || txt.includes('стк') || txt.includes('аттеста') || txt.includes('iso') || txt.includes('сертифик') || txt.includes('периодик') || txt.includes('тест ии');
+  });
+
+  if (likely.length) {
+    lines.push('Возможные поля услуги:');
+    likely.slice(0, 30).forEach((x) => {
+      lines.push(`— ${x.code} | ${x.label || 'без подписи'} | ${x.value}`);
+    });
+    lines.push('');
+  }
+
+  lines.push('Все заполненные поля сделки:');
+  entries.forEach((x) => {
+    lines.push(`— ${x.code} | ${x.label || 'без подписи'} | ${x.value}`);
+  });
+
+  const out = document.getElementById('analysis-result');
+  out.textContent = lines.join('\n');
+  out.classList.remove('hidden');
+}
+
 async function createWorkPlanTasks() {
   if (!state.selectedDeal) return;
   const d = state.selectedDeal;
@@ -1262,5 +1316,6 @@ document.getElementById('create-manager-task').addEventListener('click', createM
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
 document.getElementById('create-workplan-tasks').addEventListener('click', createWorkPlanTasks);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
+document.getElementById('show-fields').addEventListener('click', showDealFields);
 
 init();
