@@ -764,7 +764,7 @@ async function checkHandoff() {
   state.selectedAnalysis = formatAnalysisV3({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId });
 
   const out = document.getElementById('analysis-result');
-  out.textContent = state.selectedAnalysis;
+  out.innerHTML = renderHandoffResultHtml({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId });
   out.classList.remove('hidden');
   document.getElementById('write-comment').classList.remove('hidden');
   document.getElementById('create-manager-task').classList.toggle('hidden', !actionItems.length);
@@ -920,6 +920,123 @@ function buildRisks({ missing, uncertain, technicalMissing }) {
   return risks.length ? risks : ['критичных рисков передачи по найденным данным не выявлено'];
 }
 
+
+function resultStatusClass(status) {
+  const s = normalize(status);
+  if (s.includes('ошиб')) return 'error';
+  if (s.includes('частично') || s.includes('подтверд')) return 'partial';
+  return 'ok';
+}
+function listHtml(items, emptyText, renderer) {
+  if (!items || !items.length) return `<p class="muted">${escapeHtml(emptyText)}</p>`;
+  return `<ul>${items.map((x) => `<li>${renderer ? renderer(x) : escapeHtml(String(x))}</li>`).join('')}</ul>`;
+}
+function evidenceHtml(x, mode = 'found') {
+  const note = mode === 'uncertain' ? 'найден только косвенный признак' : 'источник';
+  const source = x.source ? `<span class="source-note">${escapeHtml(note)}: ${escapeHtml(x.source)}</span>` : '';
+  const snippet = x.snippet ? `<span class="source-note">фрагмент: “${escapeHtml(x.snippet)}”</span>` : '';
+  return `<strong>${escapeHtml(x.label)}</strong>${source}${snippet}`;
+}
+function renderHandoffResultHtml({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId }) {
+  const technical = technicalMissing || [];
+  const statusClass = resultStatusClass(status);
+  const needActions = missing.length || uncertain.length || technical.length;
+  const actions = needActions
+    ? [
+        'Менеджеру дозаполнить или подтвердить недостающие данные',
+        'Эксперту при первом касании подтвердить спорные пункты',
+        'Если проблема повторяется — РОП/руководителю разобрать качество передачи сделки',
+      ]
+    : [
+        'Эксперту сделать первое касание клиента',
+        'Зафиксировать ход работы, документы, оплаты, дедлайны и следующий шаг',
+      ];
+  return `
+    <div class="result-header">
+      <div class="result-header-title">
+        <h3>ИИ-проверка передачи сделки в производство</h3>
+        <span class="result-status ${statusClass}">${escapeHtml(status)}</span>
+      </div>
+      <div class="result-grid">
+        <div class="result-field"><span>Сделка</span>${escapeHtml(deal.TITLE || '')}</div>
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Контакт</span>${escapeHtml(contactName(deal.CONTACT_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stageName(deal.STAGE_ID))}</div>
+        <div class="result-field"><span>Связанная сделка продаж</span>${escapeHtml(salesId ? `ID ${salesId}` : 'не найдена')}</div>
+      </div>
+    </div>
+    <div class="result-card card-found">
+      <h3>Найдено точно</h3>
+      ${listHtml(found, 'Точных подтверждений пока нет', (x) => evidenceHtml(x, 'found'))}
+    </div>
+    <div class="result-card card-uncertain">
+      <h3>Нужно подтвердить</h3>
+      ${listHtml(uncertain, 'Спорных пунктов нет', (x) => evidenceHtml(x, 'uncertain'))}
+    </div>
+    <div class="result-card card-missing">
+      <h3>Не найдено</h3>
+      ${listHtml(missing, 'Критичных пробелов не найдено', (x) => `<strong>${escapeHtml(x.label)}</strong><span class="source-note">почему важно: ${escapeHtml(x.why)}</span>`)}
+      ${technical.length ? `<h3 style="margin-top:14px">Технически не хватает</h3>${listHtml(technical, '', (x) => `<strong>${escapeHtml(x.label)}</strong><span class="source-note">почему важно: ${escapeHtml(x.why)}</span>`)}` : ''}
+    </div>
+    <div class="result-card card-risk">
+      <h3>Риски</h3>
+      ${listHtml(risks, 'Критичных рисков не выявлено')}
+    </div>
+    <div class="result-card card-action">
+      <h3>Что сделать дальше</h3>
+      ${listHtml(actions, 'Действий нет')}
+    </div>
+  `;
+}
+function renderWorkPlanResultHtml(deal, plainText) {
+  const stage = stageName(deal.STAGE_ID);
+  const service = getService(deal) || 'услуга не указана';
+  const company = companyName(deal.COMPANY_ID);
+  const contact = contactName(deal.CONTACT_ID);
+  const next = nextStep(deal.ID);
+  const nextText = next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'следующий шаг в Bitrix не запланирован';
+  const audit = getAudit(deal.ID) || state.selectedAudit;
+  const missing = audit ? [...(audit.missing || []), ...(audit.technical || [])] : [];
+  const uncertain = audit ? [...(audit.uncertain || [])] : [];
+  const clientName = contact && contact !== '—' ? contact.split(/\s+/)[0] : '[Имя]';
+  const message = `${clientName}, добрый день! По вашей услуге “${service}” фиксирую ход работы.\n` +
+    `С нашей стороны: проверяем комплектность данных, готовим документы/перечни и контролируем дальнейший этап: ${stage}.\n` +
+    `С вашей стороны сейчас важно: прислать недостающие данные/документы и оплатить обязательные счета/пошлины, если они будут выставлены.\n` +
+    `Следующий контрольный шаг: ${nextText}.\n` +
+    `Если документы или оплата будут задержаны, сроки подачи/получения могут сдвинуться.`;
+  const mavis = [
+    'Проверяет комплектность данных и документов по услуге',
+    'Готовит или актуализирует перечень документов и копий',
+    'При необходимости заказывает счета, пошлины, техкарты, Стройдок или другие обязательные платежи',
+    'Контролирует подготовку, подачу/выезд, замечания и фактическое получение результата',
+  ];
+  const client = [
+    'Подтвердить ответственного со стороны клиента',
+    'Прислать недостающие документы/данные по перечню эксперта',
+    'Оплатить обязательные счета/пошлины и прислать платёжку, если это применимо',
+    'Заранее предупредить, если срок по документам или оплате сдвигается',
+  ];
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Черновик хода работы</h3><span class="result-status partial">требует проверки эксперта</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(company)}</div>
+        <div class="result-field"><span>Контакт</span>${escapeHtml(contact)}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(service)}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stage)}</div>
+        <div class="result-field"><span>Дата начала</span>${escapeHtml(formatDate(getStartDate(deal)) || 'не указана')}</div>
+        <div class="result-field"><span>Следующий шаг</span>${escapeHtml(nextText)}</div>
+      </div>
+    </div>
+    <div class="result-card card-found"><h3>Что делает MAVIS GROUP</h3>${listHtml(mavis, '')}</div>
+    <div class="result-card card-action"><h3>Что нужно от клиента</h3>${listHtml(client, '')}</div>
+    <div class="result-card card-uncertain"><h3>Что нужно уточнить перед отправкой</h3>${listHtml([...missing.map((x) => `Не хватает: ${x}`), ...uncertain.map((x) => `Подтвердить: ${x}`)], 'Критичных пробелов по передаче сделки не зафиксировано')}</div>
+    <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(message)}</div></div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><pre class="analysis-pre" style="margin-top:10px">${escapeHtml(plainText)}</pre></details>
+  `;
+}
+
 function formatAnalysisV3({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId }) {
   const technical = technicalMissing || [];
   return `ИИ-проверка передачи сделки в производство\n\n` +
@@ -1032,7 +1149,7 @@ async function generateWorkPlan() {
   state.selectedMissing = [];
   state.selectedAnalysis = buildWorkPlanText(state.selectedDeal);
   const out = document.getElementById('analysis-result');
-  out.textContent = state.selectedAnalysis;
+  out.innerHTML = renderWorkPlanResultHtml(state.selectedDeal, state.selectedAnalysis);
   out.classList.remove('hidden');
   document.getElementById('write-comment').classList.remove('hidden');
   document.getElementById('create-manager-task').classList.add('hidden');
@@ -1223,7 +1340,7 @@ async function showDealFields() {
   });
 
   const out = document.getElementById('analysis-result');
-  out.textContent = lines.join('\n');
+  out.innerHTML = `<pre class="analysis-pre">${escapeHtml(lines.join('\n'))}</pre>`;
   out.classList.remove('hidden');
 }
 

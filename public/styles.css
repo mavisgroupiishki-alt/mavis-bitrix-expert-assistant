@@ -44,7 +44,30 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .detail { background: #f9fafb; border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 .detail span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
 .dialog-actions { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 20px 18px; }
-.analysis { margin: 0 20px 20px; padding: 14px; background: #0f172a; color: #e5e7eb; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
+.analysis { margin: 0 20px 20px; padding: 0; background: transparent; color: var(--text); border-radius: 12px; line-height: 1.45; }
+.analysis-pre { margin: 0; padding: 14px; background: #0f172a; color: #e5e7eb; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
+.result-card { border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: #fff; margin: 12px 0; }
+.result-card h3 { font-size: 17px; margin: 0 0 10px; }
+.result-card ul { margin: 0; padding-left: 18px; }
+.result-card li { margin: 6px 0; }
+.result-header { border: 1px solid var(--line); border-radius: 16px; background: #f8fafc; padding: 14px; margin-bottom: 12px; }
+.result-header-title { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+.result-header h3 { margin: 0; font-size: 18px; }
+.result-status { display:inline-block; border-radius:999px; padding:6px 10px; font-size:13px; font-weight:800; }
+.result-status.ok { background:#ecfdf5; color:#047857; }
+.result-status.partial { background:#fff7ed; color:#9a3412; }
+.result-status.error { background:#fef2f2; color:#b91c1c; }
+.result-grid { display:grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 8px; margin-top: 12px; }
+.result-field { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px; }
+.result-field span { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+.source-note { display:block; color: var(--muted); font-size:12px; margin-top:3px; }
+.card-found { border-left: 5px solid #10b981; }
+.card-uncertain { border-left: 5px solid #f59e0b; }
+.card-missing { border-left: 5px solid #ef4444; }
+.card-risk { border-left: 5px solid #8b5cf6; }
+.card-action { border-left: 5px solid #1d8cf8; }
+.message-draft { background:#f8fafc; border:1px solid var(--line); border-radius:12px; padding:12px; white-space:pre-wrap; }
+@media (max-width: 800px) { .result-grid { grid-template-columns: 1fr; } }
 .install-card { max-width: 720px; margin: 80px auto; background: white; padding: 32px; border-radius: 18px; border: 1px solid var(--line); }
 @media (max-width: 800px) { .summary-grid { grid-template-columns: 1fr 1fr; } #deal-details { grid-template-columns: 1fr; } .topbar, .panel-header { flex-direction: column; } }
 .small-note { margin-top: 6px; font-size: 13px; }
