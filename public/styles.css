@@ -124,3 +124,29 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .report-text { margin-top:12px; }
 .report-text textarea { width:100%; min-height:240px; border:1px solid var(--line); border-radius:12px; padding:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:13px; line-height:1.45; resize:vertical; }
 @media (max-width: 900px) { .manager-report-grid { grid-template-columns: 1fr; } .manager-report-header { flex-direction:column; } }
+
+
+.handoff-journal { margin-top:16px; border:1px solid var(--line); border-radius:16px; background:#fff; padding:14px; }
+.journal-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
+.journal-header h3 { font-size:18px; margin:0; }
+.journal-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.journal-filters { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px; }
+.journal-filters label { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:12px; }
+.journal-filters select, .journal-filters input { border:1px solid var(--line); border-radius:10px; padding:9px 12px; background:#fff; min-width:190px; }
+.journal-summary { display:grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap:10px; margin-bottom:12px; }
+.journal-card { border:1px solid var(--line); border-radius:12px; padding:10px; background:#f8fafc; }
+.journal-card span { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+.journal-card strong { font-size:22px; }
+.journal-card.danger { background:#fef2f2; }
+.journal-card.warning { background:#fff7ed; }
+.journal-card.info { background:#eff6ff; }
+.journal-issues { margin:0; padding-left:18px; }
+.journal-issues li { margin:4px 0; }
+.journal-row-actions { min-width:220px; }
+.journal-row-actions button { margin:0 6px 6px 0; }
+.status-danger { background:#fef2f2; color:#b91c1c; }
+.status-warning { background:#fff7ed; color:#9a3412; }
+.status-info { background:#eff6ff; color:#1d4ed8; }
+.status-ok { background:#ecfdf5; color:#047857; }
+@media (max-width: 900px) { .journal-summary { grid-template-columns:1fr 1fr; } .journal-header { flex-direction:column; } }
+@media (max-width: 700px) { .journal-summary { grid-template-columns:1fr; } }

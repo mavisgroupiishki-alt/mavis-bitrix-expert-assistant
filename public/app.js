@@ -28,6 +28,9 @@ const state = {
   detailsLoaded: false,
   detailsProgress: '',
   dashboardFilter: 'all',
+  journalStatusFilter: 'all',
+  journalManagerFilter: 'all',
+  journalSearch: '',
 };
 
 const REQUIRED_ITEMS = [
@@ -769,6 +772,7 @@ function renderManagerDashboard(deals, metaReady) {
 
   if (!metaReady) {
     document.getElementById('manager-dashboard-owners').innerHTML = '';
+    renderHandoffJournal(deals, metaReady);
     return;
   }
 
@@ -799,6 +803,7 @@ function renderManagerDashboard(deals, metaReady) {
       </div>
     </div>
   `).join('');
+  renderHandoffJournal(deals, metaReady);
 }
 
 
@@ -954,6 +959,178 @@ function generateManagerReport() {
   const deals = getRoleVisibleDeals();
   const report = buildManagerReport(deals);
   renderManagerReport(report);
+}
+
+
+function auditIssueList(audit) {
+  if (!audit) return [];
+  const items = [
+    ...(audit.missing || []).map((x) => ({ type: 'не передано', text: x })),
+    ...(audit.uncertain || []).map((x) => ({ type: 'подтвердить', text: x })),
+    ...(audit.technical || []).map((x) => ({ type: 'технически не хватает', text: x })),
+  ];
+  return items.filter((x) => String(x.text || '').trim());
+}
+
+function auditAgeDays(audit) {
+  if (!audit || !audit.checkedAt) return 0;
+  const d = new Date(audit.checkedAt);
+  if (Number.isNaN(d.getTime())) return 0;
+  return Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
+}
+
+function handoffJournalStatus(audit) {
+  if (!audit) return { key: 'unchecked', label: 'не проверено', cls: 'info' };
+  const age = auditAgeDays(audit);
+  if (audit.statusCode === 'error' && age >= 1) return { key: 'overdue', label: `просрочено исправление ${age} дн.`, cls: 'danger' };
+  if (audit.statusCode === 'error') return { key: 'new', label: 'новая ошибка', cls: 'danger' };
+  if (audit.statusCode === 'partial') return { key: 'partial', label: 'нужно подтвердить', cls: 'warning' };
+  return { key: 'ok', label: 'исправлено / принято', cls: 'ok' };
+}
+
+function managerIdForHandoff(deal) {
+  return String(deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID || '0');
+}
+
+function buildHandoffJournalRows(deals) {
+  return deals
+    .map((deal) => {
+      const audit = getAudit(deal.ID);
+      if (!audit || !['error', 'partial'].includes(audit.statusCode)) return null;
+      const status = handoffJournalStatus(audit);
+      const issues = auditIssueList(audit);
+      return { deal, audit, issues, status, managerId: managerIdForHandoff(deal), expertId: String(deal.ASSIGNED_BY_ID || '0'), checkedAt: audit.checkedAt || deal.DATE_MODIFY || deal.DATE_CREATE };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const priority = { overdue: 100, new: 80, partial: 50, ok: 0 };
+      return (priority[b.status.key] || 0) - (priority[a.status.key] || 0) || new Date(b.checkedAt || 0) - new Date(a.checkedAt || 0);
+    });
+}
+
+function filteredHandoffJournalRows(deals) {
+  const q = normalize(state.journalSearch || '');
+  return buildHandoffJournalRows(deals).filter((row) => {
+    if (state.journalStatusFilter !== 'all' && row.status.key !== state.journalStatusFilter) return false;
+    if (state.journalManagerFilter !== 'all' && String(row.managerId) !== String(state.journalManagerFilter)) return false;
+    if (!q) return true;
+    const hay = normalize([
+      companyName(row.deal.COMPANY_ID), row.deal.TITLE, getService(row.deal), userName(row.managerId), userName(row.expertId), row.issues.map((x) => `${x.type} ${x.text}`).join(' '),
+    ].join(' '));
+    return hay.includes(q);
+  });
+}
+
+function renderHandoffJournal(deals, metaReady) {
+  const box = document.getElementById('handoff-journal');
+  if (!box) return;
+  const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  box.classList.toggle('hidden', !shouldShow);
+  if (!shouldShow) return;
+
+  const allRows = metaReady ? buildHandoffJournalRows(deals) : [];
+  const rows = metaReady ? filteredHandoffJournalRows(deals) : [];
+  const tbody = document.querySelector('#handoff-journal-table tbody');
+  const managerSelect = document.getElementById('journal-manager-filter');
+  const summary = document.getElementById('handoff-journal-summary');
+
+  if (!metaReady) {
+    summary.innerHTML = '<div class="journal-card info"><span>Статус</span><strong>Догружаем проверки...</strong></div>';
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">Дела, задачи и проверки ещё догружаются. Журнал появится автоматически.</td></tr>';
+    return;
+  }
+
+  const managerOptions = [...new Set(allRows.map((r) => String(r.managerId)))].sort((a, b) => userName(a).localeCompare(userName(b)));
+  const currentManager = state.journalManagerFilter || 'all';
+  managerSelect.innerHTML = '<option value="all">Все менеджеры</option>' + managerOptions.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(userName(id))}</option>`).join('');
+  managerSelect.value = managerOptions.includes(currentManager) ? currentManager : 'all';
+  state.journalManagerFilter = managerSelect.value;
+
+  const count = (key) => allRows.filter((r) => r.status.key === key).length;
+  const unresolvedOver1Day = allRows.filter((r) => r.status.key === 'overdue').length;
+  summary.innerHTML = [
+    ['Всего ошибок/спорных', allRows.length, 'info'],
+    ['Новые ошибки', count('new'), 'danger'],
+    ['Нужно подтвердить', count('partial'), 'warning'],
+    ['Не исправлено больше 1 дня', unresolvedOver1Day, 'danger'],
+  ].map(([label, value, cls]) => `<div class="journal-card ${cls}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join('');
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">По выбранным фильтрам ошибок передачи нет.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.slice(0, 100).map((row) => {
+    const issues = row.issues.length
+      ? row.issues.slice(0, 6).map((x) => `<li><strong>${escapeHtml(x.type)}:</strong> ${escapeHtml(x.text)}</li>`).join('')
+      : '<li>нет детализации, нужно открыть проверку</li>';
+    return `
+      <tr>
+        <td>${escapeHtml(formatDate(row.checkedAt) || '—')}<br><span class="muted">${escapeHtml(row.audit.checkedByName || '')}</span></td>
+        <td><strong>${escapeHtml(companyName(row.deal.COMPANY_ID))}</strong><br>${escapeHtml(row.deal.TITLE || '')}<br><span class="muted">ID ${escapeHtml(row.deal.ID)} · ${escapeHtml(getService(row.deal) || 'услуга не указана')}</span></td>
+        <td>${escapeHtml(userName(row.managerId))}</td>
+        <td>${escapeHtml(userName(row.expertId))}</td>
+        <td><ul class="journal-issues">${issues}</ul></td>
+        <td><span class="status-chip status-${escapeHtml(row.status.cls)}">${escapeHtml(row.status.label)}</span></td>
+        <td class="journal-row-actions">
+          <button class="secondary" data-open="${escapeHtml(row.deal.ID)}">Открыть</button>
+          <button class="secondary" data-handoff-task="${escapeHtml(row.deal.ID)}">Задача менеджеру</button>
+          <button class="secondary" data-mark-handoff-ok="${escapeHtml(row.deal.ID)}">Закрыть ошибку</button>
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+function buildHandoffFixTask(row) {
+  const issues = row.issues.length ? row.issues.map((x) => `— ${x.type}: ${x.text}`).join('\n') : '— открыть проверку передачи и дозаполнить недостающие данные';
+  return {
+    title: `Исправить ошибку передачи по сделке ID ${row.deal.ID}`,
+    responsibleId: row.managerId,
+    deadline: deadlineTodayEnd(),
+    description: `По производственной сделке зафиксирована ошибка/спорная передача.\n\nСделка: ${row.deal.TITLE || ''}\nКомпания: ${companyName(row.deal.COMPANY_ID)}\nУслуга: ${getService(row.deal) || 'услуга не указана'}\nЭксперт: ${userName(row.expertId)}\nСтатус: ${row.status.label}\n\nЧто нужно исправить/подтвердить:\n${issues}\n\nЧто сделать менеджеру:\n1. Дозаполнить информацию в исходной сделке продаж или комментарии к производственной сделке.\n2. Подтвердить эксперту, что данные исправлены.\n3. Если данные спорные — написать комментарий для РОП/руководителя экспертного отдела.`
+  };
+}
+
+async function createHandoffTaskForDeal(dealId, silent = false) {
+  const row = buildHandoffJournalRows(getRoleVisibleDeals()).find((x) => String(x.deal.ID) === String(dealId));
+  if (!row) { if (!silent) alert('По этой сделке нет активной ошибки передачи.'); return false; }
+  const task = buildHandoffFixTask(row);
+  if (hasOpenTaskWithTitle(row.deal.ID, task.title)) { if (!silent) alert('Похожая открытая задача менеджеру уже есть.'); return false; }
+  await createTask({ title: task.title, responsibleId: task.responsibleId, description: task.description, dealId: row.deal.ID, deadline: task.deadline, silent: true });
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(row.deal.ID), ENTITY_TYPE: 'deal', COMMENT: `ИИ-ассистент: создана задача менеджеру на исправление ошибки передачи.\nМенеджер: ${userName(row.managerId)}\nСтатус ошибки: ${row.status.label}` }
+  });
+  if (!silent) alert('Задача менеджеру создана.');
+  return true;
+}
+
+async function createHandoffReminderTasks() {
+  const rows = buildHandoffJournalRows(getRoleVisibleDeals())
+    .filter((row) => ['overdue', 'new', 'partial'].includes(row.status.key))
+    .filter((row) => !hasOpenTaskWithTitle(row.deal.ID, `Исправить ошибку передачи по сделке ID ${row.deal.ID}`));
+  if (!rows.length) { alert('Новых задач по ошибкам передачи нет: либо ошибок нет, либо задачи уже созданы.'); return; }
+  const preview = rows.slice(0, 15).map((row, i) => `${i + 1}. ${companyName(row.deal.COMPANY_ID)} / ${row.deal.TITLE || ''} → ${userName(row.managerId)} (${row.status.label})`).join('\n');
+  if (!window.confirm(`Будут созданы задачи менеджерам по ошибкам передачи: ${rows.length}\n\n${preview}${rows.length > 15 ? '\n...' : ''}\n\nСоздать?`)) return;
+  let created = 0;
+  for (const row of rows) {
+    const ok = await createHandoffTaskForDeal(row.deal.ID, true);
+    if (ok) created += 1;
+  }
+  alert(`Создано задач по ошибкам передачи: ${created}`);
+  await loadDeals();
+}
+
+async function markHandoffIssueOk(dealId) {
+  const deal = state.deals.find((d) => String(d.ID) === String(dealId));
+  if (!deal) return;
+  if (!window.confirm('Закрыть ошибку передачи вручную? Сделка будет отмечена как “проверено — принято в работу”.')) return;
+  const audit = { version: 1, dealId: String(deal.ID), statusCode: 'ok', status: 'ошибка передачи закрыта руководителем / РОП', checkedAt: new Date().toISOString(), checkedById: String(state.user.ID), checkedByName: `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim(), missing: [], uncertain: [], technical: [], foundCount: 0, manualClose: true };
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: `ИИ-проверка передачи сделки в производство\n\nСтатус: ошибка передачи закрыта вручную.\n\nЗакрыл пользователь: ${audit.checkedByName}.\n${auditMarker(audit)}` }
+  });
+  state.auditByDeal.set(String(deal.ID), audit);
+  renderDeals();
+  alert('Ошибка передачи закрыта.');
 }
 
 
@@ -2792,11 +2969,25 @@ if (managerDashboard) {
   managerDashboard.addEventListener('click', (e) => {
     const reportButton = e.target.closest && e.target.closest('#generate-manager-report');
     if (reportButton) return generateManagerReport();
+    const remindersButton = e.target.closest && e.target.closest('#create-handoff-reminders');
+    if (remindersButton) return createHandoffReminderTasks();
+    const taskId = e.target.getAttribute('data-handoff-task');
+    if (taskId) return createHandoffTaskForDeal(taskId);
+    const markOkId = e.target.getAttribute('data-mark-handoff-ok');
+    if (markOkId) return markHandoffIssueOk(markOkId);
+    const openId = e.target.getAttribute('data-open');
+    if (openId) return openDeal(openId);
     const filter = e.target.getAttribute('data-dashboard-filter');
     if (!filter) return;
     state.dashboardFilter = filter;
     renderDeals();
   });
+  const journalStatus = document.getElementById('journal-status-filter');
+  const journalManager = document.getElementById('journal-manager-filter');
+  const journalSearch = document.getElementById('journal-search');
+  if (journalStatus) journalStatus.addEventListener('change', (e) => { state.journalStatusFilter = e.target.value; renderDeals(); });
+  if (journalManager) journalManager.addEventListener('change', (e) => { state.journalManagerFilter = e.target.value; renderDeals(); });
+  if (journalSearch) journalSearch.addEventListener('input', (e) => { state.journalSearch = e.target.value; renderDeals(); });
 }
 
 init();

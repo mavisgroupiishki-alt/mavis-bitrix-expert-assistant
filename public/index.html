@@ -51,6 +51,40 @@
       <div id="manager-dashboard-filter-label" class="muted small-note"></div>
       <div id="manager-dashboard-owners" class="owner-grid"></div>
       <div id="manager-report" class="manager-report hidden"></div>
+
+      <div id="handoff-journal" class="handoff-journal hidden">
+        <div class="journal-header">
+          <div>
+            <h3>Журнал ошибок передачи</h3>
+            <p class="muted small-note">Фиксирует сделки, где передача из продаж требует исправления или подтверждения.</p>
+          </div>
+          <div class="journal-actions">
+            <button id="create-handoff-reminders" class="secondary">Создать задачи по ошибкам</button>
+          </div>
+        </div>
+        <div class="journal-filters">
+          <label><span>Статус</span><select id="journal-status-filter"><option value="all">Все</option><option value="overdue">Просрочено исправление</option><option value="new">Новые ошибки</option><option value="partial">Нужно подтвердить</option></select></label>
+          <label><span>Менеджер</span><select id="journal-manager-filter"><option value="all">Все менеджеры</option></select></label>
+          <label><span>Поиск</span><input id="journal-search" type="search" placeholder="Компания, сделка, ошибка" /></label>
+        </div>
+        <div id="handoff-journal-summary" class="journal-summary"></div>
+        <div class="table-wrap">
+          <table id="handoff-journal-table">
+            <thead>
+              <tr>
+                <th>Дата проверки</th>
+                <th>Сделка</th>
+                <th>Менеджер</th>
+                <th>Эксперт</th>
+                <th>Что не передано / подтвердить</th>
+                <th>Статус</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <section class="panel">
