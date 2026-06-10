@@ -61,3 +61,17 @@ META_CONCURRENCY=3
 - `AI_API_KEY=...`
 - `AI_MODEL=gpt-4o-mini`
 - `AI_TEMPERATURE=0.2`
+
+
+## v26b
+Добавлена поддержка VibeCode AI Router / BitrixGPT вместо прямого OpenAI.
+
+Рекомендуемые переменные Render для бесплатных моделей VibeCode:
+- `AI_ENABLED=true`
+- `AI_PROVIDER=vibe`
+- `AI_BASE_URL=https://vibecode.bitrix24.tech/v1`
+- `AI_MODEL=bitrix/bitrixgpt-5.5`
+- `AI_API_KEY=vibe_api_...`
+- `AI_TEMPERATURE=0.2`
+
+VibeCode совместим с OpenAI chat completions, поэтому приложение вызывает `/v1/chat/completions` и получает обычный ответ `choices[0].message.content`.

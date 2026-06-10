@@ -52,6 +52,9 @@ const config = {
   aiProvider: process.env.AI_PROVIDER || 'openai',
   aiModel: process.env.AI_MODEL || 'gpt-4o-mini',
   aiTemperature: Number(process.env.AI_TEMPERATURE || 0.2),
+  // v26b: поддержка OpenAI-compatible VibeCode AI Router.
+  // Для VibeCode: AI_PROVIDER=vibe, AI_BASE_URL=https://vibecode.bitrix24.tech/v1, AI_MODEL=bitrix/bitrixgpt-5.5.
+  aiBaseUrl: process.env.AI_BASE_URL || '',
   // Необязательно: ручная карта стадий в формате JSON, если портал не отдаёт названия стадий через API.
   // Пример: {"C28:UC_MIFXBB":"2. Сбор информации"}
   stageMap: (() => { try { return JSON.parse(process.env.STAGE_MAP_JSON || '{}'); } catch (_) { return {}; } })(),
@@ -112,12 +115,38 @@ function normalizeAiResult(parsed, rawText) {
   };
 }
 
-async function callOpenAi({ model, temperature, messages }) {
-  if (!process.env.AI_API_KEY) throw new Error('AI_API_KEY не задан в Render Environment');
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+function resolveAiProvider() {
+  const provider = String(config.aiProvider || 'openai').toLowerCase().trim();
+  const apiKey = process.env.AI_API_KEY || process.env.VIBE_API_KEY || process.env.OPENAI_API_KEY || '';
+  if (provider === 'vibe' || provider === 'vibecode' || provider === 'bitrix') {
+    return {
+      provider: 'vibe',
+      label: 'VibeCode AI Router',
+      apiKey,
+      baseUrl: (config.aiBaseUrl || process.env.VIBE_BASE_URL || 'https://vibecode.bitrix24.tech/v1').replace(/\/$/, ''),
+      authHeader: { Authorization: `Bearer ${apiKey}` },
+    };
+  }
+  return {
+    provider: 'openai',
+    label: 'OpenAI API',
+    apiKey,
+    baseUrl: (config.aiBaseUrl || 'https://api.openai.com/v1').replace(/\/$/, ''),
+    authHeader: { Authorization: `Bearer ${apiKey}` },
+  };
+}
+
+async function callAiChatCompletion({ model, temperature, messages }) {
+  const ai = resolveAiProvider();
+  if (!ai.apiKey) {
+    if (ai.provider === 'vibe') throw new Error('AI_API_KEY не задан. Для VibeCode вставь vibe_api... в Render Environment как AI_API_KEY.');
+    throw new Error('AI_API_KEY не задан в Render Environment');
+  }
+
+  const response = await fetch(`${ai.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${process.env.AI_API_KEY}`,
+      ...ai.authHeader,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -130,7 +159,7 @@ async function callOpenAi({ model, temperature, messages }) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const msg = data && data.error && data.error.message ? data.error.message : `HTTP ${response.status}`;
-    throw new Error(`OpenAI API: ${msg}`);
+    throw new Error(`${ai.label}: ${msg}`);
   }
   return data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
 }
@@ -141,8 +170,9 @@ app.post('/api/ai/analyze-deal', async (req, res) => {
       res.status(400).json({ ok: false, error: 'ИИ пока выключен. Добавь AI_ENABLED=true и AI_API_KEY в Render Environment.' });
       return;
     }
-    if (config.aiProvider !== 'openai') {
-      res.status(400).json({ ok: false, error: `Провайдер ${config.aiProvider} пока не реализован в этой версии. Используй AI_PROVIDER=openai.` });
+    const allowedAiProviders = ['openai', 'vibe', 'vibecode', 'bitrix'];
+    if (!allowedAiProviders.includes(String(config.aiProvider || '').toLowerCase())) {
+      res.status(400).json({ ok: false, error: `Провайдер ${config.aiProvider} не поддерживается. Используй AI_PROVIDER=vibe или AI_PROVIDER=openai.` });
       return;
     }
 
@@ -167,7 +197,7 @@ ${context}
   "comment": "короткий комментарий в сделку для Bitrix"
 }`;
 
-    const rawText = await callOpenAi({
+    const rawText = await callAiChatCompletion({
       model: config.aiModel,
       temperature: Number.isFinite(config.aiTemperature) ? config.aiTemperature : 0.2,
       messages: [
