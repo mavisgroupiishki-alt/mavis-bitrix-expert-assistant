@@ -25,6 +25,8 @@ const state = {
   selectedMode: '',
   selectedDeadlineTasks: [],
   selectedAiTasks: [],
+  selectedAiPayload: null,
+  selectedAiScenario: '',
   detailsLoading: false,
   detailsLoaded: false,
   detailsProgress: '',
@@ -37,6 +39,7 @@ const state = {
   salesManagerProgress: '',
   managerAiResults: [],
   managerAiTasks: [],
+  aiQualityReport: null,
 };
 
 const REQUIRED_ITEMS = [
@@ -121,6 +124,10 @@ const REQUIRED_ITEMS = [
 
 const CRITICAL_KEYS = new Set(['service', 'kp', 'terms', 'email', 'fees', 'specialists']);
 const AUDIT_TAG = 'MAVIS_AI_HANDOFF_AUDIT';
+const AI_FEEDBACK_TAG = 'MAVIS_AI_FEEDBACK';
+const ACTION_BUTTON_IDS = ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks','accept-ai-feedback','correct-ai-feedback'];
+function hideActionButtons() { ACTION_BUTTON_IDS.forEach((x) => { const el = document.getElementById(x); if (el) el.classList.add('hidden'); }); }
+function showAiFeedbackButtons(show = true) { ['accept-ai-feedback','correct-ai-feedback'].forEach((x) => { const el = document.getElementById(x); if (el) el.classList.toggle('hidden', !show); }); }
 function bxCall(method, params = {}) {
   return new Promise((resolve, reject) => {
     BX24.callMethod(method, params, (result) => {
@@ -1079,6 +1086,219 @@ async function generateManagerReport() {
 }
 
 
+function parseAiFeedbackMarker(raw) {
+  const text = String(raw || '');
+  const idx = text.indexOf(`${AI_FEEDBACK_TAG}:`);
+  if (idx === -1) return null;
+  let encoded = text.slice(idx + AI_FEEDBACK_TAG.length + 1).trim();
+  encoded = encoded.split(/-->|\n|<br\s*\/?>|\s{2,}/i)[0].trim();
+  encoded = encoded.replace(/[^A-Za-z0-9+/=]/g, '');
+  if (!encoded) return null;
+  try {
+    return JSON.parse(decodeURIComponent(escape(atob(encoded))));
+  } catch (_) {
+    try { return JSON.parse(atob(encoded)); } catch (__) { return null; }
+  }
+}
+
+function findAiFeedbacksForDeal(deal) {
+  const comments = getTimelineComments(deal.ID);
+  const out = [];
+  (comments || []).forEach((c) => {
+    const raw = String(c.COMMENT || c.TEXT || '');
+    const parsed = parseAiFeedbackMarker(raw);
+    if (!parsed) return;
+    out.push({
+      ...parsed,
+      dealId: String(parsed.dealId || deal.ID),
+      deal,
+      commentCreatedAt: c.CREATED || c.DATE_CREATE || c.created || '',
+      commentId: c.ID || c.id || '',
+    });
+  });
+  return out.sort((a, b) => new Date(b.createdAt || b.commentCreatedAt || 0) - new Date(a.createdAt || a.commentCreatedAt || 0));
+}
+
+function buildAiQualityReport(deals) {
+  const feedbacks = [];
+  deals.forEach((deal) => feedbacks.push(...findAiFeedbacksForDeal(deal)));
+
+  const accepted = feedbacks.filter((x) => x.kind === 'accepted');
+  const corrections = feedbacks.filter((x) => x.kind === 'correction');
+  const byScenario = new Map();
+  const byUser = new Map();
+  const byModel = new Map();
+
+  feedbacks.forEach((fb) => {
+    const scenario = fb.scenarioLabel || aiScenarioLabel(fb.scenario) || 'не указан сценарий';
+    if (!byScenario.has(scenario)) byScenario.set(scenario, { label: scenario, total: 0, accepted: 0, corrections: 0 });
+    const row = byScenario.get(scenario);
+    row.total += 1;
+    if (fb.kind === 'accepted') row.accepted += 1;
+    if (fb.kind === 'correction') row.corrections += 1;
+
+    const user = fb.userName || userName(fb.userId) || 'не указан пользователь';
+    if (!byUser.has(user)) byUser.set(user, { label: user, total: 0, accepted: 0, corrections: 0 });
+    const u = byUser.get(user);
+    u.total += 1;
+    if (fb.kind === 'accepted') u.accepted += 1;
+    if (fb.kind === 'correction') u.corrections += 1;
+
+    const model = fb.model || 'не указана модель';
+    byModel.set(model, (byModel.get(model) || 0) + 1);
+  });
+
+  const latestCorrections = corrections
+    .sort((a, b) => new Date(b.createdAt || b.commentCreatedAt || 0) - new Date(a.createdAt || a.commentCreatedAt || 0))
+    .slice(0, 15);
+
+  const scenarioRows = [...byScenario.values()].sort((a, b) => b.total - a.total || b.corrections - a.corrections);
+  const userRows = [...byUser.values()].sort((a, b) => b.total - a.total || b.corrections - a.corrections);
+  const total = feedbacks.length;
+  const correctionRate = total ? Math.round((corrections.length / total) * 100) : 0;
+  const acceptedRate = total ? Math.round((accepted.length / total) * 100) : 0;
+  const qualityStatus = !total
+    ? 'ещё нет оценок'
+    : correctionRate <= 20
+      ? 'хорошо, можно расширять тестирование'
+      : correctionRate <= 40
+        ? 'нужно доработать промпты / сценарии'
+        : 'много правок, автоматизацию пока не расширять';
+
+  const actions = [];
+  if (!total) {
+    actions.push('Собрать минимум 10–15 оценок ИИ от экспертов по реальным сделкам.');
+    actions.push('Попросить экспертов нажимать “ИИ-вывод верный” или “Правка к ИИ” после каждого ИИ-сценария.');
+  } else {
+    actions.push(`Процент правок: ${correctionRate}%. ${correctionRate > 30 ? 'Нужно разобрать правки и усилить промпты.' : 'Можно продолжать тестирование в ручном режиме.'}`);
+    if (latestCorrections.length) actions.push('Разобрать последние правки экспертов и выделить 3–5 типовых ошибок ИИ.');
+    if (scenarioRows.length) {
+      const worst = [...scenarioRows].sort((a, b) => (b.corrections / Math.max(1, b.total)) - (a.corrections / Math.max(1, a.total)))[0];
+      if (worst && worst.corrections) actions.push(`Первым улучшить сценарий: “${worst.label}” — правок ${worst.corrections} из ${worst.total}.`);
+    }
+  }
+
+  return {
+    date: new Date().toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }),
+    totalDeals: deals.length,
+    total,
+    accepted: accepted.length,
+    corrections: corrections.length,
+    acceptedRate,
+    correctionRate,
+    qualityStatus,
+    scenarioRows,
+    userRows,
+    modelRows: [...byModel.entries()].map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
+    latestCorrections,
+    actions,
+  };
+}
+
+function aiQualityReportText(report) {
+  const lines = [];
+  lines.push('СВОДКА КАЧЕСТВА ИИ-АССИСТЕНТА');
+  lines.push(`Дата: ${report.date}`);
+  lines.push(`Сделок в выборке: ${report.totalDeals}`);
+  lines.push(`Оценок ИИ: ${report.total}`);
+  lines.push(`Принято экспертами: ${report.accepted} (${report.acceptedRate}%)`);
+  lines.push(`С правками: ${report.corrections} (${report.correctionRate}%)`);
+  lines.push(`Статус: ${report.qualityStatus}`);
+  lines.push('');
+  lines.push('Что сделать дальше:');
+  report.actions.forEach((x) => lines.push(`— ${x}`));
+  lines.push('');
+  lines.push('По сценариям:');
+  if (!report.scenarioRows.length) lines.push('— пока нет данных');
+  report.scenarioRows.forEach((r) => lines.push(`— ${r.label}: всего ${r.total}, принято ${r.accepted}, правок ${r.corrections}`));
+  lines.push('');
+  lines.push('Последние правки экспертов:');
+  if (!report.latestCorrections.length) lines.push('— пока нет правок');
+  report.latestCorrections.forEach((fb, i) => {
+    const deal = fb.deal || {};
+    lines.push(`${i + 1}. ${companyName(deal.COMPANY_ID)} / ${deal.TITLE || 'без названия'} / ID ${deal.ID || fb.dealId}`);
+    lines.push(`   Сценарий: ${fb.scenarioLabel || aiScenarioLabel(fb.scenario) || 'не указан'}`);
+    lines.push(`   Правка: ${String(fb.correction || '').slice(0, 400) || '—'}`);
+  });
+  return lines.join('\n');
+}
+
+function renderAiQualityReport(report) {
+  const box = document.getElementById('manager-ai-report');
+  if (!box) return;
+  const text = aiQualityReportText(report);
+  const metricCards = [
+    ['Оценок ИИ', report.total],
+    ['Принято', `${report.accepted} / ${report.acceptedRate}%`],
+    ['С правками', `${report.corrections} / ${report.correctionRate}%`],
+    ['Сценариев', report.scenarioRows.length],
+  ];
+  const scenarios = report.scenarioRows.length
+    ? report.scenarioRows.map((r) => `<tr><td>${escapeHtml(r.label)}</td><td>${escapeHtml(r.total)}</td><td>${escapeHtml(r.accepted)}</td><td>${escapeHtml(r.corrections)}</td></tr>`).join('')
+    : `<tr><td colspan="4" class="muted">Пока нет оценок по сценариям.</td></tr>`;
+  const users = report.userRows.length
+    ? report.userRows.slice(0, 10).map((r) => `<tr><td>${escapeHtml(r.label)}</td><td>${escapeHtml(r.total)}</td><td>${escapeHtml(r.accepted)}</td><td>${escapeHtml(r.corrections)}</td></tr>`).join('')
+    : `<tr><td colspan="4" class="muted">Пока нет оценок по экспертам.</td></tr>`;
+  const corrections = report.latestCorrections.length
+    ? report.latestCorrections.map((fb) => {
+        const deal = fb.deal || {};
+        return `<li><strong>${escapeHtml(companyName(deal.COMPANY_ID))}</strong> · ${escapeHtml(deal.TITLE || `ID ${fb.dealId}`)}<br><span class="muted">${escapeHtml(fb.scenarioLabel || aiScenarioLabel(fb.scenario) || 'сценарий не указан')}</span><br>${escapeHtml(String(fb.correction || '—'))}</li>`;
+      }).join('')
+    : '<li class="muted">Пока нет правок экспертов.</li>';
+
+  box.innerHTML = `<div class="manager-report-header">
+    <div>
+      <h3>Сводка качества ИИ</h3>
+      <p class="muted small-note">Сформировано: ${escapeHtml(report.date)}. Отчёт строится по отметкам “ИИ-вывод верный” и “Правка к ИИ”.</p>
+    </div>
+    <div class="manager-report-actions">
+      <button id="copy-ai-quality-report" class="secondary">Скопировать сводку</button>
+    </div>
+  </div>
+  <div class="manager-report-grid">
+    ${metricCards.map(([label, value]) => `<div class="report-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join('')}
+  </div>
+  <div class="result-card ${report.correctionRate > 40 ? 'card-risk' : report.correctionRate > 20 ? 'card-uncertain' : 'card-found'}">
+    <h4>Статус качества</h4>
+    <p>${escapeHtml(report.qualityStatus)}</p>
+    <ul>${report.actions.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>
+  </div>
+  <div class="report-section"><h4>Качество по ИИ-сценариям</h4><table class="mini-table"><thead><tr><th>Сценарий</th><th>Всего</th><th>Принято</th><th>Правки</th></tr></thead><tbody>${scenarios}</tbody></table></div>
+  <div class="report-section"><h4>Оценки по экспертам</h4><table class="mini-table"><thead><tr><th>Эксперт</th><th>Всего</th><th>Принято</th><th>Правки</th></tr></thead><tbody>${users}</tbody></table></div>
+  <div class="report-section"><h4>Последние правки</h4><ol class="report-list">${corrections}</ol></div>
+  <div class="report-text"><textarea id="ai-quality-report-text" readonly>${escapeHtml(text)}</textarea></div>`;
+  box.classList.remove('hidden');
+  const copyBtn = document.getElementById('copy-ai-quality-report');
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    const ta = document.getElementById('ai-quality-report-text');
+    try {
+      await navigator.clipboard.writeText(ta?.value || text);
+      alert('Сводка качества ИИ скопирована.');
+    } catch (_) {
+      if (ta) { ta.focus(); ta.select(); }
+      alert('Не удалось скопировать автоматически. Выделила текст — скопируй вручную.');
+    }
+  });
+}
+
+async function generateAIQualityReport() {
+  const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  if (!shouldShow) return;
+  if (state.detailsLoading) {
+    alert('Сначала дождись завершения загрузки счётчиков/журнала. Сводка качества ИИ строится по комментариям сделок.');
+    return;
+  }
+  if (!state.detailsLoaded) {
+    const ok = confirm('Для сводки качества ИИ нужно загрузить комментарии по активным сделкам. Запустить загрузку счётчиков/журнала сейчас?');
+    if (!ok) return;
+    await backgroundHydrateDealMeta(getRoleVisibleDeals());
+  }
+  const report = buildAiQualityReport(getRoleVisibleDeals());
+  state.aiQualityReport = report;
+  renderAiQualityReport(report);
+}
+
+
 function managerProblemScore(deal) {
   const f = getDealIssueFlags(deal);
   return (f.handoffErrors ? 120 : 0)
@@ -1696,7 +1916,7 @@ async function openDeal(id) {
   state.selectedMode = '';
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
-  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  hideActionButtons();
   state.selectedDeadlineTasks = [];
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
   document.getElementById('deal-dialog').showModal();
@@ -2581,7 +2801,7 @@ function renderAIAnalysisHtml(deal, ai) {
     <div class="result-card card-checklist"><h3>Рекомендуемые задачи</h3>${listHtml(tasks, 'ИИ не предложил отдельные задачи')}</div>
     <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(r.client_message || '—')}</div></div>
     <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(aiResultToComment(deal, ai))}</div></details>
-    <p class="muted small-note">ИИ ничего не отправляет клиенту и не создаёт задачи автоматически. Сначала эксперт проверяет результат.</p>
+    <p class="muted small-note">ИИ ничего не отправляет клиенту и не создаёт задачи автоматически. Сначала эксперт проверяет результат. После проверки можно отметить, что вывод верный, или оставить правку — это сохранится в сделке для обучения и контроля качества.</p>
   `;
 }
 
@@ -2724,7 +2944,7 @@ async function runAIScenario(scenario = 'deal_analyze') {
   state.selectedAudit = null;
   state.selectedMissing = [];
   state.selectedDeadlineTasks = [];
-  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  hideActionButtons();
 
   const out = document.getElementById('analysis-result');
   out.innerHTML = `<div class="result-card card-action"><h3>${escapeHtml(title)}...</h3><p class="muted">Собираем данные сделки, комментарии, задачи, связанную сделку продаж и продуктовую логику. Обычно это занимает 10–40 секунд.</p></div>`;
@@ -2746,15 +2966,21 @@ async function runAIScenario(scenario = 'deal_analyze') {
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `Ошибка ИИ HTTP ${response.status}`);
     data.scenario_label = data.scenario_label || title;
+    state.selectedAiPayload = data;
+    state.selectedAiScenario = scenario;
     state.selectedAnalysis = aiResultToComment(state.selectedDeal, data).replace(/^ИИ-анализ сделки/, title);
     state.selectedAiTasks = buildAITasks(state.selectedDeal, data);
     out.innerHTML = renderAIAnalysisHtml(state.selectedDeal, data);
     document.getElementById('write-comment').classList.remove('hidden');
     document.getElementById('create-ai-tasks').classList.toggle('hidden', !state.selectedAiTasks.length);
+    showAiFeedbackButtons(true);
   } catch (e) {
     state.selectedAnalysis = '';
     state.selectedAiTasks = [];
+    state.selectedAiPayload = null;
+    state.selectedAiScenario = '';
     document.getElementById('create-ai-tasks').classList.add('hidden');
+    showAiFeedbackButtons(false);
     out.innerHTML = `<div class="result-card card-risk"><h3>Ошибка: ${escapeHtml(title)}</h3><p>${escapeHtml(e.message || String(e))}</p><p class="muted">Проверь переменные Render: AI_ENABLED, AI_PROVIDER, AI_API_KEY, AI_MODEL.</p></div>`;
   }
 }
@@ -3443,6 +3669,58 @@ async function createDeadlineTasks() {
 }
 
 
+
+function aiFeedbackMarker(payload) {
+  return `\n<!--${AI_FEEDBACK_TAG}:${btoa(unescape(encodeURIComponent(JSON.stringify(payload))))}-->`;
+}
+
+function selectedAiFeedbackBase() {
+  const deal = state.selectedDeal || {};
+  const ai = state.selectedAiPayload || {};
+  const r = ai.result || {};
+  return {
+    version: 1,
+    dealId: String(deal.ID || ''),
+    scenario: state.selectedAiScenario || ai.scenario || '',
+    scenarioLabel: ai.scenario_label || aiScenarioLabel(state.selectedAiScenario),
+    model: ai.model || (window.APP_CONFIG && APP_CONFIG.aiModel) || '',
+    status: r.status || '',
+    statusLabel: r.status_label || '',
+    userId: state.user ? String(state.user.ID) : '',
+    userName: state.user ? `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim() : '',
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function saveAiFeedback(kind, correctionText = '') {
+  if (!state.selectedDeal || !state.selectedAiPayload) return;
+  const base = selectedAiFeedbackBase();
+  const isOk = kind === 'ok';
+  const payload = { ...base, kind: isOk ? 'accepted' : 'correction', correction: String(correctionText || '').trim() };
+  const comment = isOk
+    ? `Оценка ИИ-анализа\n\nСтатус: вывод принят экспертом.\nСценарий: ${base.scenarioLabel}.\nПроверил: ${base.userName || 'пользователь'}.\n\nЭта отметка нужна для контроля качества ИИ-ассистента и режима обучения.${aiFeedbackMarker(payload)}`
+    : `Оценка ИИ-анализа\n\nСтатус: нужна правка / вывод неполный.\nСценарий: ${base.scenarioLabel}.\nПроверил: ${base.userName || 'пользователь'}.\n\nПравка эксперта:\n${payload.correction || '—'}\n\nЭта правка нужна для контроля качества ИИ-ассистента и режима обучения.${aiFeedbackMarker(payload)}`;
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(state.selectedDeal.ID), ENTITY_TYPE: 'deal', COMMENT: comment }
+  });
+  alert(isOk ? 'Оценка сохранена: ИИ-вывод принят.' : 'Правка к ИИ сохранена в сделке.');
+}
+
+async function acceptAIFeedback() {
+  await saveAiFeedback('ok');
+}
+
+async function correctAIFeedback() {
+  if (!state.selectedDeal || !state.selectedAiPayload) return;
+  const text = window.prompt('Что ИИ понял неверно или что нужно добавить? Эта правка сохранится в комментарии сделки.');
+  if (text === null) return;
+  if (!String(text).trim()) {
+    alert('Правка пустая. Напиши, что нужно исправить или добавить.');
+    return;
+  }
+  await saveAiFeedback('correction', text);
+}
+
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
   await bxCall('crm.timeline.comment.add', {
@@ -3754,6 +4032,8 @@ document.getElementById('create-expert-task').addEventListener('click', createEx
 document.getElementById('create-workplan-tasks').addEventListener('click', createWorkPlanTasks);
 document.getElementById('create-deadline-tasks').addEventListener('click', createDeadlineTasks);
 document.getElementById('create-ai-tasks').addEventListener('click', createAITasks);
+document.getElementById('accept-ai-feedback').addEventListener('click', acceptAIFeedback);
+document.getElementById('correct-ai-feedback').addEventListener('click', correctAIFeedback);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
 const managerDashboard = document.getElementById('manager-dashboard');
@@ -3769,6 +4049,8 @@ if (managerDashboard) {
     if (escalationsButton) return createEscalationTasks();
     const managerAiButton = e.target.closest && e.target.closest('#run-manager-ai');
     if (managerAiButton) return runManagerAIAnalysis();
+    const aiQualityButton = e.target.closest && e.target.closest('#generate-ai-quality-report');
+    if (aiQualityButton) return generateAIQualityReport();
     const taskId = e.target.getAttribute('data-handoff-task');
     if (taskId) return createHandoffTaskForDeal(taskId);
     const markOkId = e.target.getAttribute('data-mark-handoff-ok');

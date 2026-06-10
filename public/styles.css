@@ -154,3 +154,8 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .manager-ai-cards .result-card { margin:0; }
 .manager-ai-cards h4 { margin:0 0 8px; font-size:15px; }
 @media (max-width: 900px) { .manager-ai-cards { grid-template-columns: 1fr; } }
+
+
+.mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mini-table th, .mini-table td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
+.mini-table th { color: #475569; background: #f8fafc; font-weight: 700; }
