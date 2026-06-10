@@ -1026,6 +1026,7 @@ function renderWorkPlanResultHtml(deal, plainText) {
     </div>
     <div class="result-card card-found"><h3>Что делает MAVIS GROUP</h3>${listHtml(profile.mavis, '')}</div>
     <div class="result-card card-action"><h3>Что нужно от клиента</h3>${listHtml(profile.client, '')}</div>
+    <div class="result-card card-checklist"><h3>Чек-лист документов и данных</h3>${listHtml(productDocumentChecklist(profile).clientDocs, '')}</div>
     <div class="result-card card-uncertain"><h3>Что нужно уточнить перед отправкой</h3>${listHtml(clarify, 'Критичных уточнений не зафиксировано')}</div>
     <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(message)}</div></div>
     <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><pre class="analysis-pre" style="margin-top:10px">${escapeHtml(plainText)}</pre></details>
@@ -1243,6 +1244,156 @@ function detectProductProfile(service, title = '') {
   return profile;
 }
 
+
+function productDocumentChecklist(profile) {
+  const key = profile.key || 'general';
+  const base = {
+    clientDocs: [
+      'Карточка компании / реквизиты и актуальные контактные данные',
+      'Документы и данные по перечню эксперта для выбранной услуги',
+      'Подтверждение ответственного со стороны клиента и канала связи',
+      'Платёжные документы по обязательным счетам/пошлинам, если применимо',
+    ],
+    mavisChecks: [
+      'Проверить, что услуга и результат совпадают с ожиданием клиента',
+      'Сверить срок, который был обещан клиенту продажами',
+      'Проверить наличие следующего дела/задачи в Bitrix',
+      'Зафиксировать недостающие данные в комментарии сделки',
+    ],
+    riskControls: [
+      'Если нет документов или оплаты — предупредить клиента, что сроки могут сдвинуться',
+      'Если есть спорные обещания продаж — передать РОП/руководителю экспертного отдела',
+      'Если клиент не отвечает 2 дня — поставить задачу на звонок и уведомить руководителя',
+    ],
+  };
+
+  if (key === 'stk' || key === 'stk_periodic') {
+    return {
+      clientDocs: [
+        'Реквизиты компании и актуальные контактные данные ответственного',
+        'Текующее свидетельство технической компетентности, если это подтверждение/периодика',
+        'Нужная область технической компетентности / виды работ',
+        'Перечень специалистов, которые закрывают область работ',
+        'Документы по специалистам: дипломы, трудовые, удостоверения, аттестаты — по перечню эксперта',
+        'Данные по оборудованию и средствам измерений',
+        'Документы по средствам измерений: поверка/калибровка/аренда/право использования — если применимо',
+        'Подтверждение оплаты счетов/пошлин/дополнительных обязательных платежей',
+      ],
+      mavisChecks: [
+        'Сверить область технической компетентности с проданной услугой',
+        'Проверить, хватает ли специалистов под заявленную область',
+        'Проверить средства измерений и сроки их поверки/действия',
+        'Сформировать перечень копий и документов для клиента',
+        'Поставить контроль оплаты счетов/пошлин и даты подачи/выезда',
+      ],
+      riskControls: [
+        'Нет средств измерений или поверки — риск переноса подачи/выезда',
+        'Нет нужных специалистов — риск невозможности закрыть область работ',
+        'Клиент не предупреждён о пошлинах/доп. счетах — риск конфликта по оплате',
+      ],
+    };
+  }
+
+  if (key === 'company_attestation') {
+    return {
+      clientDocs: [
+        'Реквизиты компании и данные ответственного лица',
+        'Нужная категория и виды работ для аттестации',
+        'Учредительные/регистрационные данные компании — по перечню эксперта',
+        'Документы по специалистам, закрывающим требования по категории',
+        'Информация по опыту/объектам/договорам, если требуется для категории',
+        'Подтверждение оплаты обязательных счетов/пошлин',
+      ],
+      mavisChecks: [
+        'Сверить категорию и виды работ с проданной услугой',
+        'Проверить, хватает ли специалистов и документов под категорию',
+        'Проверить сроки и обещания продаж по получению результата',
+        'Подготовить перечень документов и маршрут подачи',
+      ],
+      riskControls: [
+        'Категория/виды работ не подтверждены — риск подготовки не того пакета',
+        'Не хватает специалистов — риск отказа/замечаний',
+        'Нет подтверждения сроков — риск некорректных ожиданий клиента',
+      ],
+    };
+  }
+
+  if (key === 'specialist_attestation') {
+    return {
+      clientDocs: [
+        'ФИО специалиста и должность, на которую нужна аттестация',
+        'Документ об образовании специалиста',
+        'Трудовая книжка / сведения о стаже',
+        'Данные по текущему месту работы и должности',
+        'Действующие удостоверения/аттестаты, если есть',
+        'Фото/заявление/дополнительные формы — по перечню эксперта',
+        'Подтверждение оплаты обязательных счетов',
+      ],
+      mavisChecks: [
+        'Проверить образование и стаж под нужную должность',
+        'Проверить, засчитывается ли стаж в строительной компании и по нужной должности',
+        'Проверить наличие действующей аттестации организации, если она влияет на зачёт стажа',
+        'Зафиксировать дату экзамена/подачи/получения результата',
+      ],
+      riskControls: [
+        'Непрофильное образование или недостаточный стаж — риск отказа/переноса',
+        'Нет подтверждения должности — риск незачёта стажа',
+        'Не согласована дата экзамена — риск срыва срока клиента',
+      ],
+    };
+  }
+
+  if (key === 'iso') {
+    return {
+      clientDocs: [
+        'Реквизиты компании и данные ответственного лица',
+        'Какой стандарт нужен: ISO 9001 / ISO 45001 / СУОТ / другой',
+        'Цель получения сертификата: тендер, объект, контрагент, внутренний запрос',
+        'Виды деятельности компании и численность сотрудников',
+        'Данные по процессам/структуре компании — по перечню эксперта',
+        'Действующие документы системы менеджмента, если есть',
+        'Подтверждение оплаты обязательных счетов',
+      ],
+      mavisChecks: [
+        'Сверить стандарт и цель сертификата с проданной услугой',
+        'Проверить срочность и срок, к которому сертификат нужен клиенту',
+        'Определить, нужен ли аудит/выезд/дополнительные документы',
+        'Согласовать маршрут подготовки и получения сертификата',
+      ],
+      riskControls: [
+        'Неясна цель сертификата — риск выбрать неверный стандарт/орган',
+        'Нет данных по процессам — риск задержки подготовки документов',
+        'Сжатый срок тендера — риск не успеть без ускоренного маршрута',
+      ],
+    };
+  }
+
+  if (key === 'recruiting') {
+    return {
+      clientDocs: [
+        'Кого нужно подобрать: должность, квалификация, категория/аттестация',
+        'Требования к опыту, документам и региону',
+        'Формат занятости и срок выхода специалиста',
+        'Условия оплаты/оформления/перевода специалиста',
+        'Кто принимает решение по кандидатам со стороны клиента',
+      ],
+      mavisChecks: [
+        'Зафиксировать требования к специалисту в сделке',
+        'Понять, ищет ли клиент сам параллельно',
+        'Поставить контроль обратной связи по кандидатам',
+        'Зафиксировать договорённости по переводу/оформлению',
+      ],
+      riskControls: [
+        'Нет требований к специалисту — риск подбора неподходящих кандидатов',
+        'Нет быстрого ЛПР — риск зависания кандидатов',
+        'Клиент ищет сам параллельно — риск потери сделки без контроля',
+      ],
+    };
+  }
+
+  return base;
+}
+
 function productProfileForDeal(deal) {
   return detectProductProfile(getService(deal) || '', deal.TITLE || '');
 }
@@ -1303,7 +1454,9 @@ function buildWorkPlanText(deal) {
     `Следующее дело/задача: ${nextText}\n\n` +
     `Логика текущего этапа:\n— ${advice}.\n\n` +
     productBullets('Что делает MAVIS GROUP', profile.mavis) + `\n\n` +
-    productBullets('Что нужно от клиента', profile.client) + `\n` +
+    productBullets('Что нужно от клиента', profile.client) + `\n\n` +
+    productBullets('Чек-лист документов и данных', productDocumentChecklist(profile).clientDocs) + `\n\n` +
+    productBullets('Что проверяет эксперт внутри MAVIS', productDocumentChecklist(profile).mavisChecks) + `\n` +
     `${riskBlock}\n\n` +
     `Черновик сообщения клиенту в мессенджер:\n` +
     `${clientName}, добрый день! По вашей услуге “${service}” фиксирую ход работы.\n` +
@@ -1331,6 +1484,72 @@ async function generateWorkPlan() {
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
 }
 
+
+
+function buildChecklistText(deal) {
+  const service = getService(deal) || 'услуга не указана';
+  const profile = productProfileForDeal(deal);
+  const checklist = productDocumentChecklist(profile);
+  const audit = getAudit(deal.ID) || state.selectedAudit;
+  const missing = audit ? [...(audit.missing || []), ...(audit.technical || [])] : [];
+  const uncertain = audit ? [...(audit.uncertain || [])] : [];
+  return `Чек-лист документов и данных по сделке\n\n` +
+    `Сделка: ${deal.TITLE || ''} / ID ${deal.ID}\n` +
+    `Компания: ${companyName(deal.COMPANY_ID)}\n` +
+    `Услуга: ${service}\n` +
+    `Продуктовая логика: ${profile.label}\n\n` +
+    productBullets('Что запросить/проверить у клиента', checklist.clientDocs) + `\n\n` +
+    productBullets('Что проверить эксперту внутри MAVIS', checklist.mavisChecks) + `\n\n` +
+    productBullets('Риски, которые нужно контролировать', checklist.riskControls) + `\n\n` +
+    `По проверке передачи сейчас:\n` +
+    `${missing.length ? missing.map((x) => `— не хватает: ${x}`).join('\n') : '— критичных отсутствующих пунктов не зафиксировано'}\n` +
+    `${uncertain.length ? uncertain.map((x) => `— подтвердить: ${x}`).join('\n') : ''}`;
+}
+
+function renderChecklistResultHtml(deal) {
+  const service = getService(deal) || 'услуга не указана';
+  const profile = productProfileForDeal(deal);
+  const checklist = productDocumentChecklist(profile);
+  const audit = getAudit(deal.ID) || state.selectedAudit;
+  const missing = audit ? [...(audit.missing || []), ...(audit.technical || [])] : [];
+  const uncertain = audit ? [...(audit.uncertain || [])] : [];
+  const clientRequest = `Добрый день! Для запуска/продолжения работы по услуге “${service}” просим подготовить и направить данные/документы по чек-листу:\n` +
+    checklist.clientDocs.map((x) => `— ${x}`).join('\n') +
+    `\n\nЕсли по какому-то пункту информации пока нет — напишите, пожалуйста, что именно отсутствует и к какой дате сможете передать.`;
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Чек-лист документов и данных</h3><span class="result-status partial">требует проверки эксперта</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(service)}</div>
+        <div class="result-field"><span>Продуктовая логика</span>${escapeHtml(profile.label)}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stageName(deal.STAGE_ID))}</div>
+      </div>
+    </div>
+    <div class="result-card card-checklist"><h3>Что запросить/проверить у клиента</h3>${listHtml(checklist.clientDocs, '')}</div>
+    <div class="result-card card-found"><h3>Что проверяет эксперт внутри MAVIS</h3>${listHtml(checklist.mavisChecks, '')}</div>
+    <div class="result-card card-risk"><h3>Риски по документам</h3>${listHtml(checklist.riskControls, '')}</div>
+    <div class="result-card card-uncertain"><h3>Уточнения по текущей проверке передачи</h3>${listHtml([...missing.map((x) => `Не хватает: ${x}`), ...uncertain.map((x) => `Подтвердить: ${x}`)], 'Критичных уточнений по проверке передачи нет')}</div>
+    <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(clientRequest)}</div></div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(buildChecklistText(deal))}</div></details>
+  `;
+}
+
+async function generateChecklist() {
+  if (!state.selectedDeal) return;
+  state.selectedMode = 'checklist';
+  state.selectedAudit = getAudit(state.selectedDeal.ID) || state.selectedAudit;
+  state.selectedMissing = [];
+  state.selectedAnalysis = buildChecklistText(state.selectedDeal);
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = renderChecklistResultHtml(state.selectedDeal);
+  out.classList.remove('hidden');
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.add('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.remove('hidden');
+}
 
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
@@ -1445,6 +1664,9 @@ function buildWorkPlanTasks(deal) {
 
 Что проверить:
 ${(profile.clarify || []).map((x) => `— ${x}`).join('\n') || '— исходные данные по услуге'}
+
+Чек-лист документов и данных:
+${productDocumentChecklist(profile).clientDocs.map((x) => `— ${x}`).join('\n')}
 
 Что запросить у клиента:
 ${profile.client.map((x) => `— ${x}`).join('\n')}`,
@@ -1616,6 +1838,7 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 document.getElementById('close-dialog').addEventListener('click', () => document.getElementById('deal-dialog').close());
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
+document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
