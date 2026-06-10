@@ -35,6 +35,7 @@ const state = {
   salesDealByProduction: new Map(),
   salesManagerLoading: false,
   salesManagerProgress: '',
+  managerAiResults: [],
 };
 
 const REQUIRED_ITEMS = [
@@ -2462,6 +2463,7 @@ function aiScenarioLabel(scenario) {
     handoff: 'ИИ-проверка передачи',
     workplan: 'ИИ-ход работы',
     documents: 'ИИ-проверка документов',
+    manager_deal: 'ИИ-анализ проблемной сделки для руководителя',
   };
   return map[scenario] || 'ИИ-анализ сделки';
 }
@@ -2494,6 +2496,12 @@ async function enrichAIContextByScenario(context, deal, scenario) {
       totalIncomingItems: (docAnalysis.docs || []).length,
     };
     context.note = 'ИИ должен проверить документы по чек-листу: что найдено, что только упоминается и требует ручной проверки, что нужно запросить у клиента.';
+  }
+
+  if (scenario === 'manager_deal') {
+    context.scenario = 'manager_deal';
+    context.issueFlags = shortFlagLabels(getDealIssueFlags(deal));
+    context.managementNote = 'Результат нужен руководителю/РОП для планёрки: кратко, по делу, с ответственным и следующим действием. Приоритет — не общий пересказ, а управленческое решение по проблемной сделке.';
   }
 
   return context;
@@ -3549,6 +3557,8 @@ if (managerDashboard) {
     if (remindersButton) return createHandoffReminderTasks();
     const escalationsButton = e.target.closest && e.target.closest('#create-escalations');
     if (escalationsButton) return createEscalationTasks();
+    const managerAiButton = e.target.closest && e.target.closest('#run-manager-ai');
+    if (managerAiButton) return runManagerAIAnalysis();
     const taskId = e.target.getAttribute('data-handoff-task');
     if (taskId) return createHandoffTaskForDeal(taskId);
     const markOkId = e.target.getAttribute('data-mark-handoff-ok');
