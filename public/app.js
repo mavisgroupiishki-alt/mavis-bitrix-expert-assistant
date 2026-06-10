@@ -303,8 +303,16 @@ async function loadDeals() {
   await hydrateDeals(deals);
   await hydrateStages(deals);
   renderDeals();
-  backgroundHydrateDealMeta(deals);
+  if (APP_CONFIG.autoLoadMeta) {
+    backgroundHydrateDealMeta(deals);
+  } else {
+    state.detailsLoading = false;
+    state.detailsLoaded = false;
+    state.detailsProgress = 'Детали по делам/задачам не загружаются автоматически, чтобы кабинет не зависал. Для сводки нажмите “Загрузить счётчики / журнал”.';
+    renderDeals();
+  }
 }
+
 
 async function hydrateDeals(deals) {
   const userIds = new Set();
@@ -539,6 +547,29 @@ async function backgroundHydrateDealMeta(deals) {
   renderDeals();
 }
 
+
+async function loadDashboardMeta() {
+  if (state.detailsLoading) {
+    alert('Детали уже загружаются. Дождись завершения текущей загрузки.');
+    return;
+  }
+  const ok = confirm('Загрузить счётчики руководителя и журнал ошибок по всем активным сделкам? Это может занять несколько минут, но кабинет уже не будет зависать при открытии.');
+  if (!ok) return;
+  await backgroundHydrateDealMeta(getRoleVisibleDeals());
+}
+
+function metaStatusText() {
+  if (state.detailsLoaded && !state.detailsLoading) return 'Данные по делам/задачам загружены.';
+  if (state.detailsLoading) return state.detailsProgress || 'Догружаем дела, задачи и проверки...';
+  return 'Детали не загружены автоматически. Открывайте конкретную сделку для проверки или нажмите “Загрузить счётчики / журнал”.';
+}
+
+function metaPlaceholder(kind) {
+  if (state.detailsLoading) return '<span class="muted">загружается...</span>';
+  if (kind === 'audit') return '<span class="status-chip status-none">не загружено</span>';
+  return '<span class="muted">не загружено</span>';
+}
+
 function getTimelineComments(dealId) { return state.commentsByDeal.get(String(dealId)) || []; }
 
 function findLatestAudit(comments) {
@@ -746,7 +777,7 @@ function renderManagerDashboard(deals, metaReady) {
   panel.classList.toggle('hidden', !shouldShow);
   if (!shouldShow) return;
 
-  const value = (n) => metaReady ? String(n) : '…';
+  const value = (n) => metaReady ? String(n) : (state.detailsLoading ? '…' : '—');
   const flags = metaReady ? deals.map((d) => ({ deal: d, flags: getDealIssueFlags(d) })) : [];
   const count = (key) => metaReady ? flags.filter((x) => x.flags[key]).length : 0;
   const cards = [
@@ -767,7 +798,7 @@ function renderManagerDashboard(deals, metaReady) {
 
   const label = metaReady
     ? `${dashboardFilterName(state.dashboardFilter)}. Данные по делам/задачам загружены.`
-    : 'Дела, задачи и проверки ещё догружаются. Счётчики руководителя обновятся автоматически.';
+    : metaStatusText();
   document.getElementById('manager-dashboard-filter-label').textContent = label;
 
   if (!metaReady) {
@@ -949,12 +980,17 @@ function renderManagerReport(report) {
   });
 }
 
-function generateManagerReport() {
+async function generateManagerReport() {
   const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
   if (!shouldShow) return;
-  if (state.detailsLoading || !state.detailsLoaded) {
+  if (state.detailsLoading) {
     alert('Данные по делам, задачам и проверкам ещё догружаются. Подожди завершения загрузки и нажми ещё раз.');
     return;
+  }
+  if (!state.detailsLoaded) {
+    const ok = confirm('Для отчёта нужно загрузить счётчики и журнал по всем сделкам. Запустить загрузку сейчас?');
+    if (!ok) return;
+    await backgroundHydrateDealMeta(getRoleVisibleDeals());
   }
   const deals = getRoleVisibleDeals();
   const report = buildManagerReport(deals);
@@ -1035,8 +1071,10 @@ function renderHandoffJournal(deals, metaReady) {
   const summary = document.getElementById('handoff-journal-summary');
 
   if (!metaReady) {
-    summary.innerHTML = '<div class="journal-card info"><span>Статус</span><strong>Догружаем проверки...</strong></div>';
-    tbody.innerHTML = '<tr><td colspan="7" class="muted">Дела, задачи и проверки ещё догружаются. Журнал появится автоматически.</td></tr>';
+    const txt = state.detailsLoading ? 'Догружаем проверки...' : 'Не загружено';
+    const msg = state.detailsLoading ? 'Дела, задачи и проверки ещё догружаются. Журнал появится автоматически.' : 'Чтобы сформировать журнал, нажмите кнопку “Загрузить счётчики / журнал”.';
+    summary.innerHTML = `<div class="journal-card info"><span>Статус</span><strong>${escapeHtml(txt)}</strong></div>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">${escapeHtml(msg)}</td></tr>`;
     return;
   }
 
@@ -1175,9 +1213,9 @@ function renderDeals() {
       <td>${escapeHtml(formatMoney(deal.OPPORTUNITY))}</td>
       <td>${escapeHtml(formatDate(getStartDate(deal)) || '—')}</td>
       <td>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</td>
-      <td>${!metaReady ? '<span class="muted">загружается...</span>' : next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
-      <td>${!metaReady ? '<span class="muted">загружается...</span>' : `${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}`}</td>
-      <td>${!metaReady ? '<span class="status-chip status-none">загружается...</span>' : auditHtml(deal.ID)}</td>
+      <td>${!metaReady ? metaPlaceholder('next') : next ? `${escapeHtml(formatDate(next.date))}<br><span class="muted">${escapeHtml(next.kind)}: ${escapeHtml(next.title || '')}</span>` : '<span class="warn">нет открытого дела/задачи</span>'}</td>
+      <td>${!metaReady ? metaPlaceholder('last') : `${escapeHtml(formatDate(lastWork) || '—')}${stale ? '<br><span class="warn">2+ дня</span>' : ''}`}</td>
+      <td>${!metaReady ? metaPlaceholder('audit') : auditHtml(deal.ID)}</td>
       <td>
         <button class="secondary" data-bx="${deal.ID}">В Bitrix</button>
         <button class="secondary" data-open="${deal.ID}">Открыть</button>
@@ -1190,12 +1228,12 @@ function renderDeals() {
 
   const visibleForRole = getRoleVisibleDeals();
   document.getElementById('count-all').textContent = visibleForRole.length;
-  document.getElementById('count-no-activity').textContent = metaReady ? visibleForRole.filter((d) => !hasNextStep(d.ID)).length : '…';
-  document.getElementById('count-stale').textContent = metaReady ? visibleForRole.filter((d) => daysSince(lastWorkDate(d)) >= 2).length : '…';
+  document.getElementById('count-no-activity').textContent = metaReady ? visibleForRole.filter((d) => !hasNextStep(d.ID)).length : (state.detailsLoading ? '…' : '—');
+  document.getElementById('count-stale').textContent = metaReady ? visibleForRole.filter((d) => daysSince(lastWorkDate(d)) >= 2).length : (state.detailsLoading ? '…' : '—');
   const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
   document.getElementById('label-count-all').textContent = isRopOnly ? 'Ошибки передачи' : 'Активные открытые сделки';
   document.getElementById('label-count-check').textContent = isRopOnly ? 'Ошибки передачи' : 'Не проверено';
-  document.getElementById('count-check').textContent = metaReady ? (isRopOnly ? visibleForRole.length : visibleForRole.filter((d) => !getAudit(d.ID)).length) : '…';
+  document.getElementById('count-check').textContent = metaReady ? (isRopOnly ? visibleForRole.length : visibleForRole.filter((d) => !getAudit(d.ID)).length) : (state.detailsLoading ? '…' : '—');
   document.getElementById('deals-title').textContent = isRopOnly ? 'Ошибки передачи из продаж' : 'Активные сделки';
 
   const roleNote = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll
@@ -1209,7 +1247,7 @@ function renderDeals() {
   document.getElementById('category-note').textContent = (APP_CONFIG.productionCategoryId
     ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}. `
     : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render. ')
-    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote} ${state.detailsProgress || ''}`;
+    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote} ${metaStatusText()}`;
 
 }
 
@@ -2967,6 +3005,8 @@ document.getElementById('show-fields').addEventListener('click', showDealFields)
 const managerDashboard = document.getElementById('manager-dashboard');
 if (managerDashboard) {
   managerDashboard.addEventListener('click', (e) => {
+    const loadMetaButton = e.target.closest && e.target.closest('#load-dashboard-meta');
+    if (loadMetaButton) return loadDashboardMeta();
     const reportButton = e.target.closest && e.target.closest('#generate-manager-report');
     if (reportButton) return generateManagerReport();
     const remindersButton = e.target.closest && e.target.closest('#create-handoff-reminders');

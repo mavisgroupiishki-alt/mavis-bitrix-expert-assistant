@@ -35,7 +35,10 @@ const config = {
   excludeClosedDeals: String(process.env.EXCLUDE_CLOSED_DEALS || 'true').toLowerCase() !== 'false',
   allowRopViewAll: String(process.env.ALLOW_ROP_VIEW_ALL || 'false').toLowerCase() === 'true',
   // Сколько сделок одновременно дозагружать по делам/задачам/комментариям.
-  metaConcurrency: Number(process.env.META_CONCURRENCY || 4),
+  metaConcurrency: Number(process.env.META_CONCURRENCY || 3),
+  // Важно для больших воронок: по умолчанию НЕ грузим метаданные по всем 400+ сделкам автоматически.
+  // Иначе Bitrix получает сотни запросов и кабинет может висеть 10–20 минут.
+  autoLoadMeta: String(process.env.AUTO_LOAD_META || 'false').toLowerCase() === 'true',
   // Если автоопределение поля “Услуга” на портале не сработает, сюда можно вписать код поля UF_CRM_...
   serviceFieldCode: process.env.SERVICE_FIELD_CODE || '',
   // Необязательно: ручная карта стадий в формате JSON, если портал не отдаёт названия стадий через API.
