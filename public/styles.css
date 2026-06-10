@@ -88,3 +88,21 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .audit-meta { display:block; margin-top:4px; color:var(--muted); font-size:12px; }
 #deals-table th:nth-child(11), #deals-table td:nth-child(11) { min-width: 180px; }
 #deals-table th:nth-child(12), #deals-table td:nth-child(12) { min-width: 230px; }
+
+
+.manager-dashboard { margin-bottom: 18px; }
+.dashboard-filters { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; }
+.dashboard-filters button.active { background: var(--primary); color:#fff; }
+.dashboard-grid { display:grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap:10px; margin-top: 10px; }
+.dashboard-card { background:#f8fafc; border:1px solid var(--line); border-radius:14px; padding:12px; }
+.dashboard-card span { display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+.dashboard-card strong { font-size:24px; }
+.dashboard-card.danger { background:#fef2f2; }
+.dashboard-card.warning { background:#fff7ed; }
+.dashboard-card.info { background:#eff6ff; }
+.owner-grid { display:grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap:10px; margin-top:12px; }
+.owner-card { border:1px solid var(--line); border-radius:14px; padding:12px; background:#fff; }
+.owner-card h3 { font-size:15px; margin-bottom:6px; }
+.owner-card .owner-stats { color:var(--muted); font-size:13px; line-height:1.5; }
+@media (max-width: 1100px) { .dashboard-grid { grid-template-columns: repeat(3, 1fr); } .owner-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 800px) { .dashboard-grid, .owner-grid { grid-template-columns: 1fr; } .dashboard-filters { justify-content:flex-start; } }

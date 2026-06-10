@@ -28,6 +28,27 @@
       <div class="summary-card"><span id="label-count-check">Не проверено</span><strong id="count-check">0</strong></div>
     </section>
 
+
+    <section id="manager-dashboard" class="panel manager-dashboard hidden">
+      <div class="panel-header">
+        <div>
+          <h2>Кабинет руководителя / РОП</h2>
+          <p class="muted small-note">Проблемный обзор по производственным сделкам: ошибки передачи, просрочки, сделки без следующего шага и без активности.</p>
+        </div>
+        <div class="dashboard-filters">
+          <button class="secondary" data-dashboard-filter="all">Все</button>
+          <button class="secondary" data-dashboard-filter="handoffErrors">Ошибки передачи</button>
+          <button class="secondary" data-dashboard-filter="noNext">Без шага</button>
+          <button class="secondary" data-dashboard-filter="stale">Без активности 2+ дня</button>
+          <button class="secondary" data-dashboard-filter="overdue">Просрочено</button>
+          <button class="secondary" data-dashboard-filter="today">Сегодня</button>
+        </div>
+      </div>
+      <div id="manager-dashboard-cards" class="dashboard-grid"></div>
+      <div id="manager-dashboard-filter-label" class="muted small-note"></div>
+      <div id="manager-dashboard-owners" class="owner-grid"></div>
+    </section>
+
     <section class="panel">
       <div class="panel-header">
         <h2 id="deals-title">Активные сделки</h2>

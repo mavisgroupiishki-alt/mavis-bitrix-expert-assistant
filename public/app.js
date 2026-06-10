@@ -27,6 +27,7 @@ const state = {
   detailsLoading: false,
   detailsLoaded: false,
   detailsProgress: '',
+  dashboardFilter: 'all',
 };
 
 const REQUIRED_ITEMS = [
@@ -614,6 +615,129 @@ function lastWorkDate(deal) {
 
 
 
+function getDeadlineValue(item) {
+  return item.DEADLINE || item.deadline || item.DEADLINE_DATE || item.deadlineDate || '';
+}
+function isOverdueDate(value) {
+  if (!value) return false;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return false;
+  return d.getTime() < Date.now();
+}
+function isTodayDate(value) {
+  if (!value) return false;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return false;
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+}
+function getDealIssueFlags(deal) {
+  const audit = getAudit(deal.ID);
+  const acts = openActivities(deal.ID);
+  const tasks = openTasks(deal.ID);
+  const deadlines = [
+    ...acts.map((a) => a.DEADLINE).filter(Boolean),
+    ...tasks.map((t) => getDeadlineValue(t)).filter(Boolean),
+  ];
+  const noDeadlineCount = acts.filter((a) => !a.DEADLINE).length + tasks.filter((t) => !getDeadlineValue(t)).length;
+  const flags = {
+    handoffErrors: Boolean(audit && audit.statusCode === 'error'),
+    handoffPartial: Boolean(audit && audit.statusCode === 'partial'),
+    unchecked: !audit,
+    noNext: !hasNextStep(deal.ID),
+    stale: daysSince(lastWorkDate(deal)) >= 2,
+    overdue: deadlines.some(isOverdueDate),
+    today: deadlines.some(isTodayDate),
+    noDeadline: noDeadlineCount > 0,
+    noDeadlineCount,
+  };
+  flags.problem = flags.handoffErrors || flags.handoffPartial || flags.noNext || flags.stale || flags.overdue || flags.noDeadline;
+  return flags;
+}
+function dealMatchesDashboardFilter(deal, filter) {
+  if (!filter || filter === 'all') return true;
+  const f = getDealIssueFlags(deal);
+  if (filter === 'problems') return f.problem;
+  return Boolean(f[filter]);
+}
+function dashboardFilterName(filter) {
+  const names = {
+    all: 'показаны все сделки',
+    problems: 'показаны только проблемные сделки',
+    handoffErrors: 'фильтр: ошибки передачи',
+    noNext: 'фильтр: сделки без следующего шага',
+    stale: 'фильтр: без рабочей активности 2+ дня',
+    overdue: 'фильтр: просроченные дедлайны',
+    today: 'фильтр: дедлайны на сегодня',
+  };
+  return names[filter] || 'показаны все сделки';
+}
+function renderManagerDashboard(deals, metaReady) {
+  const panel = document.getElementById('manager-dashboard');
+  if (!panel) return;
+  const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  panel.classList.toggle('hidden', !shouldShow);
+  if (!shouldShow) return;
+
+  const value = (n) => metaReady ? String(n) : '…';
+  const flags = metaReady ? deals.map((d) => ({ deal: d, flags: getDealIssueFlags(d) })) : [];
+  const count = (key) => metaReady ? flags.filter((x) => x.flags[key]).length : 0;
+  const cards = [
+    { label: 'Ошибки передачи', value: value(count('handoffErrors')), cls: 'danger' },
+    { label: 'Нужно подтвердить', value: value(count('handoffPartial')), cls: 'warning' },
+    { label: 'Не проверено', value: value(count('unchecked')), cls: 'info' },
+    { label: 'Без следующего шага', value: value(count('noNext')), cls: 'warning' },
+    { label: 'Просрочено', value: value(count('overdue')), cls: 'danger' },
+    { label: 'Сегодня', value: value(count('today')), cls: 'info' },
+  ];
+  document.getElementById('manager-dashboard-cards').innerHTML = cards.map((c) => `
+    <div class="dashboard-card ${c.cls}"><span>${escapeHtml(c.label)}</span><strong>${escapeHtml(c.value)}</strong></div>
+  `).join('');
+
+  panel.querySelectorAll('[data-dashboard-filter]').forEach((btn) => {
+    btn.classList.toggle('active', btn.getAttribute('data-dashboard-filter') === state.dashboardFilter);
+  });
+
+  const label = metaReady
+    ? `${dashboardFilterName(state.dashboardFilter)}. Данные по делам/задачам загружены.`
+    : 'Дела, задачи и проверки ещё догружаются. Счётчики руководителя обновятся автоматически.';
+  document.getElementById('manager-dashboard-filter-label').textContent = label;
+
+  if (!metaReady) {
+    document.getElementById('manager-dashboard-owners').innerHTML = '';
+    return;
+  }
+
+  const byOwner = new Map();
+  flags.forEach(({ deal, flags }) => {
+    const id = String(deal.ASSIGNED_BY_ID || '0');
+    if (!byOwner.has(id)) byOwner.set(id, { total: 0, handoffErrors: 0, noNext: 0, stale: 0, overdue: 0, today: 0 });
+    const row = byOwner.get(id);
+    row.total += 1;
+    if (flags.handoffErrors) row.handoffErrors += 1;
+    if (flags.noNext) row.noNext += 1;
+    if (flags.stale) row.stale += 1;
+    if (flags.overdue) row.overdue += 1;
+    if (flags.today) row.today += 1;
+  });
+  const owners = [...byOwner.entries()]
+    .map(([id, row]) => ({ id, ...row, problem: row.handoffErrors + row.noNext + row.stale + row.overdue }))
+    .sort((a, b) => b.problem - a.problem || b.total - a.total)
+    .slice(0, 9);
+  document.getElementById('manager-dashboard-owners').innerHTML = owners.map((o) => `
+    <div class="owner-card">
+      <h3>${escapeHtml(userName(o.id))}</h3>
+      <div class="owner-stats">
+        Всего сделок: <strong>${o.total}</strong><br>
+        Ошибки передачи: <strong>${o.handoffErrors}</strong><br>
+        Без шага: <strong>${o.noNext}</strong> · 2+ дня: <strong>${o.stale}</strong><br>
+        Просрочено: <strong>${o.overdue}</strong> · Сегодня: <strong>${o.today}</strong>
+      </div>
+    </div>
+  `).join('');
+}
+
+
 function getRoleVisibleDeals() {
   const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
   if (isRopOnly) return state.deals.filter((d) => {
@@ -632,8 +756,13 @@ function renderDeals() {
   tbody.innerHTML = '';
 
   const roleVisibleDeals = getRoleVisibleDeals();
-  const filtered = roleVisibleDeals.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID} ${auditLabel(getAudit(d.ID))}`).includes(q));
   const metaReady = state.detailsLoaded && !state.detailsLoading;
+  renderManagerDashboard(roleVisibleDeals, metaReady);
+
+  const filterBase = metaReady
+    ? roleVisibleDeals.filter((d) => dealMatchesDashboardFilter(d, state.dashboardFilter))
+    : roleVisibleDeals;
+  const filtered = filterBase.filter((d) => normalize(`${d.TITLE} ${companyName(d.COMPANY_ID)} ${getService(d)} ${d.STAGE_ID} ${stageName(d.STAGE_ID)} ${d.CATEGORY_ID} ${auditLabel(getAudit(d.ID))}`).includes(q));
 
   filtered.forEach((deal) => {
     const next = metaReady ? nextStep(deal.ID) : null;
@@ -2439,5 +2568,14 @@ document.getElementById('create-workplan-tasks').addEventListener('click', creat
 document.getElementById('create-deadline-tasks').addEventListener('click', createDeadlineTasks);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
+const managerDashboard = document.getElementById('manager-dashboard');
+if (managerDashboard) {
+  managerDashboard.addEventListener('click', (e) => {
+    const filter = e.target.getAttribute('data-dashboard-filter');
+    if (!filter) return;
+    state.dashboardFilter = filter;
+    renderDeals();
+  });
+}
 
 init();
