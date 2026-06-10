@@ -697,7 +697,7 @@ async function openDeal(id) {
   state.selectedMode = '';
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
-  ['write-comment','create-manager-task','create-expert-task','mark-checked'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
   document.getElementById('deal-dialog').showModal();
 }
@@ -1551,6 +1551,260 @@ async function generateChecklist() {
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
 }
 
+
+function normalizeDocText(value) {
+  return normalize(String(value || '').replace(/[ё]/g, 'е'));
+}
+
+function evidenceLabel(e) {
+  if (!e) return '';
+  return [e.source, e.name, e.text].filter(Boolean).join(' — ');
+}
+
+async function tryResolveFileName(id) {
+  const cleanId = String(id || '').replace(/[^0-9]/g, '');
+  if (!cleanId) return '';
+  try {
+    const f = await bxCall('disk.file.get', { id: cleanId });
+    return f && (f.NAME || f.name || f.TITLE || f.title || `файл ID ${cleanId}`);
+  } catch (_) {}
+  try {
+    const a = await bxCall('disk.attachedObject.get', { id: cleanId });
+    const obj = a && (a.OBJECT || a.object || a.FILE || a.file || a);
+    return obj && (obj.NAME || obj.name || obj.TITLE || obj.title || `файл ID ${cleanId}`);
+  } catch (_) {}
+  return `файл ID ${cleanId}`;
+}
+
+function collectFileIdsFromValue(raw, out = []) {
+  if (raw === null || raw === undefined || raw === '' || raw === false) return out;
+  if (Array.isArray(raw)) {
+    raw.forEach((x) => collectFileIdsFromValue(x, out));
+    return out;
+  }
+  if (typeof raw === 'object') {
+    ['ID','id','FILE_ID','fileId','ATTACHMENT_ID','attachmentId','OBJECT_ID','objectId','DISK_FILE_ID','diskFileId'].forEach((k) => {
+      if (raw[k]) out.push(String(raw[k]));
+    });
+    Object.values(raw).forEach((v) => {
+      if (Array.isArray(v) || (v && typeof v === 'object')) collectFileIdsFromValue(v, out);
+    });
+    return out;
+  }
+  const text = String(raw);
+  if (/^\d{2,}$/.test(text)) out.push(text);
+  return out;
+}
+
+function dealFieldLooksLikeFile(code, meta, raw) {
+  const text = normalizeDocText([code, fieldLabel(code), metaText(meta), JSON.stringify(raw)].join(' '));
+  if (/file|disk|файл|документ|копи|скан|вложен|прикреп|загруз/.test(text)) return true;
+  const metaType = normalizeDocText(meta && (meta.type || meta.USER_TYPE_ID || meta.userTypeId || meta.dataType));
+  return /file|disk/.test(metaType);
+}
+
+async function collectIncomingDocuments(deal) {
+  const docs = [];
+  const sources = [];
+  const dealId = deal.ID;
+
+  const addSource = (source, text, name = '') => {
+    const clean = stripHtml(String(text || '')).trim();
+    const cleanName = stripHtml(String(name || '')).trim();
+    if (!clean && !cleanName) return;
+    sources.push({ source, name: cleanName, text: clean });
+  };
+
+  const addDoc = (source, name, text = '') => {
+    const cleanName = stripHtml(String(name || '')).trim();
+    const cleanText = stripHtml(String(text || '')).trim();
+    if (!cleanName && !cleanText) return;
+    docs.push({ source, name: cleanName || cleanText.slice(0, 80), text: cleanText });
+    addSource(source, cleanText, cleanName);
+  };
+
+  try {
+    const fresh = await bxCall('crm.deal.get', { id: dealId });
+    Object.entries(fresh || {}).forEach(([code, raw]) => {
+      const meta = state.fields[code] || {};
+      if (!dealFieldLooksLikeFile(code, meta, raw)) return;
+      const resolved = resolveFieldValue(code, raw);
+      if (resolved && !/^false$/i.test(String(resolved))) addDoc(`поле сделки: ${fieldLabel(code) || code}`, resolved, resolved);
+    });
+  } catch (_) {}
+
+  let comments = [];
+  try {
+    comments = await bxList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+    }, 80);
+  } catch (_) {
+    comments = getTimelineComments(dealId);
+  }
+  comments.forEach((c) => {
+    const raw = `${c.COMMENT || c.TEXT || ''}`;
+    const clean = stripHtml(raw);
+    if (/файл|документ|копи|скан|прикреп|загруз|диплом|трудов|удостовер|аттестат|свидетельств|поверк|платеж|платёж|счет|счёт|реквизит|карточк/i.test(clean)) {
+      addDoc(`комментарий ${formatDate(c.CREATED || c.DATE_CREATE || c.created)}`, clean.slice(0, 120), clean);
+    } else {
+      addSource(`комментарий ${formatDate(c.CREATED || c.DATE_CREATE || c.created)}`, clean);
+    }
+    collectFileIdsFromValue(c.FILES || c.files || c.ATTACHMENTS || c.attachments || c.FILE_ID || c.fileId || []).slice(0, 15).forEach((id) => addDoc('файл из комментария', `файл ID ${id}`, clean));
+  });
+
+  let activities = [];
+  try {
+    activities = await bxList('crm.activity.list', {
+      filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
+      order: { ID: 'DESC' },
+      select: ['ID','SUBJECT','DESCRIPTION','CREATED','DEADLINE','TYPE_ID','PROVIDER_ID','COMPLETED','STORAGE_TYPE_ID','STORAGE_ELEMENT_IDS','FILES'],
+    }, 80);
+  } catch (_) {
+    activities = getActivities(dealId);
+  }
+
+  const fileIds = new Set();
+  activities.forEach((a) => {
+    const clean = stripHtml(`${a.SUBJECT || ''}. ${a.DESCRIPTION || ''}`);
+    if (/файл|документ|копи|скан|прикреп|загруз|диплом|трудов|удостовер|аттестат|свидетельств|поверк|платеж|платёж|счет|счёт|реквизит|карточк/i.test(clean)) {
+      addDoc(`дело/активность ${formatDate(a.CREATED || a.created)}`, a.SUBJECT || 'активность', clean);
+    } else {
+      addSource(`дело/активность ${formatDate(a.CREATED || a.created)}`, clean);
+    }
+    collectFileIdsFromValue(a.STORAGE_ELEMENT_IDS || a.storageElementIds || a.FILES || a.files || a.ATTACHMENTS || a.attachments || []).forEach((id) => fileIds.add(id));
+  });
+
+  const resolvedIds = [...fileIds].slice(0, 30);
+  await mapLimit(resolvedIds, 4, async (id) => {
+    const name = await tryResolveFileName(id);
+    if (name) addDoc('прикреплённый файл Bitrix', name, `ID ${id}`);
+  });
+
+  const unique = [];
+  const seen = new Set();
+  docs.forEach((d) => {
+    const key = normalizeDocText(`${d.source}|${d.name}|${d.text}`).slice(0, 300);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(d);
+  });
+
+  return { docs: unique, sources };
+}
+
+function docPatternsForItem(item, profile) {
+  const text = normalizeDocText(`${item} ${profile.label || ''} ${profile.key || ''}`);
+  const groups = [];
+  if (/реквизит|карточк|контакт|компани|ответствен/.test(text)) groups.push(/реквизит|карточк|унп|компани|ответствен|контакт|email|почт/);
+  if (/свидетельств|стк|спк/.test(text)) groups.push(/стк|спк|свидетельств|техническ.*компетент/);
+  if (/област|виды работ|категор/.test(text)) groups.push(/област|вид.*работ|категор|виды|работ/);
+  if (/специалист|диплом|трудов|удостовер|аттестат|фио|стаж|образован|должност/.test(text)) groups.push(/специалист|диплом|трудов|удостовер|аттестат|фио|стаж|образован|должност|прораб|мастер|гип/);
+  if (/оборуд|средств|измер|поверк|калибров|аренд|прибор/.test(text)) groups.push(/оборуд|средств.*измер|измеритель|поверк|калибров|аренд|прибор/);
+  if (/оплат|счет|счёт|пошлин|платеж|платёж/.test(text)) groups.push(/оплат|счет|счёт|пошлин|платеж|платёж|платежк|платёжк|стройдок|техкарт/);
+  if (/стандарт|iso|9001|45001|суот|процесс|штат|деятельност|систем/.test(text)) groups.push(/iso|9001|45001|суот|охран.*труд|стандарт|процесс|штат|деятельност|систем/);
+  if (/подбор|квалификац|регион|занятост|условия|кандидат/.test(text)) groups.push(/подбор|квалификац|регион|занятост|условия|кандидат|резюме|специалист/);
+
+  const words = text.split(/[^а-яa-z0-9]+/).filter((w) => w.length >= 5 && !['клиента','данные','документы','подтверждение','перечню','эксперта','обязательных','если','применимо','нужная','актуальные'].includes(w));
+  if (words.length) groups.push(new RegExp(words.slice(0, 4).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'i'));
+  return groups;
+}
+
+function analyzeIncomingDocuments(deal, collected) {
+  const profile = productProfileForDeal(deal);
+  const checklist = productDocumentChecklist(profile);
+  const allEvidence = [...(collected.docs || []), ...(collected.sources || [])];
+  const corpusItems = allEvidence.map((e) => ({ raw: e, text: normalizeDocText(evidenceLabel(e)) })).filter((x) => x.text);
+
+  const found = [];
+  const uncertain = [];
+  const missing = [];
+
+  checklist.clientDocs.forEach((item) => {
+    const patterns = docPatternsForItem(item, profile);
+    const matches = corpusItems.filter((e) => patterns.some((p) => p.test(e.text)));
+    const fileMatches = matches.filter((e) => collected.docs && collected.docs.includes(e.raw));
+    if (fileMatches.length) {
+      found.push({ label: item, source: fileMatches[0].raw.source, snippet: fileMatches[0].raw.name || fileMatches[0].raw.text });
+    } else if (matches.length) {
+      uncertain.push({ label: item, source: matches[0].raw.source, snippet: matches[0].raw.name || matches[0].raw.text });
+    } else {
+      missing.push({ label: item });
+    }
+  });
+
+  const unknownDocs = (collected.docs || []).filter((doc) => {
+    const text = normalizeDocText(evidenceLabel(doc));
+    return !found.some((f) => text.includes(normalizeDocText(f.snippet).slice(0, 25))) && !uncertain.some((u) => text.includes(normalizeDocText(u.snippet).slice(0, 25)));
+  }).slice(0, 20);
+
+  const status = missing.length === 0
+    ? 'комплект документов выглядит закрытым, нужна ручная проверка эксперта'
+    : found.length || uncertain.length
+      ? 'документы частично найдены, есть что дозапросить'
+      : 'входящие документы не найдены или не распознаны';
+
+  return { profile, checklist, found, uncertain, missing, unknownDocs, status, docs: collected.docs || [] };
+}
+
+function buildDocumentsText(deal, analysis) {
+  return `Проверка входящих документов по сделке\n\n` +
+    `Сделка: ${deal.TITLE || ''} / ID ${deal.ID}\n` +
+    `Компания: ${companyName(deal.COMPANY_ID)}\n` +
+    `Услуга: ${getService(deal) || '—'}\n` +
+    `Продуктовая логика: ${analysis.profile.label}\n` +
+    `Статус: ${analysis.status}\n\n` +
+    `Найдено по чек-листу:\n${analysis.found.length ? analysis.found.map((x) => `— ${x.label}; источник: ${x.source}; фрагмент: “${x.snippet}”`).join('\n') : '— ничего не найдено'}\n\n` +
+    `Нужно проверить вручную:\n${analysis.uncertain.length ? analysis.uncertain.map((x) => `— ${x.label}; источник: ${x.source}; фрагмент: “${x.snippet}”`).join('\n') : '— спорных совпадений нет'}\n\n` +
+    `Не найдено / нужно запросить:\n${analysis.missing.length ? analysis.missing.map((x) => `— ${x.label}`).join('\n') : '— критичных отсутствующих пунктов не выявлено'}\n\n` +
+    `Нераспределённые входящие файлы/упоминания:\n${analysis.unknownDocs.length ? analysis.unknownDocs.map((x) => `— ${x.name || x.text}; источник: ${x.source}`).join('\n') : '— нет'}\n\n` +
+    `Важно: ассистент не подтверждает юридическую корректность файлов, а только сверяет наличие/упоминания документов с продуктовым чек-листом. Эксперт должен открыть файлы и проверить содержание.`;
+}
+
+function renderDocumentsResultHtml(deal, analysis) {
+  const request = analysis.missing.length
+    ? `Добрый день! По услуге “${getService(deal) || 'услуга'}” сейчас не хватает части документов/данных. Просим направить:\n${analysis.missing.map((x) => `— ${x.label}`).join('\n')}\n\nЕсли какой-то документ пока не готов — напишите, пожалуйста, к какой дате сможете передать.`
+    : `Добрый день! По услуге “${getService(deal) || 'услуга'}” документы предварительно получены/зафиксированы. Мы проверим содержание и вернёмся с обратной связью, если потребуется дополнение.`;
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Проверка входящих документов</h3><span class="result-status ${analysis.missing.length ? 'partial' : 'ok'}">${escapeHtml(analysis.status)}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
+        <div class="result-field"><span>Продуктовая логика</span>${escapeHtml(analysis.profile.label)}</div>
+        <div class="result-field"><span>Найдено входящих файлов/упоминаний</span>${escapeHtml(String(analysis.docs.length))}</div>
+      </div>
+    </div>
+    <div class="result-card card-found"><h3>Найдено по чек-листу</h3>${listHtml(analysis.found, 'Пока ничего не найдено', (x) => `<strong>${escapeHtml(x.label)}</strong><span class="source-note">${escapeHtml(x.source)} · ${escapeHtml(x.snippet)}</span>`)}</div>
+    <div class="result-card card-uncertain"><h3>Нужно проверить вручную</h3>${listHtml(analysis.uncertain, 'Спорных совпадений нет', (x) => `<strong>${escapeHtml(x.label)}</strong><span class="source-note">${escapeHtml(x.source)} · ${escapeHtml(x.snippet)}</span>`)}</div>
+    <div class="result-card card-missing"><h3>Не найдено / запросить у клиента</h3>${listHtml(analysis.missing.map((x) => x.label), 'Критичных отсутствующих пунктов не выявлено')}</div>
+    <div class="result-card card-checklist"><h3>Нераспределённые файлы и упоминания</h3>${listHtml(analysis.unknownDocs, 'Нет отдельных файлов/упоминаний', (x) => `<strong>${escapeHtml(x.name || 'файл/упоминание')}</strong><span class="source-note">${escapeHtml(x.source)}${x.text ? ' · ' + escapeHtml(x.text).slice(0, 160) : ''}</span>`)}</div>
+    <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(request)}</div></div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(buildDocumentsText(deal, analysis))}</div></details>
+  `;
+}
+
+async function checkIncomingDocuments() {
+  if (!state.selectedDeal) return;
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = '<div class="result-card"><h3>Проверяем входящие документы...</h3><p class="muted">Смотрим поля сделки, комментарии, дела/активности и доступные прикреплённые файлы.</p></div>';
+  out.classList.remove('hidden');
+
+  const collected = await collectIncomingDocuments(state.selectedDeal);
+  const analysis = analyzeIncomingDocuments(state.selectedDeal, collected);
+  state.selectedMode = 'documents';
+  state.selectedAudit = null;
+  state.selectedMissing = analysis.missing.map((x) => x.label);
+  state.selectedAnalysis = buildDocumentsText(state.selectedDeal, analysis);
+  out.innerHTML = renderDocumentsResultHtml(state.selectedDeal, analysis);
+
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.remove('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.toggle('hidden', !analysis.missing.length);
+}
+
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
   await bxCall('crm.timeline.comment.add', {
@@ -1601,10 +1855,17 @@ async function createManagerTask() {
 
 async function createExpertTask() {
   const d = state.selectedDeal;
+  const isDocs = state.selectedMode === 'documents';
   await createTask({
-    title: 'Сделать первое касание клиента',
+    title: isDocs ? 'Проверить входящие документы по сделке' : 'Сделать первое касание клиента',
     responsibleId: d.ASSIGNED_BY_ID,
-    description: `Связаться с клиентом, подтвердить ход работы, документы, оплаты, дедлайны и следующий шаг. После звонка зафиксировать итоги в комментарии сделки.\n\n${state.selectedAnalysis || ''}`,
+    description: isDocs
+      ? `Открыть входящие файлы/комментарии по сделке, сверить содержание документов с чек-листом и дозапросить недостающее у клиента.
+
+${state.selectedAnalysis || ''}`
+      : `Связаться с клиентом, подтвердить ход работы, документы, оплаты, дедлайны и следующий шаг. После звонка зафиксировать итоги в комментарии сделки.
+
+${state.selectedAnalysis || ''}`,
     dealId: d.ID,
   });
 }
@@ -1839,6 +2100,7 @@ document.getElementById('close-dialog').addEventListener('click', () => document
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
+document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
