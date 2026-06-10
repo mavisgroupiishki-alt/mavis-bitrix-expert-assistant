@@ -38,6 +38,9 @@ const config = {
   metaConcurrency: Number(process.env.META_CONCURRENCY || 4),
   // Если автоопределение поля “Услуга” на портале не сработает, сюда можно вписать код поля UF_CRM_...
   serviceFieldCode: process.env.SERVICE_FIELD_CODE || '',
+  // Необязательно: ручная карта стадий в формате JSON, если портал не отдаёт названия стадий через API.
+  // Пример: {"C28:UC_MIFXBB":"2. Сбор информации"}
+  stageMap: (() => { try { return JSON.parse(process.env.STAGE_MAP_JSON || '{}'); } catch (_) { return {}; } })(),
 };
 
 app.get('/health', (_req, res) => {

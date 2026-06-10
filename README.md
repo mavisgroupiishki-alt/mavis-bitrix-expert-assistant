@@ -1,4 +1,4 @@
-# MAVIS Bitrix Expert Assistant — v18 Manager Dashboard
+# MAVIS Bitrix Expert Assistant — v19 Stage Fix
 
 Версия v18 добавляет кабинет руководителя / РОП поверх рабочей логики v17.
 
@@ -33,3 +33,15 @@ ROP_USER_IDS=2156
 ADMIN_USER_IDS=2110,14
 ALLOW_ROP_VIEW_ALL=false
 
+
+
+## v19
+
+Исправлено отображение стадий:
+- приложение берёт названия стадий из нескольких источников Bitrix;
+- дополнительно читает STAGE_ID.items из crm.deal.fields;
+- не дублирует технический код, если название стадии не найдено;
+- добавлен fallback для C28:NEW и C28:UC_MIFXBB.
+
+Необязательная переменная для ручных правок стадий:
+STAGE_MAP_JSON={"C28:UC_MIFXBB":"2. Сбор информации"}

@@ -325,9 +325,21 @@ async function hydrateDeals(deals) {
 }
 
 async function hydrateStages(deals) {
+  state.stageMap.clear();
+
+  // 1) Ручная карта из Render, если когда-нибудь понадобится точечно переименовать стадию.
+  Object.entries(APP_CONFIG.stageMap || {}).forEach(([code, name]) => {
+    if (code && name) state.stageMap.set(String(code), String(name));
+  });
+
+  // 2) Самый надёжный источник для части порталов: crm.deal.fields → STAGE_ID.items.
+  // В некоторых Bitrix названия стадий не приходят через crm.status.list, но уже есть в метаданных поля.
+  saveStageNamesFromDealFields();
+
   const categoryIds = [...new Set(deals.map((d) => String(d.CATEGORY_ID || '0')))];
   const entityIds = ['DEAL_STAGE', ...categoryIds.filter((id) => id !== '0').map((id) => `DEAL_STAGE_${id}`)];
 
+  // 3) Основной источник: справочник стадий.
   await mapLimit(entityIds, 4, async (entityId) => {
     try {
       const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: entityId }, order: { SORT: 'ASC' } }, 0);
@@ -335,25 +347,70 @@ async function hydrateStages(deals) {
     } catch (_) {}
   });
 
-  // Extra fallback for custom deal pipelines. Some portals return custom pipeline
-  // stages more reliably through crm.dealcategory.stage.list.
+  // 4) Fallback: иногда фильтр ENTITY_ID не срабатывает, поэтому тянем статусы без фильтра
+  // и отбираем нужные на стороне приложения.
+  try {
+    const allStatuses = await bxList('crm.status.list', { order: { SORT: 'ASC' } }, 0);
+    allStatuses
+      .filter((row) => entityIds.includes(String(row.ENTITY_ID || row.entityId || row.entity_id || '')))
+      .forEach((row) => saveStageName(row.ENTITY_ID || row.entityId || row.entity_id, row));
+  } catch (_) {}
+
+  // 5) Дополнительный fallback для пользовательских воронок.
   await mapLimit(categoryIds.filter((id) => id !== '0'), 4, async (categoryId) => {
-    try {
-      const rows = await bxList('crm.dealcategory.stage.list', { id: categoryId, order: { SORT: 'ASC' } }, 0);
-      rows.forEach((row) => saveStageName(`DEAL_STAGE_${categoryId}`, row));
-    } catch (_) {}
+    const variants = [
+      { id: Number(categoryId), order: { SORT: 'ASC' } },
+      { id: categoryId, order: { SORT: 'ASC' } },
+      { categoryId: Number(categoryId), order: { SORT: 'ASC' } },
+      { filter: { CATEGORY_ID: Number(categoryId) }, order: { SORT: 'ASC' } },
+    ];
+    for (const params of variants) {
+      try {
+        const rows = await bxList('crm.dealcategory.stage.list', params, 0);
+        rows.forEach((row) => saveStageName(`DEAL_STAGE_${categoryId}`, row));
+        if (rows.length) break;
+      } catch (_) {}
+    }
   });
+
+  // 6) Минимальный защитный fallback для текущей производственной воронки, чтобы не показывать код вместо названия.
+  // Остальные стадии всё равно должны подтянуться из API выше.
+  if (String(APP_CONFIG.productionCategoryId || '') === '28') {
+    if (!state.stageMap.has('C28:NEW')) state.stageMap.set('C28:NEW', '1. Эксперт назначен');
+    if (!state.stageMap.has('C28:UC_MIFXBB')) state.stageMap.set('C28:UC_MIFXBB', '2. Сбор информации');
+  }
+}
+
+function saveStageNamesFromDealFields() {
+  const meta = state.fields && state.fields.STAGE_ID;
+  const items = meta && (meta.items || meta.ITEMS || meta.list || meta.LIST);
+  if (!Array.isArray(items)) return;
+  items.forEach((item) => {
+    const code = String(item.ID || item.id || item.VALUE_ID || item.valueId || item.STATUS_ID || item.statusId || '');
+    const name = item.VALUE || item.value || item.NAME || item.name || item.TITLE || item.title || '';
+    saveStageCandidate(code, name);
+  });
+}
+
+function saveStageCandidate(code, name) {
+  const c = String(code || '').trim();
+  const n = String(name || '').trim();
+  if (!c || !n || c === n) return;
+  state.stageMap.set(c, n);
 }
 
 function saveStageName(entityId, row) {
   if (!row) return;
-  const statusId = String(row.STATUS_ID || row.statusId || row.ID || row.id || '');
-  const name = row.NAME || row.name || row.TITLE || row.title || statusId;
+  const statusId = String(row.STATUS_ID || row.statusId || row.ID || row.id || row.STATUS || row.status || '');
+  const name = row.NAME || row.name || row.TITLE || row.title || row.VALUE || row.value || statusId;
   if (!statusId) return;
-  state.stageMap.set(statusId, name);
-  const m = String(entityId).match(/^DEAL_STAGE_(\d+)$/);
+
+  saveStageCandidate(statusId, name);
+
+  const entity = String(entityId || row.ENTITY_ID || row.entityId || row.entity_id || '');
+  const m = entity.match(/^DEAL_STAGE_(\d+)$/);
   if (m && !statusId.startsWith(`C${m[1]}:`)) {
-    state.stageMap.set(`C${m[1]}:${statusId}`, name);
+    saveStageCandidate(`C${m[1]}:${statusId}`, name);
   }
 }
 
@@ -556,7 +613,14 @@ function contactName(id) {
   if (!c) return id ? `ID ${id}` : '—';
   return `${c.NAME || ''} ${c.LAST_NAME || ''}`.trim() || c.FULL_NAME || `ID ${id}`;
 }
-function stageName(stageId) { return state.stageMap.get(String(stageId)) || stageId || '—'; }
+function stageName(stageId) {
+  const code = String(stageId || '');
+  return state.stageMap.get(code) || code || '—';
+}
+function isStageResolved(stageId) {
+  const code = String(stageId || '');
+  return Boolean(code && state.stageMap.has(code) && state.stageMap.get(code) !== code);
+}
 function getService(deal) {
   if (!deal) return '';
   if (state.fieldMap.service && deal[state.fieldMap.service] !== undefined) {
@@ -774,7 +838,7 @@ function renderDeals() {
       <td>${escapeHtml(companyName(deal.COMPANY_ID))}</td>
       <td><strong>${escapeHtml(deal.TITLE || '')}</strong><br><span class="muted">ID ${deal.ID}</span></td>
       <td>${escapeHtml(getService(deal) || '—')}</td>
-      <td><span class="badge" title="${escapeHtml(deal.STAGE_ID || '')}">${escapeHtml(stageName(deal.STAGE_ID))}</span><br><span class="muted">${escapeHtml(deal.STAGE_ID || '—')}</span></td>
+      <td><span class="badge" title="${escapeHtml(deal.STAGE_ID || '')}">${escapeHtml(stageName(deal.STAGE_ID))}</span>${isStageResolved(deal.STAGE_ID) ? `<br><span class="muted">${escapeHtml(deal.STAGE_ID || '—')}</span>` : ''}</td>
       <td>${escapeHtml(deal.CATEGORY_ID ?? '0')}</td>
       <td>${escapeHtml(formatMoney(deal.OPPORTUNITY))}</td>
       <td>${escapeHtml(formatDate(getStartDate(deal)) || '—')}</td>
