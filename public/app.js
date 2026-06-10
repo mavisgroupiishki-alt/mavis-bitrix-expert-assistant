@@ -24,6 +24,7 @@ const state = {
   selectedAudit: null,
   selectedMode: '',
   selectedDeadlineTasks: [],
+  selectedAiTasks: [],
   detailsLoading: false,
   detailsLoaded: false,
   detailsProgress: '',
@@ -1484,7 +1485,7 @@ async function openDeal(id) {
   state.selectedMode = '';
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
-  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
   state.selectedDeadlineTasks = [];
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
   document.getElementById('deal-dialog').showModal();
@@ -1572,6 +1573,7 @@ async function checkHandoff() {
   document.getElementById('mark-checked').classList.remove('hidden');
   document.getElementById('create-workplan-tasks').classList.add('hidden');
   document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
 }
 
 
@@ -2371,20 +2373,102 @@ function renderAIAnalysisHtml(deal, ai) {
   `;
 }
 
+
+function aiResponsibleId(deal, responsible) {
+  const role = String(responsible || '').toLowerCase();
+  if (role.includes('manager')) {
+    const sales = state.salesDealByProduction.get(String(deal.ID));
+    return sales && sales.managerId ? sales.managerId : (deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID);
+  }
+  if (role.includes('leader') || role.includes('rop') || role.includes('руковод')) {
+    const leader = (APP_CONFIG.escalationResponsibleId || (APP_CONFIG.leaderUserIds || [])[0] || (APP_CONFIG.ropUserIds || [])[0] || deal.ASSIGNED_BY_ID);
+    return leader;
+  }
+  return deal.ASSIGNED_BY_ID;
+}
+
+function deadlineFromAIHint(hint) {
+  const text = normalize(hint || '');
+  if (!text) return deadlineTomorrow(12);
+  if (text.includes('1 час') || text.includes('час')) return deadlineInHours(1);
+  if (text.includes('сегодня') || text.includes('до конца дня')) return deadlineTodayEnd();
+  if (text.includes('завтра') || text.includes('следующий рабочий')) return deadlineTomorrow(12);
+  if (text.includes('2 дня') || text.includes('двух дней')) {
+    const d = new Date();
+    d.setDate(d.getDate() + 2);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  }
+  return deadlineTomorrow(12);
+}
+
+function buildAITasks(deal, aiPayload) {
+  const result = aiPayload && aiPayload.result ? aiPayload.result : aiPayload;
+  const rawTasks = Array.isArray(result && result.tasks) ? result.tasks : [];
+  return rawTasks
+    .map((t) => {
+      const title = String(t.title || '').trim();
+      if (!title) return null;
+      const role = String(t.responsible || 'expert').trim();
+      const deadline = deadlineFromAIHint(t.deadline_hint || '');
+      const description = `Задача предложена ИИ-ассистентом по сделке “${deal.TITLE || ''}”.\n\nУслуга: ${getService(deal) || 'не указана'}\nРоль: ${role}\nОриентир по сроку: ${t.deadline_hint || 'ближайший рабочий контроль'}\n\nЧто сделать:\n${t.description || title}\n\nВажно: задача создана после ручного подтверждения эксперта/руководителя.`;
+      return {
+        title: `ИИ: ${title}`,
+        responsibleId: aiResponsibleId(deal, role),
+        deadline,
+        description,
+        role,
+      };
+    })
+    .filter(Boolean)
+    .filter((task) => !hasOpenTaskWithTitle(deal.ID, task.title.replace(/^ИИ:\s*/i, '')) && !hasOpenTaskWithTitle(deal.ID, task.title));
+}
+
+async function createAITasks() {
+  if (!state.selectedDeal) return;
+  const d = state.selectedDeal;
+  const tasks = state.selectedAiTasks || [];
+  if (!tasks.length) {
+    alert('ИИ не предложил новых задач или похожие открытые задачи уже есть.');
+    return;
+  }
+  const confirmText = `Будут созданы задачи по ИИ-анализу (${tasks.length}):\n\n${tasks.map((t, i) => `${i + 1}. ${t.title} — ответственный ${userName(t.responsibleId)}, дедлайн ${formatDate(t.deadline)}`).join('\n')}\n\nСоздать?`;
+  if (!window.confirm(confirmText)) return;
+  for (const task of tasks) {
+    await createTask({
+      title: task.title,
+      responsibleId: task.responsibleId,
+      description: task.description,
+      dealId: d.ID,
+      deadline: task.deadline,
+      silent: true,
+    });
+  }
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(d.ID), ENTITY_TYPE: 'deal', COMMENT: `ИИ-ассистент: создано задач по ИИ-анализу: ${tasks.length}.\n\n${tasks.map((t) => `— ${t.title}; ответственный: ${userName(t.responsibleId)}; дедлайн: ${formatDate(t.deadline)}`).join('\n')}` }
+  });
+  alert(`Создано задач по ИИ-анализу: ${tasks.length}`);
+  state.selectedAiTasks = [];
+  document.getElementById('create-ai-tasks').classList.add('hidden');
+  await ensureDealMeta(d.ID);
+  await loadDeals();
+  if (state.selectedDeal) openDeal(String(d.ID));
+}
+
 async function analyzeDealWithAI() {
   if (!state.selectedDeal) return;
   state.selectedMode = 'ai';
   state.selectedAudit = null;
   state.selectedMissing = [];
   state.selectedDeadlineTasks = [];
-  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
 
   const out = document.getElementById('analysis-result');
   out.innerHTML = `<div class="result-card card-action"><h3>ИИ анализирует сделку...</h3><p class="muted">Собираем поля, комментарии, дела, связанную сделку продаж и чек-лист. Обычно это занимает 10–40 секунд.</p></div>`;
   out.classList.remove('hidden');
 
   if (!APP_CONFIG.aiEnabled) {
-    out.innerHTML = `<div class="result-card card-risk"><h3>ИИ пока не включён</h3><p>Добавь в Render переменные <strong>AI_ENABLED=true</strong>, <strong>AI_PROVIDER=openai</strong>, <strong>AI_API_KEY</strong> и <strong>AI_MODEL</strong>, затем сделай деплой.</p><p class="muted">Ключ в чат присылать не нужно.</p></div>`;
+    out.innerHTML = `<div class="result-card card-risk"><h3>ИИ пока не включён</h3><p>Добавь в Render переменные <strong>AI_ENABLED=true</strong>, <strong>AI_PROVIDER=vibe</strong>, <strong>AI_API_KEY</strong>, <strong>AI_BASE_URL</strong> и <strong>AI_MODEL</strong>, затем сделай деплой.</p><p class="muted">Ключ в чат присылать не нужно.</p></div>`;
     return;
   }
 
@@ -2398,10 +2482,14 @@ async function analyzeDealWithAI() {
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `Ошибка ИИ HTTP ${response.status}`);
     state.selectedAnalysis = aiResultToComment(state.selectedDeal, data);
+    state.selectedAiTasks = buildAITasks(state.selectedDeal, data);
     out.innerHTML = renderAIAnalysisHtml(state.selectedDeal, data);
     document.getElementById('write-comment').classList.remove('hidden');
+    document.getElementById('create-ai-tasks').classList.toggle('hidden', !state.selectedAiTasks.length);
   } catch (e) {
     state.selectedAnalysis = '';
+    state.selectedAiTasks = [];
+    document.getElementById('create-ai-tasks').classList.add('hidden');
     out.innerHTML = `<div class="result-card card-risk"><h3>Ошибка ИИ-анализа</h3><p>${escapeHtml(e.message || String(e))}</p><p class="muted">Проверь переменные Render: AI_ENABLED, AI_PROVIDER, AI_API_KEY, AI_MODEL.</p></div>`;
   }
 }
@@ -2421,6 +2509,7 @@ async function generateWorkPlan() {
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
   document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
 }
 
 
@@ -2489,6 +2578,7 @@ async function generateChecklist() {
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
   document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
 }
 
 
@@ -2744,6 +2834,7 @@ async function checkIncomingDocuments() {
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.toggle('hidden', !analysis.missing.length);
   document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
 }
 
 function parseDateValue(value) {
@@ -3039,6 +3130,7 @@ async function checkDeadlines() {
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.add('hidden');
   document.getElementById('create-deadline-tasks').classList.toggle('hidden', !state.selectedDeadlineTasks.length);
+  document.getElementById('create-ai-tasks').classList.add('hidden');
 }
 
 async function createDeadlineTasks() {
@@ -3377,6 +3469,7 @@ document.getElementById('create-manager-task').addEventListener('click', createM
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
 document.getElementById('create-workplan-tasks').addEventListener('click', createWorkPlanTasks);
 document.getElementById('create-deadline-tasks').addEventListener('click', createDeadlineTasks);
+document.getElementById('create-ai-tasks').addEventListener('click', createAITasks);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
 const managerDashboard = document.getElementById('manager-dashboard');
