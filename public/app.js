@@ -2351,10 +2351,11 @@ function aiResultToComment(deal, ai) {
 
 function renderAIAnalysisHtml(deal, ai) {
   const r = ai.result || ai;
+  const title = ai.scenario_label || ai.title || 'ИИ-анализ сделки';
   const tasks = (r.tasks || []).map((t) => `${t.title}${t.responsible ? ` — ${t.responsible}` : ''}${t.deadline_hint ? `, ${t.deadline_hint}` : ''}${t.description ? `<span class="source-note">${escapeHtml(t.description)}</span>` : ''}`);
   return `
     <div class="result-header">
-      <div class="result-header-title"><h3>ИИ-анализ сделки</h3><span class="result-status ${aiStatusClass(r.status)}">${escapeHtml(r.status_label || r.status || 'нужна проверка')}</span></div>
+      <div class="result-header-title"><h3>${escapeHtml(title)}</h3><span class="result-status ${aiStatusClass(r.status)}">${escapeHtml(r.status_label || r.status || 'нужна проверка')}</span></div>
       <div class="result-grid">
         <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
         <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
@@ -2455,8 +2456,52 @@ async function createAITasks() {
   if (state.selectedDeal) openDeal(String(d.ID));
 }
 
-async function analyzeDealWithAI() {
+function aiScenarioLabel(scenario) {
+  const map = {
+    deal_analyze: 'ИИ-анализ сделки',
+    handoff: 'ИИ-проверка передачи',
+    workplan: 'ИИ-ход работы',
+    documents: 'ИИ-проверка документов',
+  };
+  return map[scenario] || 'ИИ-анализ сделки';
+}
+
+async function enrichAIContextByScenario(context, deal, scenario) {
+  if (scenario === 'handoff') {
+    context.scenario = 'handoff';
+    context.requiredHandoffItems = REQUIRED_ITEMS.map((x) => ({ key: x.key, label: x.label, why: x.why }));
+    context.localHandoffAudit = getAudit(deal.ID) || state.selectedAudit || null;
+    context.note = 'ИИ должен проверить качество передачи сделки из продаж в производство и отдельно выделить ошибки менеджера, спорные пункты и действия эксперта.';
+  }
+
+  if (scenario === 'workplan') {
+    context.scenario = 'workplan';
+    context.localWorkPlanDraft = buildWorkPlanText(deal);
+    context.note = 'ИИ должен улучшить ход работы: сделать его понятным для эксперта и клиента, не обещать сроки без подтверждения, предложить задачи и контрольные точки.';
+  }
+
+  if (scenario === 'documents') {
+    context.scenario = 'documents';
+    const collected = await collectIncomingDocuments(deal);
+    const docAnalysis = analyzeIncomingDocuments(deal, collected);
+    context.localDocumentCheck = {
+      status: docAnalysis.status,
+      product: docAnalysis.profile.label,
+      found: docAnalysis.found,
+      uncertain: docAnalysis.uncertain,
+      missing: docAnalysis.missing,
+      unknownDocs: docAnalysis.unknownDocs,
+      totalIncomingItems: (docAnalysis.docs || []).length,
+    };
+    context.note = 'ИИ должен проверить документы по чек-листу: что найдено, что только упоминается и требует ручной проверки, что нужно запросить у клиента.';
+  }
+
+  return context;
+}
+
+async function runAIScenario(scenario = 'deal_analyze') {
   if (!state.selectedDeal) return;
+  const title = aiScenarioLabel(scenario);
   state.selectedMode = 'ai';
   state.selectedAudit = null;
   state.selectedMissing = [];
@@ -2464,7 +2509,7 @@ async function analyzeDealWithAI() {
   ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
 
   const out = document.getElementById('analysis-result');
-  out.innerHTML = `<div class="result-card card-action"><h3>ИИ анализирует сделку...</h3><p class="muted">Собираем поля, комментарии, дела, связанную сделку продаж и чек-лист. Обычно это занимает 10–40 секунд.</p></div>`;
+  out.innerHTML = `<div class="result-card card-action"><h3>${escapeHtml(title)}...</h3><p class="muted">Собираем данные сделки, комментарии, задачи, связанную сделку продаж и продуктовую логику. Обычно это занимает 10–40 секунд.</p></div>`;
   out.classList.remove('hidden');
 
   if (!APP_CONFIG.aiEnabled) {
@@ -2473,15 +2518,17 @@ async function analyzeDealWithAI() {
   }
 
   try {
-    const context = await buildAIContext(state.selectedDeal);
+    let context = await buildAIContext(state.selectedDeal);
+    context = await enrichAIContextByScenario(context, state.selectedDeal, scenario);
     const response = await fetch('/api/ai/analyze-deal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ context }),
+      body: JSON.stringify({ context, scenario }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `Ошибка ИИ HTTP ${response.status}`);
-    state.selectedAnalysis = aiResultToComment(state.selectedDeal, data);
+    data.scenario_label = data.scenario_label || title;
+    state.selectedAnalysis = aiResultToComment(state.selectedDeal, data).replace(/^ИИ-анализ сделки/, title);
     state.selectedAiTasks = buildAITasks(state.selectedDeal, data);
     out.innerHTML = renderAIAnalysisHtml(state.selectedDeal, data);
     document.getElementById('write-comment').classList.remove('hidden');
@@ -2490,8 +2537,24 @@ async function analyzeDealWithAI() {
     state.selectedAnalysis = '';
     state.selectedAiTasks = [];
     document.getElementById('create-ai-tasks').classList.add('hidden');
-    out.innerHTML = `<div class="result-card card-risk"><h3>Ошибка ИИ-анализа</h3><p>${escapeHtml(e.message || String(e))}</p><p class="muted">Проверь переменные Render: AI_ENABLED, AI_PROVIDER, AI_API_KEY, AI_MODEL.</p></div>`;
+    out.innerHTML = `<div class="result-card card-risk"><h3>Ошибка: ${escapeHtml(title)}</h3><p>${escapeHtml(e.message || String(e))}</p><p class="muted">Проверь переменные Render: AI_ENABLED, AI_PROVIDER, AI_API_KEY, AI_MODEL.</p></div>`;
   }
+}
+
+async function analyzeDealWithAI() {
+  return runAIScenario('deal_analyze');
+}
+
+async function analyzeHandoffWithAI() {
+  return runAIScenario('handoff');
+}
+
+async function generateWorkPlanWithAI() {
+  return runAIScenario('workplan');
+}
+
+async function checkDocumentsWithAI() {
+  return runAIScenario('documents');
 }
 
 async function generateWorkPlan() {
@@ -3460,6 +3523,9 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 document.getElementById('close-dialog').addEventListener('click', () => document.getElementById('deal-dialog').close());
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
+document.getElementById('ai-handoff').addEventListener('click', analyzeHandoffWithAI);
+document.getElementById('ai-workplan').addEventListener('click', generateWorkPlanWithAI);
+document.getElementById('ai-documents').addEventListener('click', checkDocumentsWithAI);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);

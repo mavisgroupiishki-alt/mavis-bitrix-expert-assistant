@@ -136,6 +136,30 @@ function resolveAiProvider() {
   };
 }
 
+
+function aiScenarioConfig(scenarioRaw) {
+  const scenario = String(scenarioRaw || 'deal_analyze').trim();
+  const map = {
+    deal_analyze: {
+      label: 'ИИ-анализ сделки',
+      instruction: 'Дай общий управленческий и экспертный анализ сделки: что понятно, чего не хватает, риски, следующие действия, задачи, черновик сообщения клиенту и комментарий в сделку.'
+    },
+    handoff: {
+      label: 'ИИ-проверка передачи',
+      instruction: 'Проверь качество передачи сделки из продаж в производство. Сравни производственную сделку и связанную сделку продаж. Особое внимание: услуга/товары, КП/состав/цена, город, специалисты, сроки и срочность, email и канал связи, пошлины/дополнительные счета, средства измерений, обещания менеджера, следующий шаг. Раздели вывод на: найдено точно, нужно подтвердить, не найдено/ошибки передачи, риски, что должен исправить менеджер, что должен сделать эксперт.'
+    },
+    workplan: {
+      label: 'ИИ-ход работы',
+      instruction: 'Сформируй ход работы по сделке для эксперта. Нужно: действия MAVIS GROUP, действия клиента, что уточнить, дедлайны/контрольные точки, риски сдвига сроков, черновик сообщения клиенту человеческим языком, комментарий в сделку, рекомендуемые задачи. Не обещай клиенту сроки, если они не указаны в данных.'
+    },
+    documents: {
+      label: 'ИИ-проверка документов',
+      instruction: 'Проверь входящие документы и данные по продуктовому чек-листу. Используй названия файлов, комментарии, дела, поля сделки и предварительную алгоритмическую сверку, если она есть в контексте. Раздели результат на: что найдено, что нужно открыть и проверить вручную, чего не хватает, какие риски, что запросить у клиента, задачи эксперту.'
+    }
+  };
+  return { scenario, ...(map[scenario] || map.deal_analyze) };
+}
+
 async function callAiChatCompletion({ model, temperature, messages }) {
   const ai = resolveAiProvider();
   if (!ai.apiKey) {
@@ -177,9 +201,13 @@ app.post('/api/ai/analyze-deal', async (req, res) => {
     }
 
     const payload = req.body || {};
-    const context = clipText(JSON.stringify(payload.context || {}, null, 2), 28000);
+    const scenarioCfg = aiScenarioConfig(payload.scenario);
+    const context = clipText(JSON.stringify(payload.context || {}, null, 2), 30000);
     const system = `Ты ИИ-ассистент эксперта производства MAVIS GROUP. Работаешь только как внутренний помощник эксперта, РОП и руководителя. Нельзя обещать клиенту сроки, гарантии или юридически значимые выводы, если их нет в данных. Клиенту ничего не отправляешь автоматически. Возвращай только валидный JSON без markdown.`;
-    const user = `Проанализируй производственную сделку Bitrix24 и верни структурированный результат для эксперта.
+    const user = `${scenarioCfg.label}.
+
+Задача:
+${scenarioCfg.instruction}
 
 Контекст сделки:
 ${context}
@@ -188,12 +216,12 @@ ${context}
 {
   "status": "ok|partial|risk|error",
   "status_label": "короткий статус по-русски",
-  "summary": ["что понятно по сделке"],
-  "missing": ["чего не хватает / что нужно уточнить"],
+  "summary": ["что понятно / найдено по сценарию"],
+  "missing": ["чего не хватает / что нужно уточнить / что не найдено"],
   "risks": ["риски по срокам, оплатам, документам, передаче"],
-  "next_steps": ["следующие действия эксперта"],
+  "next_steps": ["следующие действия эксперта, менеджера или руководителя"],
   "tasks": [{"title":"название задачи", "responsible":"expert|manager|leader", "deadline_hint":"когда", "description":"что сделать"}],
-  "client_message": "черновик сообщения клиенту, если данных достаточно; если нет — черновик уточняющего сообщения",
+  "client_message": "черновик сообщения клиенту, если уместно; если клиенту писать рано — текст уточнения или пустая строка",
   "comment": "короткий комментарий в сделку для Bitrix"
 }`;
 
@@ -206,7 +234,7 @@ ${context}
       ],
     });
     const parsed = safeJsonParse(rawText);
-    res.json({ ok: true, provider: config.aiProvider, model: config.aiModel, result: normalizeAiResult(parsed, rawText) });
+    res.json({ ok: true, provider: config.aiProvider, model: config.aiModel, scenario: scenarioCfg.scenario, scenario_label: scenarioCfg.label, result: normalizeAiResult(parsed, rawText) });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
