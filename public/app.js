@@ -36,6 +36,7 @@ const state = {
   salesManagerLoading: false,
   salesManagerProgress: '',
   managerAiResults: [],
+  managerAiTasks: [],
 };
 
 const REQUIRED_ITEMS = [
@@ -1075,6 +1076,215 @@ async function generateManagerReport() {
   const deals = getRoleVisibleDeals();
   const report = buildManagerReport(deals);
   renderManagerReport(report);
+}
+
+
+function managerProblemScore(deal) {
+  const f = getDealIssueFlags(deal);
+  return (f.handoffErrors ? 120 : 0)
+    + (f.overdue ? 100 : 0)
+    + (f.noNext ? 80 : 0)
+    + (f.stale ? 60 : 0)
+    + (f.handoffPartial ? 40 : 0)
+    + (f.noDeadline ? 25 : 0)
+    + (f.unchecked ? 15 : 0)
+    + (f.today ? 10 : 0);
+}
+
+function getPriorityProblemDeals(limit = 5) {
+  return getRoleVisibleDeals()
+    .filter((deal) => getDealIssueFlags(deal).problem)
+    .sort((a, b) => managerProblemScore(b) - managerProblemScore(a) || daysSince(lastWorkDate(b)) - daysSince(lastWorkDate(a)))
+    .slice(0, Math.max(1, Number(limit || 5)));
+}
+
+function managerAiResultText(results) {
+  const date = new Date().toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const lines = [];
+  lines.push('ИИ-СВОДКА ПО ПРОБЛЕМНЫМ СДЕЛКАМ');
+  lines.push(`Дата: ${date}`);
+  lines.push(`Проанализировано сделок: ${results.length}`);
+  lines.push('');
+  results.forEach((row, index) => {
+    const deal = row.deal;
+    lines.push(`${index + 1}. ${companyName(deal.COMPANY_ID)} / ${deal.TITLE || 'без названия'} / ID ${deal.ID}`);
+    lines.push(`   Услуга: ${getService(deal) || 'не указана'}`);
+    lines.push(`   Стадия: ${stageName(deal.STAGE_ID)}`);
+    lines.push(`   Эксперт: ${userName(deal.ASSIGNED_BY_ID)}`);
+    lines.push(`   Риски системы: ${shortFlagLabels(getDealIssueFlags(deal)).join(', ')}`);
+    if (row.error) {
+      lines.push(`   Ошибка ИИ: ${row.error}`);
+      lines.push('');
+      return;
+    }
+    const r = row.ai && row.ai.result ? row.ai.result : row.ai || {};
+    lines.push(`   Статус ИИ: ${r.status_label || r.status || 'нужна проверка'}`);
+    lines.push(`   Вывод: ${(r.summary || []).slice(0, 3).join('; ') || '—'}`);
+    lines.push(`   Не хватает: ${(r.missing || []).slice(0, 3).join('; ') || '—'}`);
+    lines.push(`   Риски: ${(r.risks || []).slice(0, 3).join('; ') || '—'}`);
+    lines.push(`   Действия: ${(r.next_steps || []).slice(0, 4).join('; ') || '—'}`);
+    if (r.tasks && r.tasks.length) {
+      lines.push('   Рекомендуемые задачи:');
+      r.tasks.slice(0, 5).forEach((t) => lines.push(`   — ${t.title}${t.responsible ? ` (${t.responsible})` : ''}${t.deadline_hint ? `, ${t.deadline_hint}` : ''}`));
+    }
+    lines.push('');
+  });
+  lines.push('Важно: это ИИ-черновик для руководителя/РОП. Перед постановкой задач вывод нужно проверить.');
+  return lines.join('\n');
+}
+
+function renderManagerAiReport(results) {
+  const box = document.getElementById('manager-ai-report');
+  if (!box) return;
+  const okRows = results.filter((r) => !r.error);
+  const errorRows = results.filter((r) => r.error);
+  const text = managerAiResultText(results);
+  const tasks = [];
+  results.forEach((row) => {
+    if (row.error) return;
+    const built = buildAITasks(row.deal, row.ai).map((task) => ({ ...task, deal: row.deal }));
+    built.forEach((task) => tasks.push(task));
+  });
+  state.managerAiTasks = tasks;
+
+  const cards = results.map((row) => {
+    const deal = row.deal;
+    const flags = shortFlagLabels(getDealIssueFlags(deal)).join(', ');
+    if (row.error) {
+      return `<div class="result-card card-risk">
+        <h4>${escapeHtml(companyName(deal.COMPANY_ID))} · ${escapeHtml(deal.TITLE || '')}</h4>
+        <p><strong>Ошибка ИИ:</strong> ${escapeHtml(row.error)}</p>
+        <p class="muted">${escapeHtml(flags)}</p>
+      </div>`;
+    }
+    const r = row.ai.result || row.ai;
+    return `<div class="result-card card-action">
+      <h4>${escapeHtml(companyName(deal.COMPANY_ID))} · ${escapeHtml(getService(deal) || 'услуга не указана')}</h4>
+      <div class="result-status ${aiStatusClass(r.status)}">${escapeHtml(r.status_label || r.status || 'нужна проверка')}</div>
+      <p class="muted small-note">Сделка ID ${escapeHtml(deal.ID)} · ${escapeHtml(stageName(deal.STAGE_ID))} · ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</p>
+      <p><strong>Почему проблемная:</strong> ${escapeHtml(flags)}</p>
+      <p><strong>Вывод ИИ:</strong> ${escapeHtml((r.summary || []).slice(0, 2).join('; ') || '—')}</p>
+      <p><strong>Что сделать:</strong> ${escapeHtml((r.next_steps || []).slice(0, 3).join('; ') || '—')}</p>
+      <p><strong>Задачи:</strong> ${escapeHtml((r.tasks || []).slice(0, 3).map((t) => t.title).join('; ') || '—')}</p>
+      <button class="secondary" data-open="${escapeHtml(deal.ID)}">Открыть сделку</button>
+    </div>`;
+  }).join('');
+
+  box.innerHTML = `<div class="manager-report-header">
+    <div>
+      <h3>ИИ-сводка проблемных сделок</h3>
+      <p class="muted small-note">Готово: ${okRows.length}; с ошибкой: ${errorRows.length}. Задачи не создаются автоматически.</p>
+    </div>
+    <div class="manager-report-actions">
+      <button id="copy-manager-ai-report" class="secondary">Скопировать ИИ-сводку</button>
+      <button id="create-manager-ai-tasks" class="primary ${tasks.length ? '' : 'hidden'}">Создать задачи из ИИ-сводки (${tasks.length})</button>
+    </div>
+  </div>
+  <div class="manager-ai-cards">${cards || '<p class="muted">Нет результатов ИИ-анализа.</p>'}</div>
+  <div class="report-text"><textarea id="manager-ai-report-text" readonly>${escapeHtml(text)}</textarea></div>`;
+  box.classList.remove('hidden');
+
+  const copyBtn = document.getElementById('copy-manager-ai-report');
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    const ta = document.getElementById('manager-ai-report-text');
+    try {
+      await navigator.clipboard.writeText(ta?.value || text);
+      alert('ИИ-сводка скопирована.');
+    } catch (_) {
+      if (ta) { ta.focus(); ta.select(); }
+      alert('Не удалось скопировать автоматически. Выделила текст — скопируй вручную.');
+    }
+  });
+  const createBtn = document.getElementById('create-manager-ai-tasks');
+  if (createBtn) createBtn.addEventListener('click', createManagerAITasks);
+}
+
+async function runManagerAIAnalysis() {
+  const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  if (!shouldShow) return;
+  const box = document.getElementById('manager-ai-report');
+  if (!box) return;
+  if (!APP_CONFIG.aiEnabled) {
+    box.innerHTML = `<div class="result-card card-risk"><h3>ИИ пока не включён</h3><p>Проверь Render Environment: AI_ENABLED=true, AI_PROVIDER=vibe, AI_BASE_URL, AI_MODEL и AI_API_KEY.</p></div>`;
+    box.classList.remove('hidden');
+    return;
+  }
+  if (state.detailsLoading) {
+    alert('Сначала дождись завершения загрузки счётчиков/журнала.');
+    return;
+  }
+  if (!state.detailsLoaded) {
+    const ok = confirm('Для ИИ-анализа проблемных сделок нужно загрузить счётчики и журнал. Запустить загрузку сейчас?');
+    if (!ok) return;
+    await backgroundHydrateDealMeta(getRoleVisibleDeals());
+  }
+  const limit = Number(APP_CONFIG.managerAiLimit || 5) || 5;
+  const deals = getPriorityProblemDeals(limit);
+  if (!deals.length) {
+    box.innerHTML = `<div class="result-card card-found"><h3>Проблемных сделок не найдено</h3><p class="muted">По текущим критериям нет сделок для массового ИИ-анализа.</p></div>`;
+    box.classList.remove('hidden');
+    return;
+  }
+
+  box.innerHTML = `<div class="result-card card-action"><h3>ИИ-анализ проблемных сделок...</h3><p>Взято сделок: ${deals.length}. Анализируем по одной, чтобы не перегружать VibeCode и Bitrix.</p><p id="manager-ai-progress" class="muted">Старт...</p></div>`;
+  box.classList.remove('hidden');
+
+  const results = [];
+  for (let i = 0; i < deals.length; i += 1) {
+    const deal = deals[i];
+    const progress = document.getElementById('manager-ai-progress');
+    if (progress) progress.textContent = `${i + 1}/${deals.length}: ${companyName(deal.COMPANY_ID)} · ${deal.TITLE || ''}`;
+    try {
+      let context = await buildAIContext(deal);
+      context = await enrichAIContextByScenario(context, deal, 'manager_deal');
+      context.managerBatch = {
+        position: i + 1,
+        total: deals.length,
+        problemScore: managerProblemScore(deal),
+        visibleFlags: shortFlagLabels(getDealIssueFlags(deal)),
+      };
+      const response = await fetch('/api/ai/analyze-deal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ context, scenario: 'manager_deal' }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || `Ошибка ИИ HTTP ${response.status}`);
+      data.scenario_label = data.scenario_label || 'ИИ-анализ проблемной сделки для руководителя';
+      results.push({ deal, ai: data });
+    } catch (e) {
+      results.push({ deal, error: e.message || String(e) });
+    }
+  }
+
+  state.managerAiResults = results;
+  renderManagerAiReport(results);
+}
+
+async function createManagerAITasks() {
+  const tasks = state.managerAiTasks || [];
+  if (!tasks.length) {
+    alert('Новых задач из ИИ-сводки нет или похожие открытые задачи уже существуют.');
+    return;
+  }
+  const preview = tasks.slice(0, 20).map((t, i) => `${i + 1}. ${t.title} — ${userName(t.responsibleId)}, ${formatDate(t.deadline)} (${companyName(t.deal.COMPANY_ID)})`).join('\n');
+  const suffix = tasks.length > 20 ? `\n...и ещё ${tasks.length - 20}` : '';
+  if (!window.confirm(`Будут созданы задачи из ИИ-сводки: ${tasks.length}\n\n${preview}${suffix}\n\nСоздать?`)) return;
+  let created = 0;
+  for (const task of tasks) {
+    await createTask({
+      title: task.title,
+      responsibleId: task.responsibleId,
+      description: task.description,
+      dealId: task.deal.ID,
+      deadline: task.deadline,
+      silent: true,
+    });
+    created += 1;
+  }
+  alert(`Создано задач из ИИ-сводки: ${created}`);
+  state.managerAiTasks = [];
+  await loadDeals();
 }
 
 
