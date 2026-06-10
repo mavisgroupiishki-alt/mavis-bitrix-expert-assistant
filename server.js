@@ -36,6 +36,8 @@ const config = {
   allowRopViewAll: String(process.env.ALLOW_ROP_VIEW_ALL || 'false').toLowerCase() === 'true',
   // Сколько сделок одновременно дозагружать по делам/задачам/комментариям.
   metaConcurrency: Number(process.env.META_CONCURRENCY || 3),
+  // Сколько связанных сделок продаж одновременно открывать для уточнения менеджера в журнале ошибок.
+  salesManagerConcurrency: Number(process.env.SALES_MANAGER_CONCURRENCY || 3),
   // Важно для больших воронок: по умолчанию НЕ грузим метаданные по всем 400+ сделкам автоматически.
   // Иначе Bitrix получает сотни запросов и кабинет может висеть 10–20 минут.
   autoLoadMeta: String(process.env.AUTO_LOAD_META || 'false').toLowerCase() === 'true',

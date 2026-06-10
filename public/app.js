@@ -31,6 +31,9 @@ const state = {
   journalStatusFilter: 'all',
   journalManagerFilter: 'all',
   journalSearch: '',
+  salesDealByProduction: new Map(),
+  salesManagerLoading: false,
+  salesManagerProgress: '',
 };
 
 const REQUIRED_ITEMS = [
@@ -274,6 +277,9 @@ async function loadDeals() {
   state.tasksByDeal.clear();
   state.commentsByDeal.clear();
   state.auditByDeal.clear();
+  state.salesDealByProduction.clear();
+  state.salesManagerLoading = false;
+  state.salesManagerProgress = '';
 
   const select = ['*','UF_*','ID','TITLE','COMPANY_ID','CONTACT_ID','STAGE_ID','CATEGORY_ID','OPPORTUNITY','ASSIGNED_BY_ID','CREATED_BY_ID','DATE_CREATE','DATE_MODIFY','CLOSED'];
   Object.values(state.fieldMap).filter(Boolean).forEach((f) => { if (!select.includes(f)) select.push(f); });
@@ -674,6 +680,78 @@ function getService(deal) {
 }
 function getStartDate(deal) { return state.fieldMap.startDate ? resolveFieldValue(state.fieldMap.startDate, deal[state.fieldMap.startDate]) : ''; }
 function getSalesLink(deal) { return state.fieldMap.salesDealLink ? resolveFieldValue(state.fieldMap.salesDealLink, deal[state.fieldMap.salesDealLink]) : ''; }
+
+function getSalesDealId(deal) {
+  return extractDealId(getSalesLink(deal));
+}
+
+function cachedSalesManagerInfo(deal) {
+  const audit = getAudit(deal.ID);
+  if (audit && audit.salesManagerId) {
+    return {
+      salesId: audit.salesDealId || getSalesDealId(deal) || '',
+      managerId: String(audit.salesManagerId),
+      source: 'из проверки передачи / сделки продаж',
+      title: audit.salesDealTitle || '',
+    };
+  }
+  return state.salesDealByProduction.get(String(deal.ID)) || null;
+}
+
+async function ensureUserCached(id) {
+  if (!id || state.users.has(String(id))) return;
+  try {
+    const res = await bxCall('user.get', { ID: id });
+    state.users.set(String(id), Array.isArray(res) ? res[0] : res);
+  } catch (_) {}
+}
+
+async function ensureSalesManagerForDeal(deal) {
+  const prodId = String(deal.ID);
+  if (state.salesDealByProduction.has(prodId)) return state.salesDealByProduction.get(prodId);
+  const salesId = getSalesDealId(deal);
+  if (!salesId || String(salesId) === prodId) {
+    const fallback = { salesId: '', managerId: String(deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID || '0'), source: 'нет связанной сделки продаж, взят создатель производства', title: '' };
+    state.salesDealByProduction.set(prodId, fallback);
+    return fallback;
+  }
+  try {
+    const salesDeal = await bxCall('crm.deal.get', { id: salesId });
+    const managerId = String(salesDeal.ASSIGNED_BY_ID || salesDeal.CREATED_BY_ID || deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID || '0');
+    await ensureUserCached(managerId);
+    const info = {
+      salesId: String(salesId),
+      managerId,
+      source: 'ответственный в связанной сделке продаж',
+      title: salesDeal.TITLE || '',
+      salesAssignedById: String(salesDeal.ASSIGNED_BY_ID || ''),
+      salesCreatedById: String(salesDeal.CREATED_BY_ID || ''),
+    };
+    state.salesDealByProduction.set(prodId, info);
+    return info;
+  } catch (e) {
+    const fallback = { salesId: String(salesId), managerId: String(deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID || '0'), source: 'не удалось открыть связанную сделку продаж, взят создатель производства', title: '', error: e.message };
+    state.salesDealByProduction.set(prodId, fallback);
+    return fallback;
+  }
+}
+
+async function enrichJournalSalesManagers(rows) {
+  if (state.salesManagerLoading) return;
+  const targets = (rows || []).filter((row) => getSalesDealId(row.deal) && !cachedSalesManagerInfo(row.deal));
+  if (!targets.length) return;
+  state.salesManagerLoading = true;
+  state.salesManagerProgress = `Уточняем менеджеров из связанных сделок продаж: 0/${targets.length}`;
+  let done = 0;
+  await mapLimit(targets, Number(APP_CONFIG.salesManagerConcurrency || 3), async (row) => {
+    await ensureSalesManagerForDeal(row.deal);
+    done += 1;
+    if (done === targets.length || done % 10 === 0) state.salesManagerProgress = `Уточняем менеджеров из связанных сделок продаж: ${done}/${targets.length}`;
+  });
+  state.salesManagerLoading = false;
+  state.salesManagerProgress = `Менеджеры из сделок продаж уточнены: ${targets.length}/${targets.length}`;
+  renderDeals();
+}
 function getActivities(dealId) { return state.activitiesByDeal.get(String(dealId)) || []; }
 function getTasks(dealId) { return state.tasksByDeal.get(String(dealId)) || []; }
 function openActivities(dealId) { return getActivities(dealId).filter((a) => String(a.COMPLETED || 'N').toUpperCase() !== 'Y'); }
@@ -1025,7 +1103,15 @@ function handoffJournalStatus(audit) {
 }
 
 function managerIdForHandoff(deal) {
+  const salesInfo = cachedSalesManagerInfo(deal);
+  if (salesInfo && salesInfo.managerId) return String(salesInfo.managerId);
   return String(deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID || '0');
+}
+
+function managerSourceForHandoff(deal) {
+  const salesInfo = cachedSalesManagerInfo(deal);
+  if (salesInfo && salesInfo.source) return salesInfo.source;
+  return getSalesDealId(deal) ? 'связанная сделка продаж ещё не загружена' : 'создатель производственной сделки';
 }
 
 function buildHandoffJournalRows(deals) {
@@ -1035,7 +1121,7 @@ function buildHandoffJournalRows(deals) {
       if (!audit || !['error', 'partial'].includes(audit.statusCode)) return null;
       const status = handoffJournalStatus(audit);
       const issues = auditIssueList(audit);
-      return { deal, audit, issues, status, managerId: managerIdForHandoff(deal), expertId: String(deal.ASSIGNED_BY_ID || '0'), checkedAt: audit.checkedAt || deal.DATE_MODIFY || deal.DATE_CREATE };
+      return { deal, audit, issues, status, managerId: managerIdForHandoff(deal), managerSource: managerSourceForHandoff(deal), salesDealId: (cachedSalesManagerInfo(deal) || {}).salesId || getSalesDealId(deal) || '', expertId: String(deal.ASSIGNED_BY_ID || '0'), checkedAt: audit.checkedAt || deal.DATE_MODIFY || deal.DATE_CREATE };
     })
     .filter(Boolean)
     .sort((a, b) => {
@@ -1066,6 +1152,7 @@ function renderHandoffJournal(deals, metaReady) {
 
   const allRows = metaReady ? buildHandoffJournalRows(deals) : [];
   const rows = metaReady ? filteredHandoffJournalRows(deals) : [];
+  if (metaReady && allRows.length) enrichJournalSalesManagers(allRows);
   const tbody = document.querySelector('#handoff-journal-table tbody');
   const managerSelect = document.getElementById('journal-manager-filter');
   const summary = document.getElementById('handoff-journal-summary');
@@ -1106,7 +1193,10 @@ function renderHandoffJournal(deals, metaReady) {
       <tr>
         <td>${escapeHtml(formatDate(row.checkedAt) || '—')}<br><span class="muted">${escapeHtml(row.audit.checkedByName || '')}</span></td>
         <td><strong>${escapeHtml(companyName(row.deal.COMPANY_ID))}</strong><br>${escapeHtml(row.deal.TITLE || '')}<br><span class="muted">ID ${escapeHtml(row.deal.ID)} · ${escapeHtml(getService(row.deal) || 'услуга не указана')}</span></td>
-        <td>${escapeHtml(userName(row.managerId))}</td>
+        <td>
+          <strong>${escapeHtml(userName(row.managerId))}</strong>
+          <div class="muted small-note">${escapeHtml(row.managerSource || '')}${row.salesDealId ? ` · продажа ID ${escapeHtml(row.salesDealId)}` : ''}</div>
+        </td>
         <td>${escapeHtml(userName(row.expertId))}</td>
         <td><ul class="journal-issues">${issues}</ul></td>
         <td><span class="status-chip status-${escapeHtml(row.status.cls)}">${escapeHtml(row.status.label)}</span></td>
@@ -1292,10 +1382,22 @@ async function checkHandoff() {
   const production = await collectDealContext(deal.ID, deal, 'производственная сделка');
 
   let sales = null;
+  let salesDealObj = null;
   const salesId = extractDealId(getSalesLink(deal) || contextToText(production));
   if (salesId && String(salesId) !== String(deal.ID)) {
     try {
       const salesDeal = await bxCall('crm.deal.get', { id: salesId });
+      salesDealObj = salesDeal;
+      const salesManagerId = String(salesDeal.ASSIGNED_BY_ID || salesDeal.CREATED_BY_ID || '');
+      if (salesManagerId) await ensureUserCached(salesManagerId);
+      state.salesDealByProduction.set(String(deal.ID), {
+        salesId: String(salesId),
+        managerId: salesManagerId,
+        source: 'ответственный в связанной сделке продаж',
+        title: salesDeal.TITLE || '',
+        salesAssignedById: String(salesDeal.ASSIGNED_BY_ID || ''),
+        salesCreatedById: String(salesDeal.CREATED_BY_ID || ''),
+      });
       sales = await collectDealContext(salesId, salesDeal, 'связанная сделка продаж');
     } catch (e) {
       sales = { dealId: salesId, label: 'связанная сделка продаж', sections: [{ source: 'ошибка открытия сделки продаж', text: `Не удалось открыть сделку продаж ID ${salesId}: ${e.message}` }] };
@@ -1325,7 +1427,7 @@ async function checkHandoff() {
   const actionItems = [...missing.map((r) => r.label), ...uncertain.map((r) => `${r.label} — подтвердить`), ...technicalMissing.map((r) => r.label)];
   state.selectedMode = 'handoff';
   state.selectedMissing = actionItems;
-  state.selectedAudit = buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing });
+  state.selectedAudit = buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing, salesId, salesDeal: salesDealObj });
   state.selectedAnalysis = formatAnalysisV3({ status, found, uncertain, missing, technicalMissing, risks, deal, salesId });
 
   const out = document.getElementById('analysis-result');
@@ -1341,7 +1443,7 @@ async function checkHandoff() {
 
 
 
-function buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing }) {
+function buildAuditPayload({ deal, status, found, uncertain, missing, technicalMissing, salesId, salesDeal }) {
   const statusCode = /есть ошибки/i.test(status) ? 'error' : /частично|подтверд/i.test(status) ? 'partial' : 'ok';
   return {
     version: 1,
@@ -1355,6 +1457,9 @@ function buildAuditPayload({ deal, status, found, uncertain, missing, technicalM
     uncertain: uncertain.map((x) => x.label),
     technical: (technicalMissing || []).map((x) => x.label),
     foundCount: found.length,
+    salesDealId: salesId ? String(salesId) : '',
+    salesDealTitle: salesDeal && salesDeal.TITLE ? String(salesDeal.TITLE) : '',
+    salesManagerId: salesDeal ? String(salesDeal.ASSIGNED_BY_ID || salesDeal.CREATED_BY_ID || '') : '',
   };
 }
 
