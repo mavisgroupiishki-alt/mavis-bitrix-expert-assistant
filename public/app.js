@@ -1232,6 +1232,139 @@ async function createHandoffTaskForDeal(dealId, silent = false) {
   return true;
 }
 
+
+function uniqueIds(ids) {
+  return [...new Set((ids || []).map((x) => String(x || '').trim()).filter(Boolean).filter((x) => x !== '0'))];
+}
+
+function escalationResponsibleId() {
+  return String(APP_CONFIG.escalationResponsibleId || (APP_CONFIG.leaderUserIds || [])[0] || state.user.ID || '').trim();
+}
+
+function escalationAuditorIds() {
+  const responsible = escalationResponsibleId();
+  const configured = uniqueIds(APP_CONFIG.escalationAuditorIds || []);
+  const fallback = uniqueIds([...(APP_CONFIG.leaderUserIds || []), ...(APP_CONFIG.ropUserIds || [])]);
+  return (configured.length ? configured : fallback).filter((id) => String(id) !== String(responsible));
+}
+
+function overdueItemsForDeal(deal) {
+  const activities = openActivities(deal.ID)
+    .filter((a) => isOverdueDate(a.DEADLINE))
+    .map((a) => ({ kind: 'дело', title: a.SUBJECT || 'без названия', deadline: a.DEADLINE }));
+  const tasks = openTasks(deal.ID)
+    .filter((t) => isOverdueDate(getDeadlineValue(t)))
+    .map((t) => ({ kind: 'задача', title: t.TITLE || t.title || 'без названия', deadline: getDeadlineValue(t) }));
+  return [...activities, ...tasks];
+}
+
+function buildEscalationReason(deal) {
+  const flags = getDealIssueFlags(deal);
+  const audit = getAudit(deal.ID);
+  const reasons = [];
+  const details = [];
+
+  if (audit && audit.statusCode === 'error') {
+    const age = auditAgeDays(audit);
+    reasons.push(age >= 1 ? 'ошибка передачи не исправлена 1+ день' : 'ошибка передачи');
+    const issues = auditIssueList(audit);
+    if (issues.length) details.push('Ошибки передачи:\n' + issues.map((x) => `— ${x.type}: ${x.text}`).join('\n'));
+  }
+  if (audit && audit.statusCode === 'partial' && auditAgeDays(audit) >= 1) {
+    reasons.push('спорные данные передачи не подтверждены 1+ день');
+    const issues = auditIssueList(audit);
+    if (issues.length) details.push('Нужно подтвердить по передаче:\n' + issues.map((x) => `— ${x.type}: ${x.text}`).join('\n'));
+  }
+
+  const overdue = overdueItemsForDeal(deal);
+  if (overdue.length) {
+    reasons.push('есть просроченные дела/задачи');
+    details.push('Просрочено:\n' + overdue.slice(0, 8).map((x) => `— ${x.kind}: ${x.title}, дедлайн ${formatDate(x.deadline)}`).join('\n'));
+  }
+  if (flags.noNext) reasons.push('нет следующего шага');
+  if (flags.stale) reasons.push(`нет рабочей активности ${daysSince(lastWorkDate(deal))}+ дня`);
+  if (flags.noDeadline) reasons.push(`есть открытые дела/задачи без дедлайна: ${flags.noDeadlineCount}`);
+
+  return { reasons, details, flags };
+}
+
+function escalationScore(row) {
+  const f = row.flags;
+  const audit = getAudit(row.deal.ID);
+  return (f.overdue ? 100 : 0)
+    + (audit && audit.statusCode === 'error' && auditAgeDays(audit) >= 1 ? 90 : 0)
+    + (f.noNext ? 60 : 0)
+    + (f.stale ? 45 : 0)
+    + (f.noDeadline ? 20 : 0)
+    + (audit && audit.statusCode === 'partial' && auditAgeDays(audit) >= 1 ? 30 : 0);
+}
+
+function buildEscalationRows(deals) {
+  return (deals || [])
+    .map((deal) => {
+      const { reasons, details, flags } = buildEscalationReason(deal);
+      const audit = getAudit(deal.ID);
+      const critical = flags.overdue
+        || (audit && audit.statusCode === 'error' && auditAgeDays(audit) >= 1)
+        || (audit && audit.statusCode === 'partial' && auditAgeDays(audit) >= 1)
+        || (flags.noNext && flags.stale);
+      if (!critical) return null;
+      return { deal, reasons, details, flags, score: 0 };
+    })
+    .filter(Boolean)
+    .map((row) => ({ ...row, score: escalationScore(row) }))
+    .sort((a, b) => b.score - a.score || new Date(b.deal.DATE_MODIFY || 0) - new Date(a.deal.DATE_MODIFY || 0));
+}
+
+function buildEscalationTask(row) {
+  const deal = row.deal;
+  const salesInfo = cachedSalesManagerInfo(deal);
+  const managerId = managerIdForHandoff(deal);
+  const details = row.details.length ? row.details.join('\n\n') : 'Детализация не найдена, нужно открыть сделку и проверить вручную.';
+  return {
+    title: `Эскалация по проблемной производственной сделке ID ${deal.ID}`,
+    responsibleId: escalationResponsibleId(),
+    auditorIds: escalationAuditorIds(),
+    deadline: deadlineTodayEnd(),
+    description: `Нужно управленческое решение/контроль по производственной сделке.\n\nСделка: ${deal.TITLE || ''}\nКомпания: ${companyName(deal.COMPANY_ID)}\nУслуга: ${getService(deal) || 'услуга не указана'}\nСтадия: ${stageName(deal.STAGE_ID)}\nЭксперт: ${userName(deal.ASSIGNED_BY_ID)}\nМенеджер передачи: ${userName(managerId)}${salesInfo && salesInfo.salesId ? `\nСвязанная сделка продаж: ID ${salesInfo.salesId}` : ''}\n\nПричины эскалации:\n${row.reasons.map((x) => `— ${x}`).join('\n')}\n\nДетали:\n${details}\n\nЧто сделать руководителю/РОП:\n1. Проверить, кто должен закрыть проблему: эксперт или менеджер.\n2. Поставить короткий срок исправления.\n3. При необходимости связаться с клиентом и зафиксировать новый следующий шаг.\n4. После исправления закрыть ошибку/эскалацию в кабинете ассистента.`
+  };
+}
+
+async function createEscalationTasks() {
+  if (!state.detailsLoaded || state.detailsLoading) {
+    alert('Сначала нажми “Загрузить счётчики / журнал” и дождись загрузки. Эскалации считаются только после загрузки дел, задач и проверок.');
+    return;
+  }
+  const rows = buildEscalationRows(getRoleVisibleDeals())
+    .filter((row) => !hasOpenTaskWithTitle(row.deal.ID, `Эскалация по проблемной производственной сделке ID ${row.deal.ID}`));
+  if (!rows.length) {
+    alert('Новых критических эскалаций нет: либо проблем нет, либо задачи уже созданы.');
+    return;
+  }
+  const preview = rows.slice(0, 12).map((row, i) => `${i + 1}. ${companyName(row.deal.COMPANY_ID)} / ${row.deal.TITLE || ''}: ${row.reasons.join(', ')}`).join('\n');
+  if (!window.confirm(`Будут созданы задачи-эскалации руководителю: ${rows.length}\n\n${preview}${rows.length > 12 ? '\n...' : ''}\n\nСоздать?`)) return;
+
+  let created = 0;
+  for (const row of rows) {
+    const task = buildEscalationTask(row);
+    await createTask({
+      title: task.title,
+      responsibleId: task.responsibleId,
+      auditorIds: task.auditorIds,
+      description: task.description,
+      dealId: row.deal.ID,
+      deadline: task.deadline,
+      silent: true,
+    });
+    await bxCall('crm.timeline.comment.add', {
+      fields: { ENTITY_ID: Number(row.deal.ID), ENTITY_TYPE: 'deal', COMMENT: `ИИ-ассистент: создана управленческая эскалация по проблемной сделке.\nПричины: ${row.reasons.join('; ')}\nОтветственный по эскалации: ${userName(task.responsibleId)}` }
+    });
+    created += 1;
+  }
+  alert(`Создано задач-эскалаций: ${created}`);
+  await backgroundHydrateDealMeta(getRoleVisibleDeals());
+}
+
 async function createHandoffReminderTasks() {
   const rows = buildHandoffJournalRows(getRoleVisibleDeals())
     .filter((row) => ['overdue', 'new', 'partial'].includes(row.status.key))
@@ -3038,7 +3171,7 @@ async function createWorkPlanTasks() {
   if (state.selectedDeal) openDeal(String(d.ID));
 }
 
-async function createTask({ title, responsibleId, description, dealId, deadline = null, silent = false }) {
+async function createTask({ title, responsibleId, description, dealId, deadline = null, auditorIds = [], accompliceIds = [], silent = false }) {
   const fields = {
     TITLE: title,
     RESPONSIBLE_ID: Number(responsibleId),
@@ -3046,6 +3179,10 @@ async function createTask({ title, responsibleId, description, dealId, deadline 
     UF_CRM_TASK: [`D_${dealId}`],
   };
   if (deadline) fields.DEADLINE = deadline;
+  const auditors = uniqueIds(auditorIds).filter((id) => Number(id));
+  const accomplices = uniqueIds(accompliceIds).filter((id) => Number(id));
+  if (auditors.length) fields.AUDITORS = auditors.map(Number);
+  if (accomplices.length) fields.ACCOMPLICES = accomplices.map(Number);
   await bxCall('tasks.task.add', { fields });
   if (!silent) alert('Задача создана.');
 }
@@ -3116,6 +3253,8 @@ if (managerDashboard) {
     if (reportButton) return generateManagerReport();
     const remindersButton = e.target.closest && e.target.closest('#create-handoff-reminders');
     if (remindersButton) return createHandoffReminderTasks();
+    const escalationsButton = e.target.closest && e.target.closest('#create-escalations');
+    if (escalationsButton) return createEscalationTasks();
     const taskId = e.target.getAttribute('data-handoff-task');
     if (taskId) return createHandoffTaskForDeal(taskId);
     const markOkId = e.target.getAttribute('data-mark-handoff-ok');

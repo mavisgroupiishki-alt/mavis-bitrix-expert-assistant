@@ -38,6 +38,10 @@ const config = {
   metaConcurrency: Number(process.env.META_CONCURRENCY || 3),
   // Сколько связанных сделок продаж одновременно открывать для уточнения менеджера в журнале ошибок.
   salesManagerConcurrency: Number(process.env.SALES_MANAGER_CONCURRENCY || 3),
+  // Кому создавать задачи-эскалации по критическим проблемам. Если не задано — первый ID из LEADER_USER_IDS.
+  escalationResponsibleId: process.env.ESCALATION_RESPONSIBLE_ID || '',
+  // Кто должен быть наблюдателем в задачах-эскалациях. Если не задано — руководители + РОП.
+  escalationAuditorIds: parseIdList(process.env.ESCALATION_AUDITOR_IDS || ''),
   // Важно для больших воронок: по умолчанию НЕ грузим метаданные по всем 400+ сделкам автоматически.
   // Иначе Bitrix получает сотни запросов и кабинет может висеть 10–20 минут.
   autoLoadMeta: String(process.env.AUTO_LOAD_META || 'false').toLowerCase() === 'true',
