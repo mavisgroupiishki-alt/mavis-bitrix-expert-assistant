@@ -35,6 +35,9 @@
           <h2>Кабинет руководителя / РОП</h2>
           <p class="muted small-note">Проблемный обзор по производственным сделкам: ошибки передачи, просрочки, сделки без следующего шага и без активности.</p>
         </div>
+        <div class="dashboard-actions">
+          <button id="generate-manager-report" class="primary">Сформировать отчёт</button>
+        </div>
         <div class="dashboard-filters">
           <button class="secondary" data-dashboard-filter="all">Все</button>
           <button class="secondary" data-dashboard-filter="handoffErrors">Ошибки передачи</button>
@@ -47,6 +50,7 @@
       <div id="manager-dashboard-cards" class="dashboard-grid"></div>
       <div id="manager-dashboard-filter-label" class="muted small-note"></div>
       <div id="manager-dashboard-owners" class="owner-grid"></div>
+      <div id="manager-report" class="manager-report hidden"></div>
     </section>
 
     <section class="panel">

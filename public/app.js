@@ -802,6 +802,161 @@ function renderManagerDashboard(deals, metaReady) {
 }
 
 
+function shortFlagLabels(flags) {
+  const out = [];
+  if (flags.handoffErrors) out.push('ошибка передачи');
+  if (flags.handoffPartial) out.push('нужно подтвердить передачу');
+  if (flags.unchecked) out.push('не проверено');
+  if (flags.noNext) out.push('нет следующего шага');
+  if (flags.stale) out.push('нет активности 2+ дня');
+  if (flags.overdue) out.push('есть просрочка');
+  if (flags.today) out.push('дедлайн сегодня');
+  if (flags.noDeadline) out.push('есть дела/задачи без дедлайна');
+  return out.length ? out : ['без критичных рисков'];
+}
+
+function buildManagerReport(deals) {
+  const rows = deals.map((deal) => ({ deal, flags: getDealIssueFlags(deal) }));
+  const count = (key) => rows.filter((x) => x.flags[key]).length;
+  const problemRows = rows.filter((x) => x.flags.problem);
+  const priorityRows = problemRows
+    .sort((a, b) => {
+      const score = (x) => (x.flags.handoffErrors ? 100 : 0) + (x.flags.overdue ? 80 : 0) + (x.flags.noNext ? 60 : 0) + (x.flags.stale ? 40 : 0) + (x.flags.handoffPartial ? 30 : 0) + (x.flags.unchecked ? 10 : 0);
+      return score(b) - score(a) || daysSince(lastWorkDate(b.deal)) - daysSince(lastWorkDate(a.deal));
+    })
+    .slice(0, 20);
+
+  const byOwner = new Map();
+  rows.forEach(({ deal, flags }) => {
+    const id = String(deal.ASSIGNED_BY_ID || '0');
+    if (!byOwner.has(id)) byOwner.set(id, { id, total: 0, handoffErrors: 0, handoffPartial: 0, unchecked: 0, noNext: 0, stale: 0, overdue: 0, today: 0, noDeadline: 0, problems: 0 });
+    const row = byOwner.get(id);
+    row.total += 1;
+    ['handoffErrors','handoffPartial','unchecked','noNext','stale','overdue','today','noDeadline'].forEach((k) => { if (flags[k]) row[k] += 1; });
+    if (flags.problem) row.problems += 1;
+  });
+  const owners = [...byOwner.values()].sort((a, b) => b.problems - a.problems || b.total - a.total);
+
+  const metrics = {
+    total: deals.length,
+    problem: problemRows.length,
+    handoffErrors: count('handoffErrors'),
+    handoffPartial: count('handoffPartial'),
+    unchecked: count('unchecked'),
+    noNext: count('noNext'),
+    stale: count('stale'),
+    overdue: count('overdue'),
+    today: count('today'),
+    noDeadline: count('noDeadline'),
+  };
+
+  const date = new Date().toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const actions = [];
+  if (metrics.handoffErrors) actions.push(`Разобрать ошибки передачи с РОП/менеджерами: ${metrics.handoffErrors} сдел.`);
+  if (metrics.overdue) actions.push(`Закрыть просроченные дела/задачи сегодня: ${metrics.overdue} сдел.`);
+  if (metrics.noNext) actions.push(`Поставить следующий шаг по сделкам без дела/задачи: ${metrics.noNext} сдел.`);
+  if (metrics.stale) actions.push(`Проверить сделки без рабочей активности 2+ дня: ${metrics.stale} сдел.`);
+  if (metrics.handoffPartial) actions.push(`Подтвердить спорные данные передачи: ${metrics.handoffPartial} сдел.`);
+  if (metrics.unchecked) actions.push(`Проверить передачу по непроверенным сделкам: ${metrics.unchecked} сдел.`);
+  if (!actions.length) actions.push('Критичных действий по текущим данным нет.');
+
+  const textLines = [];
+  textLines.push(`ОТЧЁТ ИИ-АССИСТЕНТА ЭКСПЕРТА`);
+  textLines.push(`Дата формирования: ${date}`);
+  textLines.push('');
+  textLines.push(`1. Сводка`);
+  textLines.push(`— Активные сделки: ${metrics.total}`);
+  textLines.push(`— Проблемные сделки: ${metrics.problem}`);
+  textLines.push(`— Ошибки передачи: ${metrics.handoffErrors}`);
+  textLines.push(`— Нужно подтвердить передачу: ${metrics.handoffPartial}`);
+  textLines.push(`— Не проверено: ${metrics.unchecked}`);
+  textLines.push(`— Без следующего шага: ${metrics.noNext}`);
+  textLines.push(`— Без активности 2+ дня: ${metrics.stale}`);
+  textLines.push(`— Просрочено: ${metrics.overdue}`);
+  textLines.push(`— Дедлайны на сегодня: ${metrics.today}`);
+  textLines.push(`— Дела/задачи без дедлайна: ${metrics.noDeadline}`);
+  textLines.push('');
+  textLines.push(`2. Что сделать на планёрке`);
+  actions.forEach((a) => textLines.push(`— ${a}`));
+  textLines.push('');
+  textLines.push(`3. Сводка по ответственным`);
+  owners.slice(0, 12).forEach((o) => textLines.push(`— ${userName(o.id)}: всего ${o.total}, проблем ${o.problems}, ошибки передачи ${o.handoffErrors}, без шага ${o.noNext}, 2+ дня ${o.stale}, просрочено ${o.overdue}, сегодня ${o.today}`));
+  textLines.push('');
+  textLines.push(`4. Приоритетные проблемные сделки`);
+  if (!priorityRows.length) {
+    textLines.push('— Проблемных сделок по текущим критериям нет.');
+  } else {
+    priorityRows.forEach(({ deal, flags }, index) => {
+      const next = nextStep(deal.ID);
+      textLines.push(`${index + 1}. ${companyName(deal.COMPANY_ID)} / ${deal.TITLE || 'без названия'} / ID ${deal.ID}`);
+      textLines.push(`   Услуга: ${getService(deal) || 'не указана'}; ответственный: ${userName(deal.ASSIGNED_BY_ID)}; стадия: ${stageName(deal.STAGE_ID)}`);
+      textLines.push(`   Риски: ${shortFlagLabels(flags).join(', ')}`);
+      textLines.push(`   Следующий шаг: ${next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'не запланирован'}`);
+    });
+  }
+
+  return { metrics, owners, actions, priorityRows, text: textLines.join('\n'), date };
+}
+
+function renderManagerReport(report) {
+  const box = document.getElementById('manager-report');
+  if (!box) return;
+  const metricCards = [
+    ['Активные', report.metrics.total],
+    ['Проблемные', report.metrics.problem],
+    ['Ошибки передачи', report.metrics.handoffErrors],
+    ['Без шага', report.metrics.noNext],
+    ['Просрочено', report.metrics.overdue],
+    ['Сегодня', report.metrics.today],
+  ];
+  const priorityHtml = report.priorityRows.length
+    ? `<ol class="report-list">${report.priorityRows.slice(0, 10).map(({ deal, flags }) => `<li><strong>${escapeHtml(companyName(deal.COMPANY_ID))}</strong> · ${escapeHtml(getService(deal) || 'услуга не указана')} · ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}<br><span class="muted">${escapeHtml(shortFlagLabels(flags).join(', '))}</span></li>`).join('')}</ol>`
+    : '<p class="muted">Проблемных сделок по текущим критериям нет.</p>';
+  box.innerHTML = `
+    <div class="manager-report-header">
+      <div>
+        <h3>Отчёт руководителя</h3>
+        <p class="muted small-note">Сформировано: ${escapeHtml(report.date)}. Можно скопировать текст и использовать на планёрке.</p>
+      </div>
+      <div class="manager-report-actions">
+        <button id="copy-manager-report" class="secondary">Скопировать отчёт</button>
+      </div>
+    </div>
+    <div class="manager-report-grid">
+      ${metricCards.map(([label, value]) => `<div class="report-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join('')}
+    </div>
+    <div class="report-section"><h4>Что сделать на планёрке</h4><ul class="report-list">${report.actions.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>
+    <div class="report-section"><h4>Приоритетные проблемные сделки</h4>${priorityHtml}</div>
+    <div class="report-text"><textarea id="manager-report-text" readonly>${escapeHtml(report.text)}</textarea></div>
+  `;
+  box.classList.remove('hidden');
+  const copyButton = document.getElementById('copy-manager-report');
+  if (copyButton) copyButton.addEventListener('click', async () => {
+    const text = document.getElementById('manager-report-text')?.value || report.text;
+    try {
+      await navigator.clipboard.writeText(text);
+      alert('Отчёт скопирован.');
+    } catch (_) {
+      const ta = document.getElementById('manager-report-text');
+      if (ta) { ta.focus(); ta.select(); }
+      alert('Не удалось скопировать автоматически. Выделила текст отчёта — скопируй вручную.');
+    }
+  });
+}
+
+function generateManagerReport() {
+  const shouldShow = state.isAdmin || state.isLeader || state.isRop || APP_CONFIG.allowRopViewAll;
+  if (!shouldShow) return;
+  if (state.detailsLoading || !state.detailsLoaded) {
+    alert('Данные по делам, задачам и проверкам ещё догружаются. Подожди завершения загрузки и нажми ещё раз.');
+    return;
+  }
+  const deals = getRoleVisibleDeals();
+  const report = buildManagerReport(deals);
+  renderManagerReport(report);
+}
+
+
 function getRoleVisibleDeals() {
   const isRopOnly = state.isRop && !(state.isAdmin || state.isLeader) && !APP_CONFIG.allowRopViewAll;
   if (isRopOnly) return state.deals.filter((d) => {
@@ -2635,6 +2790,8 @@ document.getElementById('show-fields').addEventListener('click', showDealFields)
 const managerDashboard = document.getElementById('manager-dashboard');
 if (managerDashboard) {
   managerDashboard.addEventListener('click', (e) => {
+    const reportButton = e.target.closest && e.target.closest('#generate-manager-report');
+    if (reportButton) return generateManagerReport();
     const filter = e.target.getAttribute('data-dashboard-filter');
     if (!filter) return;
     state.dashboardFilter = filter;
