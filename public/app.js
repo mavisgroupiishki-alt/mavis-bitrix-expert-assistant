@@ -2272,6 +2272,140 @@ function buildWorkPlanText(deal) {
     `Ход работы сформирован ассистентом. Продуктовая логика: ${profile.label}. Текущий этап: ${stage}. Следующий шаг: ${nextText}. Эксперту нужно подтвердить с клиентом документы, оплаты, дедлайны и зафиксировать итог первого/следующего касания.`;
 }
 
+
+async function buildAIContext(deal) {
+  const product = productProfileForDeal(deal);
+  const checklist = productDocumentChecklist(product);
+  const audit = getAudit(deal.ID) || state.selectedAudit || null;
+  const production = await collectDealContext(deal.ID, deal, 'производственная сделка');
+
+  let sales = null;
+  let salesDeal = null;
+  const salesId = getSalesDealId(deal) || extractDealId(contextToText(production));
+  if (salesId && String(salesId) !== String(deal.ID)) {
+    try {
+      salesDeal = await bxCall('crm.deal.get', { id: salesId });
+      sales = await collectDealContext(salesId, salesDeal, 'связанная сделка продаж');
+      const managerId = String(salesDeal.ASSIGNED_BY_ID || salesDeal.CREATED_BY_ID || '');
+      if (managerId) await ensureUserCached(managerId);
+    } catch (e) {
+      sales = { dealId: salesId, label: 'связанная сделка продаж', sections: [{ source: 'ошибка загрузки', text: e.message }] };
+    }
+  }
+
+  const acts = state.activitiesByDeal.get(String(deal.ID)) || [];
+  const tasks = state.tasksByDeal.get(String(deal.ID)) || [];
+  return {
+    deal: {
+      id: String(deal.ID),
+      title: deal.TITLE || '',
+      company: companyName(deal.COMPANY_ID),
+      contact: contactName(deal.CONTACT_ID),
+      service: getService(deal) || '',
+      stage: stageName(deal.STAGE_ID),
+      stageCode: deal.STAGE_ID || '',
+      sum: deal.OPPORTUNITY || '',
+      startDate: getStartDate(deal) || '',
+      expert: userName(deal.ASSIGNED_BY_ID),
+      createdBy: userName(deal.CREATED_BY_ID),
+      salesDealLink: getSalesLink(deal) || '',
+      salesDealId: salesId || '',
+      salesManager: salesDeal ? userName(salesDeal.ASSIGNED_BY_ID || salesDeal.CREATED_BY_ID) : '',
+      nextStep: nextStep(deal.ID) ? `${formatDate(nextStep(deal.ID).date)} — ${nextStep(deal.ID).kind}: ${nextStep(deal.ID).title || ''}` : '',
+      lastWorkDate: formatDate(lastWorkDate(deal)) || '',
+    },
+    currentAudit: audit ? {
+      status: auditLabel(audit),
+      missing: audit.missing || [],
+      uncertain: audit.uncertain || [],
+      technical: audit.technical || [],
+      checkedAt: audit.checkedAt || '',
+    } : null,
+    product: {
+      key: product.key,
+      label: product.label,
+      mavisActions: product.mavis || [],
+      clientActions: product.client || [],
+      clarify: product.clarify || [],
+    },
+    checklist,
+    openActivities: acts.slice(0, 20).map((a) => ({ subject: a.SUBJECT || '', deadline: a.DEADLINE || '', completed: a.COMPLETED || '', type: a.PROVIDER_ID || a.TYPE_ID || '' })),
+    openTasks: tasks.slice(0, 20).map((t) => ({ title: (t.title || t.TITLE || ''), deadline: (t.deadline || t.DEADLINE || ''), status: (t.status || t.STATUS || '') })),
+    contexts: { production, sales },
+  };
+}
+
+function aiStatusClass(status) {
+  if (status === 'ok') return 'ok';
+  if (status === 'risk' || status === 'error') return 'error';
+  return 'partial';
+}
+
+function aiResultToComment(deal, ai) {
+  const r = ai.result || ai;
+  const tasks = (r.tasks || []).map((t) => `— ${t.title}${t.deadline_hint ? ` (${t.deadline_hint})` : ''}: ${t.description || ''}`).join('\n') || '— нет';
+  return `ИИ-анализ сделки\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nКомпания: ${companyName(deal.COMPANY_ID)}\nУслуга: ${getService(deal) || 'не указана'}\nСтатус: ${r.status_label || r.status || 'нужна проверка'}\n\nЧто понятно:\n${(r.summary || []).map((x) => `— ${x}`).join('\n') || '— нет'}\n\nЧего не хватает / уточнить:\n${(r.missing || []).map((x) => `— ${x}`).join('\n') || '— нет'}\n\nРиски:\n${(r.risks || []).map((x) => `— ${x}`).join('\n') || '— нет'}\n\nСледующие действия:\n${(r.next_steps || []).map((x) => `— ${x}`).join('\n') || '— нет'}\n\nРекомендуемые задачи:\n${tasks}\n\nЧерновик сообщения клиенту:\n${r.client_message || '—'}\n\nКомментарий ИИ:\n${r.comment || '—'}\n\nВажно: это черновик ИИ. Эксперт должен проверить вывод перед отправкой клиенту или постановкой задач.`;
+}
+
+function renderAIAnalysisHtml(deal, ai) {
+  const r = ai.result || ai;
+  const tasks = (r.tasks || []).map((t) => `${t.title}${t.responsible ? ` — ${t.responsible}` : ''}${t.deadline_hint ? `, ${t.deadline_hint}` : ''}${t.description ? `<span class="source-note">${escapeHtml(t.description)}</span>` : ''}`);
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>ИИ-анализ сделки</h3><span class="result-status ${aiStatusClass(r.status)}">${escapeHtml(r.status_label || r.status || 'нужна проверка')}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stageName(deal.STAGE_ID))}</div>
+        <div class="result-field"><span>Модель</span>${escapeHtml(ai.model || APP_CONFIG.aiModel || 'AI')}</div>
+      </div>
+    </div>
+    <div class="result-card card-found"><h3>Что понятно по сделке</h3>${listHtml(r.summary || [], 'ИИ не вернул краткое резюме')}</div>
+    <div class="result-card card-uncertain"><h3>Чего не хватает / что уточнить</h3>${listHtml(r.missing || [], 'Критичных уточнений не найдено')}</div>
+    <div class="result-card card-risk"><h3>Риски</h3>${listHtml(r.risks || [], 'Критичных рисков не найдено')}</div>
+    <div class="result-card card-action"><h3>Следующие действия эксперта</h3>${listHtml(r.next_steps || [], 'Следующие действия не определены')}</div>
+    <div class="result-card card-checklist"><h3>Рекомендуемые задачи</h3>${listHtml(tasks, 'ИИ не предложил отдельные задачи')}</div>
+    <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml(r.client_message || '—')}</div></div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(aiResultToComment(deal, ai))}</div></details>
+    <p class="muted small-note">ИИ ничего не отправляет клиенту и не создаёт задачи автоматически. Сначала эксперт проверяет результат.</p>
+  `;
+}
+
+async function analyzeDealWithAI() {
+  if (!state.selectedDeal) return;
+  state.selectedMode = 'ai';
+  state.selectedAudit = null;
+  state.selectedMissing = [];
+  state.selectedDeadlineTasks = [];
+  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = `<div class="result-card card-action"><h3>ИИ анализирует сделку...</h3><p class="muted">Собираем поля, комментарии, дела, связанную сделку продаж и чек-лист. Обычно это занимает 10–40 секунд.</p></div>`;
+  out.classList.remove('hidden');
+
+  if (!APP_CONFIG.aiEnabled) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>ИИ пока не включён</h3><p>Добавь в Render переменные <strong>AI_ENABLED=true</strong>, <strong>AI_PROVIDER=openai</strong>, <strong>AI_API_KEY</strong> и <strong>AI_MODEL</strong>, затем сделай деплой.</p><p class="muted">Ключ в чат присылать не нужно.</p></div>`;
+    return;
+  }
+
+  try {
+    const context = await buildAIContext(state.selectedDeal);
+    const response = await fetch('/api/ai/analyze-deal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `Ошибка ИИ HTTP ${response.status}`);
+    state.selectedAnalysis = aiResultToComment(state.selectedDeal, data);
+    out.innerHTML = renderAIAnalysisHtml(state.selectedDeal, data);
+    document.getElementById('write-comment').classList.remove('hidden');
+  } catch (e) {
+    state.selectedAnalysis = '';
+    out.innerHTML = `<div class="result-card card-risk"><h3>Ошибка ИИ-анализа</h3><p>${escapeHtml(e.message || String(e))}</p><p class="muted">Проверь переменные Render: AI_ENABLED, AI_PROVIDER, AI_API_KEY, AI_MODEL.</p></div>`;
+  }
+}
+
 async function generateWorkPlan() {
   if (!state.selectedDeal) return;
   state.selectedMode = 'workplan';
@@ -3233,6 +3367,7 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 });
 document.getElementById('close-dialog').addEventListener('click', () => document.getElementById('deal-dialog').close());
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
+document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
