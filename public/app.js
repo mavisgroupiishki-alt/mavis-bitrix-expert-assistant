@@ -23,6 +23,7 @@ const state = {
   selectedMissing: [],
   selectedAudit: null,
   selectedMode: '',
+  selectedDeadlineTasks: [],
   detailsLoading: false,
   detailsLoaded: false,
   detailsProgress: '',
@@ -697,7 +698,8 @@ async function openDeal(id) {
   state.selectedMode = '';
   document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${id}`;
   document.getElementById('analysis-result').classList.add('hidden');
-  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks'].forEach((x) => document.getElementById(x).classList.add('hidden'));
+  state.selectedDeadlineTasks = [];
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
   document.getElementById('deal-dialog').showModal();
 }
@@ -771,6 +773,7 @@ async function checkHandoff() {
   document.getElementById('create-expert-task').classList.remove('hidden');
   document.getElementById('mark-checked').classList.remove('hidden');
   document.getElementById('create-workplan-tasks').classList.add('hidden');
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
 }
 
 
@@ -1482,6 +1485,7 @@ async function generateWorkPlan() {
   document.getElementById('create-expert-task').classList.add('hidden');
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
 }
 
 
@@ -1549,6 +1553,7 @@ async function generateChecklist() {
   document.getElementById('create-expert-task').classList.add('hidden');
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
 }
 
 
@@ -1803,7 +1808,332 @@ async function checkIncomingDocuments() {
   document.getElementById('create-expert-task').classList.remove('hidden');
   document.getElementById('mark-checked').classList.add('hidden');
   document.getElementById('create-workplan-tasks').classList.toggle('hidden', !analysis.missing.length);
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
 }
+
+function parseDateValue(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function isPastDate(value) {
+  const d = parseDateValue(value);
+  return d ? d.getTime() < Date.now() : false;
+}
+
+function isTodayDate(value) {
+  const d = parseDateValue(value);
+  if (!d) return false;
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+}
+
+function deadlineStatusLabel(value) {
+  if (!value) return 'без дедлайна';
+  if (isPastDate(value)) return 'просрочено';
+  if (isTodayDate(value)) return 'сегодня';
+  return 'запланировано';
+}
+
+function taskKey(title) {
+  return normalize(title).replace(/\s+/g, ' ').trim();
+}
+
+function uniqueRecommendedTasks(dealId, tasks) {
+  const seen = new Set();
+  return tasks.filter((task) => {
+    const key = taskKey(task.title);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return !hasOpenTaskWithTitle(dealId, task.title);
+  });
+}
+
+function stageControlAdvice(stage, profile) {
+  const text = normalize(`${stage} ${profile.key || ''} ${profile.label || ''}`);
+  if (/эксперт назначен|new/.test(text)) {
+    return {
+      title: 'Сделать первое касание клиента',
+      deadline: deadlineInHours(1),
+      why: 'сделка только назначена эксперту, важно быстро подтвердить клиенту ход работы и следующий шаг',
+    };
+  }
+  if (/сбор/.test(text)) {
+    return {
+      title: 'Проконтролировать сбор документов от клиента',
+      deadline: deadlineTomorrow(12),
+      why: 'на стадии сбора информации основная зона риска — клиент не прислал документы или данные',
+    };
+  }
+  if (/заявк|подач|проверка органом|орган/.test(text)) {
+    return {
+      title: 'Проверить статус заявки / подачи в органе',
+      deadline: deadlineTomorrow(15),
+      why: 'после подачи важно не потерять статус рассмотрения, замечания и сроки ответа органа',
+    };
+  }
+  if (/подбор/.test(text)) {
+    return {
+      title: 'Проконтролировать подбор специалиста',
+      deadline: deadlineTomorrow(12),
+      why: 'на стадии подбора важно зафиксировать, кто ищет специалиста и к какой дате',
+    };
+  }
+  if (/обучен|экзамен/.test(text)) {
+    return {
+      title: 'Проконтролировать обучение / экзамен',
+      deadline: deadlineTomorrow(12),
+      why: 'по обучению и экзаменам важно подтвердить дату, документы и явку специалиста',
+    };
+  }
+  if (/передан оформителю|оформител/.test(text)) {
+    return {
+      title: 'Проверить статус оформления документов',
+      deadline: deadlineTomorrow(12),
+      why: 'после передачи оформителю нужно контролировать готовность документов и возможные правки',
+    };
+  }
+  if (/документы готовы|готов/.test(text)) {
+    return {
+      title: 'Передать результат клиенту и зафиксировать получение',
+      deadline: deadlineTodayEnd(),
+      why: 'если документы готовы, важно закрыть передачу результата и не держать сделку открытой без причины',
+    };
+  }
+  if (/выезд/.test(text)) {
+    return {
+      title: 'Подтвердить дату выезда / подачи с клиентом',
+      deadline: deadlineTomorrow(12),
+      why: 'по выезду/подаче важны дата, готовность документов, оплата и ответственный со стороны клиента',
+    };
+  }
+  if (/устранение замечаний|замечан/.test(text)) {
+    return {
+      title: 'Отработать замечания органа',
+      deadline: deadlineTodayEnd(),
+      why: 'замечания органа напрямую влияют на срок получения результата',
+    };
+  }
+  if (/возврат/.test(text)) {
+    return {
+      title: 'Разобрать причину возврата и согласовать следующий шаг',
+      deadline: deadlineTodayEnd(),
+      why: 'возврат требует быстрого решения: исправление, повторная подача или эскалация руководителю',
+    };
+  }
+  return {
+    title: profile.firstTask || 'Поставить следующий производственный контроль по сделке',
+    deadline: deadlineTomorrow(12),
+    why: 'по текущей стадии нужен явный контрольный шаг, чтобы сделка не зависла',
+  };
+}
+
+function buildDeadlineControl(deal) {
+  const profile = productProfileForDeal(deal);
+  const stage = stageName(deal.STAGE_ID);
+  const service = getService(deal) || 'услуга не указана';
+  const next = nextStep(deal.ID);
+  const lastWork = lastWorkDate(deal);
+  const staleDays = daysSince(lastWork);
+  const openActs = openActivities(deal.ID);
+  const openTs = openTasks(deal.ID);
+  const dueToday = [];
+  const overdue = [];
+  const withoutDeadline = [];
+
+  openActs.forEach((a) => {
+    const item = { kind: 'дело', title: a.SUBJECT || 'дело без названия', deadline: a.DEADLINE };
+    if (!a.DEADLINE) withoutDeadline.push(item);
+    else if (isPastDate(a.DEADLINE)) overdue.push(item);
+    else if (isTodayDate(a.DEADLINE)) dueToday.push(item);
+  });
+  openTs.forEach((t) => {
+    const item = { kind: 'задача', title: t.TITLE || t.title || 'задача без названия', deadline: t.DEADLINE || t.deadline };
+    if (!item.deadline) withoutDeadline.push(item);
+    else if (isPastDate(item.deadline)) overdue.push(item);
+    else if (isTodayDate(item.deadline)) dueToday.push(item);
+  });
+
+  const risks = [];
+  const controls = [];
+  const recommendedTasks = [];
+  const addTask = (title, deadline, description, reason = '') => {
+    recommendedTasks.push({ title, deadline, description, reason });
+  };
+
+  if (!next) {
+    risks.push('В сделке нет открытого дела/задачи — нет зафиксированного следующего шага.');
+    addTask(
+      'Поставить следующий контрольный шаг по сделке',
+      deadlineTodayEnd(),
+      `В сделке “${deal.TITLE}” нет открытого дела/задачи. Нужно определить следующий шаг по стадии “${stage}”, зафиксировать дедлайн и ответственного.\n\nУслуга: ${service}.`,
+      'нет следующего шага'
+    );
+  } else {
+    controls.push(`Следующий шаг: ${formatDate(next.date)} — ${next.kind}: ${next.title || 'без названия'} (${deadlineStatusLabel(next.date)}).`);
+    if (isPastDate(next.date)) {
+      risks.push('Ближайший следующий шаг просрочен.');
+      addTask(
+        'Закрыть просроченный следующий шаг по сделке',
+        deadlineInHours(2),
+        `По сделке “${deal.TITLE}” просрочен следующий шаг: ${next.kind} “${next.title || ''}”, дедлайн ${formatDate(next.date)}. Нужно выполнить действие, перенести дедлайн или зафиксировать причину задержки в комментарии.`,
+        'есть просроченный следующий шаг'
+      );
+    }
+  }
+
+  if (staleDays >= 2) {
+    risks.push(`Нет рабочей активности ${staleDays} дн. — сделка может зависнуть без движения.`);
+    addTask(
+      'Вернуть сделку в работу / связаться с клиентом',
+      deadlineTodayEnd(),
+      `По сделке “${deal.TITLE}” нет рабочей активности ${staleDays} дн. Нужно связаться с клиентом или выполнить внутренний следующий шаг, затем зафиксировать итог в комментарии сделки.`,
+      'нет активности 2+ дня'
+    );
+  }
+
+  if (overdue.length) {
+    risks.push(`Есть просроченные дела/задачи: ${overdue.length}.`);
+  }
+  if (dueToday.length) {
+    controls.push(`Дедлайны на сегодня: ${dueToday.length}.`);
+    addTask(
+      'Проверить дедлайны на сегодня по сделке',
+      deadlineTodayEnd(),
+      `По сделке “${deal.TITLE}” есть дедлайны на сегодня. Нужно проверить выполнение и зафиксировать результат.\n\n${dueToday.map((x) => `— ${x.kind}: ${x.title}, дедлайн ${formatDate(x.deadline)}`).join('\n')}`,
+      'есть дедлайны на сегодня'
+    );
+  }
+  if (withoutDeadline.length) {
+    risks.push(`Есть открытые дела/задачи без дедлайна: ${withoutDeadline.length}.`);
+    addTask(
+      'Проставить дедлайны по открытым делам/задачам',
+      deadlineTodayEnd(),
+      `По сделке “${deal.TITLE}” есть открытые дела/задачи без дедлайна. Нужно проставить даты контроля или закрыть неактуальные элементы.\n\n${withoutDeadline.map((x) => `— ${x.kind}: ${x.title}`).join('\n')}`,
+      'есть открытые элементы без дедлайна'
+    );
+  }
+
+  const stageAdvice = stageControlAdvice(stage, profile);
+  addTask(
+    stageAdvice.title,
+    stageAdvice.deadline,
+    `Контроль по стадии “${stage}” и услуге “${service}”.\n\nЧто сделать: ${stageAdvice.why}.\n\nПродуктовая логика: ${profile.label}.`,
+    'контроль текущей стадии'
+  );
+
+  if (profile.paymentRequired) {
+    addTask(
+      'Проверить оплату счетов/пошлин по сделке',
+      deadlineTomorrow(12),
+      `Проверить по сделке “${deal.TITLE}”, нужны ли счета, пошлины, Стройдок, техкарты или другие обязательные платежи. Зафиксировать статус оплаты/обещанную дату оплаты в комментарии.`,
+      'контроль оплат/пошлин'
+    );
+  }
+
+  const uniqueTasks = uniqueRecommendedTasks(deal.ID, recommendedTasks);
+  const status = overdue.length || staleDays >= 2 || !next
+    ? 'есть риски по дедлайнам'
+    : dueToday.length || withoutDeadline.length
+      ? 'нужен контроль сегодня'
+      : 'критичных рисков по дедлайнам не найдено';
+
+  return { profile, stage, service, next, lastWork, staleDays, openActs, openTs, dueToday, overdue, withoutDeadline, controls, risks, recommendedTasks: uniqueTasks, status };
+}
+
+function buildDeadlineControlText(deal, analysis) {
+  const itemLine = (x) => `— ${x.kind}: ${x.title}${x.deadline ? `, дедлайн ${formatDate(x.deadline)}` : ', без дедлайна'}`;
+  return `Контроль дедлайнов по сделке\n\n` +
+    `Сделка: ${deal.TITLE || ''} / ID ${deal.ID}\n` +
+    `Компания: ${companyName(deal.COMPANY_ID)}\n` +
+    `Услуга: ${analysis.service}\n` +
+    `Продуктовая логика: ${analysis.profile.label}\n` +
+    `Стадия: ${analysis.stage}\n` +
+    `Статус: ${analysis.status}\n\n` +
+    `Текущий следующий шаг:\n${analysis.next ? `— ${analysis.next.kind}: ${analysis.next.title || ''}, дедлайн ${formatDate(analysis.next.date)}` : '— не запланирован'}\n\n` +
+    `Последняя рабочая активность: ${formatDate(analysis.lastWork)} (${analysis.staleDays} дн. назад)\n\n` +
+    `Просрочено:\n${analysis.overdue.length ? analysis.overdue.map(itemLine).join('\n') : '— нет'}\n\n` +
+    `Дедлайны сегодня:\n${analysis.dueToday.length ? analysis.dueToday.map(itemLine).join('\n') : '— нет'}\n\n` +
+    `Без дедлайна:\n${analysis.withoutDeadline.length ? analysis.withoutDeadline.map(itemLine).join('\n') : '— нет'}\n\n` +
+    `Риски:\n${analysis.risks.length ? analysis.risks.map((x) => `— ${x}`).join('\n') : '— критичных рисков не выявлено'}\n\n` +
+    `Рекомендуемые задачи контроля:\n${analysis.recommendedTasks.length ? analysis.recommendedTasks.map((x) => `— ${x.title}; дедлайн ${formatDate(x.deadline)}; причина: ${x.reason}`).join('\n') : '— новые задачи не требуются или уже созданы'}`;
+}
+
+function renderDeadlineControlHtml(deal, analysis) {
+  const statusClass = analysis.status.includes('риски') ? 'error' : analysis.status.includes('сегодня') ? 'partial' : 'ok';
+  const itemRenderer = (x) => `<strong>${escapeHtml(x.kind)}: ${escapeHtml(x.title || 'без названия')}</strong><span class="source-note">${escapeHtml(x.deadline ? formatDate(x.deadline) : 'без дедлайна')}</span>`;
+  const taskRenderer = (x) => `<strong>${escapeHtml(x.title)}</strong><span class="source-note">дедлайн: ${escapeHtml(formatDate(x.deadline))}</span>${x.reason ? `<span class="source-note">причина: ${escapeHtml(x.reason)}</span>` : ''}`;
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Контроль дедлайнов</h3><span class="result-status ${statusClass}">${escapeHtml(analysis.status)}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(analysis.service)}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(analysis.stage)}</div>
+        <div class="result-field"><span>Последняя активность</span>${escapeHtml(formatDate(analysis.lastWork))}</div>
+        <div class="result-field"><span>Следующий шаг</span>${escapeHtml(analysis.next ? `${formatDate(analysis.next.date)} — ${analysis.next.kind}: ${analysis.next.title || ''}` : 'не запланирован')}</div>
+        <div class="result-field"><span>Открыто дел/задач</span>${escapeHtml(String(analysis.openActs.length + analysis.openTs.length))}</div>
+      </div>
+    </div>
+    <div class="result-card card-risk"><h3>Риски по дедлайнам</h3>${listHtml(analysis.risks, 'Критичных рисков не выявлено')}</div>
+    <div class="result-card card-uncertain"><h3>Просрочено</h3>${listHtml(analysis.overdue, 'Просроченных дел/задач нет', itemRenderer)}</div>
+    <div class="result-card card-action"><h3>Дедлайны на сегодня</h3>${listHtml(analysis.dueToday, 'На сегодня дедлайнов нет', itemRenderer)}</div>
+    <div class="result-card card-missing"><h3>Открытые дела/задачи без дедлайна</h3>${listHtml(analysis.withoutDeadline, 'Открытых элементов без дедлайна нет', itemRenderer)}</div>
+    <div class="result-card card-found"><h3>Рекомендуемые задачи контроля</h3>${listHtml(analysis.recommendedTasks, 'Новые задачи не требуются или уже созданы', taskRenderer)}</div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(buildDeadlineControlText(deal, analysis))}</div></details>
+  `;
+}
+
+async function checkDeadlines() {
+  if (!state.selectedDeal) return;
+  await ensureDealMeta(state.selectedDeal.ID);
+  state.selectedMode = 'deadlines';
+  state.selectedAudit = null;
+  state.selectedMissing = [];
+  const analysis = buildDeadlineControl(state.selectedDeal);
+  state.selectedDeadlineTasks = analysis.recommendedTasks;
+  state.selectedAnalysis = buildDeadlineControlText(state.selectedDeal, analysis);
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = renderDeadlineControlHtml(state.selectedDeal, analysis);
+  out.classList.remove('hidden');
+
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.add('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.add('hidden');
+  document.getElementById('create-deadline-tasks').classList.toggle('hidden', !state.selectedDeadlineTasks.length);
+}
+
+async function createDeadlineTasks() {
+  if (!state.selectedDeal) return;
+  const d = state.selectedDeal;
+  const tasks = state.selectedDeadlineTasks && state.selectedDeadlineTasks.length
+    ? state.selectedDeadlineTasks
+    : buildDeadlineControl(d).recommendedTasks;
+  if (!tasks.length) {
+    alert('Новые задачи контроля не требуются или уже созданы.');
+    return;
+  }
+  const confirmText = `Будут созданы задачи контроля (${tasks.length}):\n\n${tasks.map((t, i) => `${i + 1}. ${t.title} — дедлайн ${formatDate(t.deadline)}`).join('\n')}\n\nСоздать?`;
+  if (!window.confirm(confirmText)) return;
+  for (const task of tasks) {
+    await createTask({
+      title: task.title,
+      responsibleId: d.ASSIGNED_BY_ID,
+      description: task.description,
+      dealId: d.ID,
+      deadline: task.deadline,
+      silent: true,
+    });
+  }
+  alert(`Создано задач контроля: ${tasks.length}`);
+  state.selectedDeadlineTasks = [];
+  await loadDeals();
+  if (state.selectedDeal) openDeal(String(d.ID));
+}
+
 
 async function writeComment() {
   if (!state.selectedDeal || !state.selectedAnalysis) return;
@@ -2101,10 +2431,12 @@ document.getElementById('check-handoff').addEventListener('click', checkHandoff)
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
+document.getElementById('check-deadlines').addEventListener('click', checkDeadlines);
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
 document.getElementById('create-workplan-tasks').addEventListener('click', createWorkPlanTasks);
+document.getElementById('create-deadline-tasks').addEventListener('click', createDeadlineTasks);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
 
