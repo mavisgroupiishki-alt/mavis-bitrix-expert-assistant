@@ -125,7 +125,7 @@ const REQUIRED_ITEMS = [
 const CRITICAL_KEYS = new Set(['service', 'kp', 'terms', 'email', 'fees', 'specialists']);
 const AUDIT_TAG = 'MAVIS_AI_HANDOFF_AUDIT';
 const AI_FEEDBACK_TAG = 'MAVIS_AI_FEEDBACK';
-const ACTION_BUTTON_IDS = ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks','accept-ai-feedback','correct-ai-feedback'];
+const ACTION_BUTTON_IDS = ['write-comment','create-manager-task','create-expert-task','mark-checked','create-workplan-tasks','create-deadline-tasks','create-ai-tasks','send-copy-list-client','accept-ai-feedback','correct-ai-feedback'];
 function hideActionButtons() { ACTION_BUTTON_IDS.forEach((x) => { const el = document.getElementById(x); if (el) el.classList.add('hidden'); }); }
 function showAiFeedbackButtons(show = true) { ['accept-ai-feedback','correct-ai-feedback'].forEach((x) => { const el = document.getElementById(x); if (el) el.classList.toggle('hidden', !show); }); }
 function bxCall(method, params = {}) {
@@ -2683,7 +2683,253 @@ function generateCopyList() {
   document.getElementById('create-workplan-tasks').classList.remove('hidden');
   document.getElementById('create-deadline-tasks').classList.add('hidden');
   document.getElementById('create-ai-tasks').classList.add('hidden');
+  document.getElementById('send-copy-list-client').classList.remove('hidden');
   showAiFeedbackButtons(false);
+}
+
+function firstMultiValue(field) {
+  if (!field) return '';
+  if (Array.isArray(field)) {
+    const first = field.find((x) => x && (x.VALUE || x.value));
+    return first ? String(first.VALUE || first.value || '').trim() : '';
+  }
+  return String(field || '').trim();
+}
+
+function splitFirstEmail(value) {
+  const text = String(value || '');
+  const m = text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return m ? m[0] : '';
+}
+
+function normalizePhoneForDisplay(value) {
+  const raw = String(value || '').trim();
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  if (raw.startsWith('+')) return `+${digits}`;
+  return digits;
+}
+
+function getPrimaryClientEmail(deal) {
+  const contact = state.contacts.get(String(deal.CONTACT_ID)) || {};
+  const company = state.companies.get(String(deal.COMPANY_ID)) || {};
+  return splitFirstEmail(firstMultiValue(contact.EMAIL) || extractMultiField(contact.EMAIL) || firstMultiValue(company.EMAIL) || extractMultiField(company.EMAIL));
+}
+
+function getPrimaryClientPhone(deal) {
+  const contact = state.contacts.get(String(deal.CONTACT_ID)) || {};
+  const company = state.companies.get(String(deal.COMPANY_ID)) || {};
+  return normalizePhoneForDisplay(firstMultiValue(contact.PHONE) || extractMultiField(contact.PHONE) || firstMultiValue(company.PHONE) || extractMultiField(company.PHONE));
+}
+
+function copyListEmailBody(deal) {
+  const template = copyListTemplateForDeal(deal);
+  const listText = copyListText(deal);
+  const service = getService(deal) || 'услуга';
+  if (!template) return listText;
+  return `Добрый день!
+
+Направляем перечень копий/документов по услуге: ${service}.
+
+Важно: ${template.note}
+
+Пожалуйста, подготовьте документы по списку ниже. Если по какому-то пункту документа пока нет — напишите, пожалуйста, что именно отсутствует, чтобы эксперт подсказал дальнейшие действия.
+
+${template.clientDocs.map((x) => `— ${x}`).join('\n')}${template.tools && template.tools.length ? `
+
+Средства измерений / инструменты для сверки:
+${template.tools.map((x) => `— ${x}`).join('\n')}` : ''}
+
+С уважением,
+MAVIS GROUP`;
+}
+
+function copyListWhatsappText(deal) {
+  const template = copyListTemplateForDeal(deal);
+  const service = getService(deal) || 'услуге';
+  const title = template ? template.title : 'перечень копий';
+  return `Добрый день! Подготовили перечень копий/документов по ${service}. Полный перечень направили на email или готовы продублировать здесь. Важно: копии нужно заверить “копия верна” / подпись / расшифровка подписи / печать. Если какого-то документа нет — напишите, подскажем дальнейшие действия.
+
+${title}`;
+}
+
+function copyListEmailSubject(deal) {
+  const service = getService(deal) || 'услуге';
+  return `Перечень копий документов по ${service}`;
+}
+
+async function sendEmailViaBitrix(deal, to, subject, body) {
+  const from = APP_CONFIG.emailFrom || state.user.EMAIL || '';
+  if (!from) throw new Error('Не найден отправитель email. Добавь EMAIL_FROM в Render или проверь email текущего пользователя Bitrix.');
+  try {
+    return await bxCall('mail.message.send', { from, to: [to], subject, body });
+  } catch (firstError) {
+    const communication = {
+      VALUE: to,
+      ENTITY_ID: Number(deal.CONTACT_ID || deal.COMPANY_ID || deal.ID),
+      ENTITY_TYPE_ID: deal.CONTACT_ID ? 3 : deal.COMPANY_ID ? 4 : 2,
+    };
+    try {
+      return await bxCall('crm.activity.add', {
+        fields: {
+          OWNER_TYPE_ID: 2,
+          OWNER_ID: Number(deal.ID),
+          TYPE_ID: 4,
+          SUBJECT: subject,
+          DESCRIPTION: body,
+          DESCRIPTION_TYPE: 1,
+          COMPLETED: 'Y',
+          DIRECTION: 2,
+          RESPONSIBLE_ID: Number(deal.ASSIGNED_BY_ID || state.user.ID),
+          START_TIME: new Date().toISOString(),
+          END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          COMMUNICATIONS: [communication],
+          SETTINGS: { MESSAGE_FROM: `${APP_CONFIG.emailSenderName || 'MAVIS GROUP'} <${from}>` },
+        },
+      });
+    } catch (_) {
+      throw firstError;
+    }
+  }
+}
+
+async function sendWazzupMessage({ deal, phone, text }) {
+  const response = await fetch('/api/wazzup/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      dealId: deal.ID,
+      phone,
+      text,
+      crmUserId: state.user && state.user.ID,
+      username: companyName(deal.COMPANY_ID),
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) throw new Error(data.error || `Wazzup HTTP ${response.status}`);
+  return data;
+}
+
+async function recordCopyListSent(deal, sentChannels, email, phone) {
+  const comment = `Перечень копий отправлен клиенту
+
+Сделка: ${deal.TITLE || ''} / ID ${deal.ID}
+Услуга: ${getService(deal) || '—'}
+Каналы: ${sentChannels.join(', ')}
+Email: ${email || '—'}
+WhatsApp: ${phone || '—'}
+Отправил: ${state.user ? `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim() : 'пользователь'}
+Дата: ${formatDate(new Date().toISOString())}
+
+Следующий шаг: проконтролировать получение документов от клиента.`;
+  await bxCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: comment }
+  });
+}
+
+async function createCopyListControlTask(deal) {
+  const title = 'Проверить получение документов от клиента';
+  if (hasOpenTaskWithTitle(deal.ID, title)) return false;
+  await createTask({
+    title,
+    responsibleId: deal.ASSIGNED_BY_ID,
+    description: `Клиенту отправлен перечень копий/документов по сделке “${deal.TITLE}”.
+
+Нужно проверить, получил ли клиент перечень, и поставить/актуализировать дедлайн предоставления документов.
+
+Услуга: ${getService(deal) || '—'}
+Компания: ${companyName(deal.COMPANY_ID)}`,
+    dealId: deal.ID,
+    deadline: deadlineTomorrow(12),
+    silent: true,
+  });
+  return true;
+}
+
+async function sendCopyListToClient() {
+  if (!state.selectedDeal) return;
+  const deal = state.selectedDeal;
+  if (state.selectedMode !== 'copylist' || !state.selectedAnalysis) generateCopyList();
+
+  const email = getPrimaryClientEmail(deal);
+  const phone = getPrimaryClientPhone(deal);
+  const subject = copyListEmailSubject(deal);
+  const emailBody = copyListEmailBody(deal);
+  const whatsappText = copyListWhatsappText(deal);
+
+  let defaultChannel = email && phone ? '3' : email ? '1' : phone ? '2' : '';
+  const choice = window.prompt(
+    `Куда отправить перечень?
+
+1 — Email${email ? ` (${email})` : ' — email не найден'}
+2 — WhatsApp${phone ? ` (${phone})` : ' — телефон не найден'}
+3 — Email + WhatsApp
+
+Введите 1, 2 или 3:`,
+    defaultChannel
+  );
+  if (choice === null) return;
+  const normalized = String(choice || '').trim();
+  const sendEmail = normalized === '1' || normalized === '3';
+  const sendWa = normalized === '2' || normalized === '3';
+  if (!sendEmail && !sendWa) {
+    alert('Канал не выбран. Нужно ввести 1, 2 или 3.');
+    return;
+  }
+  if (sendEmail && !email) {
+    alert('Email клиента не найден в контакте/компании. Заполни email в Bitrix или отправь через WhatsApp.');
+    return;
+  }
+  if (sendWa && !phone) {
+    alert('Телефон клиента не найден в контакте/компании. Заполни телефон в Bitrix или отправь через email.');
+    return;
+  }
+
+  const preview = `Проверь перед отправкой.
+
+Email: ${sendEmail ? email : 'не отправляем'}
+WhatsApp: ${sendWa ? phone : 'не отправляем'}
+
+Тема письма:
+${subject}
+
+WhatsApp-сообщение:
+${whatsappText}
+
+Email будет отправлен с полным перечнем документов. Продолжаем?`;
+  if (!window.confirm(preview)) return;
+
+  const sent = [];
+  const errors = [];
+  if (sendEmail) {
+    try {
+      await sendEmailViaBitrix(deal, email, subject, emailBody);
+      sent.push('Email');
+    } catch (e) {
+      errors.push(`Email: ${e.message || String(e)}`);
+    }
+  }
+  if (sendWa) {
+    try {
+      await sendWazzupMessage({ deal, phone, text: whatsappText });
+      sent.push('WhatsApp/Wazzup');
+    } catch (e) {
+      errors.push(`WhatsApp/Wazzup: ${e.message || String(e)}`);
+    }
+  }
+
+  if (sent.length) {
+    await recordCopyListSent(deal, sent, email, phone);
+    const taskCreated = await createCopyListControlTask(deal);
+    renderDeals();
+    const suffix = taskCreated ? '\nСоздана задача на контроль документов.' : '\nЗадача на контроль документов уже была открыта.';
+    const errText = errors.length ? '\n\nОшибки по другим каналам:\n' + errors.join('\n') : '';
+    alert(`Отправлено: ${sent.join(', ')}.${suffix}${errText}`);
+    return;
+  }
+
+  alert(`Не удалось отправить перечень.\n\n${errors.join('\n') || 'Неизвестная ошибка'}`);
+
 }
 
 function productDocumentChecklist(profile) {
@@ -4487,6 +4733,7 @@ document.getElementById('ai-documents').addEventListener('click', checkDocuments
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('generate-copy-list').addEventListener('click', generateCopyList);
+document.getElementById('send-copy-list-client').addEventListener('click', sendCopyListToClient);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
 document.getElementById('check-deadlines').addEventListener('click', checkDeadlines);
 document.getElementById('show-product-knowledge').addEventListener('click', showProductKnowledge);

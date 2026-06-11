@@ -62,6 +62,13 @@ const config = {
   // Необязательно: ручная карта стадий в формате JSON, если портал не отдаёт названия стадий через API.
   // Пример: {"C28:UC_MIFXBB":"2. Сбор информации"}
   stageMap: (() => { try { return JSON.parse(process.env.STAGE_MAP_JSON || '{}'); } catch (_) { return {}; } })(),
+
+  // v36: отправка перечней клиенту. Секреты Wazzup не отдаём в браузер.
+  emailFrom: process.env.EMAIL_FROM || '',
+  emailSenderName: process.env.EMAIL_SENDER_NAME || 'MAVIS GROUP',
+  wazzupEnabled: Boolean(process.env.WAZZUP_API_KEY && process.env.WAZZUP_CHANNEL_ID),
+  wazzupChannelConfigured: Boolean(process.env.WAZZUP_CHANNEL_ID),
+  wazzupChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
 };
 
 app.get('/health', (_req, res) => {
@@ -338,6 +345,75 @@ ${context}
     });
     const parsed = safeJsonParse(rawText);
     res.json({ ok: true, provider: config.aiProvider, model: config.aiModel, scenario: scenarioCfg.scenario, scenario_label: scenarioCfg.label, result: normalizeAiResult(parsed, rawText) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
+
+function normalizeWazzupPhone(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const plus = raw.startsWith('+') ? '+' : '';
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  return `${plus}${digits}`;
+}
+
+app.post('/api/wazzup/send', async (req, res) => {
+  try {
+    const apiKey = process.env.WAZZUP_API_KEY || '';
+    const channelId = process.env.WAZZUP_CHANNEL_ID || '';
+    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+    const chatType = process.env.WAZZUP_CHAT_TYPE || 'whatsapp';
+    if (!apiKey) {
+      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
+      return;
+    }
+    if (!channelId) {
+      res.status(400).json({ ok: false, error: 'WAZZUP_CHANNEL_ID не задан в Render Environment.' });
+      return;
+    }
+
+    const body = req.body || {};
+    const text = String(body.text || '').trim();
+    const phone = normalizeWazzupPhone(body.phone || body.chatId || '');
+    const chatId = String(body.chatId || '').trim();
+    if (!text) {
+      res.status(400).json({ ok: false, error: 'Текст сообщения пустой.' });
+      return;
+    }
+    if (!phone && !chatId) {
+      res.status(400).json({ ok: false, error: 'Не найден телефон / chatId клиента для WhatsApp.' });
+      return;
+    }
+
+    const payload = {
+      channelId,
+      chatType,
+      text,
+      crmMessageId: `mavis-copylist-${body.dealId || 'deal'}-${Date.now()}`,
+    };
+    if (chatId) payload.chatId = chatId;
+    else payload.phone = phone;
+    if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
+    if (body.username) payload.username = String(body.username);
+
+    const response = await fetch(`${baseUrl}/message`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const message = data && (data.description || data.error || data.message) ? (data.description || data.error || data.message) : `HTTP ${response.status}`;
+      res.status(response.status).json({ ok: false, error: `Wazzup: ${message}`, data });
+      return;
+    }
+    res.json({ ok: true, data });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }

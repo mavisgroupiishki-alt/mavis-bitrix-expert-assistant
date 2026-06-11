@@ -1,3 +1,37 @@
+
+## v36 — отправка перечней клиенту
+
+Добавлено безопасное отправление перечня копий клиенту после ручного подтверждения эксперта.
+
+Что появилось:
+- кнопка `Отправить перечень клиенту` после формирования перечня;
+- выбор канала: Email, WhatsApp/Wazzup или Email + WhatsApp;
+- предпросмотр перед отправкой;
+- запись комментария в сделку после успешной отправки;
+- задача эксперту `Проверить получение документов от клиента`;
+- отправка не выполняется автоматически — только после подтверждения.
+
+Email:
+- пробует отправить через `mail.message.send`;
+- если не получилось, пробует создать исходящую CRM email-активность через `crm.activity.add`;
+- если Bitrix вернёт ошибку прав, добавьте приложению право `mail` и переустановите/обновите права приложения.
+
+WhatsApp / Wazzup:
+- используется Wazzup API `POST https://api.wazzup24.com/v3/message`;
+- в Render нужно добавить `WAZZUP_API_KEY` и `WAZZUP_CHANNEL_ID`;
+- ключ Wazzup нельзя добавлять в GitHub или отправлять в чат.
+
+Переменные Render для v36:
+
+```env
+EMAIL_FROM=
+EMAIL_SENDER_NAME=MAVIS GROUP
+WAZZUP_API_KEY=
+WAZZUP_CHANNEL_ID=
+WAZZUP_CHAT_TYPE=whatsapp
+WAZZUP_BASE_URL=https://api.wazzup24.com/v3
+```
+
 LEADER_USER_IDS=2110,14,2182
 ROP_USER_IDS=2156
 ADMIN_USER_IDS=2110,14
