@@ -1,6 +1,10 @@
 /* global BX24, APP_CONFIG */
 
 const state = {
+  mode: 'dashboard',
+  placementInfo: null,
+  currentDealId: '',
+  placementRegisterStatus: '',
   user: null,
   role: 'expert',
   isAdmin: false,
@@ -257,9 +261,137 @@ function detectFieldMap(fields) {
   };
 }
 
+
+function normalizePlacementOptions(options) {
+  if (!options) return {};
+  if (typeof options === 'object') return options;
+  if (typeof options === 'string') {
+    try { return JSON.parse(options); } catch (_) { return {}; }
+  }
+  return {};
+}
+
+function getPlacementInfoSafe() {
+  try {
+    if (BX24.placement && typeof BX24.placement.info === 'function') {
+      const info = BX24.placement.info() || {};
+      info.options = normalizePlacementOptions(info.options);
+      return info;
+    }
+  } catch (_) {}
+  return { placement: '', options: {} };
+}
+
+function getDealIdFromPlacement(info) {
+  const options = normalizePlacementOptions(info && info.options);
+  const params = new URLSearchParams(window.location.search || '');
+  const candidates = [
+    options.ID,
+    options.id,
+    options.ENTITY_ID,
+    options.entityId,
+    options.ENTITY_ID_VALUE,
+    options.DEAL_ID,
+    options.dealId,
+    options.entity_id,
+    options.entityId,
+    params.get('deal_id'),
+    params.get('DEAL_ID'),
+    params.get('id'),
+    params.get('ID'),
+  ];
+  const found = candidates.find((x) => String(x || '').match(/^\d+$/));
+  return found ? String(found) : '';
+}
+
+function isDealTabPlacement(info) {
+  const placement = String((info && info.placement) || '').toUpperCase();
+  return placement === 'CRM_DEAL_DETAIL_TAB' || window.location.pathname.replace(/\/$/, '') === '/deal';
+}
+
+function prepareDealTabUi() {
+  document.body.classList.add('deal-mode');
+  const summary = document.querySelector('.summary-grid');
+  if (summary) summary.classList.add('hidden');
+  const manager = document.getElementById('manager-dashboard');
+  if (manager) manager.classList.add('hidden');
+  const listPanel = document.getElementById('deals-list-panel');
+  if (listPanel) listPanel.classList.add('hidden');
+  const title = document.querySelector('.topbar h1');
+  if (title) title.textContent = 'ИИ-ассистент в сделке';
+  const reload = document.getElementById('reload');
+  if (reload) reload.textContent = 'Обновить сделку';
+  const dialog = document.getElementById('deal-dialog');
+  if (dialog) {
+    dialog.setAttribute('open', '');
+    dialog.classList.add('deal-tab-panel');
+  }
+  const close = document.getElementById('close-dialog');
+  if (close) close.classList.add('hidden');
+}
+
+async function maybeRegisterDealTabPlacement() {
+  if (!state.isAdmin) return;
+  const handler = `${window.location.origin}/deal`;
+  try {
+    let already = false;
+    try {
+      const current = await bxCall('placement.get', {});
+      const rows = Array.isArray(current) ? current : (current && current.result) || [];
+      already = rows.some((x) => String(x.PLACEMENT || x.placement || '').toUpperCase() === 'CRM_DEAL_DETAIL_TAB' && String(x.HANDLER || x.handler || '').includes('/deal'));
+    } catch (_) {}
+    if (!already) {
+      await bxCall('placement.bind', {
+        PLACEMENT: 'CRM_DEAL_DETAIL_TAB',
+        HANDLER: handler,
+        TITLE: 'ИИ-ассистент',
+        DESCRIPTION: 'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP',
+      });
+      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” зарегистрирована в карточке сделки.';
+    } else {
+      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” уже зарегистрирована в карточке сделки.';
+    }
+  } catch (e) {
+    state.placementRegisterStatus = `Не удалось автоматически зарегистрировать вкладку в карточке сделки: ${e.message || e}`;
+  }
+}
+
+async function loadDealTab(dealId) {
+  if (!dealId) {
+    showError('Не удалось определить ID сделки из карточки Bitrix. Открой вкладку “ИИ-ассистент” именно внутри карточки сделки.');
+    return;
+  }
+  document.getElementById('loading').classList.remove('hidden');
+  document.getElementById('loading').textContent = `Загружаем сделку ID ${dealId}...`;
+  hideError();
+  state.detailsLoaded = false;
+  state.detailsLoading = false;
+  state.detailsProgress = '';
+  state.activitiesByDeal.clear();
+  state.tasksByDeal.clear();
+  state.commentsByDeal.clear();
+  state.auditByDeal.clear();
+  state.salesDealByProduction.clear();
+  state.selectedDeal = null;
+  const deal = await bxCall('crm.deal.get', { id: dealId });
+  state.deals = [deal];
+  await hydrateDeals([deal]);
+  await hydrateStages([deal]);
+  await hydrateDealMeta(deal);
+  state.currentDealId = String(dealId);
+  await openDeal(dealId);
+  document.getElementById('loading').classList.add('hidden');
+  const note = document.getElementById('category-note');
+  if (note) note.textContent = 'Режим карточки сделки: ассистент работает только с текущей сделкой. Общий кабинет оставлен для отчётности руководителя и контроля.';
+}
+
 async function init() {
   try {
     await new Promise((resolve) => BX24.init(resolve));
+    state.placementInfo = getPlacementInfoSafe();
+    state.mode = isDealTabPlacement(state.placementInfo) ? 'dealTab' : 'dashboard';
+    state.currentDealId = getDealIdFromPlacement(state.placementInfo);
+
     state.user = await bxCall('user.current');
     try { state.isAdmin = Boolean(await bxCall('user.admin')); } catch (_) { state.isAdmin = false; }
     state.isLeader = (APP_CONFIG.leaderUserIds || []).includes(String(state.user.ID)) || (APP_CONFIG.adminUserIds || []).includes(String(state.user.ID));
@@ -270,7 +402,14 @@ async function init() {
     state.fields = await bxCall('crm.deal.fields');
     state.enumMaps = buildEnumMaps(state.fields);
     state.fieldMap = detectFieldMap(state.fields);
-    await loadDeals();
+
+    if (state.mode === 'dealTab') {
+      prepareDealTabUi();
+      await loadDealTab(state.currentDealId);
+    } else {
+      await maybeRegisterDealTabPlacement();
+      await loadDeals();
+    }
   } catch (e) {
     showError(e.message);
   }
@@ -1902,7 +2041,7 @@ function renderDeals() {
   document.getElementById('category-note').textContent = (APP_CONFIG.productionCategoryId
     ? `Фильтр по воронке производства: CATEGORY_ID=${APP_CONFIG.productionCategoryId}. `
     : 'Фильтр по воронке пока не задан. Посмотри колонку “Воронка ID” и добавь PRODUCTION_CATEGORY_ID в Render. ')
-    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote} ${metaStatusText()}`;
+    + `${APP_CONFIG.excludeClosedDeals !== false ? 'Закрытые сделки исключены. ' : 'Закрытые сделки НЕ исключены. '} ${roleNote} ${limitNote} ${metaStatusText()} ${state.placementRegisterStatus || ''}`;
 
 }
 
@@ -1919,7 +2058,13 @@ async function openDeal(id) {
   hideActionButtons();
   state.selectedDeadlineTasks = [];
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
-  document.getElementById('deal-dialog').showModal();
+  const dialog = document.getElementById('deal-dialog');
+  if (state.mode === 'dealTab') {
+    dialog.setAttribute('open', '');
+    dialog.classList.add('deal-tab-panel');
+  } else {
+    dialog.showModal();
+  }
 }
 
 function detailHtml(deal) {
@@ -4793,7 +4938,7 @@ function escapeHtml(value) {
 function showError(message) { document.getElementById('loading').classList.add('hidden'); const el = document.getElementById('error'); el.textContent = message; el.classList.remove('hidden'); }
 function hideError() { document.getElementById('error').classList.add('hidden'); }
 
-document.getElementById('reload').addEventListener('click', loadDeals);
+document.getElementById('reload').addEventListener('click', () => state.mode === 'dealTab' ? loadDealTab(state.currentDealId) : loadDeals());
 document.getElementById('search').addEventListener('input', renderDeals);
 document.getElementById('deals-table').addEventListener('click', (e) => {
   const bxId = e.target.getAttribute('data-bx');
@@ -4803,7 +4948,7 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
     if (e.target.getAttribute('data-check')) checkHandoff();
   });
 });
-document.getElementById('close-dialog').addEventListener('click', () => document.getElementById('deal-dialog').close());
+document.getElementById('close-dialog').addEventListener('click', () => { if (state.mode !== 'dealTab') document.getElementById('deal-dialog').close(); });
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
 document.getElementById('ai-handoff').addEventListener('click', analyzeHandoffWithAI);

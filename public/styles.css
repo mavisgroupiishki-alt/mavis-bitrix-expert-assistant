@@ -159,3 +159,27 @@ dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .mini-table th, .mini-table td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
 .mini-table th { color: #475569; background: #f8fafc; font-weight: 700; }
+
+
+/* v39: режим вкладки внутри карточки сделки Bitrix */
+body.deal-mode { background: transparent; }
+body.deal-mode .app { padding: 12px; }
+body.deal-mode .topbar { margin-bottom: 12px; }
+body.deal-mode h1 { font-size: 24px; }
+body.deal-mode #deal-dialog.deal-tab-panel {
+  display: block;
+  position: static;
+  inset: auto;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: none;
+  background: var(--card);
+}
+body.deal-mode #deal-dialog.deal-tab-panel::backdrop { display: none; background: transparent; }
+body.deal-mode .dialog-header { padding: 16px 18px; }
+body.deal-mode #deal-details { padding: 16px 18px; }
+body.deal-mode .dialog-actions { padding: 0 18px 16px; }
+body.deal-mode .analysis { margin: 0 18px 18px; }

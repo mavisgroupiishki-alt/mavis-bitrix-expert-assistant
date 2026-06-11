@@ -515,7 +515,7 @@ app.post('/api/wazzup/send', async (req, res) => {
 });
 
 // Main app page used as "Путь вашего обработчика" in Bitrix24.
-app.all(['/', '/app'], (_req, res) => {
+app.all(['/', '/app', '/deal'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
