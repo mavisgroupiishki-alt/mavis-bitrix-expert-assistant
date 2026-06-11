@@ -2793,6 +2793,53 @@ async function sendEmailViaBitrix(deal, to, subject, body) {
   }
 }
 
+
+async function checkWazzupConnection() {
+  const box = document.getElementById('analysis-result');
+  box.classList.remove('hidden');
+  box.innerHTML = `<div class="result-card"><h3>Проверяем Wazzup...</h3><p class="muted">Запрашиваем список каналов через Wazzup API.</p></div>`;
+  try {
+    const response = await fetch('/api/wazzup/channels');
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const channels = Array.isArray(data.channels) ? data.channels : [];
+    const configured = data.configuredChannelId || '';
+    const whatsappChannels = channels.filter((ch) => /whatsapp|wa/i.test(`${ch.transport} ${ch.plainId}`));
+    const recommended = (whatsappChannels.find((ch) => ch.isActive) || whatsappChannels[0] || channels.find((ch) => ch.isActive) || channels[0] || {}).channelId || '';
+    const rows = channels.length ? channels.map((ch) => `
+      <tr>
+        <td><code>${escapeHtml(ch.channelId || '—')}</code></td>
+        <td>${escapeHtml(ch.transport || '—')}</td>
+        <td>${escapeHtml(ch.plainId || '—')}</td>
+        <td>${escapeHtml(ch.state || ch.rawState || '—')}</td>
+        <td>${configured && configured === ch.channelId ? '<strong>указан в Render</strong>' : (recommended && recommended === ch.channelId ? 'рекомендован' : '')}</td>
+      </tr>`).join('') : '<tr><td colspan="5">Каналы не найдены. Проверь права API-ключа или подключение канала в Wazzup.</td></tr>';
+    box.innerHTML = `
+      <div class="result-header"><div class="result-header-title"><h3>Диагностика Wazzup</h3><span class="result-status ${channels.length ? 'ok' : 'risk'}">${channels.length ? 'каналы получены' : 'каналы не найдены'}</span></div></div>
+      <div class="result-card card-info">
+        <h3>Что добавить в Render</h3>
+        <p><strong>WAZZUP_API_KEY</strong> — уже должен быть добавлен.</p>
+        <p><strong>WAZZUP_BASE_URL</strong> — <code>${escapeHtml(data.baseUrl || 'https://api.wazzup24.com/v3')}</code></p>
+        <p><strong>WAZZUP_CHAT_TYPE</strong> — <code>${escapeHtml(data.configuredChatType || 'whatsapp')}</code></p>
+        <p><strong>WAZZUP_CHANNEL_ID</strong> — ${recommended ? `<code>${escapeHtml(recommended)}</code>` : 'не удалось определить автоматически'}</p>
+        ${recommended ? `<p class="muted small-note">Скопируй именно channelId, не номер телефона/канала.</p>` : ''}
+      </div>
+      <div class="result-card">
+        <h3>Каналы Wazzup</h3>
+        <div class="table-wrap"><table class="mini-table"><thead><tr><th>channelId</th><th>transport</th><th>plainId</th><th>state</th><th>подсказка</th></tr></thead><tbody>${rows}</tbody></table></div>
+      </div>
+      <div class="result-card card-action">
+        <h3>Следующий шаг</h3>
+        <p>Добавь в Render переменную <code>WAZZUP_CHANNEL_ID</code> со значением рекомендованного channelId, затем сделай <strong>Manual Deploy → Clear build cache & deploy</strong>.</p>
+        <p>После этого можно тестировать кнопку <strong>“Отправить перечень клиенту”</strong>.</p>
+      </div>`;
+  } catch (error) {
+    box.innerHTML = `
+      <div class="result-card card-risk"><h3>Wazzup не подключился</h3><p>${escapeHtml(error.message || String(error))}</p></div>
+      <div class="result-card card-action"><h3>Что проверить</h3><ul><li>В Render добавлен <code>WAZZUP_API_KEY</code>.</li><li>После добавления переменной сделан деплой.</li><li>Ключ создан в Wazzup в разделе API.</li><li>Канал Wazzup активен.</li></ul></div>`;
+  }
+}
+
 async function sendWazzupMessage({ deal, phone, text }) {
   const response = await fetch('/api/wazzup/send', {
     method: 'POST',
@@ -4734,6 +4781,7 @@ document.getElementById('generate-workplan').addEventListener('click', generateW
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('generate-copy-list').addEventListener('click', generateCopyList);
 document.getElementById('send-copy-list-client').addEventListener('click', sendCopyListToClient);
+document.getElementById('check-wazzup').addEventListener('click', checkWazzupConnection);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
 document.getElementById('check-deadlines').addEventListener('click', checkDeadlines);
 document.getElementById('show-product-knowledge').addEventListener('click', showProductKnowledge);

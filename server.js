@@ -67,6 +67,7 @@ const config = {
   emailFrom: process.env.EMAIL_FROM || '',
   emailSenderName: process.env.EMAIL_SENDER_NAME || 'MAVIS GROUP',
   wazzupEnabled: Boolean(process.env.WAZZUP_API_KEY && process.env.WAZZUP_CHANNEL_ID),
+  wazzupApiConfigured: Boolean(process.env.WAZZUP_API_KEY),
   wazzupChannelConfigured: Boolean(process.env.WAZZUP_CHANNEL_ID),
   wazzupChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
 };
@@ -359,6 +360,47 @@ function normalizeWazzupPhone(value) {
   if (!digits) return '';
   return `${plus}${digits}`;
 }
+
+
+app.get('/api/wazzup/channels', async (_req, res) => {
+  try {
+    const apiKey = process.env.WAZZUP_API_KEY || '';
+    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+    if (!apiKey) {
+      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
+      return;
+    }
+
+    const response = await fetch(`${baseUrl}/channels`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'X-Api-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = data && (data.description || data.error || data.message) ? (data.description || data.error || data.message) : `HTTP ${response.status}`;
+      res.status(response.status).json({ ok: false, error: `Wazzup: ${message}`, data });
+      return;
+    }
+
+    const source = Array.isArray(data) ? data : Array.isArray(data && data.data) ? data.data : Array.isArray(data && data.channels) ? data.channels : [];
+    const channels = source.map((ch) => ({
+      channelId: String(ch.channelId || ch.id || ch.uuid || ''),
+      transport: String(ch.transport || ch.type || ch.provider || ''),
+      plainId: String(ch.plainId || ch.phone || ch.name || ch.title || ''),
+      state: String(ch.state || ch.status || ''),
+      isActive: Boolean(ch.state === 'active' || ch.state === 'connected' || ch.isActive || ch.enabled),
+      rawState: ch.state || ch.status || '',
+    })).filter((ch) => ch.channelId || ch.plainId);
+
+    res.json({ ok: true, baseUrl, configuredChannelId: process.env.WAZZUP_CHANNEL_ID || '', configuredChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp', channels, raw: data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
 
 app.post('/api/wazzup/send', async (req, res) => {
   try {
