@@ -318,7 +318,13 @@ function prepareDealTabUi() {
   const listPanel = document.getElementById('deals-list-panel');
   if (listPanel) listPanel.classList.add('hidden');
   const title = document.querySelector('.topbar h1');
-  if (title) title.textContent = 'ИИ-ассистент в сделке';
+  if (title) title.textContent = 'ИИ-ассистент по текущей сделке';
+  const userLine = document.getElementById('user-line');
+  if (userLine) userLine.classList.add('deal-user-line');
+  const help = document.getElementById('deal-mode-help');
+  if (help) help.classList.remove('hidden');
+  const register = document.getElementById('register-deal-tab');
+  if (register) register.classList.add('hidden');
   const reload = document.getElementById('reload');
   if (reload) reload.textContent = 'Обновить сделку';
   const dialog = document.getElementById('deal-dialog');
@@ -3827,7 +3833,8 @@ async function createAITasks() {
   state.selectedAiTasks = [];
   document.getElementById('create-ai-tasks').classList.add('hidden');
   await ensureDealMeta(d.ID);
-  await loadDeals();
+  if (state.mode === 'dealTab') await loadDealTab(String(d.ID));
+  else await loadDeals();
   if (state.selectedDeal) openDeal(String(d.ID));
 }
 
@@ -4610,7 +4617,8 @@ async function createDeadlineTasks() {
   }
   alert(`Создано задач контроля: ${tasks.length}`);
   state.selectedDeadlineTasks = [];
-  await loadDeals();
+  if (state.mode === 'dealTab') await loadDealTab(String(d.ID));
+  else await loadDeals();
   if (state.selectedDeal) openDeal(String(d.ID));
 }
 
@@ -4898,7 +4906,8 @@ async function createWorkPlanTasks() {
     });
   }
   alert(`Создано задач: ${tasks.length}`);
-  await loadDeals();
+  if (state.mode === 'dealTab') await loadDealTab(String(d.ID));
+  else await loadDeals();
   if (state.selectedDeal) openDeal(String(d.ID));
 }
 
@@ -4916,6 +4925,72 @@ async function createTask({ title, responsibleId, description, dealId, deadline 
   if (accomplices.length) fields.ACCOMPLICES = accomplices.map(Number);
   await bxCall('tasks.task.add', { fields });
   if (!silent) alert('Задача создана.');
+}
+
+
+function showPilotChecklist() {
+  if (!state.selectedDeal) return;
+  const deal = state.selectedDeal;
+  state.selectedMode = 'pilot_checklist';
+  const service = getService(deal) || 'услуга не указана';
+  const next = nextStep(deal.ID);
+  const checklistText = [
+    'ЧЕК-ЛИСТ ТЕСТИРОВАНИЯ ИИ-АССИСТЕНТА ПО СДЕЛКЕ',
+    `Сделка: ${deal.TITLE || deal.ID}`,
+    `Компания: ${companyName(deal.COMPANY_ID)}`,
+    `Услуга: ${service}`,
+    `Стадия: ${stageName(deal.STAGE_ID)}`,
+    `Ответственный: ${userName(deal.ASSIGNED_BY_ID)}`,
+    '',
+    '1. Проверить передачу из продаж: услуга, КП, сроки, email/канал связи, специалисты, пошлины/доп. счета, средства измерений, ссылка на сделку продаж.',
+    '2. Запустить ИИ-анализ сделки: проверить, понял ли ИИ текущую ситуацию, риски и следующий шаг.',
+    '3. Запустить ИИ-ход работы: проверить, корректно ли разделены действия MAVIS и клиента.',
+    '4. Сформировать перечень копий: проверить, соответствует ли перечень услуге.',
+    '5. Проверить документы: сверить найденное с чек-листом и отметить, чего не хватает.',
+    '6. Проверить дедлайны: есть ли следующий шаг, просрочки, задачи без дедлайна.',
+    '7. Если ИИ ошибся — нажать “Правка к ИИ” и кратко написать, что исправить.',
+    '8. Если вывод корректный — нажать “ИИ-вывод верный”.',
+    '',
+    'Важно: в пилоте ассистент ничего не отправляет клиенту и не создаёт задачи без подтверждения эксперта.'
+  ].join('\n');
+  state.selectedAnalysis = checklistText;
+  state.selectedMissing = [];
+  const audit = getAudit(deal.ID);
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Чек-лист тестирования по сделке</h3><span class="result-status partial">пилотный режим</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(service)}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stageName(deal.STAGE_ID))}</div>
+        <div class="result-field"><span>Следующий шаг</span>${escapeHtml(next ? `${formatDate(next.date)} — ${next.title || ''}` : 'нет открытого дела/задачи')}</div>
+      </div>
+    </div>
+    <div class="result-card card-action"><h3>Что эксперт проверяет в этой сделке</h3>
+      <ol>
+        <li>Проверить передачу из продаж: услуга, КП, сроки, email/канал связи, специалисты, пошлины/доп. счета, средства измерений, ссылка на сделку продаж.</li>
+        <li>Запустить ИИ-анализ сделки и проверить, верно ли ИИ понял ситуацию, риски и следующий шаг.</li>
+        <li>Запустить ИИ-ход работы и проверить разделение: что делает MAVIS, что делает клиент, какие дедлайны нужны.</li>
+        <li>Сформировать перечень копий и проверить, соответствует ли он услуге.</li>
+        <li>Проверить документы и сверить найденное с чек-листом.</li>
+        <li>Проверить дедлайны: следующий шаг, просрочки, задачи без дедлайна.</li>
+        <li>Оценить ИИ: “ИИ-вывод верный” или “Правка к ИИ”.</li>
+      </ol>
+    </div>
+    <div class="result-card card-uncertain"><h3>Правило пилота</h3><p>Ассистент работает в режиме подсказки. Клиенту ничего не отправляется и задачи не создаются без подтверждения эксперта.</p></div>
+    <div class="result-card"><h3>Текущий статус проверки передачи</h3><p>${audit ? escapeHtml(audit.status || 'проверка есть') : 'Проверка передачи ещё не зафиксирована.'}</p></div>
+    <details class="result-card"><summary><strong>Текст для комментария в сделку</strong></summary><div class="message-draft">${escapeHtml(checklistText)}</div></details>
+  `;
+  out.classList.remove('hidden');
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.add('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.add('hidden');
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
+  showAiFeedbackButtons(false);
 }
 
 function openInBitrix(id) {
@@ -5000,6 +5075,8 @@ document.getElementById('accept-ai-feedback').addEventListener('click', acceptAI
 document.getElementById('correct-ai-feedback').addEventListener('click', correctAIFeedback);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
+const pilotChecklistBtn = document.getElementById('show-pilot-checklist');
+if (pilotChecklistBtn) pilotChecklistBtn.addEventListener('click', showPilotChecklist);
 const managerDashboard = document.getElementById('manager-dashboard');
 if (managerDashboard) {
   managerDashboard.addEventListener('click', (e) => {

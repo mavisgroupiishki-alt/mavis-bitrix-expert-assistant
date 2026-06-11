@@ -134,30 +134,63 @@
         <button id="close-dialog" class="icon">×</button>
       </div>
       <div id="deal-details"></div>
-      <div class="dialog-actions">
-        <button id="check-handoff" class="primary">Проверить передачу</button>
-        <button id="ai-analyze" class="secondary">ИИ-анализ сделки</button>
-        <button id="ai-handoff" class="secondary">ИИ-проверка передачи</button>
-        <button id="ai-workplan" class="secondary">ИИ-ход работы</button>
-        <button id="ai-documents" class="secondary">ИИ-проверка документов</button>
-        <button id="generate-workplan" class="secondary">Сформировать ход работы</button>
-        <button id="generate-checklist" class="secondary">Сформировать чек-лист документов</button>
-        <button id="generate-copy-list" class="secondary">Перечень копий клиенту</button>
-        <button id="send-copy-list-client" class="secondary hidden">Отправить перечень клиенту</button>
-        <button id="check-wazzup" class="secondary">Проверить Wazzup</button>
-        <button id="check-documents" class="secondary">Проверить входящие документы</button>
-        <button id="check-deadlines" class="secondary">Проверить дедлайны</button>
-        <button id="show-product-knowledge" class="secondary">База знаний по услуге</button>
-        <button id="write-comment" class="secondary hidden">Записать комментарий</button>
-        <button id="create-manager-task" class="secondary hidden">Создать задачу менеджеру</button>
-        <button id="create-expert-task" class="secondary hidden">Создать задачу эксперту</button>
-        <button id="create-workplan-tasks" class="secondary hidden">Создать задачи по ходу работы</button>
-        <button id="create-deadline-tasks" class="secondary hidden">Создать задачи контроля</button>
-        <button id="create-ai-tasks" class="secondary hidden">Создать задачи ИИ</button>
-        <button id="accept-ai-feedback" class="secondary hidden">ИИ-вывод верный</button>
-        <button id="correct-ai-feedback" class="secondary hidden">Правка к ИИ</button>
-        <button id="mark-checked" class="secondary hidden">Отметить как проверено</button>
-        <button id="show-fields" class="secondary">Показать поля сделки</button>
+      <div id="deal-mode-help" class="deal-mode-help hidden">
+        <strong>Режим сделки.</strong> Ассистент работает только с текущей карточкой: анализирует передачу, ход работы, документы, дедлайны и помогает создать задачи после подтверждения эксперта.
+      </div>
+      <div class="dialog-actions workflow-actions">
+        <div class="workflow-group workflow-main">
+          <div class="workflow-title"><span>1</span> Передача из продаж</div>
+          <div class="workflow-buttons">
+            <button id="check-handoff" class="primary">Проверить передачу</button>
+            <button id="ai-handoff" class="secondary">ИИ-проверка передачи</button>
+            <button id="mark-checked" class="secondary hidden">Отметить как проверено</button>
+            <button id="create-manager-task" class="secondary hidden">Создать задачу менеджеру</button>
+          </div>
+        </div>
+
+        <div class="workflow-group">
+          <div class="workflow-title"><span>2</span> Ход работы и ИИ-анализ</div>
+          <div class="workflow-buttons">
+            <button id="ai-analyze" class="secondary">ИИ-анализ сделки</button>
+            <button id="ai-workplan" class="secondary">ИИ-ход работы</button>
+            <button id="generate-workplan" class="secondary">Сформировать ход работы</button>
+            <button id="create-ai-tasks" class="secondary hidden">Создать задачи ИИ</button>
+            <button id="create-workplan-tasks" class="secondary hidden">Создать задачи по ходу работы</button>
+          </div>
+        </div>
+
+        <div class="workflow-group">
+          <div class="workflow-title"><span>3</span> Документы и перечни клиенту</div>
+          <div class="workflow-buttons">
+            <button id="generate-checklist" class="secondary">Сформировать чек-лист документов</button>
+            <button id="generate-copy-list" class="secondary">Перечень копий клиенту</button>
+            <button id="send-copy-list-client" class="secondary hidden">Отправить перечень клиенту</button>
+            <button id="ai-documents" class="secondary">ИИ-проверка документов</button>
+            <button id="check-documents" class="secondary">Проверить входящие документы</button>
+          </div>
+        </div>
+
+        <div class="workflow-group">
+          <div class="workflow-title"><span>4</span> Дедлайны, задачи и база знаний</div>
+          <div class="workflow-buttons">
+            <button id="check-deadlines" class="secondary">Проверить дедлайны</button>
+            <button id="create-deadline-tasks" class="secondary hidden">Создать задачи контроля</button>
+            <button id="create-expert-task" class="secondary hidden">Создать задачу эксперту</button>
+            <button id="show-product-knowledge" class="secondary">База знаний по услуге</button>
+            <button id="write-comment" class="secondary hidden">Записать комментарий</button>
+          </div>
+        </div>
+
+        <div class="workflow-group workflow-tech">
+          <div class="workflow-title"><span>i</span> Техническое / тестирование</div>
+          <div class="workflow-buttons">
+            <button id="accept-ai-feedback" class="secondary hidden">ИИ-вывод верный</button>
+            <button id="correct-ai-feedback" class="secondary hidden">Правка к ИИ</button>
+            <button id="show-pilot-checklist" class="secondary">Чек-лист теста</button>
+            <button id="check-wazzup" class="secondary">Проверить Wazzup</button>
+            <button id="show-fields" class="secondary">Показать поля сделки</button>
+          </div>
+        </div>
       </div>
       <div id="analysis-result" class="analysis hidden"></div>
     </dialog>
