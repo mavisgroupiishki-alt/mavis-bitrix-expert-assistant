@@ -330,8 +330,12 @@ function prepareDealTabUi() {
   if (close) close.classList.add('hidden');
 }
 
-async function maybeRegisterDealTabPlacement() {
-  if (!state.isAdmin) return;
+async function bindDealTabPlacement({ showAlert = false, force = false } = {}) {
+  if (!state.isAdmin) {
+    state.placementRegisterStatus = 'Вкладку может зарегистрировать только администратор Bitrix.';
+    if (showAlert) alert(state.placementRegisterStatus);
+    return false;
+  }
   const handler = `${window.location.origin}/deal`;
   try {
     let already = false;
@@ -340,20 +344,30 @@ async function maybeRegisterDealTabPlacement() {
       const rows = Array.isArray(current) ? current : (current && current.result) || [];
       already = rows.some((x) => String(x.PLACEMENT || x.placement || '').toUpperCase() === 'CRM_DEAL_DETAIL_TAB' && String(x.HANDLER || x.handler || '').includes('/deal'));
     } catch (_) {}
-    if (!already) {
+    if (!already || force) {
       await bxCall('placement.bind', {
         PLACEMENT: 'CRM_DEAL_DETAIL_TAB',
         HANDLER: handler,
         TITLE: 'ИИ-ассистент',
         DESCRIPTION: 'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP',
       });
-      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” зарегистрирована в карточке сделки.';
-    } else {
-      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” уже зарегистрирована в карточке сделки.';
+      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
+      if (showAlert) alert(state.placementRegisterStatus);
+      return true;
     }
+    state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” уже зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
+    if (showAlert) alert(state.placementRegisterStatus);
+    return true;
   } catch (e) {
-    state.placementRegisterStatus = `Не удалось автоматически зарегистрировать вкладку в карточке сделки: ${e.message || e}`;
+    const msg = e && (e.message || e.error_description || e.error) ? (e.message || e.error_description || e.error) : String(e);
+    state.placementRegisterStatus = `Не удалось зарегистрировать вкладку: ${msg}. Проверь права приложения: crm и placement, затем переустанови приложение.`;
+    if (showAlert) alert(state.placementRegisterStatus);
+    return false;
   }
+}
+
+async function maybeRegisterDealTabPlacement() {
+  await bindDealTabPlacement({ showAlert: false, force: false });
 }
 
 async function loadDealTab(dealId) {
@@ -4939,6 +4953,20 @@ function showError(message) { document.getElementById('loading').classList.add('
 function hideError() { document.getElementById('error').classList.add('hidden'); }
 
 document.getElementById('reload').addEventListener('click', () => state.mode === 'dealTab' ? loadDealTab(state.currentDealId) : loadDeals());
+
+const registerDealTabBtn = document.getElementById('register-deal-tab');
+if (registerDealTabBtn) {
+  registerDealTabBtn.addEventListener('click', async () => {
+    registerDealTabBtn.disabled = true;
+    registerDealTabBtn.textContent = 'Регистрируем...';
+    await bindDealTabPlacement({ showAlert: true, force: false });
+    registerDealTabBtn.disabled = false;
+    registerDealTabBtn.textContent = 'Добавить вкладку в сделку';
+    const note = document.getElementById('category-note');
+    if (note) note.textContent = `${note.textContent || ''} ${state.placementRegisterStatus || ''}`;
+  });
+}
+
 document.getElementById('search').addEventListener('input', renderDeals);
 document.getElementById('deals-table').addEventListener('click', (e) => {
   const bxId = e.target.getAttribute('data-bx');

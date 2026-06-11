@@ -25,7 +25,11 @@
           HANDLER: handler,
           TITLE: 'ИИ-ассистент',
           DESCRIPTION: 'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP'
-        }, function () {
+        }, function (res) {
+          if (res && res.error && res.error()) {
+            status.textContent = 'Не удалось зарегистрировать вкладку: ' + res.error() + '. Проверьте права приложения: crm и placement.';
+            return;
+          }
           status.textContent = 'Завершаем установку приложения...';
           BX24.installFinish();
           status.textContent = 'Установка завершена. В карточке сделки должна появиться вкладка “ИИ-ассистент”.';
