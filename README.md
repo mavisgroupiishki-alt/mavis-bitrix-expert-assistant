@@ -1,3 +1,29 @@
+# v38 — отправка перечней через Telegram и Viber
+
+Добавлена поддержка двух активных каналов Wazzup одновременно: Telegram и Viber.
+
+Что появилось:
+- диагностика Wazzup показывает, какой `channelId` вставлять в `WAZZUP_TG_CHANNEL_ID` и `WAZZUP_VIBER_CHANNEL_ID`;
+- отправка перечня клиенту теперь предлагает выбрать Email, Telegram, Viber или несколько каналов сразу;
+- сообщения в мессенджеры отправляются только после подтверждения эксперта;
+- в сделке фиксируется, куда именно отправлен перечень;
+- создаётся задача на контроль получения документов.
+
+Переменные Render:
+
+```env
+WAZZUP_API_KEY=
+WAZZUP_BASE_URL=https://api.wazzup24.com/v3
+WAZZUP_TG_CHANNEL_ID=678ecc61-f4db-4d62-bcb4-0aee75a8839f
+WAZZUP_TG_CHAT_TYPE=telegram
+WAZZUP_VIBER_CHANNEL_ID=7a4e407e-bece-4ed1-8d85-dc45a9320659
+WAZZUP_VIBER_CHAT_TYPE=viber
+```
+
+Старые переменные `WAZZUP_CHANNEL_ID` и `WAZZUP_CHAT_TYPE` оставлены как fallback, но для текущей схемы MAVIS лучше использовать отдельные переменные для Telegram и Viber.
+
+---
+
 
 ## v36 — отправка перечней клиенту
 

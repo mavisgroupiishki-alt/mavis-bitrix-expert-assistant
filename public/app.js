@@ -2722,6 +2722,30 @@ function getPrimaryClientPhone(deal) {
   return normalizePhoneForDisplay(firstMultiValue(contact.PHONE) || extractMultiField(contact.PHONE) || firstMultiValue(company.PHONE) || extractMultiField(company.PHONE));
 }
 
+function configuredMessengerChannels() {
+  const cfg = Array.isArray(APP_CONFIG.wazzupChannels) ? APP_CONFIG.wazzupChannels : [];
+  const channels = [];
+  if (cfg.some((ch) => ch.key === 'telegram')) channels.push({ key: 'telegram', label: 'Telegram' });
+  if (cfg.some((ch) => ch.key === 'viber')) channels.push({ key: 'viber', label: 'Viber' });
+  if (!channels.length && cfg.some((ch) => ch.key === 'default')) channels.push({ key: 'default', label: 'Wazzup' });
+  return channels;
+}
+
+function messengerLabel(key) {
+  if (key === 'telegram') return 'Telegram';
+  if (key === 'viber') return 'Viber';
+  return 'Wazzup';
+}
+
+function copyListMessengerText(deal, channelLabel) {
+  const template = copyListTemplateForDeal(deal);
+  const service = getService(deal) || 'услуге';
+  const title = template ? template.title : 'перечень копий';
+  return `Добрый день! Подготовили перечень копий/документов по ${service}. Можем продублировать полный перечень здесь или направить на email. Важно: копии нужно заверить “копия верна” / подпись / расшифровка подписи / печать. Если какого-то документа нет — напишите, подскажем дальнейшие действия.
+
+${title}`;
+}
+
 function copyListEmailBody(deal) {
   const template = copyListTemplateForDeal(deal);
   const listText = copyListText(deal);
@@ -2745,12 +2769,7 @@ MAVIS GROUP`;
 }
 
 function copyListWhatsappText(deal) {
-  const template = copyListTemplateForDeal(deal);
-  const service = getService(deal) || 'услуге';
-  const title = template ? template.title : 'перечень копий';
-  return `Добрый день! Подготовили перечень копий/документов по ${service}. Полный перечень направили на email или готовы продублировать здесь. Важно: копии нужно заверить “копия верна” / подпись / расшифровка подписи / печать. Если какого-то документа нет — напишите, подскажем дальнейшие действия.
-
-${title}`;
+  return copyListMessengerText(deal, 'Wazzup');
 }
 
 function copyListEmailSubject(deal) {
@@ -2803,26 +2822,40 @@ async function checkWazzupConnection() {
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
     const channels = Array.isArray(data.channels) ? data.channels : [];
-    const configured = data.configuredChannelId || '';
-    const whatsappChannels = channels.filter((ch) => /whatsapp|wa/i.test(`${ch.transport} ${ch.plainId}`));
-    const recommended = (whatsappChannels.find((ch) => ch.isActive) || whatsappChannels[0] || channels.find((ch) => ch.isActive) || channels[0] || {}).channelId || '';
-    const rows = channels.length ? channels.map((ch) => `
+    const configuredList = Array.isArray(data.configuredChannels) ? data.configuredChannels : [];
+    const configuredText = configuredList.length
+      ? configuredList.map((ch) => `${escapeHtml(ch.label)}: <code>${escapeHtml(ch.chatType || ch.key)}</code>`).join('<br>')
+      : 'пока не настроены';
+
+    const tg = channels.find((ch) => /tgapi|telegram/i.test(`${ch.transport} ${ch.plainId}`));
+    const viber = channels.find((ch) => /viber/i.test(`${ch.transport} ${ch.plainId}`));
+    const rows = channels.length ? channels.map((ch) => {
+      let hint = '';
+      if (tg && tg.channelId === ch.channelId) hint = 'Telegram — добавить как WAZZUP_TG_CHANNEL_ID';
+      if (viber && viber.channelId === ch.channelId) hint = 'Viber — добавить как WAZZUP_VIBER_CHANNEL_ID';
+      const isConfigured = configuredList.some((cfg) => cfg.key === 'telegram' && tg && tg.channelId === ch.channelId) || configuredList.some((cfg) => cfg.key === 'viber' && viber && viber.channelId === ch.channelId);
+      if (isConfigured) hint = 'уже настроен в Render';
+      return `
       <tr>
         <td><code>${escapeHtml(ch.channelId || '—')}</code></td>
         <td>${escapeHtml(ch.transport || '—')}</td>
         <td>${escapeHtml(ch.plainId || '—')}</td>
         <td>${escapeHtml(ch.state || ch.rawState || '—')}</td>
-        <td>${configured && configured === ch.channelId ? '<strong>указан в Render</strong>' : (recommended && recommended === ch.channelId ? 'рекомендован' : '')}</td>
-      </tr>`).join('') : '<tr><td colspan="5">Каналы не найдены. Проверь права API-ключа или подключение канала в Wazzup.</td></tr>';
+        <td>${hint}</td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="5">Каналы не найдены. Проверь права API-ключа или подключение канала в Wazzup.</td></tr>';
+
     box.innerHTML = `
       <div class="result-header"><div class="result-header-title"><h3>Диагностика Wazzup</h3><span class="result-status ${channels.length ? 'ok' : 'risk'}">${channels.length ? 'каналы получены' : 'каналы не найдены'}</span></div></div>
       <div class="result-card card-info">
-        <h3>Что добавить в Render</h3>
+        <h3>Что добавить в Render для двух каналов</h3>
         <p><strong>WAZZUP_API_KEY</strong> — уже должен быть добавлен.</p>
         <p><strong>WAZZUP_BASE_URL</strong> — <code>${escapeHtml(data.baseUrl || 'https://api.wazzup24.com/v3')}</code></p>
-        <p><strong>WAZZUP_CHAT_TYPE</strong> — <code>${escapeHtml(data.configuredChatType || 'whatsapp')}</code></p>
-        <p><strong>WAZZUP_CHANNEL_ID</strong> — ${recommended ? `<code>${escapeHtml(recommended)}</code>` : 'не удалось определить автоматически'}</p>
-        ${recommended ? `<p class="muted small-note">Скопируй именно channelId, не номер телефона/канала.</p>` : ''}
+        <p><strong>WAZZUP_TG_CHANNEL_ID</strong> — ${tg ? `<code>${escapeHtml(tg.channelId)}</code>` : 'Telegram-канал не найден'}</p>
+        <p><strong>WAZZUP_TG_CHAT_TYPE</strong> — <code>telegram</code></p>
+        <p><strong>WAZZUP_VIBER_CHANNEL_ID</strong> — ${viber ? `<code>${escapeHtml(viber.channelId)}</code>` : 'Viber-канал не найден'}</p>
+        <p><strong>WAZZUP_VIBER_CHAT_TYPE</strong> — <code>viber</code></p>
+        <p class="muted small-note">Уже настроено в приложении:<br>${configuredText}</p>
       </div>
       <div class="result-card">
         <h3>Каналы Wazzup</h3>
@@ -2830,8 +2863,8 @@ async function checkWazzupConnection() {
       </div>
       <div class="result-card card-action">
         <h3>Следующий шаг</h3>
-        <p>Добавь в Render переменную <code>WAZZUP_CHANNEL_ID</code> со значением рекомендованного channelId, затем сделай <strong>Manual Deploy → Clear build cache & deploy</strong>.</p>
-        <p>После этого можно тестировать кнопку <strong>“Отправить перечень клиенту”</strong>.</p>
+        <p>Добавь оба channelId в Render, затем сделай <strong>Manual Deploy → Clear build cache & deploy</strong>.</p>
+        <p>После этого при отправке перечня можно будет выбрать <strong>Email</strong>, <strong>Telegram</strong>, <strong>Viber</strong> или несколько каналов сразу.</p>
       </div>`;
   } catch (error) {
     box.innerHTML = `
@@ -2840,7 +2873,7 @@ async function checkWazzupConnection() {
   }
 }
 
-async function sendWazzupMessage({ deal, phone, text }) {
+async function sendWazzupMessage({ deal, phone, text, channelKey }) {
   const response = await fetch('/api/wazzup/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2848,6 +2881,7 @@ async function sendWazzupMessage({ deal, phone, text }) {
       dealId: deal.ID,
       phone,
       text,
+      channelKey,
       crmUserId: state.user && state.user.ID,
       username: companyName(deal.COMPANY_ID),
     }),
@@ -2864,7 +2898,7 @@ async function recordCopyListSent(deal, sentChannels, email, phone) {
 Услуга: ${getService(deal) || '—'}
 Каналы: ${sentChannels.join(', ')}
 Email: ${email || '—'}
-WhatsApp: ${phone || '—'}
+Мессенджер / телефон: ${phone || '—'}
 Отправил: ${state.user ? `${state.user.NAME || ''} ${state.user.LAST_NAME || ''}`.trim() : 'пользователь'}
 Дата: ${formatDate(new Date().toISOString())}
 
@@ -2902,48 +2936,46 @@ async function sendCopyListToClient() {
   const phone = getPrimaryClientPhone(deal);
   const subject = copyListEmailSubject(deal);
   const emailBody = copyListEmailBody(deal);
-  const whatsappText = copyListWhatsappText(deal);
+  const messengers = configuredMessengerChannels();
 
-  let defaultChannel = email && phone ? '3' : email ? '1' : phone ? '2' : '';
+  const options = [];
+  options.push({ code: String(options.length + 1), type: 'email', label: `Email${email ? ` (${email})` : ' — email не найден'}` });
+  for (const ch of messengers) options.push({ code: String(options.length + 1), type: ch.key, label: `${ch.label}${phone ? ` (${phone})` : ' — телефон не найден'}` });
+  if (email && messengers.length) options.push({ code: String(options.length + 1), type: 'email+messengers', label: `Email + ${messengers.map((x) => x.label).join(' + ')}` });
+  if (messengers.length > 1) options.push({ code: String(options.length + 1), type: 'all-messengers', label: messengers.map((x) => x.label).join(' + ') });
+
+  const defaultOption = email && messengers.length ? options.find((x) => x.type === 'email+messengers') : email ? options.find((x) => x.type === 'email') : messengers[0];
   const choice = window.prompt(
-    `Куда отправить перечень?
-
-1 — Email${email ? ` (${email})` : ' — email не найден'}
-2 — WhatsApp${phone ? ` (${phone})` : ' — телефон не найден'}
-3 — Email + WhatsApp
-
-Введите 1, 2 или 3:`,
-    defaultChannel
+    `Куда отправить перечень?\n\n${options.map((x) => `${x.code} — ${x.label}`).join('\n')}\n\nВведите номер варианта:`,
+    defaultOption ? defaultOption.code : ''
   );
   if (choice === null) return;
-  const normalized = String(choice || '').trim();
-  const sendEmail = normalized === '1' || normalized === '3';
-  const sendWa = normalized === '2' || normalized === '3';
-  if (!sendEmail && !sendWa) {
-    alert('Канал не выбран. Нужно ввести 1, 2 или 3.');
+  const selected = options.find((x) => x.code === String(choice || '').trim());
+  if (!selected) {
+    alert('Канал не выбран. Нужно ввести номер варианта из списка.');
     return;
   }
+
+  const sendEmail = selected.type === 'email' || selected.type === 'email+messengers';
+  let selectedMessengers = [];
+  if (selected.type === 'email+messengers' || selected.type === 'all-messengers') selectedMessengers = messengers;
+  else if (['telegram', 'viber', 'default'].includes(selected.type)) selectedMessengers = messengers.filter((x) => x.key === selected.type);
+
   if (sendEmail && !email) {
-    alert('Email клиента не найден в контакте/компании. Заполни email в Bitrix или отправь через WhatsApp.');
+    alert('Email клиента не найден в контакте/компании. Заполни email в Bitrix или отправь через мессенджер.');
     return;
   }
-  if (sendWa && !phone) {
-    alert('Телефон клиента не найден в контакте/компании. Заполни телефон в Bitrix или отправь через email.');
+  if (selectedMessengers.length && !phone) {
+    alert('Телефон клиента не найден в контакте/компании. Для Telegram/Viber через Wazzup нужен телефон/чат клиента в CRM.');
+    return;
+  }
+  if (selectedMessengers.length && !APP_CONFIG.wazzupApiConfigured) {
+    alert('WAZZUP_API_KEY не задан в Render. Добавь ключ Wazzup и сделай деплой.');
     return;
   }
 
-  const preview = `Проверь перед отправкой.
-
-Email: ${sendEmail ? email : 'не отправляем'}
-WhatsApp: ${sendWa ? phone : 'не отправляем'}
-
-Тема письма:
-${subject}
-
-WhatsApp-сообщение:
-${whatsappText}
-
-Email будет отправлен с полным перечнем документов. Продолжаем?`;
+  const messengerPreview = selectedMessengers.map((ch) => `${ch.label}: ${phone}\n${copyListMessengerText(deal, ch.label)}`).join('\n\n---\n\n');
+  const preview = `Проверь перед отправкой.\n\nEmail: ${sendEmail ? email : 'не отправляем'}\nМессенджеры: ${selectedMessengers.length ? selectedMessengers.map((x) => x.label).join(', ') + ` (${phone})` : 'не отправляем'}\n\nТема письма:\n${subject}\n\nСообщение в мессенджер:\n${messengerPreview || 'не отправляем'}\n\nEmail будет отправлен с полным перечнем документов. В мессенджер уйдёт короткое уведомление. Продолжаем?`;
   if (!window.confirm(preview)) return;
 
   const sent = [];
@@ -2956,12 +2988,12 @@ Email будет отправлен с полным перечнем докум�
       errors.push(`Email: ${e.message || String(e)}`);
     }
   }
-  if (sendWa) {
+  for (const ch of selectedMessengers) {
     try {
-      await sendWazzupMessage({ deal, phone, text: whatsappText });
-      sent.push('WhatsApp/Wazzup');
+      await sendWazzupMessage({ deal, phone, text: copyListMessengerText(deal, ch.label), channelKey: ch.key });
+      sent.push(ch.label);
     } catch (e) {
-      errors.push(`WhatsApp/Wazzup: ${e.message || String(e)}`);
+      errors.push(`${ch.label}: ${e.message || String(e)}`);
     }
   }
 

@@ -63,13 +63,18 @@ const config = {
   // Пример: {"C28:UC_MIFXBB":"2. Сбор информации"}
   stageMap: (() => { try { return JSON.parse(process.env.STAGE_MAP_JSON || '{}'); } catch (_) { return {}; } })(),
 
-  // v36: отправка перечней клиенту. Секреты Wazzup не отдаём в браузер.
+  // v36-v38: отправка перечней клиенту. Секреты Wazzup не отдаём в браузер.
   emailFrom: process.env.EMAIL_FROM || '',
   emailSenderName: process.env.EMAIL_SENDER_NAME || 'MAVIS GROUP',
-  wazzupEnabled: Boolean(process.env.WAZZUP_API_KEY && process.env.WAZZUP_CHANNEL_ID),
   wazzupApiConfigured: Boolean(process.env.WAZZUP_API_KEY),
-  wazzupChannelConfigured: Boolean(process.env.WAZZUP_CHANNEL_ID),
+  wazzupChannelConfigured: Boolean(process.env.WAZZUP_CHANNEL_ID || process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID || process.env.WAZZUP_VIBER_CHANNEL_ID),
   wazzupChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
+  wazzupChannels: [
+    process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID ? { key: 'telegram', label: 'Telegram', chatType: process.env.WAZZUP_TG_CHAT_TYPE || process.env.WAZZUP_TELEGRAM_CHAT_TYPE || 'telegram', channelId: process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID } : null,
+    process.env.WAZZUP_VIBER_CHANNEL_ID ? { key: 'viber', label: 'Viber', chatType: process.env.WAZZUP_VIBER_CHAT_TYPE || 'viber', channelId: process.env.WAZZUP_VIBER_CHANNEL_ID } : null,
+    process.env.WAZZUP_CHANNEL_ID ? { key: 'default', label: process.env.WAZZUP_CHANNEL_LABEL || 'Wazzup', chatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp', channelId: process.env.WAZZUP_CHANNEL_ID } : null,
+  ].filter(Boolean).map((ch) => ({ key: ch.key, label: ch.label, chatType: ch.chatType, configured: Boolean(ch.channelId) })),
+  wazzupEnabled: Boolean(process.env.WAZZUP_API_KEY && (process.env.WAZZUP_CHANNEL_ID || process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID || process.env.WAZZUP_VIBER_CHANNEL_ID)),
 };
 
 app.get('/health', (_req, res) => {
@@ -361,6 +366,42 @@ function normalizeWazzupPhone(value) {
   return `${plus}${digits}`;
 }
 
+function getConfiguredWazzupChannel(channelKey) {
+  const key = String(channelKey || '').trim().toLowerCase();
+  const channels = {
+    telegram: {
+      key: 'telegram',
+      label: 'Telegram',
+      channelId: process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID || '',
+      chatType: process.env.WAZZUP_TG_CHAT_TYPE || process.env.WAZZUP_TELEGRAM_CHAT_TYPE || 'telegram',
+    },
+    viber: {
+      key: 'viber',
+      label: 'Viber',
+      channelId: process.env.WAZZUP_VIBER_CHANNEL_ID || '',
+      chatType: process.env.WAZZUP_VIBER_CHAT_TYPE || 'viber',
+    },
+    default: {
+      key: 'default',
+      label: process.env.WAZZUP_CHANNEL_LABEL || 'Wazzup',
+      channelId: process.env.WAZZUP_CHANNEL_ID || '',
+      chatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
+    },
+  };
+  if (key && channels[key] && channels[key].channelId) return channels[key];
+  if (channels.telegram.channelId) return channels.telegram;
+  if (channels.viber.channelId) return channels.viber;
+  if (channels.default.channelId) return channels.default;
+  return null;
+}
+
+function publicWazzupChannelList() {
+  return ['telegram', 'viber', 'default']
+    .map((key) => getConfiguredWazzupChannel(key))
+    .filter(Boolean)
+    .map((ch) => ({ key: ch.key, label: ch.label, chatType: ch.chatType, configured: true }));
+}
+
 
 app.get('/api/wazzup/channels', async (_req, res) => {
   try {
@@ -396,7 +437,15 @@ app.get('/api/wazzup/channels', async (_req, res) => {
       rawState: ch.state || ch.status || '',
     })).filter((ch) => ch.channelId || ch.plainId);
 
-    res.json({ ok: true, baseUrl, configuredChannelId: process.env.WAZZUP_CHANNEL_ID || '', configuredChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp', channels, raw: data });
+    res.json({
+      ok: true,
+      baseUrl,
+      configuredChannelId: process.env.WAZZUP_CHANNEL_ID || '',
+      configuredChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
+      configuredChannels: publicWazzupChannelList(),
+      channels,
+      raw: data,
+    });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
@@ -405,19 +454,20 @@ app.get('/api/wazzup/channels', async (_req, res) => {
 app.post('/api/wazzup/send', async (req, res) => {
   try {
     const apiKey = process.env.WAZZUP_API_KEY || '';
-    const channelId = process.env.WAZZUP_CHANNEL_ID || '';
     const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
-    const chatType = process.env.WAZZUP_CHAT_TYPE || 'whatsapp';
     if (!apiKey) {
       res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
       return;
     }
-    if (!channelId) {
-      res.status(400).json({ ok: false, error: 'WAZZUP_CHANNEL_ID не задан в Render Environment.' });
+
+    const body = req.body || {};
+    const channelKey = body.channelKey || body.channel || '';
+    const configured = getConfiguredWazzupChannel(channelKey);
+    if (!configured || !configured.channelId) {
+      res.status(400).json({ ok: false, error: `Wazzup-канал ${channelKey || 'по умолчанию'} не задан в Render Environment.` });
       return;
     }
 
-    const body = req.body || {};
     const text = String(body.text || '').trim();
     const phone = normalizeWazzupPhone(body.phone || body.chatId || '');
     const chatId = String(body.chatId || '').trim();
@@ -426,16 +476,18 @@ app.post('/api/wazzup/send', async (req, res) => {
       return;
     }
     if (!phone && !chatId) {
-      res.status(400).json({ ok: false, error: 'Не найден телефон / chatId клиента для WhatsApp.' });
+      res.status(400).json({ ok: false, error: 'Не найден телефон / chatId клиента для отправки через Wazzup.' });
       return;
     }
 
     const payload = {
-      channelId,
-      chatType,
+      channelId: configured.channelId,
+      chatType: configured.chatType,
       text,
-      crmMessageId: `mavis-copylist-${body.dealId || 'deal'}-${Date.now()}`,
+      crmMessageId: `mavis-copylist-${configured.key}-${body.dealId || 'deal'}-${Date.now()}`,
     };
+    // Для Telegram/Viber в Wazzup часто достаточно номера клиента из CRM.
+    // Если передан chatId, используем его; иначе передаём phone.
     if (chatId) payload.chatId = chatId;
     else payload.phone = phone;
     if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
@@ -445,6 +497,7 @@ app.post('/api/wazzup/send', async (req, res) => {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
+        'X-Api-Key': apiKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
@@ -452,10 +505,10 @@ app.post('/api/wazzup/send', async (req, res) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       const message = data && (data.description || data.error || data.message) ? (data.description || data.error || data.message) : `HTTP ${response.status}`;
-      res.status(response.status).json({ ok: false, error: `Wazzup: ${message}`, data });
+      res.status(response.status).json({ ok: false, error: `Wazzup ${configured.label}: ${message}`, data, payload: { ...payload, text: '[hidden]' } });
       return;
     }
-    res.json({ ok: true, data });
+    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
