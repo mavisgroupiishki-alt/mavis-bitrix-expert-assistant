@@ -2482,6 +2482,210 @@ function detectProductProfile(service, title = '') {
 }
 
 
+
+function copyListTemplateForDeal(deal) {
+  const serviceText = normalize([getService(deal), deal.TITLE].join(' '));
+  const profile = productProfileForDeal(deal);
+  let key = '';
+  if (/(спк|стк|свидетельств.*техническ|техническ.*компетент)/.test(serviceText) && /(сертиф|серт|iso|исо|суот|45001|9001)/.test(serviceText) && /(аттест|атт\b|категор)/.test(serviceText)) key = 'stk_cert_att';
+  else if (/(спк|стк|свидетельств.*техническ|техническ.*компетент)/.test(serviceText) && /(сертиф|серт|iso|исо|суот|45001|9001)/.test(serviceText)) key = 'stk_cert';
+  else if (/(спк|стк|свидетельств.*техническ|техническ.*компетент)/.test(serviceText) && /(аттест|атт\b|категор)/.test(serviceText)) key = 'stk_att';
+  else if (/(генподряд|ген\s*2|2\s*кат|втор.*кат|генеральн)/.test(serviceText) && /(аттест|атт\b|категор)/.test(serviceText)) key = 'att_gen_2cat';
+  else if (profile.key === 'stk' || profile.key === 'stk_periodic' || /(спк|стк|свидетельств.*техническ|техническ.*компетент)/.test(serviceText)) key = 'stk';
+  else if (profile.key === 'company_attestation' || /(аттеста.*организац|аттеста.*компан|категор|атт\b)/.test(serviceText)) key = 'att';
+  else if (profile.key === 'iso' || /(iso|исо|сертиф|суот|45001|9001)/.test(serviceText)) key = 'iso';
+
+  const commonRule = 'Все копии заверяются директором: “копия верна” / подпись / расшифровка подписи / печать. Для аттестации скан-копии нужно делать с оригинала документа, не с другой копии.';
+
+  const spkDocs1 = [
+    'Копия свидетельства о регистрации — 1 экз.',
+    'Если менялся юридический адрес — копия уведомления об изменении юридического адреса — 1 экз.',
+    'Копия документа, подтверждающего право на занимаемое помещение: договор аренды, купли-продажи и т.д. — 1 экз.',
+    'Копия устава: первая и последняя страница — 1 экз.',
+    'Копия трудовой / приказа о приеме / контракта по совместительству, диплома и аттестата на аттестованных сотрудников ГИ/прораб/мастер — 1 экз.',
+    'Копии по средствам измерений: договоры аренды, акты приема-передачи, накладные, свидетельства о поверке/калибровке — 1 экз.',
+    'Для покупных средств измерений: счет и платежка на покупку. Для арендуемых: договор аренды + акт приема-передачи + свидетельства о поверке.',
+    'Уведомление о присоединении по ИПС «Стройдокумент» — 1 экз.',
+    'Счет и платежка на приобретение QR-кода / технологических карт — 1 экз.',
+    'Копия штатного расписания, где отражены аттестованные сотрудники — 1 экз.',
+    'Копия книги учета проверок: первая страница с номером и наименованием организации + вторая пустая страница — 1 экз.',
+  ];
+
+  const spkDocs2 = [
+    'Копия свидетельства о регистрации — 2 экз.',
+    'Копия устава — 2 экз. (первая и вторая страницы).',
+    'Если менялся юридический адрес — копия уведомления об изменении юридического адреса — 2 экз.',
+    'Копия документа, подтверждающего право на занимаемое помещение по юридическому адресу: договор аренды с актом приема-передачи, купли-продажи и т.д. — 2 экз.',
+    'Копии договоров, а также счета оплаченных пошлин органа проверки — 2 экз.',
+    'Копии дипломов и трудовой книжки на заместителя директора/директора — 2 экз.',
+    'Копии дипломов, аттестатов и трудовых на аттестованных сотрудников ГИ/прораб/мастер, полностью все страницы; при наличии вкладыша — вместе с титульным листом; приказ о назначении — 2 экз.',
+    'Копии по средствам измерения: договоры аренды, акты приема-передачи, накладные, документы о поверке — 2 экз.',
+    'Сделать копию счета и платежки по ИПС «Стройдокумент» — 2 экз.',
+    'Сделать копии счета и платежки на приобретение технологических карт — 2 экз.',
+    'Копия штатного расписания, где отражены аттестованные сотрудники — 2 экз.',
+    'Копия книги учета проверок: первая страница с номером и наименованием организации + вторая пустая страница — 2 экз.',
+    'Копия удостоверения по охране труда — 2 экз.',
+  ];
+
+  const spkAttDocs = [
+    'Копия свидетельства о регистрации — 1 экз.',
+    'Копия устава — 1 экз. (первая и вторая страницы).',
+    'Если менялся юридический адрес — копия уведомления об изменении юридического адреса — 1 экз.',
+    'Копия документа, подтверждающего право на занимаемое помещение по юридическому адресу — 1 экз.',
+    'Копии договоров, а также счета оплаченных пошлин органа проверки — 1 экз.',
+    'Копии дипломов и трудовой книжки на заместителя директора/директора — 1 экз.',
+    'Копии дипломов, аттестатов и трудовых на аттестованных сотрудников ГИ/прораб/мастер, приказ о назначении; совместитель подходит только для СПК — 1 экз.',
+    'Копии по средствам измерения: договоры аренды, акты приема-передачи, накладные, документы о поверке — 1 экз.',
+    'Копия счета и платежки по ИПС «Стройдокумент» — 1 экз.',
+    'Копии счета и платежки на приобретение технологических карт — 1 экз.',
+    'Копия штатного расписания, где отражены аттестованные сотрудники — 1 экз.',
+    'Копия книги учета проверок: первая страница с номером и наименованием организации + вторая пустая страница — 1 экз.',
+  ];
+
+  const attDocs = [
+    'Копия диплома и трудовой директора — 1 экз.',
+    'Копии дипломов, аттестатов и трудовых на аттестованного главного инженера — 1 экз.; полностью все страницы, вкладыш копируется вместе с титульным листом.',
+    'Копии дипломов, аттестатов и трудовых на аттестованных сотрудников — 1 экз.; полностью все страницы, при наличии вкладыша — вместе с титульным листом.',
+    'Копии диплома и трудовой книжки на руководителя в области строительства: заместитель директора — главный инженер, высшее строительное образование и опыт в строительстве 5 лет.',
+    'Если у директора нет подходящего опыта и диплома, требования может закрыть аттестованный главный инженер в должности «заместитель директора — главный инженер», при высшем образовании и опыте в строительстве 5 лет.',
+  ];
+
+  const gen2Extra = [
+    'Для генподряда: копии 2 договоров и актов ввода.',
+    'К каждому генподрядному договору приложить по 1 договору с субподрядчиками и акт выполненных работ.',
+    'Приложить документ, подтверждающий класс сложности: задание на проектирование / заключение экспертизы.',
+    'Требование к договорам: компания должна быть указана генподрядчиком и в договоре, и в актах ввода.',
+    'Объект по договору должен быть 3 класса сложности.',
+    'Объекты должны быть за последние 5 лет.',
+  ];
+
+  const isoInfo = [
+    'Список сотрудников с датами приема и увольнения, включая старых сотрудников за последний год; отметить, у кого есть удостоверение по охране труда.',
+    'Перечень поставщиков с указанием продукции и поставщика: 3–4 наименования.',
+    'Перечень объектов по строительно-монтажным работам: достаточно 1 наименования.',
+    'На выезде/проверке показать оригиналы: свидетельство о госрегистрации, устав, договоры аренды, штатное расписание, журналы инструктажей по охране труда, книгу замечаний, книгу учета проверок, удостоверение по охране труда, технологические карты, договор/исполнительную документацию по объекту, общие журналы, должностные инструкции, уведомление о присоединении к публичному договору Стройдок.',
+  ];
+
+  const toolsSpk = [
+    'Нивелир',
+    'Рейка нивелирная',
+    'Плотномер динамический',
+    'Рулетка измерительная',
+    'Линейка измерительная',
+    'Уровень электронный строительный',
+    'Рейка контрольная',
+    'Штангенциркуль',
+    'Угольник поверочный',
+    'Термометр -35 °С — +50 °С',
+    'Теодолит',
+  ];
+
+  const toolsCert = [
+    'Теодолит электронный',
+    'Нивелир',
+    'Рейка нивелирная',
+    'Уровень',
+    'Штангенциркуль ШЦ-1',
+    'Угольник поверочный УШ',
+    'Линейка',
+    'Термометр',
+    'Рулетка',
+    'Рейка контрольная',
+  ];
+
+  const templates = {
+    stk: { key: 'stk', title: 'Перечень копий для СПК', copies: '1 экземпляр', source: 'Перечень копий СПК', note: commonRule, clientDocs: spkDocs1, tools: toolsSpk, extraSections: [] },
+    att: { key: 'att', title: 'Перечень копий для аттестации', copies: '1 экземпляр', source: 'Перечень копий АТТ', note: commonRule, clientDocs: attDocs, tools: [], extraSections: [] },
+    att_gen_2cat: { key: 'att_gen_2cat', title: 'Перечень копий для аттестации генподряд 2 категория', copies: '1 экземпляр', source: 'Перечень копий АТТ ген 2 кат.', note: commonRule, clientDocs: [...attDocs, ...gen2Extra], tools: [], extraSections: [{ title: 'Особые требования по генподряду', items: gen2Extra }] },
+    stk_att: { key: 'stk_att', title: 'Перечень копий для СПК + аттестации', copies: 'СПК — 1 экз.; аттестация — 1 экз.', source: 'Перечень копий СПК + АТТ', note: commonRule, clientDocs: [...spkAttDocs, ...attDocs], tools: ['Термометр -35 °С — +50 °С', 'Гигрометр', 'Теодолит', 'Рулетка металлическая', 'Линейка металлическая', 'Нивелир', 'Нивелирная рейка', 'Уровень электронный', 'Рейка контрольная 2000 мм', 'Штангенциркуль', 'Набор щупов', 'Угольник поверочный', 'Плотномер динамический'], extraSections: [{ title: 'Дополнительно для ISO/сертификации, если входит в комплекс', items: isoInfo }] },
+    stk_cert: { key: 'stk_cert', title: 'Перечень копий для СПК + сертификации', copies: '2 экземпляра', source: 'Перечень копий СПК + СЕРТ', note: commonRule, clientDocs: spkDocs2, tools: toolsCert, extraSections: [] },
+    stk_cert_att: { key: 'stk_cert_att', title: 'Перечень копий для СПК + сертификации + аттестации', copies: 'СПК/сертификация — 2 экз.; аттестация — 1 экз.', source: 'Перечень копий СПК + СЕРТ + АТТ', note: commonRule, clientDocs: [...spkDocs2, ...attDocs], tools: toolsCert, extraSections: [{ title: 'Дополнительно для аттестации', items: attDocs }] },
+    iso: { key: 'iso', title: 'Перечень данных для ISO / СУОТ', copies: 'по перечню эксперта', source: 'Учебный пакет / перечень ISO', note: 'Для ISO/СУОТ клиенту сначала направляется перечень данных, затем эксперт уточняет необходимость оригиналов/выезда.', clientDocs: isoInfo, tools: [], extraSections: [] },
+  };
+
+  return templates[key] || null;
+}
+
+function workTypesReferenceForProfile(profile) {
+  const common = [
+    'Общестроительные работы: земляные, фундаменты, каменные/армокаменные, монолитные, сборные ЖБИ, стальные/деревянные конструкции, кровли, фасады, отделка, полы — обычно проверяем СТК; по ряду видов нужен аттестат и прораб общестрой.',
+    'Сантехника: внутренние и наружные инженерные системы, водоснабжение/канализация, отопление/вентиляция, тепловые сети — проверяем СТК и аттестат, часто нужны прорабы ВК и ОВ отдельно.',
+    'Электрика: электромонтажные работы, автоматизация, слаботочные сети — проверяем СТК и аттестат; обычно нужен прораб электрик, по автоматизации/сетям связи может быть отдельный специалист.',
+    'Редкие отдельные виды: мелиорация, гидротехника, геодезия, дороги, аэродромы, мосты, технологическое оборудование и трубопроводы — требуют отдельной сверки вида работ и специалиста.',
+  ];
+  if (['stk', 'stk_periodic', 'company_attestation'].includes(profile.key)) return common;
+  return [];
+}
+
+function copyListText(deal) {
+  const template = copyListTemplateForDeal(deal);
+  if (!template) {
+    return `Перечень копий клиенту\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nУслуга: ${getService(deal) || 'не указана'}\n\nДля этой услуги точный перечень копий не распознан автоматически. Эксперту нужно выбрать перечень вручную: СПК, АТТ, СПК+АТТ, СПК+СЕРТ, СПК+СЕРТ+АТТ или АТТ ген 2 кат.`;
+  }
+  const sections = [];
+  sections.push(`Перечень копий клиенту`);
+  sections.push(`Сделка: ${deal.TITLE || ''} / ID ${deal.ID}`);
+  sections.push(`Компания: ${companyName(deal.COMPANY_ID)}`);
+  sections.push(`Услуга: ${getService(deal) || 'не указана'}`);
+  sections.push(`Шаблон: ${template.title}`);
+  sections.push(`Количество экземпляров: ${template.copies}`);
+  sections.push(`\nВажно: ${template.note}`);
+  sections.push(`\nЧто подготовить:\n${template.clientDocs.map((x) => `— ${x}`).join('\n')}`);
+  if (template.tools && template.tools.length) sections.push(`\nСредства измерений / инструменты для сверки:\n${template.tools.map((x) => `— ${x}`).join('\n')}`);
+  (template.extraSections || []).forEach((section) => {
+    sections.push(`\n${section.title}:\n${(section.items || []).map((x) => `— ${x}`).join('\n')}`);
+  });
+  sections.push(`\nКомментарий эксперту: перед отправкой проверьте, что выбран правильный перечень под фактический состав услуги и виды работ.`);
+  return sections.join('\n');
+}
+
+function renderCopyListResultHtml(deal) {
+  const template = copyListTemplateForDeal(deal);
+  const profile = productProfileForDeal(deal);
+  if (!template) {
+    return `
+      <div class="result-card card-risk"><h3>Перечень копий не выбран автоматически</h3><p>Услуга: <strong>${escapeHtml(getService(deal) || 'не указана')}</strong></p><p>Эксперту нужно вручную выбрать один из перечней: СПК, АТТ, СПК+АТТ, СПК+СЕРТ, СПК+СЕРТ+АТТ, АТТ ген 2 кат.</p></div>
+      <details class="result-card"><summary><strong>Показать текст для комментария</strong></summary><div class="message-draft">${escapeHtml(copyListText(deal))}</div></details>
+    `;
+  }
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Перечень копий клиенту</h3><span class="result-status partial">${escapeHtml(template.title)}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
+        <div class="result-field"><span>Продуктовая логика</span>${escapeHtml(profile.label)}</div>
+        <div class="result-field"><span>Экземпляры</span>${escapeHtml(template.copies)}</div>
+      </div>
+    </div>
+    <div class="result-card card-uncertain"><h3>Правило заверения копий</h3><p>${escapeHtml(template.note)}</p></div>
+    <div class="result-card card-checklist"><h3>Что подготовить клиенту</h3>${listHtml(template.clientDocs, 'Нет пунктов')}</div>
+    ${template.tools && template.tools.length ? `<div class="result-card card-found"><h3>Средства измерений / инструменты</h3>${listHtml(template.tools, '')}</div>` : ''}
+    ${(template.extraSections || []).map((section) => `<div class="result-card card-action"><h3>${escapeHtml(section.title)}</h3>${listHtml(section.items || [], '')}</div>`).join('')}
+    <div class="result-card"><h3>Черновик сообщения клиенту</h3><div class="message-draft">${escapeHtml('Добрый день! Направляем перечень копий/документов по вашей услуге. Пожалуйста, подготовьте документы по списку ниже. Все копии нужно заверить: “копия верна” / подпись / расшифровка подписи / печать. Если по какому-то пункту документа пока нет — напишите, пожалуйста, что именно отсутствует, чтобы эксперт подсказал дальнейшие действия.\n\n' + template.clientDocs.map((x) => `— ${x}`).join('\n'))}</div></div>
+    <details class="result-card"><summary><strong>Показать полный текст для комментария</strong></summary><div class="message-draft">${escapeHtml(copyListText(deal))}</div></details>
+  `;
+}
+
+function generateCopyList() {
+  if (!state.selectedDeal) return;
+  state.selectedMode = 'copylist';
+  state.selectedAudit = getAudit(state.selectedDeal.ID) || state.selectedAudit;
+  state.selectedMissing = [];
+  state.selectedAnalysis = copyListText(state.selectedDeal);
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = renderCopyListResultHtml(state.selectedDeal);
+  out.classList.remove('hidden');
+  document.getElementById('write-comment').classList.remove('hidden');
+  document.getElementById('create-manager-task').classList.add('hidden');
+  document.getElementById('create-expert-task').classList.add('hidden');
+  document.getElementById('mark-checked').classList.add('hidden');
+  document.getElementById('create-workplan-tasks').classList.remove('hidden');
+  document.getElementById('create-deadline-tasks').classList.add('hidden');
+  document.getElementById('create-ai-tasks').classList.add('hidden');
+  showAiFeedbackButtons(false);
+}
+
 function productDocumentChecklist(profile) {
   const key = profile.key || 'general';
   const base = {
@@ -2631,6 +2835,259 @@ function productDocumentChecklist(profile) {
   return base;
 }
 
+
+function productKnowledgeBase(profile) {
+  const key = profile.key || 'general';
+  const common = {
+    goal: 'Быстро понять маршрут оказания услуги, что запросить у клиента, какие риски контролировать и какие внутренние действия поставить в работу.',
+    expertMust: [
+      'Не обещать клиенту сроки, если они не подтверждены в сделке, комментариях или руководителем.',
+      'Всегда фиксировать следующий шаг в Bitrix: дело или задачу с дедлайном.',
+      'Отделять внутренние проблемы передачи от клиентского сообщения: клиенту не пишем “ошибка менеджера” или “эскалация”.',
+      'Если данных не хватает — сначала уточнить минимально необходимое, затем зафиксировать пробелы в сделке.',
+    ],
+    handoffMust: [
+      'Услуга/состав услуги',
+      'КП, сумма и что включено в стоимость',
+      'Сроки и срочность, которые озвучены клиенту',
+      'Email и основной канал связи',
+      'Пошлины/дополнительные счета, если применимо',
+      'Следующий шаг и ответственный',
+    ],
+  };
+
+  const map = {
+    stk: {
+      title: 'СТК / СПК — свидетельство технической компетентности',
+      route: [
+        'Подтвердить область технической компетентности и виды работ.',
+        'Проверить специалистов, оборудование и средства измерений под заявленную область.',
+        'Сформировать перечень копий / документов для клиента.',
+        'Проверить обязательные счета, пошлины, Стройдок/техкарты, если применимо.',
+        'Зафиксировать контроль подачи, выезда, проверки органом и устранения замечаний.',
+      ],
+      client: [
+        'Реквизиты и контакт ответственного.',
+        'Область работ / нужные виды работ.',
+        'Документы по специалистам.',
+        'Данные по оборудованию и средствам измерений.',
+        'Оплата обязательных счетов/пошлин, если применимо.',
+      ],
+      risks: [
+        'Нет средств измерений или документов по ним — риск переноса подачи/выезда.',
+        'Не хватает специалистов под область — риск невозможности подать пакет.',
+        'Клиент не предупреждён о пошлинах — риск конфликта по оплатам.',
+      ],
+      aiRules: [
+        'ИИ должен отдельно искать специалистов, средства измерений, область работ и пошлины.',
+        'Если средство измерений только упомянуто, но нет документов — писать “проверить вручную”, а не “закрыто”.',
+      ],
+    },
+    stk_periodic: {
+      title: 'Периодика / подтверждение СТК',
+      route: [
+        'Проверить действующее свидетельство и срок периодики/подтверждения.',
+        'Сравнить текущую область с тем, что подтверждаем или расширяем.',
+        'Проверить, не изменились ли специалисты, оборудование, средства измерений и документы.',
+        'Сформировать перечень актуальных копий и контроль оплаты обязательных счетов.',
+      ],
+      client: [
+        'Действующее свидетельство.',
+        'Информация, что изменилось с прошлого подтверждения.',
+        'Актуальные документы по специалистам, оборудованию и средствам измерений.',
+      ],
+      risks: [
+        'Клиент думает, что “ничего не изменилось”, но документы/поверки могли устареть.',
+        'Пропуск срока периодики может привести к проблемам с действием свидетельства.',
+      ],
+      aiRules: [
+        'ИИ должен различать новое СТК и подтверждение/периодику.',
+        'Обязательно подсвечивать срок и изменения с прошлого периода.',
+      ],
+    },
+    company_attestation: {
+      title: 'Аттестация организации',
+      route: [
+        'Понять категорию/виды работ и требуемый результат.',
+        'Проверить специалистов, документы компании, опыт и подтверждения.',
+        'Сформировать перечень документов и контроль подготовки пакета.',
+        'Поставить контроль подачи и результата.',
+      ],
+      client: [
+        'Категория/виды работ.',
+        'Документы компании.',
+        'Сведения по специалистам и опыту.',
+        'Документы, подтверждающие соответствие требованиям.',
+      ],
+      risks: [
+        'Не подтверждённая категория — риск неверного маршрута.',
+        'Нет специалистов/опыта — риск отказа или невозможности подачи.',
+      ],
+      aiRules: [
+        'ИИ должен не подменять аттестацию организации аттестацией специалиста.',
+        'Если непонятна категория — это отдельный пробел передачи.',
+      ],
+    },
+    specialist_attestation: {
+      title: 'Аттестация специалиста',
+      route: [
+        'Уточнить должность и вид аттестации специалиста.',
+        'Проверить образование, стаж, текущую должность и документы.',
+        'Понять, нужен ли перевод на должность или доп. документы.',
+        'Поставить контроль экзамена/подачи/получения результата.',
+      ],
+      client: [
+        'ФИО специалиста.',
+        'Должность и требуемая аттестация.',
+        'Диплом/образование.',
+        'Трудовая/подтверждение стажа.',
+        'Приказ/должность/перевод, если нужен.',
+      ],
+      risks: [
+        'Стаж не подтверждается — риск невозможности аттестации.',
+        'Должность не соответствует требованиям — нужен перевод/корректировка.',
+        'Нет документов по образованию — невозможно проверить допуск.',
+      ],
+      aiRules: [
+        'ИИ должен отдельно выделять: образование, стаж, должность, перевод, экзамен.',
+        'Нельзя писать, что специалист подходит, если документы не подтверждают стаж/образование.',
+      ],
+    },
+    iso: {
+      title: 'ISO / СУОТ / охрана труда',
+      route: [
+        'Уточнить стандарт и цель сертификата: тендер, клиент, внутреннее требование.',
+        'Проверить данные компании, процессы и текущие документы системы менеджмента.',
+        'Определить маршрут подготовки, аудита/проверки и получения сертификата.',
+        'Поставить контроль сроков, если сертификат нужен к тендеру.',
+      ],
+      client: [
+        'Стандарт: ISO 9001 / ISO 45001 / СУОТ / другой.',
+        'Цель и срок, к которому нужен сертификат.',
+        'Реквизиты компании и сфера деятельности.',
+        'Данные по процессам, персоналу, документам системы менеджмента.',
+      ],
+      risks: [
+        'Неясна цель сертификата — риск выбрать неверный стандарт или орган.',
+        'Сжатый срок тендера — риск не успеть без ускоренного маршрута.',
+        'Нет данных по процессам — риск задержки подготовки документов.',
+      ],
+      aiRules: [
+        'ИИ должен отличать ISO 9001 от ISO 45001/СУОТ.',
+        'Если есть тендерный срок — подсвечивать как высокий риск дедлайна.',
+      ],
+    },
+    recruiting: {
+      title: 'Подбор специалиста',
+      route: [
+        'Зафиксировать, кого нужно подобрать и под какой продукт/требование.',
+        'Уточнить квалификацию, документы, опыт, регион и формат занятости.',
+        'Понять, ищет ли клиент сам параллельно.',
+        'Поставить контроль обратной связи по кандидатам.',
+      ],
+      client: [
+        'Кого ищем: должность, квалификация, категория/аттестация.',
+        'Требования к опыту и документам.',
+        'Формат занятости, регион, срок выхода.',
+        'Кто принимает решение по кандидатам.',
+      ],
+      risks: [
+        'Нет требований — риск подбора неподходящих кандидатов.',
+        'Нет быстрого ЛПР — кандидаты зависают.',
+        'Клиент ищет сам — риск потери контроля по сделке.',
+      ],
+      aiRules: [
+        'ИИ должен отличать подбор специалиста от аттестации специалиста.',
+        'Если не указан ЛПР по кандидатам — это пробел для уточнения.',
+      ],
+    },
+    general: {
+      title: 'Общий сценарий / продукт не распознан',
+      route: [
+        'Уточнить точную услугу и ожидаемый результат клиента.',
+        'Проверить КП, сумму, сроки и договорённости продаж.',
+        'Сформировать минимальный перечень данных и документов.',
+        'Поставить следующий контрольный шаг.',
+      ],
+      client: [
+        'Подтвердить, какую услугу оформляем и какой результат нужен.',
+        'Передать документы по перечню эксперта.',
+        'Подтвердить ответственного и канал связи.',
+      ],
+      risks: [
+        'Не распознана услуга — риск неверного маршрута производства.',
+        'Нет КП/состава услуги — риск несоответствия ожиданий клиента.',
+      ],
+      aiRules: [
+        'ИИ не должен додумывать продукт. Если услуга неясна — писать “уточнить услугу”.',
+      ],
+    },
+  };
+
+  const item = map[key] || map.general;
+  return { ...common, ...item, key };
+}
+
+function knowledgeBaseText(deal) {
+  const profile = productProfileForDeal(deal);
+  const kb = productKnowledgeBase(profile);
+  return `База знаний по услуге\n\n` +
+    `Сделка: ${deal.TITLE || ''} / ID ${deal.ID}\n` +
+    `Компания: ${companyName(deal.COMPANY_ID)}\n` +
+    `Услуга: ${getService(deal) || 'не указана'}\n` +
+    `Продукт: ${kb.title}\n\n` +
+    `Цель сценария:\n— ${kb.goal}\n\n` +
+    `Маршрут работы эксперта:\n${kb.route.map((x) => `— ${x}`).join('\n')}\n\n` +
+    `Что нужно от клиента:\n${kb.client.map((x) => `— ${x}`).join('\n')}\n\n` +
+    `Перечень копий клиенту:\n${(copyListTemplateForDeal(deal) ? copyListTemplateForDeal(deal).clientDocs : ['Точный перечень копий не распознан автоматически — выбрать вручную']).map((x) => `— ${x}`).join('\n')}\n\n` +
+    `${workTypesReferenceForProfile(profile).length ? `Справка по видам работ и специалистам:\n${workTypesReferenceForProfile(profile).map((x) => `— ${x}`).join('\n')}\n\n` : ''}` +
+    `Что обязательно проверить эксперту:\n${kb.expertMust.map((x) => `— ${x}`).join('\n')}\n\n` +
+    `Что должно быть в передаче из продаж:\n${kb.handoffMust.map((x) => `— ${x}`).join('\n')}\n\n` +
+    `Риски:\n${kb.risks.map((x) => `— ${x}`).join('\n')}\n\n` +
+    `Правила для ИИ:\n${kb.aiRules.map((x) => `— ${x}`).join('\n')}`;
+}
+
+function renderKnowledgeBaseHtml(deal) {
+  const profile = productProfileForDeal(deal);
+  const kb = productKnowledgeBase(profile);
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>База знаний по услуге</h3><span class="result-status ok">${escapeHtml(kb.title)}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Компания</span>${escapeHtml(companyName(deal.COMPANY_ID))}</div>
+        <div class="result-field"><span>Услуга</span>${escapeHtml(getService(deal) || '—')}</div>
+        <div class="result-field"><span>Стадия</span>${escapeHtml(stageName(deal.STAGE_ID))}</div>
+        <div class="result-field"><span>Продуктовая логика</span>${escapeHtml(profile.label)}</div>
+      </div>
+    </div>
+    <div class="result-card card-action"><h3>Маршрут работы эксперта</h3>${listHtml(kb.route, 'Маршрут не задан')}</div>
+    <div class="result-card card-checklist"><h3>Что нужно от клиента</h3>${listHtml(kb.client, 'Нет отдельного клиентского перечня')}</div>
+    <div class="result-card card-action"><h3>Перечень копий клиенту</h3>${listHtml((copyListTemplateForDeal(deal) ? copyListTemplateForDeal(deal).clientDocs : ['Точный перечень копий не распознан автоматически — выбрать вручную']), '')}</div>
+    ${workTypesReferenceForProfile(profile).length ? `<div class="result-card card-uncertain"><h3>Справка по видам работ и специалистам</h3>${listHtml(workTypesReferenceForProfile(profile), '')}</div>` : ''}
+    <div class="result-card card-found"><h3>Что обязательно проверить эксперту</h3>${listHtml(kb.expertMust, 'Нет обязательных проверок')}</div>
+    <div class="result-card card-uncertain"><h3>Что должно быть в передаче из продаж</h3>${listHtml(kb.handoffMust, 'Нет требований к передаче')}</div>
+    <div class="result-card card-risk"><h3>Риски по услуге</h3>${listHtml(kb.risks, 'Критичных рисков не задано')}</div>
+    <div class="result-card"><h3>Правила для ИИ по этому продукту</h3>${listHtml(kb.aiRules, 'Специальных правил для ИИ нет')}</div>
+    <details class="result-card"><summary><strong>Показать полный текст базы знаний</strong></summary><div class="message-draft">${escapeHtml(knowledgeBaseText(deal))}</div></details>
+  `;
+}
+
+function showProductKnowledge() {
+  if (!state.selectedDeal) return;
+  state.selectedMode = 'knowledge';
+  state.selectedAudit = null;
+  state.selectedMissing = [];
+  state.selectedDeadlineTasks = [];
+  state.selectedAiTasks = [];
+  state.selectedAiPayload = null;
+  state.selectedAiScenario = '';
+  state.selectedAnalysis = knowledgeBaseText(state.selectedDeal);
+  const out = document.getElementById('analysis-result');
+  out.innerHTML = renderKnowledgeBaseHtml(state.selectedDeal);
+  out.classList.remove('hidden');
+  hideActionButtons();
+}
+
 function productProfileForDeal(deal) {
   return detectProductProfile(getService(deal) || '', deal.TITLE || '');
 }
@@ -2760,8 +3217,11 @@ async function buildAIContext(deal) {
       mavisActions: product.mavis || [],
       clientActions: product.client || [],
       clarify: product.clarify || [],
+      knowledgeBase: productKnowledgeBase(product),
     },
     checklist,
+    clientCopyList: copyListTemplateForDeal(deal),
+    workTypesReference: workTypesReferenceForProfile(product),
     openActivities: acts.slice(0, 20).map((a) => ({ subject: a.SUBJECT || '', deadline: a.DEADLINE || '', completed: a.COMPLETED || '', type: a.PROVIDER_ID || a.TYPE_ID || '' })),
     openTasks: tasks.slice(0, 20).map((t) => ({ title: (t.title || t.TITLE || ''), deadline: (t.deadline || t.DEADLINE || ''), status: (t.status || t.STATUS || '') })),
     contexts: { production, sales },
@@ -3034,6 +3494,7 @@ function buildChecklistText(deal) {
     `Услуга: ${service}\n` +
     `Продуктовая логика: ${profile.label}\n\n` +
     productBullets('Что запросить/проверить у клиента', checklist.clientDocs) + `\n\n` +
+    productBullets('Перечень копий клиенту', (copyListTemplateForDeal(deal) ? copyListTemplateForDeal(deal).clientDocs : ['Точный перечень копий не распознан автоматически — выбрать вручную'])) + `\n\n` +
     productBullets('Что проверить эксперту внутри MAVIS', checklist.mavisChecks) + `\n\n` +
     productBullets('Риски, которые нужно контролировать', checklist.riskControls) + `\n\n` +
     `По проверке передачи сейчас:\n` +
@@ -3062,6 +3523,7 @@ function renderChecklistResultHtml(deal) {
       </div>
     </div>
     <div class="result-card card-checklist"><h3>Что запросить/проверить у клиента</h3>${listHtml(checklist.clientDocs, '')}</div>
+    <div class="result-card card-action"><h3>Перечень копий клиенту</h3>${listHtml((copyListTemplateForDeal(deal) ? copyListTemplateForDeal(deal).clientDocs : ['Точный перечень копий не распознан автоматически — выбрать вручную']), '')}</div>
     <div class="result-card card-found"><h3>Что проверяет эксперт внутри MAVIS</h3>${listHtml(checklist.mavisChecks, '')}</div>
     <div class="result-card card-risk"><h3>Риски по документам</h3>${listHtml(checklist.riskControls, '')}</div>
     <div class="result-card card-uncertain"><h3>Уточнения по текущей проверке передачи</h3>${listHtml([...missing.map((x) => `Не хватает: ${x}`), ...uncertain.map((x) => `Подтвердить: ${x}`)], 'Критичных уточнений по проверке передачи нет')}</div>
@@ -4024,8 +4486,10 @@ document.getElementById('ai-workplan').addEventListener('click', generateWorkPla
 document.getElementById('ai-documents').addEventListener('click', checkDocumentsWithAI);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
+document.getElementById('generate-copy-list').addEventListener('click', generateCopyList);
 document.getElementById('check-documents').addEventListener('click', checkIncomingDocuments);
 document.getElementById('check-deadlines').addEventListener('click', checkDeadlines);
+document.getElementById('show-product-knowledge').addEventListener('click', showProductKnowledge);
 document.getElementById('write-comment').addEventListener('click', writeComment);
 document.getElementById('create-manager-task').addEventListener('click', createManagerTask);
 document.getElementById('create-expert-task').addEventListener('click', createExpertTask);
