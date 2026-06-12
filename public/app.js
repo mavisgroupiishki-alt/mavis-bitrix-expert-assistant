@@ -5137,7 +5137,7 @@ async function runExecutorAutopilot() {
     if (!transcript) throw new Error('Расшифровка вернула пустой текст. Нужно проверить формат записи звонка или провайдера распознавания.');
 
     out.innerHTML = `<div class="result-card"><h3>Расшифровка получена</h3><p>Анализирую звонок по регламенту аттестации организации...</p></div>`;
-    const context = await buildAIContextForDeal(deal, 'executor_attestation_call');
+    const context = await buildAIContext(deal);
     context.call_transcript = transcript;
     context.executor_mode = {
       enabled: true,
