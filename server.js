@@ -578,13 +578,35 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
       headers: { ...ai.authHeader },
       body: form,
     });
-    const data = await response.json().catch(() => ({}));
+
+    const responseText = await response.text().catch(() => '');
+    let data = {};
+    try { data = responseText ? JSON.parse(responseText) : {}; } catch (_e) { data = { raw: responseText }; }
+
     if (!response.ok) {
-      const msg = data && data.error && data.error.message ? data.error.message : (data.error || data.message || `HTTP ${response.status}`);
-      throw new Error(`Расшифровка аудио: ${msg}`);
+      const providerHint = ai.baseUrl.includes('vibecode')
+        ? 'Похоже, текущий VibeCode/BitrixGPT endpoint не поддерживает /audio/transcriptions. Оставь AI_PROVIDER=vibe для текстового анализа, но для аудио укажи отдельный TRANSCRIBE_PROVIDER=openai и TRANSCRIBE_BASE_URL=https://api.openai.com/v1, либо другой speech-to-text endpoint.'
+        : 'Проверь ключ, модель, формат и размер файла аудио.';
+      const msg = data && data.error && data.error.message ? data.error.message : (data.error || data.message || data.raw || `HTTP ${response.status}`);
+      res.status(500).json({
+        ok: false,
+        error: `Расшифровка аудио: ${msg}`,
+        diagnostics: {
+          provider: ai.provider,
+          baseUrl: ai.baseUrl,
+          model: config.transcribeModel || 'whisper-1',
+          audioContentType: contentType,
+          audioBytes: arrayBuffer.byteLength,
+          fileName,
+          httpStatus: response.status,
+          hint: providerHint,
+          providerResponse: data,
+        },
+      });
+      return;
     }
     const text = data.text || data.transcript || data.result || '';
-    res.json({ ok: true, provider: ai.provider, model: config.transcribeModel, text, raw: data });
+    res.json({ ok: true, provider: ai.provider, model: config.transcribeModel, text, raw: data, diagnostics: { audioContentType: contentType, audioBytes: arrayBuffer.byteLength, fileName } });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
