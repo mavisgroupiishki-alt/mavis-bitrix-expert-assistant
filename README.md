@@ -1,4 +1,4 @@
-# MAVIS Bitrix Expert Assistant — v42 Pilot Checklist
+# MAVIS Bitrix Expert Assistant — v43c VibeCode Whisper
 
 Версия v42 добавляет управляемый пилотный чек-лист прямо во вкладку `ИИ-ассистент` внутри карточки сделки.
 
@@ -51,7 +51,8 @@ PREFERRED_CONTACT_FIELD_CODE=UF_CRM_1781189436900
 CALL_TRANSCRIPTION_ENABLED=true
 TRANSCRIBE_PROVIDER=vibe
 TRANSCRIBE_BASE_URL=https://vibecode.bitrix24.tech/v1
-TRANSCRIBE_MODEL=whisper-1
+TRANSCRIBE_MODEL=bitrix/deepdml/faster-whisper-large-v3-turbo-ct2
+TRANSCRIBE_SEND_MODEL=true
 ```
 
-Важно: провайдер распознавания должен поддерживать OpenAI-compatible endpoint `/audio/transcriptions`. Если VibeCode не поддержит аудио, автопилот остановится с понятной ошибкой, и нужно будет подключить отдельный сервис распознавания речи.
+Важно: v43c использует VibeCode `/v1/audio/transcriptions`. Сначала отправляет model=`bitrix/deepdml/faster-whisper-large-v3-turbo-ct2`; если VibeCode вернет 400 из-за поля model, автоматически повторяет запрос без model, как в официальном примере VibeCode.

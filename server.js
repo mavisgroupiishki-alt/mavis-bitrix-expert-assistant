@@ -84,7 +84,8 @@ const config = {
   preferredContactFieldCode: process.env.PREFERRED_CONTACT_FIELD_CODE || '',
   callTranscriptionEnabled: String(process.env.CALL_TRANSCRIPTION_ENABLED || 'false').toLowerCase() === 'true',
   transcribeProvider: process.env.TRANSCRIBE_PROVIDER || process.env.AI_PROVIDER || 'vibe',
-  transcribeModel: process.env.TRANSCRIBE_MODEL || 'whisper-1',
+  transcribeModel: process.env.TRANSCRIBE_MODEL || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2',
+  transcribeSendModel: String(process.env.TRANSCRIBE_SEND_MODEL || 'true').toLowerCase() !== 'false',
   transcribeBaseUrl: process.env.TRANSCRIBE_BASE_URL || process.env.AI_BASE_URL || '',
 };
 
@@ -541,7 +542,12 @@ function resolveTranscribeProvider() {
   const provider = String(config.transcribeProvider || config.aiProvider || 'vibe').toLowerCase().trim();
   const apiKey = process.env.TRANSCRIBE_API_KEY || process.env.AI_API_KEY || process.env.VIBE_API_KEY || process.env.OPENAI_API_KEY || '';
   const baseUrl = (config.transcribeBaseUrl || config.aiBaseUrl || (provider === 'openai' ? 'https://api.openai.com/v1' : 'https://vibecode.bitrix24.tech/v1')).replace(/\/$/, '');
-  return { provider, apiKey, baseUrl, authHeader: { Authorization: `Bearer ${apiKey}` } };
+  // VibeCode официально принимает X-Api-Key и Authorization: Bearer.
+  // Для speech-to-text используем X-Api-Key как основной вариант, чтобы не путать с OpenAI BYOK.
+  const authHeader = baseUrl.includes('vibecode.bitrix24.tech')
+    ? { 'X-Api-Key': apiKey }
+    : { Authorization: `Bearer ${apiKey}` };
+  return { provider, apiKey, baseUrl, authHeader };
 }
 
 app.post('/api/ai/transcribe-url', async (req, res) => {
@@ -567,25 +573,42 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
     const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
     const fileName = String(req.body.fileName || 'call-record.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call-record.mp3';
 
-    const form = new FormData();
-    form.append('model', config.transcribeModel || 'whisper-1');
-    form.append('file', new Blob([arrayBuffer], { type: contentType }), fileName);
-    form.append('language', 'ru');
-    form.append('response_format', 'json');
+    const configuredModel = config.transcribeModel || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
+    const shouldSendModel = Boolean(config.transcribeSendModel && configuredModel);
 
-    const response = await fetch(`${ai.baseUrl}/audio/transcriptions`, {
-      method: 'POST',
-      headers: { ...ai.authHeader },
-      body: form,
-    });
+    async function callTranscription(includeModel) {
+      const form = new FormData();
+      // VibeCode speech-to-text работает через /v1/audio/transcriptions. В новых AI Router моделях можно указать model.
+      // Если конкретный портал/endpoint вернёт 400 из-за model, ниже есть автоматический fallback без поля model.
+      if (includeModel) form.append('model', configuredModel);
+      form.append('file', new Blob([arrayBuffer], { type: contentType }), fileName);
+      form.append('language', 'ru');
+      form.append('response_format', 'json');
+      const response = await fetch(`${ai.baseUrl}/audio/transcriptions`, {
+        method: 'POST',
+        headers: { ...ai.authHeader },
+        body: form,
+      });
+      const responseText = await response.text().catch(() => '');
+      let data = {};
+      try { data = responseText ? JSON.parse(responseText) : {}; } catch (_e) { data = { raw: responseText }; }
+      return { response, data };
+    }
 
-    const responseText = await response.text().catch(() => '');
-    let data = {};
-    try { data = responseText ? JSON.parse(responseText) : {}; } catch (_e) { data = { raw: responseText }; }
+    let usedModelField = shouldSendModel;
+    let retryWithoutModel = false;
+    let { response, data } = await callTranscription(shouldSendModel);
+
+    // Документация VibeCode показывает пример без поля model, поэтому при 400 пробуем второй раз без model.
+    if (!response.ok && response.status === 400 && shouldSendModel && ai.baseUrl.includes('vibecode.bitrix24.tech')) {
+      retryWithoutModel = true;
+      usedModelField = false;
+      ({ response, data } = await callTranscription(false));
+    }
 
     if (!response.ok) {
       const providerHint = ai.baseUrl.includes('vibecode')
-        ? 'Похоже, текущий VibeCode/BitrixGPT endpoint не поддерживает /audio/transcriptions. Оставь AI_PROVIDER=vibe для текстового анализа, но для аудио укажи отдельный TRANSCRIBE_PROVIDER=openai и TRANSCRIBE_BASE_URL=https://api.openai.com/v1, либо другой speech-to-text endpoint.'
+        ? 'VibeCode поддерживает /v1/audio/transcriptions через Whisper Large v3 Turbo. Проверь: ключ vibe_api/vibe_app, scope vibe:ai, что файл не пустой, и что Bitrix отдал реальный аудиофайл, а не HTML-страницу/заглушку.'
         : 'Проверь ключ, модель, формат и размер файла аудио.';
       const msg = data && data.error && data.error.message ? data.error.message : (data.error || data.message || data.raw || `HTTP ${response.status}`);
       res.status(500).json({
@@ -594,7 +617,9 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
         diagnostics: {
           provider: ai.provider,
           baseUrl: ai.baseUrl,
-          model: config.transcribeModel || 'whisper-1',
+          model: configuredModel,
+          modelFieldSent: usedModelField,
+          retryWithoutModel,
           audioContentType: contentType,
           audioBytes: arrayBuffer.byteLength,
           fileName,
@@ -606,7 +631,7 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
       return;
     }
     const text = data.text || data.transcript || data.result || '';
-    res.json({ ok: true, provider: ai.provider, model: config.transcribeModel, text, raw: data, diagnostics: { audioContentType: contentType, audioBytes: arrayBuffer.byteLength, fileName } });
+    res.json({ ok: true, provider: ai.provider, model: configuredModel, modelFieldSent: usedModelField, retryWithoutModel, text, raw: data, diagnostics: { audioContentType: contentType, audioBytes: arrayBuffer.byteLength, fileName } });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
