@@ -75,6 +75,17 @@ const config = {
     process.env.WAZZUP_CHANNEL_ID ? { key: 'default', label: process.env.WAZZUP_CHANNEL_LABEL || 'Wazzup', chatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp', channelId: process.env.WAZZUP_CHANNEL_ID } : null,
   ].filter(Boolean).map((ch) => ({ key: ch.key, label: ch.label, chatType: ch.chatType, configured: Boolean(ch.channelId) })),
   wazzupEnabled: Boolean(process.env.WAZZUP_API_KEY && (process.env.WAZZUP_CHANNEL_ID || process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID || process.env.WAZZUP_VIBER_CHANNEL_ID)),
+
+  // v43: тестовый режим ассистента-исполнителя на одной сделке.
+  executorMode: String(process.env.EXECUTOR_MODE || 'false').toLowerCase() === 'true',
+  executorTestDealId: process.env.EXECUTOR_TEST_DEAL_ID || '',
+  executorExpertId: process.env.EXECUTOR_EXPERT_ID || '',
+  executorProduct: process.env.EXECUTOR_PRODUCT || 'attestation',
+  preferredContactFieldCode: process.env.PREFERRED_CONTACT_FIELD_CODE || '',
+  callTranscriptionEnabled: String(process.env.CALL_TRANSCRIPTION_ENABLED || 'false').toLowerCase() === 'true',
+  transcribeProvider: process.env.TRANSCRIBE_PROVIDER || process.env.AI_PROVIDER || 'vibe',
+  transcribeModel: process.env.TRANSCRIBE_MODEL || 'whisper-1',
+  transcribeBaseUrl: process.env.TRANSCRIBE_BASE_URL || process.env.AI_BASE_URL || '',
 };
 
 app.get('/health', (_req, res) => {
@@ -240,6 +251,12 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
     deal_analyze: [
       'Фокус сценария: общий анализ сделки. Сначала дай управленческий статус, затем пробелы, риски и действия.',
     ],
+    executor_attestation_call: [
+      'Фокус сценария: ассистент-исполнитель по аттестации организации после первичного звонка. Не режим подсказки, а рабочий маршрут исполнения.',
+      'Из звонка и сделки извлеки: вид работ, кто закрывает руководителя, есть ли директор с высшим строительным и 5 годами опыта, есть ли главный инженер и его аттестат, может ли один человек закрыть руководителя и ГИ, есть ли прораб/мастер под каждый вид работ, кого переводим/аттестуем/подбираем, канал связи, сроки и обещания.',
+      'Сформируй конкретный ход работы: что уже сделал ассистент, что пишет клиенту, какие документы запрашивает, какие дела создаёт, когда запускать ЛК Белстройцентра, когда ждать документы, когда передавать оформителям, когда собирать папку и что контролировать после подачи.',
+      'По аттестации организации учитывай: Белстройцентр, бумажная подача, перечень копий, заявка через личный кабинет, договор/акты как успешное прохождение, замечания как отдельный этап устранения.',
+    ],
   };
 
   return [...common, ...(guides[key] || guides.general), ...(scenarioHints[scenario] || scenarioHints.deal_analyze)].join('\n');
@@ -267,6 +284,10 @@ function aiScenarioConfig(scenarioRaw) {
     manager_deal: {
       label: 'ИИ-анализ проблемной сделки для руководителя',
       instruction: 'Проанализируй проблемную производственную сделку глазами руководителя/РОП. Дай краткий управленческий вывод: почему сделка попала в проблемные, что мешает движению, кто должен сделать следующий шаг (эксперт/менеджер/руководитель), какие риски по клиенту и срокам, какие 1-3 действия нужно поставить в работу. Не пиши длинно; результат нужен для планёрки и контроля.'
+    },
+    executor_attestation_call: {
+      label: 'Автопилот АТТ: анализ первичного звонка',
+      instruction: 'Ты ассистент-исполнитель по сделке аттестации организации. На основании сделки, КП/комментариев и расшифровки первичного звонка сформируй рабочий маршрут исполнения. Обязательно: 1) кратко что понял из передачи и звонка; 2) схема специалистов: директор/руководитель, ГИ, прораб/мастер по видам работ, кого переводим/аттестуем/подбираем; 3) какие данные отсутствуют; 4) ход работы для клиента; 5) сообщение клиенту; 6) комментарий Кристине; 7) список задач/дел с ответственными expert|manager|leader и дедлайнами; 8) этап по ЛК Белстройцентра: запрос письма/ссылки, регистрация/заявка, номер заявки или остановка при капче/ошибке.'
     }
   };
   return { scenario, ...(map[scenario] || map.deal_analyze) };
@@ -509,6 +530,61 @@ app.post('/api/wazzup/send', async (req, res) => {
       return;
     }
     res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
+
+
+function resolveTranscribeProvider() {
+  const provider = String(config.transcribeProvider || config.aiProvider || 'vibe').toLowerCase().trim();
+  const apiKey = process.env.TRANSCRIBE_API_KEY || process.env.AI_API_KEY || process.env.VIBE_API_KEY || process.env.OPENAI_API_KEY || '';
+  const baseUrl = (config.transcribeBaseUrl || config.aiBaseUrl || (provider === 'openai' ? 'https://api.openai.com/v1' : 'https://vibecode.bitrix24.tech/v1')).replace(/\/$/, '');
+  return { provider, apiKey, baseUrl, authHeader: { Authorization: `Bearer ${apiKey}` } };
+}
+
+app.post('/api/ai/transcribe-url', async (req, res) => {
+  try {
+    if (!config.callTranscriptionEnabled) {
+      res.status(400).json({ ok: false, error: 'Расшифровка звонков выключена. Добавь CALL_TRANSCRIPTION_ENABLED=true в Render.' });
+      return;
+    }
+    const url = String((req.body && req.body.url) || '').trim();
+    if (!url) {
+      res.status(400).json({ ok: false, error: 'Не передан URL аудиозаписи.' });
+      return;
+    }
+    const ai = resolveTranscribeProvider();
+    if (!ai.apiKey) {
+      res.status(400).json({ ok: false, error: 'Не задан ключ для расшифровки. Добавь TRANSCRIBE_API_KEY или AI_API_KEY.' });
+      return;
+    }
+
+    const audioResp = await fetch(url);
+    if (!audioResp.ok) throw new Error(`Не удалось скачать аудио: HTTP ${audioResp.status}`);
+    const arrayBuffer = await audioResp.arrayBuffer();
+    const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
+    const fileName = String(req.body.fileName || 'call-record.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call-record.mp3';
+
+    const form = new FormData();
+    form.append('model', config.transcribeModel || 'whisper-1');
+    form.append('file', new Blob([arrayBuffer], { type: contentType }), fileName);
+    form.append('language', 'ru');
+    form.append('response_format', 'json');
+
+    const response = await fetch(`${ai.baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { ...ai.authHeader },
+      body: form,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const msg = data && data.error && data.error.message ? data.error.message : (data.error || data.message || `HTTP ${response.status}`);
+      throw new Error(`Расшифровка аудио: ${msg}`);
+    }
+    const text = data.text || data.transcript || data.result || '';
+    res.json({ ok: true, provider: ai.provider, model: config.transcribeModel, text, raw: data });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }

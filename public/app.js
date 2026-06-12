@@ -2103,7 +2103,11 @@ function detailHtml(deal) {
     ['Проверка передачи', stripHtml(auditLabel(getAudit(deal.ID)))],
     ['Следующее дело/задача', next ? `${formatDate(next.date)} — ${next.kind}: ${next.title || ''}` : 'нет открытого дела/задачи'],
   ];
-  return fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
+  const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
+  if (isExecutorTestDeal(deal)) {
+    return html + `<div class="executor-banner"><strong>v43: тестовый ассистент-исполнитель включён для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
+  }
+  return html;
 }
 
 async function checkHandoff() {
@@ -4844,7 +4848,7 @@ async function showDealFields() {
   lines.push('');
   lines.push('Как пользоваться: найди строку, где значение равно услуге из карточки Bitrix.');
   lines.push('Например: тест ии / СПК / Аттестация / ISO.');
-  lines.push('Код слева нужно будет добавить в Render как SERVICE_FIELD_CODE.');
+  lines.push('Код слева нужно будет добавить в Render как SERVICE_FIELD_CODE. Для поля связи ищи значение Telegram/Вайбер/Email и добавляй код как PREFERRED_CONTACT_FIELD_CODE.');
   lines.push('');
 
   const entries = Object.entries(fresh || {})
@@ -4864,7 +4868,7 @@ async function showDealFields() {
 
   const likely = entries.filter((x) => {
     const txt = normalize([x.code, x.label, x.value].join(' '));
-    return txt.includes('услуг') || txt.includes('спк') || txt.includes('стк') || txt.includes('аттеста') || txt.includes('iso') || txt.includes('сертифик') || txt.includes('периодик') || txt.includes('тест ии');
+    return txt.includes('услуг') || txt.includes('спк') || txt.includes('стк') || txt.includes('аттеста') || txt.includes('iso') || txt.includes('сертифик') || txt.includes('периодик') || txt.includes('тест ии') || txt.includes('вайбер') || txt.includes('viber') || txt.includes('telegram') || txt.includes('телеграм') || txt.includes('email') || txt.includes('почт');
   });
 
   if (likely.length) {
@@ -4927,6 +4931,259 @@ async function createTask({ title, responsibleId, description, dealId, deadline 
   if (!silent) alert('Задача создана.');
 }
 
+
+function isExecutorTestDeal(deal) {
+  return Boolean(APP_CONFIG.executorMode && APP_CONFIG.executorTestDealId && String(deal && deal.ID) === String(APP_CONFIG.executorTestDealId));
+}
+
+function preferredChannelKey(deal) {
+  const code = APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900';
+  const raw = deal && deal[code];
+  const resolved = resolveFieldValue(code, raw) || String(raw || '');
+  const text = normalize(resolved);
+  if (/viber|вайбер/.test(text)) return 'viber';
+  if (/telegram|телеграм|tg/.test(text)) return 'telegram';
+  if (/email|почт|e-mail/.test(text)) return 'email';
+  return configuredMessengerChannels()[0] ? configuredMessengerChannels()[0].key : 'viber';
+}
+
+function attestationExecutorKnowledge() {
+  return [
+    'Внутренняя база знаний MAVIS GROUP по аттестации организации:',
+    'Аттестация организации — разрешительный документ для выполнения строительной деятельности на объектах 1–4 класса сложности. Уполномоченный орган — РУП «Белстройцентр».',
+    'Главный блок контроля — специалисты и их должности по основному месту работы.',
+    'Передача из продаж должна содержать: КП, виды работ, специалисты, кто есть, кого переводим, кого аттестуем, кого подбираем, сроки, срочность и обещания клиенту.',
+    'По строительной аттестации нужны: руководитель в области строительства, аттестованный главный инженер, прораб/мастер по каждому подвиду деятельности, рабочие по технологическим картам.',
+    'Руководитель: директор / заместитель директора / заместитель директора-главный инженер; высшее строительное образование и 5 лет стажа в ИТР-должностях.',
+    'ГИ должен быть в должности главный инженер или заместитель директора-главный инженер. Замдиректора-ГИ может закрыть руководителя и ГИ одним человеком.',
+    'Прораб/мастер должен быть в должности прораб / мастер / начальник участка и иметь аттестацию под нужный вид работ.',
+    'Если директор закрывает прораба или ГИ, нужна запись в трудовой на строительную должность; директорские функции можно оставить через внутреннее совмещение.',
+    'Первичный звонок: подтвердить виды работ, схему специалистов, сроки, канал связи; не собирать всю базу заново, если менеджер передал данные.',
+    'После звонка в течение 1 часа отправить ход работы клиенту. До обеда следующего рабочего дня — адаптированный перечень копий и счета, если есть.',
+    'Перечень копий адаптируется под вид работ: например, общестрой — прораб общестрой; фасады/благоустройство — отдельный прораб/мастер по направлению; электрика — прораб электрик.',
+    'Порядок работы: перечень копий + заявка в ЛК Белстройцентра; проверка специалистов; запрос дипломов/трудовых/аттестатов; передача оформителям; ожидание форм; сбор папки; передача в Белстройцентр; договор/акт или замечания; контроль приказа/реестра.',
+    'ЛК Белстройцентра в v43: полуавтомат. Ассистент запрашивает у клиента письмо со ссылкой, забирает ссылку, пытается открыть/заполнить через браузерную автоматизацию; при капче/ошибке останавливается и пишет Кристине.',
+    'В тесте ООО “Бобик”: услуга Аттестация СМР; по комментарию продаж — аттестат 1–4 категории на общестрой + фасады; штат: ГИ, прораб общестрой, прораб фасады.',
+  ].join('\n');
+}
+
+function collectActivityAudioCandidates(activity) {
+  const out = [];
+  const push = (candidate) => {
+    if (!candidate) return;
+    const c = { ...candidate, activityId: activity.ID, subject: activity.SUBJECT || '', provider: activity.PROVIDER_ID || '' };
+    const key = c.url || c.fileId || c.value;
+    if (!key) return;
+    out.push(c);
+  };
+  const scan = (value, path = '') => {
+    if (value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      const urls = value.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+      urls.forEach((url) => {
+        if (/record|call|audio|mp3|wav|m4a|download|disk|bitrix/i.test(url)) push({ type: 'url', url, value: url, path });
+      });
+      return;
+    }
+    if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+      if (/file|record|storage|disk/i.test(path)) push({ type: 'fileId', fileId: String(value), value: String(value), path });
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((v, i) => scan(v, `${path}[${i}]`));
+    if (typeof value === 'object') {
+      const url = value.DOWNLOAD_URL || value.downloadUrl || value.url || value.URL || value.link || value.LINK;
+      const id = value.ID || value.id || value.FILE_ID || value.fileId || value.file_id || value.VALUE;
+      if (url) push({ type: 'url', url: String(url), value: String(url), path });
+      if (id && /file|record|storage|disk/i.test(`${path} ${Object.keys(value).join(' ')}`)) push({ type: 'fileId', fileId: String(id), value: String(id), path });
+      Object.entries(value).forEach(([k, v]) => scan(v, path ? `${path}.${k}` : k));
+    }
+  };
+  scan(activity, 'activity');
+  const uniq = [];
+  const seen = new Set();
+  out.forEach((x) => {
+    const key = `${x.type}:${x.url || x.fileId}`;
+    if (!seen.has(key)) { seen.add(key); uniq.push(x); }
+  });
+  return uniq;
+}
+
+async function resolveCandidateDownloadUrl(candidate) {
+  if (candidate.url) return candidate.url;
+  if (!candidate.fileId) return '';
+  try {
+    const file = await bxCall('disk.file.get', { id: candidate.fileId });
+    return file && (file.DOWNLOAD_URL || file.downloadUrl || file.download_url || file.url || file.LINK || file.link) || '';
+  } catch (e) {
+    candidate.error = e.message || String(e);
+    return '';
+  }
+}
+
+async function findCallRecordingsForDeal(dealId) {
+  const acts = await bxList('crm.activity.list', {
+    filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
+    order: { ID: 'DESC' },
+    select: ['*']
+  }, 80);
+  const callActs = acts.filter((a) => {
+    const text = normalize([a.SUBJECT, a.DESCRIPTION, a.PROVIDER_ID, a.TYPE_ID, a.PROVIDER_TYPE_ID].join(' '));
+    return /звон|call|voximplant|telephony|телеф/.test(text) || String(a.TYPE_ID || '') === '2';
+  });
+  const candidates = [];
+  callActs.forEach((a) => candidates.push(...collectActivityAudioCandidates(a)));
+  for (const c of candidates) c.downloadUrl = await resolveCandidateDownloadUrl(c);
+  return { activities: callActs, candidates: candidates.filter((c) => c.downloadUrl || c.url), rawCandidates: candidates };
+}
+
+async function showCallRecordings() {
+  if (!state.selectedDeal) return;
+  const deal = state.selectedDeal;
+  const out = document.getElementById('analysis-result');
+  out.classList.remove('hidden');
+  out.innerHTML = `<div class="result-card"><h3>Ищем записи звонков...</h3><p class="muted">Проверяем дела/активности текущей сделки.</p></div>`;
+  try {
+    const found = await findCallRecordingsForDeal(deal.ID);
+    const rows = found.activities.length ? found.activities.map((a) => `<tr><td>${escapeHtml(a.ID)}</td><td>${escapeHtml(a.SUBJECT || '—')}</td><td>${escapeHtml(a.PROVIDER_ID || '—')}</td><td>${escapeHtml(a.CREATED || a.START_TIME || '—')}</td></tr>`).join('') : '<tr><td colspan="4">Активности звонка не найдены</td></tr>';
+    const cand = found.rawCandidates.length ? found.rawCandidates.map((c) => `<li><strong>${escapeHtml(c.type)}</strong> · activity ${escapeHtml(c.activityId || '')} · ${escapeHtml(c.path || '')}<br><span class="muted small-note">${escapeHtml(c.downloadUrl || c.url || c.fileId || c.error || 'URL не получен')}</span></li>`).join('') : '<li>Кандидаты аудиофайлов пока не найдены. После тестового звонка нажми кнопку ещё раз.</li>';
+    out.innerHTML = `
+      <div class="result-header"><div class="result-header-title"><h3>Записи звонков в сделке</h3><span class="result-status ${found.candidates.length ? 'ok' : 'partial'}">${found.candidates.length ? 'аудио найдено' : 'ждём звонок'}</span></div></div>
+      <div class="result-card"><h3>Активности звонков</h3><div class="table-wrap"><table class="mini-table"><thead><tr><th>ID</th><th>Тема</th><th>Провайдер</th><th>Дата</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+      <div class="result-card"><h3>Кандидаты на аудиозапись</h3><ul>${cand}</ul></div>
+      <div class="result-card card-action"><h3>Что дальше</h3><p>После звонка нажми <strong>“Автопилот АТТ: звонок → ход работы”</strong>. Ассистент возьмёт найденную запись, расшифрует её и запустит анализ.</p></div>`;
+  } catch (error) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Не удалось найти звонки</h3><p>${escapeHtml(error.message || String(error))}</p></div>`;
+  }
+}
+
+function renderExecutorResult(ai, transcript, deal, sentInfo = '') {
+  const r = ai.result || ai;
+  const tasks = Array.isArray(r.tasks) ? r.tasks : [];
+  return `
+    <div class="result-header">
+      <div class="result-header-title"><h3>Автопилот АТТ по тестовой сделке</h3><span class="result-status ${escapeHtml(r.status || 'partial')}">${escapeHtml(r.status_label || 'анализ выполнен')}</span></div>
+      <div class="result-grid">
+        <div class="result-field"><span>Сделка</span>${escapeHtml(deal.TITLE || deal.ID)}</div>
+        <div class="result-field"><span>Эксперт-наблюдатель</span>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</div>
+        <div class="result-field"><span>Канал связи</span>${escapeHtml(messengerLabel(preferredChannelKey(deal)))}</div>
+        <div class="result-field"><span>Звонок</span>${transcript ? 'расшифрован' : 'нет расшифровки'}</div>
+      </div>
+    </div>
+    ${sentInfo ? `<div class="result-card card-ok"><h3>Автодействия выполнены</h3><p>${escapeHtml(sentInfo)}</p></div>` : ''}
+    <div class="result-card card-info"><h3>Что ассистент понял</h3>${listHtml(r.summary || [], 'Нет сводки')}</div>
+    ${r.missing && r.missing.length ? `<div class="result-card card-uncertain"><h3>Чего не хватает</h3>${listHtml(r.missing)}</div>` : ''}
+    ${r.risks && r.risks.length ? `<div class="result-card card-risk"><h3>Риски</h3>${listHtml(r.risks)}</div>` : ''}
+    ${r.next_steps && r.next_steps.length ? `<div class="result-card card-action"><h3>Следующие шаги</h3>${listHtml(r.next_steps)}</div>` : ''}
+    ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
+    ${r.comment ? `<div class="result-card"><h3>Комментарий Кристине</h3><div class="message-draft">${escapeHtml(r.comment)}</div></div>` : ''}
+    ${tasks.length ? `<div class="result-card"><h3>Задачи, созданные/рекомендованные ассистентом</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : ''}
+    <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
+}
+
+function executorCommentText(ai, transcript, deal) {
+  const r = ai.result || ai;
+  return `АВТОПИЛОТ АТТ — отчёт ассистента-исполнителя\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nУслуга: ${getService(deal) || 'Аттестация организации'}\nЭксперт-наблюдатель: ${userName(deal.ASSIGNED_BY_ID)}\n\nСтатус: ${r.status_label || r.status || 'анализ выполнен'}\n\nЧто понял:\n${(r.summary || []).map((x) => `— ${x}`).join('\n') || '— нет сводки'}\n\nЧего не хватает:\n${(r.missing || []).map((x) => `— ${x}`).join('\n') || '— критичных пробелов не выделено'}\n\nРиски:\n${(r.risks || []).map((x) => `— ${x}`).join('\n') || '— рисков не выделено'}\n\nСледующие шаги:\n${(r.next_steps || []).map((x) => `— ${x}`).join('\n') || '— следующий шаг не сформирован'}\n\nСообщение клиенту:\n${r.client_message || '—'}\n\nКомментарий ассистента Кристине:\n${r.comment || '—'}\n\nРасшифровка звонка сохранена в анализе ассистента. Текст звонка:\n${transcript || '—'}`;
+}
+
+async function createExecutorTasksFromAI(deal, result) {
+  const tasks = Array.isArray(result.tasks) ? result.tasks : [];
+  let created = 0;
+  for (const t of tasks) {
+    const title = String(t.title || '').trim();
+    if (!title || hasOpenTaskWithTitle(deal.ID, title)) continue;
+    let responsibleId = deal.ASSIGNED_BY_ID;
+    if (t.responsible === 'manager') responsibleId = deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID;
+    if (t.responsible === 'leader') responsibleId = (APP_CONFIG.leaderUserIds && APP_CONFIG.leaderUserIds[0]) || deal.ASSIGNED_BY_ID;
+    await createTask({
+      title,
+      responsibleId,
+      description: `${t.description || ''}\n\nСоздано автопилотом АТТ по сделке “${deal.TITLE}”.\nИсточник: анализ первичного звонка и данных сделки.`,
+      dealId: deal.ID,
+      deadline: deadlineTomorrow(12),
+      silent: true,
+    });
+    created += 1;
+  }
+  return created;
+}
+
+async function runExecutorAutopilot() {
+  if (!state.selectedDeal) return;
+  const deal = state.selectedDeal;
+  const out = document.getElementById('analysis-result');
+  out.classList.remove('hidden');
+  if (!isExecutorTestDeal(deal)) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот не запущен</h3><p>Режим исполнителя разрешён только для сделки <code>${escapeHtml(APP_CONFIG.executorTestDealId || 'не задано')}</code>. Текущая сделка: <code>${escapeHtml(deal.ID)}</code>.</p></div>`;
+    return;
+  }
+  out.innerHTML = `<div class="result-card"><h3>Запускаю автопилот АТТ...</h3><p class="muted">Ищу звонок, скачиваю запись, запускаю расшифровку и ИИ-анализ.</p></div>`;
+  try {
+    await ensureDealMeta(deal.ID);
+    const found = await findCallRecordingsForDeal(deal.ID);
+    if (!found.candidates.length) throw new Error('Запись звонка пока не найдена в активностях сделки. После звонка обнови сделку и нажми автопилот ещё раз.');
+    const candidate = found.candidates[0];
+    const audioUrl = candidate.downloadUrl || candidate.url;
+    if (!audioUrl) throw new Error('Звонок найден, но не удалось получить ссылку на скачивание аудио. Нажми “Найти записи звонков” и пришли результат диагностики.');
+
+    out.innerHTML = `<div class="result-card"><h3>Звонок найден</h3><p>Запускаю ИИ-расшифровку аудиозаписи...</p></div>`;
+    const trResp = await fetch('/api/ai/transcribe-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: audioUrl, fileName: `deal-${deal.ID}-call.mp3` }),
+    });
+    const tr = await trResp.json().catch(() => ({}));
+    if (!trResp.ok || !tr.ok) throw new Error(tr.error || `Расшифровка HTTP ${trResp.status}`);
+    const transcript = String(tr.text || '').trim();
+    if (!transcript) throw new Error('Расшифровка вернула пустой текст. Нужно проверить формат записи звонка или провайдера распознавания.');
+
+    out.innerHTML = `<div class="result-card"><h3>Расшифровка получена</h3><p>Анализирую звонок по регламенту аттестации организации...</p></div>`;
+    const context = await buildAIContextForDeal(deal, 'executor_attestation_call');
+    context.call_transcript = transcript;
+    context.executor_mode = {
+      enabled: true,
+      dealId: String(deal.ID),
+      product: 'Аттестация организации / Аттестация СМР',
+      preferredContactFieldCode: APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900',
+      preferredChannel: preferredChannelKey(deal),
+      expertObserverId: APP_CONFIG.executorExpertId || String(deal.ASSIGNED_BY_ID || ''),
+      knowledge: attestationExecutorKnowledge(),
+    };
+    const aiResp = await fetch('/api/ai/analyze-deal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scenario: 'executor_attestation_call', context }),
+    });
+    const ai = await aiResp.json().catch(() => ({}));
+    if (!aiResp.ok || !ai.ok) throw new Error(ai.error || `ИИ-анализ HTTP ${aiResp.status}`);
+    state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот АТТ', result: ai.result };
+    state.selectedAnalysis = executorCommentText(ai, transcript, deal);
+
+    const commentText = executorCommentText(ai, transcript, deal);
+    await bxCall('crm.timeline.comment.add', { fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: commentText } });
+    const created = await createExecutorTasksFromAI(deal, ai.result || {});
+
+    let sentInfo = `Комментарий в сделку записан. Создано задач: ${created}.`;
+    const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() : '';
+    if (msg) {
+      const channel = preferredChannelKey(deal);
+      const phone = getPrimaryClientPhone(deal);
+      if (channel === 'email') {
+        const email = getPrimaryClientEmail(deal);
+        if (email) { await sendEmailViaBitrix(deal, email, 'Ход работы по аттестации организации', msg); sentInfo += ' Сообщение клиенту отправлено на email.'; }
+        else sentInfo += ' Email клиента не найден, сообщение клиенту не отправлено.';
+      } else if (phone && APP_CONFIG.wazzupApiConfigured) {
+        await sendWazzupMessage({ deal, phone, text: msg, channelKey: channel });
+        sentInfo += ` Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
+      } else {
+        sentInfo += ' Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
+      }
+    }
+    out.innerHTML = renderExecutorResult(ai, transcript, deal, sentInfo);
+    await hydrateDealMeta(deal);
+  } catch (error) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот остановился</h3><p>${escapeHtml(error.message || String(error))}</p></div><div class="result-card card-action"><h3>Что проверить</h3><ul><li>В Render включены <code>EXECUTOR_MODE=true</code>, <code>EXECUTOR_TEST_DEAL_ID=34946</code>, <code>CALL_TRANSCRIPTION_ENABLED=true</code>.</li><li>В сделке уже есть активность звонка с записью.</li><li>Для расшифровки задан <code>TRANSCRIBE_API_KEY</code> или <code>AI_API_KEY</code>, а провайдер поддерживает <code>/audio/transcriptions</code>.</li></ul></div>`;
+  }
+}
 
 function showPilotChecklist() {
   if (!state.selectedDeal) return;
@@ -5058,6 +5315,10 @@ document.getElementById('ai-handoff').addEventListener('click', analyzeHandoffWi
 document.getElementById('ai-workplan').addEventListener('click', generateWorkPlanWithAI);
 document.getElementById('ai-documents').addEventListener('click', checkDocumentsWithAI);
 document.getElementById('generate-workplan').addEventListener('click', generateWorkPlan);
+const executorAutopilotBtn = document.getElementById('executor-autopilot');
+if (executorAutopilotBtn) executorAutopilotBtn.addEventListener('click', runExecutorAutopilot);
+const findCallsBtn = document.getElementById('find-call-recordings');
+if (findCallsBtn) findCallsBtn.addEventListener('click', showCallRecordings);
 document.getElementById('generate-checklist').addEventListener('click', generateChecklist);
 document.getElementById('generate-copy-list').addEventListener('click', generateCopyList);
 document.getElementById('send-copy-list-client').addEventListener('click', sendCopyListToClient);
