@@ -2105,7 +2105,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v43: тестовый ассистент-исполнитель включён для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
+    return html + `<div class="executor-banner"><strong>v43f: тестовый ассистент-исполнитель включён для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
   }
   return html;
 }
@@ -2903,6 +2903,8 @@ function configuredMessengerChannels() {
 function messengerLabel(key) {
   if (key === 'telegram') return 'Telegram';
   if (key === 'viber') return 'Viber';
+  if (key === 'email') return 'Email';
+  if (key === 'manual') return 'не выбран';
   return 'Wazzup';
 }
 
@@ -4944,7 +4946,9 @@ function preferredChannelKey(deal) {
   if (/viber|вайбер/.test(text)) return 'viber';
   if (/telegram|телеграм|tg/.test(text)) return 'telegram';
   if (/email|почт|e-mail/.test(text)) return 'email';
-  return configuredMessengerChannels()[0] ? configuredMessengerChannels()[0].key : 'viber';
+  // Важно: если поле связи заполнено не Telegram/Viber/Email (например, туда случайно попала услуга 'АТТ'),
+  // не отправляем сообщение автоматически через первый доступный канал. Иначе ассистент может ошибочно уйти в Wazzup/Viber.
+  return 'manual';
 }
 
 function attestationExecutorKnowledge() {
@@ -4963,7 +4967,7 @@ function attestationExecutorKnowledge() {
     'Перечень копий адаптируется под вид работ: например, общестрой — прораб общестрой; фасады/благоустройство — отдельный прораб/мастер по направлению; электрика — прораб электрик.',
     'Порядок работы: перечень копий + заявка в ЛК Белстройцентра; проверка специалистов; запрос дипломов/трудовых/аттестатов; передача оформителям; ожидание форм; сбор папки; передача в Белстройцентр; договор/акт или замечания; контроль приказа/реестра.',
     'ЛК Белстройцентра в v43: полуавтомат. Ассистент запрашивает у клиента письмо со ссылкой, забирает ссылку, пытается открыть/заполнить через браузерную автоматизацию; при капче/ошибке останавливается и пишет Кристине.',
-    'В тесте ООО “Бобик”: услуга Аттестация СМР; по комментарию продаж — аттестат 1–4 категории на общестрой + фасады; штат: ГИ, прораб общестрой, прораб фасады.',
+    'В тесте ООО “Бобик”: услуга Аттестация СМР; актуальный вид работ — только общестроительные работы. Фасады НЕ включаем, даже если в старом комментарии/КП встречается слово фасады. Штат: Анна закрывает руководителя/ГИ, сын — прораб общестрой.',
   ].join('\n');
 }
 
@@ -5107,6 +5111,41 @@ async function createExecutorTasksFromAI(deal, result) {
   return created;
 }
 
+
+function isRelevantAttestationTranscript(text) {
+  const t = normalize(text || '');
+  if (!t) return false;
+  const positive = [
+    /аттест/, /белстрой/, /смр/, /общестро/, /общестрой/, /вид(ы)? работ/,
+    /директор/, /главн.*инженер|\bги\b/, /прораб|мастер/, /диплом/, /трудов/,
+    /стаж/, /высш/, /специалист/, /квалификац/
+  ];
+  let score = 0;
+  positive.forEach((rx) => { if (rx.test(t)) score += 1; });
+  // Для первичного звонка по аттестации обычно должно быть хотя бы 2-3 признака.
+  // Это защищает от ошибочно привязанного звонка про инструменты/другую сделку.
+  return score >= 2;
+}
+
+function transcriptPreview(text, maxLen = 350) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  return t.length > maxLen ? `${t.slice(0, maxLen)}...` : t;
+}
+
+async function transcribeExecutorCandidate(candidate, deal, out, index, total) {
+  const audioUrl = candidate.downloadUrl || candidate.url;
+  if (!audioUrl) throw new Error('Кандидат звонка найден, но нет ссылки на скачивание аудио.');
+  out.innerHTML = `<div class="result-card"><h3>Проверяю запись звонка ${index + 1} из ${total}</h3><p>Скачиваю и запускаю ИИ-расшифровку...</p><p class="muted small-note">Активность: ${escapeHtml(candidate.activityId || '—')} · ${escapeHtml(candidate.subject || '')}</p></div>`;
+  const trResp = await fetch('/api/ai/transcribe-url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: audioUrl, fileName: `deal-${deal.ID}-call-${candidate.activityId || index}.mp3` }),
+  });
+  const tr = await trResp.json().catch(() => ({}));
+  if (!trResp.ok || !tr.ok) throw new Error(tr.error || `Расшифровка HTTP ${trResp.status}`);
+  return String(tr.text || '').trim();
+}
+
 async function runExecutorAutopilot() {
   if (!state.selectedDeal) return;
   const deal = state.selectedDeal;
@@ -5121,20 +5160,25 @@ async function runExecutorAutopilot() {
     await ensureDealMeta(deal.ID);
     const found = await findCallRecordingsForDeal(deal.ID);
     if (!found.candidates.length) throw new Error('Запись звонка пока не найдена в активностях сделки. После звонка обнови сделку и нажми автопилот ещё раз.');
-    const candidate = found.candidates[0];
-    const audioUrl = candidate.downloadUrl || candidate.url;
-    if (!audioUrl) throw new Error('Звонок найден, но не удалось получить ссылку на скачивание аудио. Нажми “Найти записи звонков” и пришли результат диагностики.');
-
-    out.innerHTML = `<div class="result-card"><h3>Звонок найден</h3><p>Запускаю ИИ-расшифровку аудиозаписи...</p></div>`;
-    const trResp = await fetch('/api/ai/transcribe-url', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: audioUrl, fileName: `deal-${deal.ID}-call.mp3` }),
-    });
-    const tr = await trResp.json().catch(() => ({}));
-    if (!trResp.ok || !tr.ok) throw new Error(tr.error || `Расшифровка HTTP ${trResp.status}`);
-    const transcript = String(tr.text || '').trim();
-    if (!transcript) throw new Error('Расшифровка вернула пустой текст. Нужно проверить формат записи звонка или провайдера распознавания.');
+    let transcript = '';
+    let selectedCandidate = null;
+    const checked = [];
+    const candidatesToCheck = found.candidates.slice(0, 6);
+    for (let i = 0; i < candidatesToCheck.length; i += 1) {
+      const candidate = candidatesToCheck[i];
+      const text = await transcribeExecutorCandidate(candidate, deal, out, i, candidatesToCheck.length);
+      checked.push({ activityId: candidate.activityId, subject: candidate.subject || '', textPreview: transcriptPreview(text), relevant: isRelevantAttestationTranscript(text) });
+      if (!text) continue;
+      if (isRelevantAttestationTranscript(text)) {
+        transcript = text;
+        selectedCandidate = candidate;
+        break;
+      }
+    }
+    if (!transcript || !selectedCandidate) {
+      const last = checked[checked.length - 1];
+      throw new Error(`Найденные записи звонков расшифрованы, но не похожи на первичный звонок по аттестации. Автопилот остановлен, задачи/сообщения не создаём. Последний фрагмент: ${last ? last.textPreview : '—'}`);
+    }
 
     out.innerHTML = `<div class="result-card"><h3>Расшифровка получена</h3><p>Анализирую звонок по регламенту аттестации организации...</p></div>`;
     const context = await buildAIContext(deal);
@@ -5147,6 +5191,7 @@ async function runExecutorAutopilot() {
       preferredChannel: preferredChannelKey(deal),
       expertObserverId: APP_CONFIG.executorExpertId || String(deal.ASSIGNED_BY_ID || ''),
       knowledge: attestationExecutorKnowledge(),
+      strict_test_rule: 'Для сделки ООО Бобик актуальный вид работ: только общестроительные работы. Фасады не включать. Если в комментарии сделки встречается фасады — считать это старой/ошибочной информацией и вынести в риск передачи.',
     };
     const aiResp = await fetch('/api/ai/analyze-deal', {
       method: 'POST',
@@ -5171,9 +5216,15 @@ async function runExecutorAutopilot() {
         const email = getPrimaryClientEmail(deal);
         if (email) { await sendEmailViaBitrix(deal, email, 'Ход работы по аттестации организации', msg); sentInfo += ' Сообщение клиенту отправлено на email.'; }
         else sentInfo += ' Email клиента не найден, сообщение клиенту не отправлено.';
+      } else if (channel === 'manual') {
+        sentInfo += ' Сообщение клиенту подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано как Telegram/Viber/Email.';
       } else if (phone && APP_CONFIG.wazzupApiConfigured) {
-        await sendWazzupMessage({ deal, phone, text: msg, channelKey: channel });
-        sentInfo += ` Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
+        try {
+          await sendWazzupMessage({ deal, phone, text: msg, channelKey: channel });
+          sentInfo += ` Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
+        } catch (sendError) {
+          sentInfo += ` Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
+        }
       } else {
         sentInfo += ' Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
       }
