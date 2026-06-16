@@ -533,14 +533,19 @@ app.post('/api/wazzup/send', async (req, res) => {
       clearUnanswered: false,
     };
 
-    // Wazzup v3: для viber/whatsapp chatId = телефон только цифрами; для Telegram Personal можно phone или username.
-    // Важно: phone без '+'. Username передаем только если он похож на реальный Telegram username.
+    // Wazzup v3: согласно официальной документации основной идентификатор получателя — chatId
+    // (для WhatsApp/Viber/Telegram это телефон только цифрами без '+'). Отдельного поля "phone"
+    // в схеме /v3/message нет — раньше мы его всё равно отправляли, и часть запросов в Telegram
+    // падала на стороне Wazzup с HTTP 500 без объяснения. Теперь для Telegram тоже используем chatId,
+    // а username — только как запасной вариант, если телефона нет вообще.
     if (configured.chatType === 'telegram') {
-      if (chatId) payload.chatId = chatId;
-      if (phone) payload.phone = phone;
-      if (username) payload.username = username;
-      if (!payload.chatId && !payload.phone && !payload.username) {
-        res.status(400).json({ ok: false, error: 'Для Telegram Wazzup не найден phone/chatId/username клиента. Проверь телефон контакта в Bitrix или наличие Telegram-чата.' });
+      const recipientId = chatId || phone;
+      if (recipientId) {
+        payload.chatId = recipientId;
+      } else if (username) {
+        payload.username = username;
+      } else {
+        res.status(400).json({ ok: false, error: 'Для Telegram Wazzup не найден телефон/chatId/username клиента. Проверь телефон контакта в Bitrix или наличие Telegram-чата.' });
         return;
       }
     } else {
@@ -562,9 +567,10 @@ app.post('/api/wazzup/send', async (req, res) => {
       },
       body: JSON.stringify(payload),
     });
-    const data = await response.json().catch(() => ({}));
+    const responseText = await response.text();
+    const data = (() => { try { return JSON.parse(responseText); } catch (_) { return {}; } })();
     if (!response.ok) {
-      const message = compactWazzupError(data, `HTTP ${response.status}`);
+      const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
       res.status(response.status).json({
         ok: false,
         error: `Wazzup ${configured.label}: ${message}`,

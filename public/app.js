@@ -5131,13 +5131,12 @@ async function showCallRecordings() {
 
 function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
   const r = ai.result || ai;
-  const tasks = Array.isArray(r.tasks) ? r.tasks : [];
   const handoff = extra.handoff || null;
   const stageMove = extra.stageMove || null;
-  const tasksCreated = extra.tasksCreated || null;
+  const planItems = planNextActionsText(r);
   return `
     <div class="result-header">
-      <div class="result-header-title"><h3>Автопилот АТТ по тестовой сделке</h3><span class="result-status ${escapeHtml(r.status || 'partial')}">${escapeHtml(r.status_label || 'анализ выполнен')}</span></div>
+      <div class="result-header-title"><h3>Автопилот — ${escapeHtml(getService(deal) || 'услуга не указана')}</h3><span class="result-status ${escapeHtml(r.status || 'partial')}">${escapeHtml(r.status_label || 'анализ выполнен')}</span></div>
       <div class="result-grid">
         <div class="result-field"><span>Сделка</span>${escapeHtml(deal.TITLE || deal.ID)}</div>
         <div class="result-field"><span>Эксперт-наблюдатель</span>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</div>
@@ -5150,58 +5149,65 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
     <div class="result-card card-info"><h3>Что ассистент понял</h3>${listHtml(r.summary || [], 'Нет сводки')}</div>
     ${r.missing && r.missing.length ? `<div class="result-card card-uncertain"><h3>Чего не хватает</h3>${listHtml(r.missing)}</div>` : ''}
     ${r.risks && r.risks.length ? `<div class="result-card card-risk"><h3>Риски</h3>${listHtml(r.risks)}</div>` : ''}
-    ${r.next_steps && r.next_steps.length ? `<div class="result-card card-action"><h3>Следующие шаги</h3>${listHtml(r.next_steps)}</div>` : ''}
     ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
-    ${r.comment ? `<div class="result-card"><h3>Комментарий Кристине</h3><div class="message-draft">${escapeHtml(r.comment)}</div></div>` : ''}
-    ${tasksCreated ? `<div class="result-card card-action"><h3>Внутренние дела</h3><p>Создано: ${tasksCreated.created}. Пропущено (уже есть/без названия): ${tasksCreated.skipped}.${tasksCreated.errors.length ? ` Ошибки: ${escapeHtml(tasksCreated.errors.join('; '))}` : ''}</p></div>` : (tasks.length ? `<div class="result-card"><h3>Контрольные пункты из анализа</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : '')}
+    ${planItems.length ? `<div class="result-card card-action"><h3>Что ассистент делает дальше сам</h3>${listHtml(planItems)}</div>` : ''}
     ${stageMove ? `<div class="result-card ${stageMove.moved ? 'card-ok' : 'card-uncertain'}"><h3>Стадия сделки</h3><p>${escapeHtml(stageMove.text)}</p></div>` : ''}
     <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
 }
 
 function executorCommentText(ai, transcript, deal, extra = {}) {
+  // v45: комментарий в сделку — короткий отчёт эксперту, БЕЗ полной расшифровки звонка
+  // (она хранится в самой активности звонка и в карточке) и БЕЗ перечисления созданных задач
+  // (задачи людям не создаются — ассистент исполняет сам и отчитывается, что сделано/не сделано).
   const r = ai.result || ai;
   const handoff = extra.handoff;
   const stageMove = extra.stageMove;
-  const tasksCreated = extra.tasksCreated;
-  return `АВТОПИЛОТ АТТ — отчёт ассистента-исполнителя\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nУслуга: ${getService(deal) || 'СПК + Аттестация организации'}\nЭксперт-наблюдатель: ${userName(deal.ASSIGNED_BY_ID)}\n\n1) Проверка передачи: ${handoff ? handoff.statusText : 'не выполнялась'}\n${handoff && handoff.missingLabels && handoff.missingLabels.length ? handoff.missingLabels.map((x) => `— ${x}`).join('\n') + '\n' : ''}\nСтатус: ${r.status_label || r.status || 'анализ выполнен'}\n\n2) Что понял из звонка:\n${(r.summary || []).map((x) => `— ${x}`).join('\n') || '— нет сводки'}\n\nЧего не хватает:\n${(r.missing || []).map((x) => `— ${x}`).join('\n') || '— критичных пробелов не выделено'}\n\nРиски:\n${(r.risks || []).map((x) => `— ${x}`).join('\n') || '— рисков не выделено'}\n\nСледующие шаги:\n${(r.next_steps || []).map((x) => `— ${x}`).join('\n') || '— следующий шаг не сформирован'}\n\n3) Сообщение клиенту:\n${r.client_message || '—'}\n\n4) Внутренние дела: ${tasksCreated ? `создано ${tasksCreated.created}, пропущено ${tasksCreated.skipped}${tasksCreated.errors.length ? `, ошибки: ${tasksCreated.errors.join('; ')}` : ''}` : 'не создавались'}\n\n5) Стадия сделки: ${stageMove ? stageMove.text : 'не менялась'}\n\nКомментарий ассистента Кристине:\n${r.comment || '—'}\n\nРасшифровка звонка сохранена в анализе ассистента. Текст звонка:\n${transcript || '—'}`;
+  const planItems = planNextActionsText(r);
+  const lines = [];
+  lines.push(`Автопилот · ${getService(deal) || deal.TITLE || 'сделка ' + deal.ID}`);
+  lines.push(`Статус: ${r.status_label || r.status || 'анализ выполнен'}`);
+  lines.push('');
+  lines.push(`Передача: ${handoff ? handoff.statusText : 'не проверялась'}`);
+  if (handoff && handoff.missingLabels && handoff.missingLabels.length) {
+    lines.push(...handoff.missingLabels.slice(0, 6).map((x) => `— ${x}`));
+  }
+  lines.push('');
+  lines.push('Из звонка понял:');
+  lines.push(...(r.summary || []).slice(0, 5).map((x) => `— ${x}`));
+  if (r.missing && r.missing.length) {
+    lines.push('');
+    lines.push('Не хватает:');
+    lines.push(...r.missing.slice(0, 5).map((x) => `— ${x}`));
+  }
+  if (r.risks && r.risks.length) {
+    lines.push('');
+    lines.push('Риски:');
+    lines.push(...r.risks.slice(0, 4).map((x) => `— ${x}`));
+  }
+  lines.push('');
+  lines.push(`Клиенту: ${r.client_message ? 'сообщение подготовлено' : 'сообщение не сформировано'} (детали см. в результате анализа выше в чате)`);
+  if (planItems.length) {
+    lines.push('');
+    lines.push('Делаю дальше сам:');
+    lines.push(...planItems.slice(0, 6).map((x) => `— ${x}`));
+  }
+  lines.push('');
+  lines.push(`Стадия: ${stageMove ? stageMove.text : 'не менялась'}`);
+  if (r.comment) {
+    lines.push('');
+    lines.push(`Комментарий ассистента: ${r.comment}`);
+  }
+  return lines.join('\n');
 }
 
-async function createExecutorTasksFromAI(deal, result) {
-  // v44: ассистент-исполнитель сам ставит внутренние дела (документы/оплата/дедлайны/следующий шаг).
-  // Задачи только для сотрудников MAVIS (expert/manager/leader). Клиенту задачи никогда не создаются —
-  // для клиента используется client_message, отправленный отдельным шагом.
+function planNextActionsText(result) {
+  // v45: ассистент-исполнитель НЕ ставит задачи людям в Bitrix (это было ошибкой v44 — система
+  // ставила задачи Кристине и даже специалисту клиента). Вместо этого ассистент сам выполняет то,
+  // что может технически (отправка сообщения клиенту), а всё остальное из плана ИИ фиксирует
+  // как пункты "что делаю дальше сам" в отчётном комментарии — без постановки задач сторонним людям.
   const tasks = Array.isArray(result && result.tasks) ? result.tasks : [];
-  if (!tasks.length) return { created: 0, skipped: 0, errors: [] };
-  let created = 0;
-  let skipped = 0;
-  const errors = [];
-  const responsibleFor = (role) => {
-    if (role === 'leader') return Number(APP_CONFIG.executorLeaderId || APP_CONFIG.executorExpertId || deal.ASSIGNED_BY_ID);
-    if (role === 'manager') {
-      const cached = cachedSalesManagerInfo(deal);
-      return Number((cached && cached.managerId) || deal.ASSIGNED_BY_ID);
-    }
-    return Number(APP_CONFIG.executorExpertId || deal.ASSIGNED_BY_ID);
-  };
-  for (const t of tasks) {
-    const title = String(t.title || '').trim();
-    if (!title) { skipped += 1; continue; }
-    if (hasOpenTaskWithTitle(deal.ID, title)) { skipped += 1; continue; }
-    try {
-      await createTask({
-        title: `Автопилот АТТ: ${title}`,
-        responsibleId: responsibleFor(String(t.responsible || 'expert').trim()),
-        description: `${t.description || ''}\n\nСрок (подсказка ИИ): ${t.deadline_hint || 'не указан'}\nЗадача создана автопилотом по тестовой сделке ${deal.ID}.`,
-        dealId: deal.ID,
-        auditorIds: [APP_CONFIG.executorExpertId].filter(Boolean),
-        silent: true,
-      });
-      created += 1;
-    } catch (e) {
-      errors.push(`${title}: ${e.message || String(e)}`);
-    }
-  }
-  return { created, skipped, errors };
+  if (!tasks.length) return [];
+  return tasks.map((t) => `${t.title}${t.deadline_hint ? ` (срок: ${t.deadline_hint})` : ''}`);
 }
 
 
@@ -5296,19 +5302,24 @@ async function runExecutorAutopilot() {
       throw new Error(`Найденные записи звонков расшифрованы, но не похожи на первичный звонок по аттестации. Автопилот остановлен, дела/сообщения не создаём. Последний фрагмент: ${last ? last.textPreview : '—'}`);
     }
 
-    out.innerHTML = `<div class="result-card"><h3>Шаг 3 из 6 · Анализирую звонок по маршруту SPK_ATT...</h3></div>`;
+    const realService = getService(deal) || deal.TITLE || '';
+    const profile = detectProductProfile(realService, deal.TITLE || '');
+    out.innerHTML = `<div class="result-card"><h3>Шаг 3 из 6 · Анализирую звонок по услуге «${escapeHtml(realService || profile.label)}»...</h3></div>`;
     const context = await buildAIContext(deal);
     context.call_transcript = transcript;
     context.handoff_check = handoffInfo;
     context.executor_mode = {
       enabled: true,
       dealId: String(deal.ID),
-      product: 'СПК + Аттестация организации (единый маршрут SPK_ATT)',
+      // Реальная услуга из поля сделки, а не предположение ассистента. Если в звонке клиент
+      // называет другие виды работ/услугу, чем записано в сделке — это расхождение указывается
+      // в "missing"/"risks" ИИ-анализа, а не подменяется жёстким правилом из кода.
+      product: realService || profile.label || 'услуга не определена',
       preferredContactFieldCode: APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900',
       preferredChannel: preferredChannelKey(deal),
       expertObserverId: APP_CONFIG.executorExpertId || String(deal.ASSIGNED_BY_ID || ''),
       knowledge: attestationExecutorKnowledge(),
-      strict_test_rule: 'Для сделки ООО Бобик актуальный вид работ: только общестроительные работы. Фасады не включать. Если в комментарии сделки встречается фасады — считать это старой/ошибочной информацией и вынести в риск передачи.',
+      note_to_ai: 'Поле "product" взято из реального поля Услуга в Bitrix. Виды работ определяй из звонка и комментариев сделки как они есть, без предположений о том, какие виды работ "должны" быть.',
     };
     const aiResp = await fetch('/api/ai/analyze-deal', {
       method: 'POST',
@@ -5344,8 +5355,7 @@ async function runExecutorAutopilot() {
       sentInfo = 'ИИ не сформировал сообщение клиенту на этом шаге.';
     }
 
-    out.innerHTML = `<div class="result-card"><h3>Шаг 5 из 6 · Ставлю внутренние дела и проверяю стадию...</h3></div>`;
-    const tasksCreated = await createExecutorTasksFromAI(deal, ai.result);
+    out.innerHTML = `<div class="result-card"><h3>Шаг 5 из 6 · Проверяю стадию сделки...</h3></div>`;
 
     // Шаг 6: движение стадии. Двигаем только вперёд и только если ИИ явно решил,
     // что переход подтверждён звонком/анализом. Никогда не угадываем стадию вручную.
@@ -5366,8 +5376,8 @@ async function runExecutorAutopilot() {
       stageMove = { moved: false, text: decision && decision.reason ? `Остаёмся на текущей стадии. Причина: ${decision.reason}.` : 'ИИ не нашёл оснований двигать стадию сейчас.' };
     }
 
-    const extra = { handoff: handoffInfo, stageMove, tasksCreated };
-    state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот АТТ', result: ai.result };
+    const extra = { handoff: handoffInfo, stageMove };
+    state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот', result: ai.result };
     state.selectedAnalysis = executorCommentText(ai, transcript, deal, extra);
 
     const commentText = executorCommentText(ai, transcript, deal, extra);
