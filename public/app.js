@@ -5156,46 +5156,38 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
 }
 
 function executorCommentText(ai, transcript, deal, extra = {}) {
-  // v45: комментарий в сделку — короткий отчёт эксперту, БЕЗ полной расшифровки звонка
-  // (она хранится в самой активности звонка и в карточке) и БЕЗ перечисления созданных задач
-  // (задачи людям не создаются — ассистент исполняет сам и отчитывается, что сделано/не сделано).
+  // v46: ещё короче. Убран пересказ звонка ("из звонка понял" дублирует саму запись звонка
+  // в активности и сообщение клиенту). Пробелы и риски объединены в один список без повторов,
+  // максимум по 3-4 строки на блок — это рабочий отчёт эксперту, не протокол.
   const r = ai.result || ai;
   const handoff = extra.handoff;
   const stageMove = extra.stageMove;
   const planItems = planNextActionsText(r);
   const lines = [];
-  lines.push(`Автопилот · ${getService(deal) || deal.TITLE || 'сделка ' + deal.ID}`);
-  lines.push(`Статус: ${r.status_label || r.status || 'анализ выполнен'}`);
+  lines.push(`Автопилот · ${getService(deal) || deal.TITLE || 'сделка ' + deal.ID} · ${r.status_label || r.status || 'анализ выполнен'}`);
   lines.push('');
-  lines.push(`Передача: ${handoff ? handoff.statusText : 'не проверялась'}`);
-  if (handoff && handoff.missingLabels && handoff.missingLabels.length) {
-    lines.push(...handoff.missingLabels.slice(0, 6).map((x) => `— ${x}`));
-  }
-  lines.push('');
-  lines.push('Из звонка понял:');
-  lines.push(...(r.summary || []).slice(0, 5).map((x) => `— ${x}`));
-  if (r.missing && r.missing.length) {
+  if (handoff && handoff.criticalCount) {
+    lines.push(`Передача: ${handoff.statusText}`);
+    lines.push(...handoff.missingLabels.slice(0, 4).map((x) => `— ${x}`));
     lines.push('');
-    lines.push('Не хватает:');
-    lines.push(...r.missing.slice(0, 5).map((x) => `— ${x}`));
   }
-  if (r.risks && r.risks.length) {
+  const gaps = [...(r.missing || []), ...(r.risks || [])].filter(Boolean);
+  if (gaps.length) {
+    lines.push('Главные пробелы/риски:');
+    lines.push(...gaps.slice(0, 4).map((x) => `— ${x}`));
     lines.push('');
-    lines.push('Риски:');
-    lines.push(...r.risks.slice(0, 4).map((x) => `— ${x}`));
   }
-  lines.push('');
-  lines.push(`Клиенту: ${r.client_message ? 'сообщение подготовлено' : 'сообщение не сформировано'} (детали см. в результате анализа выше в чате)`);
+  lines.push(`Клиенту: ${r.client_message ? 'сообщение подготовлено и отправлено/в процессе отправки' : 'сообщение не сформировано'}`);
   if (planItems.length) {
     lines.push('');
     lines.push('Делаю дальше сам:');
-    lines.push(...planItems.slice(0, 6).map((x) => `— ${x}`));
+    lines.push(...planItems.slice(0, 4).map((x) => `— ${x}`));
   }
   lines.push('');
   lines.push(`Стадия: ${stageMove ? stageMove.text : 'не менялась'}`);
   if (r.comment) {
     lines.push('');
-    lines.push(`Комментарий ассистента: ${r.comment}`);
+    lines.push(r.comment);
   }
   return lines.join('\n');
 }

@@ -533,15 +533,16 @@ app.post('/api/wazzup/send', async (req, res) => {
       clearUnanswered: false,
     };
 
-    // Wazzup v3: согласно официальной документации основной идентификатор получателя — chatId
-    // (для WhatsApp/Viber/Telegram это телефон только цифрами без '+'). Отдельного поля "phone"
-    // в схеме /v3/message нет — раньше мы его всё равно отправляли, и часть запросов в Telegram
-    // падала на стороне Wazzup с HTTP 500 без объяснения. Теперь для Telegram тоже используем chatId,
-    // а username — только как запасной вариант, если телефона нет вообще.
+    // Wazzup v3, официальная документация (Sending messages): для Telegram Personal
+    // chatId известен ТОЛЬКО из вебхука входящего сообщения или из ответа Wazzup на предыдущую
+    // отправку. Его нельзя просто подставить как "номер телефона цифрами" — это ломает запрос
+    // (отсюда HTTP 500 в v45). Для исходящего сообщения, когда chatId неизвестен, нужно передавать
+    // phone или username — это специальные поля именно для Telegram Personal.
     if (configured.chatType === 'telegram') {
-      const recipientId = chatId || phone;
-      if (recipientId) {
-        payload.chatId = recipientId;
+      if (chatId) {
+        payload.chatId = chatId;
+      } else if (phone) {
+        payload.phone = phone;
       } else if (username) {
         payload.username = username;
       } else {
@@ -558,17 +559,30 @@ app.post('/api/wazzup/send', async (req, res) => {
     }
     if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
 
-    const response = await fetch(`${baseUrl}/message`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'X-Api-Key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    const responseText = await response.text();
-    const data = (() => { try { return JSON.parse(responseText); } catch (_) { return {}; } })();
+    // Wazzup документирует MESSAGES_CAN_NOT_ADD ("непредвиденная ошибка сервера") как известную
+    // транзиентную ошибку 500 на их стороне. Делаем одну повторную попытку с уникальным
+    // crmMessageId перед тем, как считать отправку окончательно неудачной.
+    const attemptSend = async (attemptPayload) => {
+      const resp = await fetch(`${baseUrl}/message`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'X-Api-Key': apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(attemptPayload),
+      });
+      const text = await resp.text();
+      const json = (() => { try { return JSON.parse(text); } catch (_) { return {}; } })();
+      return { resp, text, json };
+    };
+
+    let { resp: response, text: responseText, json: data } = await attemptSend(payload);
+    if (!response.ok && response.status >= 500) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const retryPayload = { ...payload, crmMessageId: `${payload.crmMessageId}-retry` };
+      ({ resp: response, text: responseText, json: data } = await attemptSend(retryPayload));
+    }
     if (!response.ok) {
       const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
       res.status(response.status).json({
