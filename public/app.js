@@ -830,6 +830,72 @@ function isStageResolved(stageId) {
   const code = String(stageId || '');
   return Boolean(code && state.stageMap.has(code) && state.stageMap.get(code) !== code);
 }
+
+async function fetchOrderedStagesForCategory(categoryId) {
+  const cid = Number(categoryId || 0);
+  const variants = [
+    { id: cid, order: { SORT: 'ASC' } },
+    { id: String(cid), order: { SORT: 'ASC' } },
+    { categoryId: cid, order: { SORT: 'ASC' } },
+    { filter: { CATEGORY_ID: cid }, order: { SORT: 'ASC' } },
+  ];
+  for (const params of variants) {
+    try {
+      const rows = await bxList('crm.dealcategory.stage.list', params, 0);
+      if (rows && rows.length) {
+        return rows
+          .map((r) => ({
+            code: String(r.STATUS_ID || r.statusId || r.ID || r.id || ''),
+            name: String(r.NAME || r.name || r.TITLE || r.title || ''),
+            sort: Number(r.SORT || r.sort || 0),
+          }))
+          .filter((r) => r.code)
+          .sort((a, b) => a.sort - b.sort);
+      }
+    } catch (_) {}
+  }
+  // Fallback: общая воронка без CATEGORY_ID (cid === 0).
+  try {
+    const rows = await bxList('crm.status.list', { filter: { ENTITY_ID: 'DEAL_STAGE' }, order: { SORT: 'ASC' } }, 0);
+    return rows
+      .map((r) => ({ code: String(r.STATUS_ID || r.ID || ''), name: String(r.NAME || ''), sort: Number(r.SORT || 0) }))
+      .filter((r) => r.code)
+      .sort((a, b) => a.sort - b.sort);
+  } catch (_) {}
+  return [];
+}
+
+// Подбирает следующую стадию по смысловой подсказке (ключевые слова на русском),
+// двигаясь по упорядоченному списку стадий воронки. Никогда не угадывает —
+// если совпадения нет, возвращает null и автопилот должен остаться на текущей стадии.
+function matchStageByHint(orderedStages, hintText, currentStageCode) {
+  const hint = normalize(hintText);
+  if (!hint) return null;
+  const currentIndex = orderedStages.findIndex((s) => s.code === String(currentStageCode || ''));
+  const candidates = orderedStages
+    .map((s, idx) => ({ ...s, idx }))
+    .filter((s) => currentIndex < 0 || s.idx > currentIndex); // двигаемся только вперёд по воронке
+  let best = null;
+  let bestScore = 0;
+  candidates.forEach((s) => {
+    const name = normalize(s.name);
+    const hintWords = hint.split(/\s+/).filter((w) => w.length > 3);
+    let score = 0;
+    hintWords.forEach((w) => { if (name.includes(w)) score += 1; });
+    if (score > bestScore) { bestScore = score; best = s; }
+  });
+  return bestScore > 0 ? best : null;
+}
+
+async function moveDealStageSafely(deal, targetStageCode, reasonForLog) {
+  try {
+    await bxCall('crm.deal.update', { id: deal.ID, fields: { STAGE_ID: targetStageCode } });
+    return { moved: true, stageCode: targetStageCode, reason: reasonForLog };
+  } catch (e) {
+    return { moved: false, error: e.message || String(e), reason: reasonForLog };
+  }
+}
+
 function getService(deal) {
   if (!deal) return '';
   if (state.fieldMap.service && deal[state.fieldMap.service] !== undefined) {
@@ -5063,9 +5129,12 @@ async function showCallRecordings() {
   }
 }
 
-function renderExecutorResult(ai, transcript, deal, sentInfo = '') {
+function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
   const r = ai.result || ai;
   const tasks = Array.isArray(r.tasks) ? r.tasks : [];
+  const handoff = extra.handoff || null;
+  const stageMove = extra.stageMove || null;
+  const tasksCreated = extra.tasksCreated || null;
   return `
     <div class="result-header">
       <div class="result-header-title"><h3>Автопилот АТТ по тестовой сделке</h3><span class="result-status ${escapeHtml(r.status || 'partial')}">${escapeHtml(r.status_label || 'анализ выполнен')}</span></div>
@@ -5076,6 +5145,7 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '') {
         <div class="result-field"><span>Звонок</span>${transcript ? 'расшифрован' : 'нет расшифровки'}</div>
       </div>
     </div>
+    ${handoff ? `<div class="result-card ${handoff.criticalCount ? 'card-risk' : 'card-found'}"><h3>1. Проверка передачи</h3><p>${escapeHtml(handoff.statusText)}</p>${handoff.criticalCount ? listHtml(handoff.missingLabels) : ''}</div>` : ''}
     ${sentInfo ? `<div class="result-card card-ok"><h3>Автодействия выполнены</h3><p>${escapeHtml(sentInfo)}</p></div>` : ''}
     <div class="result-card card-info"><h3>Что ассистент понял</h3>${listHtml(r.summary || [], 'Нет сводки')}</div>
     ${r.missing && r.missing.length ? `<div class="result-card card-uncertain"><h3>Чего не хватает</h3>${listHtml(r.missing)}</div>` : ''}
@@ -5083,20 +5153,55 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '') {
     ${r.next_steps && r.next_steps.length ? `<div class="result-card card-action"><h3>Следующие шаги</h3>${listHtml(r.next_steps)}</div>` : ''}
     ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
     ${r.comment ? `<div class="result-card"><h3>Комментарий Кристине</h3><div class="message-draft">${escapeHtml(r.comment)}</div></div>` : ''}
-    ${tasks.length ? `<div class="result-card"><h3>Контрольные пункты из анализа</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : ''}
+    ${tasksCreated ? `<div class="result-card card-action"><h3>Внутренние дела</h3><p>Создано: ${tasksCreated.created}. Пропущено (уже есть/без названия): ${tasksCreated.skipped}.${tasksCreated.errors.length ? ` Ошибки: ${escapeHtml(tasksCreated.errors.join('; '))}` : ''}</p></div>` : (tasks.length ? `<div class="result-card"><h3>Контрольные пункты из анализа</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : '')}
+    ${stageMove ? `<div class="result-card ${stageMove.moved ? 'card-ok' : 'card-uncertain'}"><h3>Стадия сделки</h3><p>${escapeHtml(stageMove.text)}</p></div>` : ''}
     <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
 }
 
-function executorCommentText(ai, transcript, deal) {
+function executorCommentText(ai, transcript, deal, extra = {}) {
   const r = ai.result || ai;
-  return `АВТОПИЛОТ АТТ — отчёт ассистента-исполнителя\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nУслуга: ${getService(deal) || 'Аттестация организации'}\nЭксперт-наблюдатель: ${userName(deal.ASSIGNED_BY_ID)}\n\nСтатус: ${r.status_label || r.status || 'анализ выполнен'}\n\nЧто понял:\n${(r.summary || []).map((x) => `— ${x}`).join('\n') || '— нет сводки'}\n\nЧего не хватает:\n${(r.missing || []).map((x) => `— ${x}`).join('\n') || '— критичных пробелов не выделено'}\n\nРиски:\n${(r.risks || []).map((x) => `— ${x}`).join('\n') || '— рисков не выделено'}\n\nСледующие шаги:\n${(r.next_steps || []).map((x) => `— ${x}`).join('\n') || '— следующий шаг не сформирован'}\n\nСообщение клиенту:\n${r.client_message || '—'}\n\nКомментарий ассистента Кристине:\n${r.comment || '—'}\n\nРасшифровка звонка сохранена в анализе ассистента. Текст звонка:\n${transcript || '—'}`;
+  const handoff = extra.handoff;
+  const stageMove = extra.stageMove;
+  const tasksCreated = extra.tasksCreated;
+  return `АВТОПИЛОТ АТТ — отчёт ассистента-исполнителя\n\nСделка: ${deal.TITLE || ''} / ID ${deal.ID}\nУслуга: ${getService(deal) || 'СПК + Аттестация организации'}\nЭксперт-наблюдатель: ${userName(deal.ASSIGNED_BY_ID)}\n\n1) Проверка передачи: ${handoff ? handoff.statusText : 'не выполнялась'}\n${handoff && handoff.missingLabels && handoff.missingLabels.length ? handoff.missingLabels.map((x) => `— ${x}`).join('\n') + '\n' : ''}\nСтатус: ${r.status_label || r.status || 'анализ выполнен'}\n\n2) Что понял из звонка:\n${(r.summary || []).map((x) => `— ${x}`).join('\n') || '— нет сводки'}\n\nЧего не хватает:\n${(r.missing || []).map((x) => `— ${x}`).join('\n') || '— критичных пробелов не выделено'}\n\nРиски:\n${(r.risks || []).map((x) => `— ${x}`).join('\n') || '— рисков не выделено'}\n\nСледующие шаги:\n${(r.next_steps || []).map((x) => `— ${x}`).join('\n') || '— следующий шаг не сформирован'}\n\n3) Сообщение клиенту:\n${r.client_message || '—'}\n\n4) Внутренние дела: ${tasksCreated ? `создано ${tasksCreated.created}, пропущено ${tasksCreated.skipped}${tasksCreated.errors.length ? `, ошибки: ${tasksCreated.errors.join('; ')}` : ''}` : 'не создавались'}\n\n5) Стадия сделки: ${stageMove ? stageMove.text : 'не менялась'}\n\nКомментарий ассистента Кристине:\n${r.comment || '—'}\n\nРасшифровка звонка сохранена в анализе ассистента. Текст звонка:\n${transcript || '—'}`;
 }
 
 async function createExecutorTasksFromAI(deal, result) {
-  // v43h: ассистент работает как исполнитель, а не как постановщик задач.
-  // Он НЕ создает задачи Кристине/менеджеру.
-  // Он выполняет доступные действия сам, а о выполненном/невыполненном пишет в комментарий сделки.
-  return 0;
+  // v44: ассистент-исполнитель сам ставит внутренние дела (документы/оплата/дедлайны/следующий шаг).
+  // Задачи только для сотрудников MAVIS (expert/manager/leader). Клиенту задачи никогда не создаются —
+  // для клиента используется client_message, отправленный отдельным шагом.
+  const tasks = Array.isArray(result && result.tasks) ? result.tasks : [];
+  if (!tasks.length) return { created: 0, skipped: 0, errors: [] };
+  let created = 0;
+  let skipped = 0;
+  const errors = [];
+  const responsibleFor = (role) => {
+    if (role === 'leader') return Number(APP_CONFIG.executorLeaderId || APP_CONFIG.executorExpertId || deal.ASSIGNED_BY_ID);
+    if (role === 'manager') {
+      const cached = cachedSalesManagerInfo(deal);
+      return Number((cached && cached.managerId) || deal.ASSIGNED_BY_ID);
+    }
+    return Number(APP_CONFIG.executorExpertId || deal.ASSIGNED_BY_ID);
+  };
+  for (const t of tasks) {
+    const title = String(t.title || '').trim();
+    if (!title) { skipped += 1; continue; }
+    if (hasOpenTaskWithTitle(deal.ID, title)) { skipped += 1; continue; }
+    try {
+      await createTask({
+        title: `Автопилот АТТ: ${title}`,
+        responsibleId: responsibleFor(String(t.responsible || 'expert').trim()),
+        description: `${t.description || ''}\n\nСрок (подсказка ИИ): ${t.deadline_hint || 'не указан'}\nЗадача создана автопилотом по тестовой сделке ${deal.ID}.`,
+        dealId: deal.ID,
+        auditorIds: [APP_CONFIG.executorExpertId].filter(Boolean),
+        silent: true,
+      });
+      created += 1;
+    } catch (e) {
+      errors.push(`${title}: ${e.message || String(e)}`);
+    }
+  }
+  return { created, skipped, errors };
 }
 
 
@@ -5143,9 +5248,32 @@ async function runExecutorAutopilot() {
     out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот не запущен</h3><p>Режим исполнителя разрешён только для сделки <code>${escapeHtml(APP_CONFIG.executorTestDealId || 'не задано')}</code>. Текущая сделка: <code>${escapeHtml(deal.ID)}</code>.</p></div>`;
     return;
   }
-  out.innerHTML = `<div class="result-card"><h3>Запускаю автопилот АТТ...</h3><p class="muted">Ищу звонок, скачиваю запись, запускаю расшифровку и ИИ-анализ.</p></div>`;
+  out.innerHTML = `<div class="result-card"><h3>Шаг 1 из 6 · Проверяю передачу из продаж...</h3></div>`;
   try {
     await ensureDealMeta(deal.ID);
+
+    // Шаг 1: проверка передачи. Не останавливает автопилот, но критичные пробелы
+    // фиксируются в отчёте и создают задачу менеджеру — без додумывания недостающих данных.
+    let handoffInfo = null;
+    try {
+      await checkHandoff();
+      const audit = state.selectedAudit;
+      const criticalCount = (audit && audit.missing ? audit.missing.length : 0);
+      handoffInfo = {
+        statusText: audit ? audit.status : 'не удалось проверить передачу',
+        missingLabels: audit ? [...(audit.missing || []), ...(audit.technical || [])] : [],
+        criticalCount,
+        salesDealId: audit ? audit.salesDealId : '',
+        salesManagerId: audit ? audit.salesManagerId : '',
+      };
+      if (criticalCount && handoffInfo.salesManagerId) {
+        try { await createHandoffTaskForDeal(deal.ID, true); } catch (_) {}
+      }
+    } catch (e) {
+      handoffInfo = { statusText: `проверка передачи не выполнена: ${e.message || String(e)}`, missingLabels: [], criticalCount: 0 };
+    }
+
+    out.innerHTML = `<div class="result-card"><h3>Шаг 2 из 6 · Ищу запись звонка...</h3></div>`;
     const found = await findCallRecordingsForDeal(deal.ID);
     if (!found.candidates.length) throw new Error('Запись звонка пока не найдена в активностях сделки. После звонка обнови сделку и нажми автопилот ещё раз.');
     let transcript = '';
@@ -5165,16 +5293,17 @@ async function runExecutorAutopilot() {
     }
     if (!transcript || !selectedCandidate) {
       const last = checked[checked.length - 1];
-      throw new Error(`Найденные записи звонков расшифрованы, но не похожи на первичный звонок по аттестации. Автопилот остановлен, задачи/сообщения не создаём. Последний фрагмент: ${last ? last.textPreview : '—'}`);
+      throw new Error(`Найденные записи звонков расшифрованы, но не похожи на первичный звонок по аттестации. Автопилот остановлен, дела/сообщения не создаём. Последний фрагмент: ${last ? last.textPreview : '—'}`);
     }
 
-    out.innerHTML = `<div class="result-card"><h3>Расшифровка получена</h3><p>Анализирую звонок по регламенту аттестации организации...</p></div>`;
+    out.innerHTML = `<div class="result-card"><h3>Шаг 3 из 6 · Анализирую звонок по маршруту SPK_ATT...</h3></div>`;
     const context = await buildAIContext(deal);
     context.call_transcript = transcript;
+    context.handoff_check = handoffInfo;
     context.executor_mode = {
       enabled: true,
       dealId: String(deal.ID),
-      product: 'Аттестация организации / Аттестация СМР',
+      product: 'СПК + Аттестация организации (единый маршрут SPK_ATT)',
       preferredContactFieldCode: APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900',
       preferredChannel: preferredChannelKey(deal),
       expertObserverId: APP_CONFIG.executorExpertId || String(deal.ASSIGNED_BY_ID || ''),
@@ -5188,37 +5317,66 @@ async function runExecutorAutopilot() {
     });
     const ai = await aiResp.json().catch(() => ({}));
     if (!aiResp.ok || !ai.ok) throw new Error(ai.error || `ИИ-анализ HTTP ${aiResp.status}`);
-    state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот АТТ', result: ai.result };
-    state.selectedAnalysis = executorCommentText(ai, transcript, deal);
 
-    const commentText = executorCommentText(ai, transcript, deal);
-    await bxCall('crm.timeline.comment.add', { fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: commentText } });
-    // v43h: задачи не создаём. Ассистент только выполняет действия сам и отчитывается.
-
-    let sentInfo = `Комментарий в сделку записан. Задачи не создавались: режим ассистента-исполнителя.`;
+    out.innerHTML = `<div class="result-card"><h3>Шаг 4 из 6 · Отправляю перечень/ход работы клиенту...</h3></div>`;
+    let sentInfo = '';
     const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() : '';
     if (msg) {
       const channel = preferredChannelKey(deal);
       const phone = getPrimaryClientPhone(deal);
       if (channel === 'email') {
         const email = getPrimaryClientEmail(deal);
-        if (email) { await sendEmailViaBitrix(deal, email, 'Ход работы по аттестации организации', msg); sentInfo += ' Сообщение клиенту отправлено на email.'; }
-        else sentInfo += ' Email клиента не найден, сообщение клиенту не отправлено.';
+        if (email) { await sendEmailViaBitrix(deal, email, 'Ход работы по СПК и аттестации организации', msg); sentInfo += 'Сообщение клиенту отправлено на email.'; }
+        else sentInfo += 'Email клиента не найден, сообщение клиенту не отправлено.';
       } else if (channel === 'manual') {
-        sentInfo += ' Сообщение клиенту подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано как Telegram/Viber/Email.';
+        sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано как Telegram/Viber/Email.';
       } else if (phone && APP_CONFIG.wazzupApiConfigured) {
         try {
           await sendWazzupMessage({ deal, phone, text: msg, channelKey: channel });
-          sentInfo += ` Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
+          sentInfo += `Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
         } catch (sendError) {
-          sentInfo += ` Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
+          sentInfo += `Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
         }
       } else {
-        sentInfo += ' Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
+        sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
       }
+    } else {
+      sentInfo = 'ИИ не сформировал сообщение клиенту на этом шаге.';
     }
-    out.innerHTML = renderExecutorResult(ai, transcript, deal, sentInfo);
+
+    out.innerHTML = `<div class="result-card"><h3>Шаг 5 из 6 · Ставлю внутренние дела и проверяю стадию...</h3></div>`;
+    const tasksCreated = await createExecutorTasksFromAI(deal, ai.result);
+
+    // Шаг 6: движение стадии. Двигаем только вперёд и только если ИИ явно решил,
+    // что переход подтверждён звонком/анализом. Никогда не угадываем стадию вручную.
+    let stageMove = null;
+    const decision = ai.result && ai.result.stage_decision;
+    if (decision && decision.should_move && decision.target_stage_hint) {
+      const orderedStages = await fetchOrderedStagesForCategory(deal.CATEGORY_ID || 0);
+      const target = matchStageByHint(orderedStages, decision.target_stage_hint, deal.STAGE_ID);
+      if (target) {
+        const moveResult = await moveDealStageSafely(deal, target.code, decision.reason);
+        stageMove = moveResult.moved
+          ? { moved: true, text: `Стадия передвинута на «${target.name}». Причина: ${decision.reason || 'подтверждено анализом звонка'}.` }
+          : { moved: false, text: `Не удалось передвинуть стадию на «${target.name}»: ${moveResult.error}.` };
+      } else {
+        stageMove = { moved: false, text: `ИИ предложил двигать стадию (подсказка: «${decision.target_stage_hint}»), но подходящая стадия дальше по воронке не найдена. Стадия не менялась.` };
+      }
+    } else {
+      stageMove = { moved: false, text: decision && decision.reason ? `Остаёмся на текущей стадии. Причина: ${decision.reason}.` : 'ИИ не нашёл оснований двигать стадию сейчас.' };
+    }
+
+    const extra = { handoff: handoffInfo, stageMove, tasksCreated };
+    state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот АТТ', result: ai.result };
+    state.selectedAnalysis = executorCommentText(ai, transcript, deal, extra);
+
+    const commentText = executorCommentText(ai, transcript, deal, extra);
+    await bxCall('crm.timeline.comment.add', { fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: commentText } });
+
+    hideActionButtons();
+    out.innerHTML = renderExecutorResult(ai, transcript, deal, sentInfo, extra);
     await hydrateDealMeta(deal);
+    if (stageMove.moved) await openDeal(String(deal.ID));
   } catch (error) {
     out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот остановился</h3><p>${escapeHtml(error.message || String(error))}</p></div><div class="result-card card-action"><h3>Что проверить</h3><ul><li>В Render включены <code>EXECUTOR_MODE=true</code>, <code>EXECUTOR_TEST_DEAL_ID=34946</code>, <code>CALL_TRANSCRIPTION_ENABLED=true</code>.</li><li>В сделке уже есть активность звонка с записью.</li><li>Для расшифровки задан <code>TRANSCRIBE_API_KEY</code> или <code>AI_API_KEY</code>, а провайдер поддерживает <code>/audio/transcriptions</code>.</li></ul></div>`;
   }
