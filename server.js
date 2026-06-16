@@ -380,12 +380,27 @@ ${context}
 
 
 function normalizeWazzupPhone(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  const plus = raw.startsWith('+') ? '+' : '';
-  const digits = raw.replace(/\D/g, '');
-  if (!digits) return '';
-  return `${plus}${digits}`;
+  // Wazzup для phone/chatId требует только цифры без плюса, пробелов и скобок.
+  // Старые версии отправляли +375..., из-за этого Telegram/Wazzup мог возвращать Message data is invalid / HTTP 500.
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits || '';
+}
+
+function normalizeWazzupUsername(value) {
+  const text = String(value || '').trim().replace(/^@/, '');
+  // username Telegram не может быть названием компании с пробелами/кавычками.
+  return /^[A-Za-z0-9_]{5,32}$/.test(text) ? text : '';
+}
+
+function compactWazzupError(data, fallback) {
+  if (!data || typeof data !== 'object') return fallback;
+  const parts = [];
+  if (data.error) parts.push(String(data.error));
+  if (data.description) parts.push(String(data.description));
+  if (data.message) parts.push(String(data.message));
+  if (data.data && data.data.fields) parts.push(`fields: ${JSON.stringify(data.data.fields)}`);
+  if (data.requestId) parts.push(`requestId: ${data.requestId}`);
+  return parts.filter(Boolean).join(' | ') || fallback;
 }
 
 function getConfiguredWazzupChannel(channelKey) {
@@ -491,14 +506,11 @@ app.post('/api/wazzup/send', async (req, res) => {
     }
 
     const text = String(body.text || '').trim();
-    const phone = normalizeWazzupPhone(body.phone || body.chatId || '');
-    const chatId = String(body.chatId || '').trim();
+    const phone = normalizeWazzupPhone(body.phone || '');
+    const chatId = normalizeWazzupPhone(body.chatId || '');
+    const username = normalizeWazzupUsername(body.telegramUsername || body.username || '');
     if (!text) {
       res.status(400).json({ ok: false, error: 'Текст сообщения пустой.' });
-      return;
-    }
-    if (!phone && !chatId) {
-      res.status(400).json({ ok: false, error: 'Не найден телефон / chatId клиента для отправки через Wazzup.' });
       return;
     }
 
@@ -506,14 +518,29 @@ app.post('/api/wazzup/send', async (req, res) => {
       channelId: configured.channelId,
       chatType: configured.chatType,
       text,
-      crmMessageId: `mavis-copylist-${configured.key}-${body.dealId || 'deal'}-${Date.now()}`,
+      crmMessageId: `mavis-executor-${configured.key}-${body.dealId || 'deal'}-${Date.now()}`,
+      clearUnanswered: false,
     };
-    // Для Telegram/Viber в Wazzup часто достаточно номера клиента из CRM.
-    // Если передан chatId, используем его; иначе передаём phone.
-    if (chatId) payload.chatId = chatId;
-    else payload.phone = phone;
+
+    // Wazzup v3: для viber/whatsapp chatId = телефон только цифрами; для Telegram Personal можно phone или username.
+    // Важно: phone без '+'. Username передаем только если он похож на реальный Telegram username.
+    if (configured.chatType === 'telegram') {
+      if (chatId) payload.chatId = chatId;
+      if (phone) payload.phone = phone;
+      if (username) payload.username = username;
+      if (!payload.chatId && !payload.phone && !payload.username) {
+        res.status(400).json({ ok: false, error: 'Для Telegram Wazzup не найден phone/chatId/username клиента. Проверь телефон контакта в Bitrix или наличие Telegram-чата.' });
+        return;
+      }
+    } else {
+      const recipientId = chatId || phone;
+      if (!recipientId) {
+        res.status(400).json({ ok: false, error: `Для ${configured.label} не найден chatId/телефон клиента. Проверь телефон контакта в Bitrix.` });
+        return;
+      }
+      payload.chatId = recipientId;
+    }
     if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
-    if (body.username) payload.username = String(body.username);
 
     const response = await fetch(`${baseUrl}/message`, {
       method: 'POST',
@@ -526,8 +553,13 @@ app.post('/api/wazzup/send', async (req, res) => {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const message = data && (data.description || data.error || data.message) ? (data.description || data.error || data.message) : `HTTP ${response.status}`;
-      res.status(response.status).json({ ok: false, error: `Wazzup ${configured.label}: ${message}`, data, payload: { ...payload, text: '[hidden]' } });
+      const message = compactWazzupError(data, `HTTP ${response.status}`);
+      res.status(response.status).json({
+        ok: false,
+        error: `Wazzup ${configured.label}: ${message}`,
+        data,
+        safePayload: { ...payload, text: '[hidden]' },
+      });
       return;
     }
     res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });

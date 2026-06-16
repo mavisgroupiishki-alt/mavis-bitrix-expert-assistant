@@ -1,4 +1,13 @@
-# MAVIS Bitrix Expert Assistant — v43d VibeCode Whisper
+# MAVIS Bitrix Expert Assistant — v43h executor Wazzup fix
+
+Что исправлено в v43h:
+- режим исполнителя не создаёт задачи;
+- исправлена отправка в Wazzup Telegram/Viber: телефон теперь отправляется только цифрами без +;
+- больше не передаётся название компании как Telegram username;
+- ошибка Wazzup показывает детали ответа API;
+- ассистент по-прежнему работает только по тестовой сделке, указанной в EXECUTOR_TEST_DEAL_ID.
+
+# MAVIS Bitrix Expert Assistant — v43h VibeCode Whisper
 
 Версия v42 добавляет управляемый пилотный чек-лист прямо во вкладку `ИИ-ассистент` внутри карточки сделки.
 
@@ -55,9 +64,9 @@ TRANSCRIBE_MODEL=bitrix/deepdml/faster-whisper-large-v3-turbo-ct2
 TRANSCRIBE_SEND_MODEL=true
 ```
 
-Важно: v43d использует VibeCode `/v1/audio/transcriptions`. Сначала отправляет model=`bitrix/deepdml/faster-whisper-large-v3-turbo-ct2`; если VibeCode вернет 400 из-за поля model, автоматически повторяет запрос без model, как в официальном примере VibeCode.
+Важно: v43h использует VibeCode `/v1/audio/transcriptions`. Сначала отправляет model=`bitrix/deepdml/faster-whisper-large-v3-turbo-ct2`; если VibeCode вернет 400 из-за поля model, автоматически повторяет запрос без model, как в официальном примере VibeCode.
 
 
-## v43d
+## v43h
 - Исправлена ошибка автопилота: buildAIContextForDeal is not defined.
 - Автопилот АТТ теперь использует существующий сбор контекста сделки buildAIContext(deal).

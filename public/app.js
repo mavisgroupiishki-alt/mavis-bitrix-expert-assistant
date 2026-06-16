@@ -2105,7 +2105,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v43f: тестовый ассистент-исполнитель включён для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
+    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
   }
   return html;
 }
@@ -3054,11 +3054,14 @@ async function sendWazzupMessage({ deal, phone, text, channelKey }) {
       text,
       channelKey,
       crmUserId: state.user && state.user.ID,
-      username: companyName(deal.COMPANY_ID),
+      // username больше не передаем названием компании: для Telegram это должно быть только реальное имя пользователя без @.
     }),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.ok) throw new Error(data.error || `Wazzup HTTP ${response.status}`);
+  if (!response.ok || !data.ok) {
+    const extra = data && data.data ? ` · детали: ${JSON.stringify(data.data).slice(0, 500)}` : '';
+    throw new Error((data.error || `Wazzup HTTP ${response.status}`) + extra);
+  }
   return data;
 }
 
@@ -5080,7 +5083,7 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '') {
     ${r.next_steps && r.next_steps.length ? `<div class="result-card card-action"><h3>Следующие шаги</h3>${listHtml(r.next_steps)}</div>` : ''}
     ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
     ${r.comment ? `<div class="result-card"><h3>Комментарий Кристине</h3><div class="message-draft">${escapeHtml(r.comment)}</div></div>` : ''}
-    ${tasks.length ? `<div class="result-card"><h3>Задачи, созданные/рекомендованные ассистентом</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : ''}
+    ${tasks.length ? `<div class="result-card"><h3>Контрольные пункты из анализа</h3>${listHtml(tasks.map((t) => `${t.title} — ${t.deadline_hint || 'срок уточнить'} (${t.responsible || 'expert'})`))}</div>` : ''}
     <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
 }
 
@@ -5090,25 +5093,10 @@ function executorCommentText(ai, transcript, deal) {
 }
 
 async function createExecutorTasksFromAI(deal, result) {
-  const tasks = Array.isArray(result.tasks) ? result.tasks : [];
-  let created = 0;
-  for (const t of tasks) {
-    const title = String(t.title || '').trim();
-    if (!title || hasOpenTaskWithTitle(deal.ID, title)) continue;
-    let responsibleId = deal.ASSIGNED_BY_ID;
-    if (t.responsible === 'manager') responsibleId = deal.CREATED_BY_ID || deal.ASSIGNED_BY_ID;
-    if (t.responsible === 'leader') responsibleId = (APP_CONFIG.leaderUserIds && APP_CONFIG.leaderUserIds[0]) || deal.ASSIGNED_BY_ID;
-    await createTask({
-      title,
-      responsibleId,
-      description: `${t.description || ''}\n\nСоздано автопилотом АТТ по сделке “${deal.TITLE}”.\nИсточник: анализ первичного звонка и данных сделки.`,
-      dealId: deal.ID,
-      deadline: deadlineTomorrow(12),
-      silent: true,
-    });
-    created += 1;
-  }
-  return created;
+  // v43h: ассистент работает как исполнитель, а не как постановщик задач.
+  // Он НЕ создает задачи Кристине/менеджеру.
+  // Он выполняет доступные действия сам, а о выполненном/невыполненном пишет в комментарий сделки.
+  return 0;
 }
 
 
@@ -5205,9 +5193,9 @@ async function runExecutorAutopilot() {
 
     const commentText = executorCommentText(ai, transcript, deal);
     await bxCall('crm.timeline.comment.add', { fields: { ENTITY_ID: Number(deal.ID), ENTITY_TYPE: 'deal', COMMENT: commentText } });
-    const created = await createExecutorTasksFromAI(deal, ai.result || {});
+    // v43h: задачи не создаём. Ассистент только выполняет действия сам и отчитывается.
 
-    let sentInfo = `Комментарий в сделку записан. Создано задач: ${created}.`;
+    let sentInfo = `Комментарий в сделку записан. Задачи не создавались: режим ассистента-исполнителя.`;
     const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() : '';
     if (msg) {
       const channel = preferredChannelKey(deal);
