@@ -2195,7 +2195,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.</div>`;
+    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button></div>`;
   }
   return html;
 }
@@ -5603,6 +5603,29 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 document.getElementById('close-dialog').addEventListener('click', () => { if (state.mode !== 'dealTab') document.getElementById('deal-dialog').close(); });
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
+document.getElementById('deal-details').addEventListener('click', async (e) => {
+  if (!e.target.getAttribute('data-register-wazzup-webhook')) return;
+  const btn = e.target;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Регистрирую...';
+  try {
+    const webhookUrl = `${window.location.origin}/api/wazzup/webhook`;
+    const response = await fetch('/api/wazzup/register-webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhookUrl }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    btn.textContent = 'Зарегистрировано ✓';
+    alert(`Вебхук успешно зарегистрирован в Wazzup: ${webhookUrl}\nТеперь живой бот будет получать сообщения клиента автоматически.`);
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    alert(`Не удалось зарегистрировать вебхук: ${err.message}`);
+  }
+});
 document.getElementById('ai-handoff').addEventListener('click', analyzeHandoffWithAI);
 document.getElementById('ai-workplan').addEventListener('click', generateWorkPlanWithAI);
 document.getElementById('ai-documents').addEventListener('click', checkDocumentsWithAI);

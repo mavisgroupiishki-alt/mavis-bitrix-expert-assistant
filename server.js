@@ -641,6 +641,40 @@ app.post('/api/wazzup/send', async (req, res) => {
   }
 });
 
+app.post('/api/wazzup/register-webhook', async (req, res) => {
+  try {
+    const apiKey = process.env.WAZZUP_API_KEY || '';
+    if (!apiKey) {
+      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
+      return;
+    }
+    const webhookUrl = String((req.body && req.body.webhookUrl) || '').trim();
+    if (!webhookUrl) {
+      res.status(400).json({ ok: false, error: 'webhookUrl не передан.' });
+      return;
+    }
+    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/webhooks`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        webhooksUri: webhookUrl,
+        subscriptions: { messagesAndStatuses: true, contactsAndDealsCreation: false },
+      }),
+    });
+    const text = await response.text();
+    const data = (() => { try { return JSON.parse(text); } catch (_) { return {}; } })();
+    if (!response.ok) {
+      const message = compactWazzupError(data, text ? text.slice(0, 300) : `HTTP ${response.status}`);
+      res.status(response.status).json({ ok: false, error: `Wazzup: ${message}` });
+      return;
+    }
+    res.json({ ok: true, data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
 // --- v54: живой бот в Wazzup-чате (пилот только для тестовой сделки) -----------------------
 
 function normalizePhoneDigits(value) {
