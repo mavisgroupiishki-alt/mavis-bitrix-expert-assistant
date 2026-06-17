@@ -263,6 +263,7 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
     ],
     executor_attestation_call: [
       'Фокус сценария: ассистент-исполнитель по аттестации организации после первичного звонка. Не режим подсказки, а рабочий маршрут исполнения. Ассистент сам ведёт сделку: пишет клиенту, ставит внутренние дела, двигает стадию, отчитывается эксперту-наблюдателю комментарием. Клиенту никогда не пишешь от имени человека-эксперта без подтверждения — пишешь как ассистент.',
+      'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp и т.п.), даже если клиент сам назвал его в звонке для пересылки чего-то конкретного. Вместо "пришлите в Viber" или "перешлите в Telegram" пиши просто "пришлите мне" / "перешлите мне" — без названия канала. Это исключает противоречие между тем, что сказано в тексте, и тем мессенджером, в котором клиент реально получает сообщение.',
       'Из звонка и сделки извлеки: вид работ, кто закрывает руководителя, есть ли директор с высшим строительным и 5 годами опыта, есть ли главный инженер и его аттестат, может ли один человек закрыть руководителя и ГИ, есть ли прораб/мастер под каждый вид работ, кого переводим/аттестуем/подбираем, канал связи, сроки и обещания.',
       'Сформируй конкретный ход работы: что уже сделал ассистент, что пишет клиенту, какие документы запрашивает, какие внутренние дела создаёт (НЕ для клиента — для эксперта/менеджера/руководителя), когда запускать ЛК Белстройцентра, когда ждать документы, когда передавать оформителям, когда собирать папку и что контролировать после подачи.',
       'По аттестации организации учитывай: Белстройцентр, бумажная подача, перечень копий, заявка через личный кабинет, договор/акты как успешное прохождение, замечания как отдельный этап устранения.',
@@ -559,19 +560,17 @@ app.post('/api/wazzup/send', async (req, res) => {
     }
     if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
 
-    // Диагностика: строим альтернативный МИНИМАЛЬНЫЙ payload только с обязательными полями
-    // (channelId, chatType, phone/chatId, text) — без crmMessageId, clearUnanswered, crmUserId.
-    // Если полный payload даёт 500, а минимальный проходит — значит причина в одном из
-    // дополнительных полей именно для Telegram. Это последняя непротестированная гипотеза
-    // в рамках самого Telegram-канала, без выхода на Viber/WhatsApp и без обращения в поддержку.
+    // ПОДТВЕРЖДЕНО ДИАГНОСТИКОЙ (v51): для Telegram один из полей crmMessageId/clearUnanswered/
+    // crmUserId вызывал HTTP 500 у Wazzup. Минимальный payload (только channelId, chatType,
+    // phone/chatId, text) отправляется и проходит успешно. Поэтому для Telegram минимальный
+    // payload теперь ОСНОВНОЙ, а не запасной вариант — без лишней неудачной попытки и задержки.
+    // Для остальных каналов (Viber/WhatsApp) полный payload работал нормально, оставляем как был.
     const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text };
     if (payload.chatId) minimalPayload.chatId = payload.chatId;
     if (payload.phone) minimalPayload.phone = payload.phone;
     if (payload.username) minimalPayload.username = payload.username;
+    const payloadToSend = configured.chatType === 'telegram' ? minimalPayload : payload;
 
-    // Wazzup документирует MESSAGES_CAN_NOT_ADD ("непредвиденная ошибка сервера") как известную
-    // транзиентную ошибку 500 на их стороне. Делаем одну повторную попытку с уникальным
-    // crmMessageId перед тем, как считать отправку окончательно неудачной.
     const attemptSend = async (attemptPayload) => {
       const resp = await fetch(`${baseUrl}/message`, {
         method: 'POST',
@@ -586,30 +585,24 @@ app.post('/api/wazzup/send', async (req, res) => {
       return { resp, text, json };
     };
 
-    let { resp: response, text: responseText, json: data } = await attemptSend(payload);
-    let usedMinimal = false;
+    let { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
+    // Запасной вариант на случай документированной у Wazzup транзиентной ошибки MESSAGES_CAN_NOT_ADD:
+    // если основная попытка дала 500, пробуем второй раз тот же payload через секунду.
     if (!response.ok && response.status >= 500) {
       await new Promise((r) => setTimeout(r, 1000));
-      ({ resp: response, text: responseText, json: data } = await attemptSend(minimalPayload));
-      usedMinimal = true;
-      // Если минимальный payload прошёл — значит при полном payload что-то в дополнительных
-      // полях (crmMessageId/clearUnanswered/crmUserId) вызывало 500 именно для этого канала/диалога.
-      // Логируем это явно, чтобы было видно в Render logs при следующей проверке.
-      if (response.ok) {
-        console.log('[wazzup] Полный payload дал 500, минимальный (без crmMessageId/clearUnanswered/crmUserId) прошёл успешно. Канал:', configured.key);
-      }
+      ({ resp: response, text: responseText, json: data } = await attemptSend(payloadToSend));
     }
     if (!response.ok) {
       const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
       res.status(response.status).json({
         ok: false,
-        error: `Wazzup ${configured.label}: ${message}${usedMinimal ? ' (испробован и минимальный payload — тот же результат)' : ''}`,
+        error: `Wazzup ${configured.label}: ${message}`,
         data,
-        safePayload: { ...payload, text: '[hidden]' },
+        safePayload: { ...payloadToSend, text: '[hidden]' },
       });
       return;
     }
-    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data, usedMinimalPayload: usedMinimal });
+    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
