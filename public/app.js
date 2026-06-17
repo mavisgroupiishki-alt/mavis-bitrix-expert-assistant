@@ -46,7 +46,7 @@ const state = {
   aiQualityReport: null,
 };
 
-const REQUIRED_ITEMS = [
+const REQUIRED_ITEMS_BASE = [
   {
     key: 'city',
     label: 'город клиента',
@@ -110,21 +110,35 @@ const REQUIRED_ITEMS = [
     exact: [/\b(перевести|перевод|переводим|перевести на должность|должност|трудов\w* книжк|совмещен|совмещение)\b/i],
     weak: [/\b(директор|работает|оформить)\b/i],
   },
-  {
+];
+
+// v48: эти два пункта применимы только к продуктам, где они реально нужны.
+// "Подбор специалистов" — когда у клиента есть открытые позиции, которые ищет MAVIS (СТК/периодика).
+// "Средства измерений" — когда продукт требует измерительного оборудования (СТК), а не для
+// чистой аттестации организации без СПК, где этого пункта в принципе не существует.
+const REQUIRED_ITEMS_OPTIONAL = {
+  searching: {
     key: 'searching',
     label: 'кого клиент ищет сам / кого подбирает MAVIS',
     why: 'без этого непонятно, кто отвечает за закрытие кадрового блока',
     exact: [/\b(ищет сам|клиент ищет|ищут сами|подбирает|подбираем|подбор специалист|найти специалист|наш специалист|ваш специалист)\b/i],
     weak: [/\b(ищет|найти|подбор)\b/i],
+    appliesTo: new Set(['stk', 'stk_periodic', 'stk_att']),
   },
-  {
+  measurements: {
     key: 'measurements',
     label: 'средства измерений',
-    why: 'для СТК и части работ без средств измерений может сорваться подача или выезд',
+    why: 'для СТК без средств измерений может сорваться подача или выезд',
     exact: [/\b(средств\w* измерен|измерительн\w* средств|прибор|поверк|аренд\w* прибор|аренд\w* средств|свои средства)\b/i],
     weak: [/\b(аренда|измерен)\b/i],
+    appliesTo: new Set(['stk', 'stk_periodic', 'stk_att']),
   },
-];
+};
+
+function requiredItemsForProduct(productKey) {
+  const optional = Object.values(REQUIRED_ITEMS_OPTIONAL).filter((item) => item.appliesTo.has(productKey));
+  return [...REQUIRED_ITEMS_BASE, ...optional];
+}
 
 const CRITICAL_KEYS = new Set(['service', 'kp', 'terms', 'email', 'fees', 'specialists']);
 const AUDIT_TAG = 'MAVIS_AI_HANDOFF_AUDIT';
@@ -2176,7 +2190,7 @@ function detailHtml(deal) {
   return html;
 }
 
-async function checkHandoff() {
+async function checkHandoff(extraTranscript = '') {
   if (!state.selectedDeal) return;
   const deal = state.selectedDeal;
   const production = await collectDealContext(deal.ID, deal, 'производственная сделка');
@@ -2204,8 +2218,18 @@ async function checkHandoff() {
     }
   }
 
-  const contexts = sales ? [production, sales] : [production];
-  const results = REQUIRED_ITEMS.map((item) => analyzeRequirement(item, contexts, deal));
+  // v48: если передана расшифровка звонка (вызов из автопилота), включаем её в контексты —
+  // итоговая проверка передачи должна учитывать и то, что выяснилось в самом звонке, а не только
+  // то, что зафиксировали продажи заранее. Без звонка (обычная кнопка "Проверить передачу")
+  // работает как раньше — оценка только по данным продаж/сделки.
+  const callContext = extraTranscript
+    ? { dealId: deal.ID, label: 'расшифровка первичного звонка эксперта', sections: [{ source: 'расшифровка звонка', text: extraTranscript }] }
+    : null;
+
+  const contexts = [production, sales, callContext].filter(Boolean);
+  const productProfile = detectProductProfile(getService(deal), deal.TITLE || '');
+  const items = requiredItemsForProduct(productProfile.key);
+  const results = items.map((item) => analyzeRequirement(item, contexts, deal));
   const found = results.filter((r) => r.status === 'found');
   const uncertain = results.filter((r) => r.status === 'uncertain');
   const missing = results.filter((r) => r.status === 'missing');
@@ -2283,8 +2307,12 @@ async function collectDealContext(id, deal, label) {
   }
 
   try {
-    const comments = await bxList('crm.timeline.comment.list', { filter: { ENTITY_ID: id, ENTITY_TYPE: 'deal' }, order: { ID: 'DESC' } }, 50);
-    const text = comments.map((c) => stripHtml(`${c.CREATED || c.DATE_CREATE || ''}: ${c.COMMENT || c.TEXT || ''}`)).filter(Boolean).join('\n');
+    const comments = await bxList('crm.timeline.comment.list', { filter: { ENTITY_ID: id, ENTITY_TYPE: 'deal' }, select: ['ID', 'COMMENT', 'CREATED', 'FILES'], order: { ID: 'DESC' } }, 50);
+    const text = comments.map((c) => {
+      const fileNames = Array.isArray(c.FILES) ? c.FILES.map((f) => f.NAME || f.name || '').filter(Boolean) : [];
+      const filesNote = fileNames.length ? ` [Прикреплённые файлы: ${fileNames.join(', ')}]` : '';
+      return stripHtml(`${c.CREATED || c.DATE_CREATE || ''}: ${c.COMMENT || c.TEXT || ''}${filesNote}`);
+    }).filter(Boolean).join('\n');
     sections.push({ source: `${label}: комментарии`, text: text || 'комментариев нет' });
   } catch (e) {
     sections.push({ source: `${label}: комментарии`, text: `недоступны: ${e.message}` });
@@ -2314,6 +2342,7 @@ function summarizeDealFields(id, deal) {
     `Дата начала оказания услуг: ${getStartDate(deal) || ''}`,
     `Ответственный: ${userName(deal.ASSIGNED_BY_ID)}`,
     `Создал сделку: ${userName(deal.CREATED_BY_ID)}`,
+    `Предпочитаемый способ связи (поле сделки): ${messengerLabel(preferredChannelKey(deal))}`,
     `Ссылка на сделку отдела продаж: ${getSalesLink(deal) || ''}`,
     `Компания адрес: ${company.ADDRESS || ''} ${company.ADDRESS_CITY || ''} ${company.ADDRESS_REGION || ''} ${company.ADDRESS_PROVINCE || ''}`,
     `Компания email: ${extractMultiField(company.EMAIL)}`,
@@ -2341,11 +2370,22 @@ function directEvidence(item, deal, contexts) {
   if (item.key === 'service' && getService(deal)) {
     return { status: 'found', source: 'поле “Услуга” производственной сделки', snippet: getService(deal) };
   }
+  if (item.key === 'channel') {
+    const ch = preferredChannelKey(deal);
+    if (ch && ch !== 'manual') {
+      return { status: 'found', source: 'поле “Предпочитаемый способ связи” сделки', snippet: messengerLabel(ch) };
+    }
+  }
   if (item.key === 'email') {
     const evidence = findEvidence(contexts, [/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i]);
     if (evidence) return { status: 'found', source: evidence.source, snippet: evidence.snippet };
   }
   if (item.key === 'kp') {
+    // Прикреплённый файл (счёт, КП, договор) в комментариях/активностях сделки тоже считается
+    // подтверждением — раньше детектор смотрел только на текстовые слова "КП"/"коммерческое",
+    // и пропускал файлы, прикреплённые без этих слов в самом тексте сообщения.
+    const fileEvidence = findEvidence(contexts, [/\.(pdf|docx?|xlsx?|jpg|jpeg|png)\b/i, /\[disk\s*file/i, /счет[\s_-]?заказ|счёт[\s_-]?заказ|коммерческое предложение/i]);
+    if (fileEvidence) return { status: 'found', source: fileEvidence.source, snippet: fileEvidence.snippet };
     const productEvidence = findEvidence(contexts.filter((c) => c.sections.some((s) => s.source.includes('товары'))), [/./]);
     if (productEvidence && !/товары не заполнены|недоступны/i.test(productEvidence.snippet)) {
       const kpEvidence = findEvidence(contexts, item.exact || []);
@@ -3930,7 +3970,8 @@ function aiScenarioLabel(scenario) {
 async function enrichAIContextByScenario(context, deal, scenario) {
   if (scenario === 'handoff') {
     context.scenario = 'handoff';
-    context.requiredHandoffItems = REQUIRED_ITEMS.map((x) => ({ key: x.key, label: x.label, why: x.why }));
+    const productProfile = detectProductProfile(getService(deal), deal.TITLE || '');
+    context.requiredHandoffItems = requiredItemsForProduct(productProfile.key).map((x) => ({ key: x.key, label: x.label, why: x.why }));
     context.localHandoffAudit = getAudit(deal.ID) || state.selectedAudit || null;
     context.note = 'ИИ должен проверить качество передачи сделки из продаж в производство и отдельно выделить ошибки менеджера, спорные пункты и действия эксперта.';
   }
@@ -5249,32 +5290,14 @@ async function runExecutorAutopilot() {
     out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот не запущен</h3><p>Режим исполнителя разрешён только для сделки <code>${escapeHtml(APP_CONFIG.executorTestDealId || 'не задано')}</code>. Текущая сделка: <code>${escapeHtml(deal.ID)}</code>.</p></div>`;
     return;
   }
-  out.innerHTML = `<div class="result-card"><h3>Шаг 1 из 6 · Проверяю передачу из продаж...</h3></div>`;
+  out.innerHTML = `<div class="result-card"><h3>Шаг 1 из 6 · Ищу запись звонка...</h3></div>`;
   try {
     await ensureDealMeta(deal.ID);
 
-    // Шаг 1: проверка передачи. Не останавливает автопилот, но критичные пробелы
-    // фиксируются в отчёте и создают задачу менеджеру — без додумывания недостающих данных.
-    let handoffInfo = null;
-    try {
-      await checkHandoff();
-      const audit = state.selectedAudit;
-      const criticalCount = (audit && audit.missing ? audit.missing.length : 0);
-      handoffInfo = {
-        statusText: audit ? audit.status : 'не удалось проверить передачу',
-        missingLabels: audit ? [...(audit.missing || []), ...(audit.technical || [])] : [],
-        criticalCount,
-        salesDealId: audit ? audit.salesDealId : '',
-        salesManagerId: audit ? audit.salesManagerId : '',
-      };
-      if (criticalCount && handoffInfo.salesManagerId) {
-        try { await createHandoffTaskForDeal(deal.ID, true); } catch (_) {}
-      }
-    } catch (e) {
-      handoffInfo = { statusText: `проверка передачи не выполнена: ${e.message || String(e)}`, missingLabels: [], criticalCount: 0 };
-    }
-
-    out.innerHTML = `<div class="result-card"><h3>Шаг 2 из 6 · Ищу запись звонка...</h3></div>`;
+    // Шаг 1: находим и расшифровываем звонок ДО проверки передачи. Это важно: проверка передачи
+    // должна быть итоговой оценкой, учитывающей и то, что выяснилось из самого звонка, а не только
+    // то, что было зафиксировано продажами заранее — иначе пробелы, закрытые в разговоре с клиентом,
+    // ошибочно показываются как открытые.
     const found = await findCallRecordingsForDeal(deal.ID);
     if (!found.candidates.length) throw new Error('Запись звонка пока не найдена в активностях сделки. После звонка обнови сделку и нажми автопилот ещё раз.');
     let transcript = '';
@@ -5295,6 +5318,26 @@ async function runExecutorAutopilot() {
     if (!transcript || !selectedCandidate) {
       const last = checked[checked.length - 1];
       throw new Error(`Найденные записи звонков расшифрованы, но не похожи на первичный звонок по аттестации. Автопилот остановлен, дела/сообщения не создаём. Последний фрагмент: ${last ? last.textPreview : '—'}`);
+    }
+
+    out.innerHTML = `<div class="result-card"><h3>Шаг 2 из 6 · Проверяю передачу из продаж (с учётом звонка)...</h3></div>`;
+    let handoffInfo = null;
+    try {
+      await checkHandoff(transcript);
+      const audit = state.selectedAudit;
+      const criticalCount = (audit && audit.missing ? audit.missing.length : 0);
+      handoffInfo = {
+        statusText: audit ? audit.status : 'не удалось проверить передачу',
+        missingLabels: audit ? [...(audit.missing || []), ...(audit.technical || [])] : [],
+        criticalCount,
+        salesDealId: audit ? audit.salesDealId : '',
+        salesManagerId: audit ? audit.salesManagerId : '',
+      };
+      if (criticalCount && handoffInfo.salesManagerId) {
+        try { await createHandoffTaskForDeal(deal.ID, true); } catch (_) {}
+      }
+    } catch (e) {
+      handoffInfo = { statusText: `проверка передачи не выполнена: ${e.message || String(e)}`, missingLabels: [], criticalCount: 0 };
     }
 
     const realService = getService(deal) || deal.TITLE || '';

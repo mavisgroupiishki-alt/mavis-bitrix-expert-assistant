@@ -465,7 +465,6 @@ app.get('/api/wazzup/channels', async (_req, res) => {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${apiKey}`,
-        'X-Api-Key': apiKey,
         'Content-Type': 'application/json',
       },
     });
@@ -568,7 +567,6 @@ app.post('/api/wazzup/send', async (req, res) => {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          'X-Api-Key': apiKey,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(attemptPayload),
