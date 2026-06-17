@@ -559,6 +559,16 @@ app.post('/api/wazzup/send', async (req, res) => {
     }
     if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
 
+    // Диагностика: строим альтернативный МИНИМАЛЬНЫЙ payload только с обязательными полями
+    // (channelId, chatType, phone/chatId, text) — без crmMessageId, clearUnanswered, crmUserId.
+    // Если полный payload даёт 500, а минимальный проходит — значит причина в одном из
+    // дополнительных полей именно для Telegram. Это последняя непротестированная гипотеза
+    // в рамках самого Telegram-канала, без выхода на Viber/WhatsApp и без обращения в поддержку.
+    const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text };
+    if (payload.chatId) minimalPayload.chatId = payload.chatId;
+    if (payload.phone) minimalPayload.phone = payload.phone;
+    if (payload.username) minimalPayload.username = payload.username;
+
     // Wazzup документирует MESSAGES_CAN_NOT_ADD ("непредвиденная ошибка сервера") как известную
     // транзиентную ошибку 500 на их стороне. Делаем одну повторную попытку с уникальным
     // crmMessageId перед тем, как считать отправку окончательно неудачной.
@@ -577,22 +587,29 @@ app.post('/api/wazzup/send', async (req, res) => {
     };
 
     let { resp: response, text: responseText, json: data } = await attemptSend(payload);
+    let usedMinimal = false;
     if (!response.ok && response.status >= 500) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const retryPayload = { ...payload, crmMessageId: `${payload.crmMessageId}-retry` };
-      ({ resp: response, text: responseText, json: data } = await attemptSend(retryPayload));
+      await new Promise((r) => setTimeout(r, 1000));
+      ({ resp: response, text: responseText, json: data } = await attemptSend(minimalPayload));
+      usedMinimal = true;
+      // Если минимальный payload прошёл — значит при полном payload что-то в дополнительных
+      // полях (crmMessageId/clearUnanswered/crmUserId) вызывало 500 именно для этого канала/диалога.
+      // Логируем это явно, чтобы было видно в Render logs при следующей проверке.
+      if (response.ok) {
+        console.log('[wazzup] Полный payload дал 500, минимальный (без crmMessageId/clearUnanswered/crmUserId) прошёл успешно. Канал:', configured.key);
+      }
     }
     if (!response.ok) {
       const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
       res.status(response.status).json({
         ok: false,
-        error: `Wazzup ${configured.label}: ${message}`,
+        error: `Wazzup ${configured.label}: ${message}${usedMinimal ? ' (испробован и минимальный payload — тот же результат)' : ''}`,
         data,
         safePayload: { ...payload, text: '[hidden]' },
       });
       return;
     }
-    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });
+    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data, usedMinimalPayload: usedMinimal });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }
