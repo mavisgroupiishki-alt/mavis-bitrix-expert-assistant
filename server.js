@@ -89,7 +89,51 @@ const config = {
   transcribeModel: process.env.TRANSCRIBE_MODEL || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2',
   transcribeSendModel: String(process.env.TRANSCRIBE_SEND_MODEL || 'true').toLowerCase() !== 'false',
   transcribeBaseUrl: process.env.TRANSCRIBE_BASE_URL || process.env.AI_BASE_URL || '',
+
+  // v54: живой бот в Wazzup-чате. BITRIX_WEBHOOK_URL — входящий вебхук Bitrix (создаётся в
+  // разделе "Разработчикам" → "Входящий вебхук"), нужен серверу для работы с Bitrix без открытого
+  // браузера (вебхук от Wazzup может прийти в любой момент, когда никто не открыл Bitrix).
+  bitrixWebhookUrl: (process.env.BITRIX_WEBHOOK_URL || '').replace(/\/+$/, ''),
+  // Только этот номер телефона обрабатывается живым ботом — пилотная сделка 34946.
+  liveChatTestPhone: process.env.LIVE_CHAT_TEST_PHONE || '',
+  liveChatTestDealId: process.env.LIVE_CHAT_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || '',
+  // Wazzup присылает Authorization: Bearer {crmKey}, если crmKey задан в их настройках интеграции.
+  // Если задан и здесь — сверяем заголовок, чтобы отбросить случайные/чужие запросы на вебхук.
+  wazzupCrmKey: process.env.WAZZUP_CRM_KEY || '',
+  liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
 };
+
+// Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
+// когда никто не открыл Bitrix в браузере (там работа идёт через BX24.callMethod, что недоступно
+// здесь). Используется только живым ботом (вебхук-обработчик), не основным приложением.
+async function bitrixRestCall(method, params = {}) {
+  if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
+  const response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) {
+    const msg = data && (data.error_description || data.error) ? `${data.error}: ${data.error_description || ''}` : `HTTP ${response.status}`;
+    throw new Error(`Bitrix REST ${method}: ${msg}`);
+  }
+  return data.result;
+}
+
+async function bitrixRestList(method, params = {}, limit = 200) {
+  const out = [];
+  let start = 0;
+  for (;;) {
+    const page = await bitrixRestCall(method, { ...params, start });
+    const items = Array.isArray(page) ? page : (page && page.items) || [];
+    out.push(...items);
+    if (!Array.isArray(page) || items.length === 0 || out.length >= limit) break;
+    start += items.length;
+    if (out.length >= limit) break;
+  }
+  return out.slice(0, limit);
+}
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'mavis-bitrix-expert-assistant' });
@@ -301,7 +345,15 @@ function aiScenarioConfig(scenarioRaw) {
     executor_attestation_call: {
       label: 'Автопилот АТТ: анализ первичного звонка',
       instruction: 'Ты ассистент-исполнитель по сделке аттестации организации. На основании сделки, КП/комментариев и расшифровки первичного звонка сформируй рабочий маршрут исполнения. Обязательно: 1) кратко что понял из передачи и звонка; 2) схема специалистов: директор/руководитель, ГИ, прораб/мастер по видам работ, кого переводим/аттестуем/подбираем; 3) какие данные отсутствуют; 4) ход работы для клиента; 5) сообщение клиенту; 6) комментарий Кристине; 7) список ВНУТРЕННИХ дел/задач с ответственными expert|manager|leader и дедлайнами (никогда задач "для клиента"); 8) этап по ЛК Белстройцентра: запрос письма/ссылки, регистрация/заявка, номер заявки или остановка при капче/ошибке; 9) решение по стадии сделки в Bitrix: двигать дальше по воронке или оставить как есть, с понятной причиной.'
-    }
+    },
+    live_chat_classify: {
+      label: 'Живой бот: классификатор безопасности входящего сообщения',
+      instruction: 'Ты классификатор безопасности для автоответчика в чате с клиентом по сделке аттестации. Тебе дают историю переписки и новое входящее сообщение клиента. Определи: можно ли ассистенту ответить клиенту полностью автоматически, без участия живого человека (эксперта). ОТВЕЧАЙ "needs_human" (нужен живой человек), если сообщение содержит: жалобу, недовольство, конфликт, спор о цене или условиях, угрозу отказа/возврата, любую эмоционально напряжённую или чувствительную тему, юридический вопрос, запрос скидки, или вопрос, который не связан с текущим этапом сделки и на который нет явного ответа в контексте сделки. ОТВЕЧАЙ "safe_auto_reply" только если это конкретный фактический вопрос или ответ по ходу сделки (статус, что делать дальше, подтверждение данных, ответ на вопрос ассистента типа "есть ли у вас личный кабинет"), на который есть однозначный ответ из контекста сделки. При любой неопределённости — выбирай needs_human, лучше лишний раз позвать человека, чем дать клиенту неверный или неуместный автоматический ответ.'
+    },
+    live_chat_reply: {
+      label: 'Живой бот: автоответ клиенту',
+      instruction: 'Ты ассистент-исполнитель, который ведёт переписку с клиентом по сделке аттестации от имени MAVIS GROUP. Тебе дан полный контекст сделки (звонок, поля, история переписки) и новое сообщение клиента, которое уже проверено как безопасное для автоответа. Напиши короткий, человечный, деловой ответ клиенту по существу его сообщения. НИКОГДА не упоминай название конкретного мессенджера (Viber/Telegram/WhatsApp) в ответе. Не придумывай факты, которых нет в контексте сделки — если чего-то не знаешь, честно скажи, что уточнишь, и не отвечай вместо того, чтобы это вызвало needs_human на классификаторе. Тон — спокойный, доброжелательный, без канцелярита.'
+    },
   };
   return { scenario, ...(map[scenario] || map.deal_analyze) };
 }
@@ -500,111 +552,249 @@ app.get('/api/wazzup/channels', async (_req, res) => {
   }
 });
 
+// Вынесено в отдельную функцию, чтобы её мог использовать и маршрут /api/wazzup/send (ручная
+// отправка через автопилот), и обработчик вебхука живого бота (автоответ клиенту) — одна и та же
+// проверенная логика (минимальный payload для Telegram, повтор при 500).
+async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId }) {
+  const apiKey = process.env.WAZZUP_API_KEY || '';
+  const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+  if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
+
+  const configured = getConfiguredWazzupChannel(channelKey);
+  if (!configured || !configured.channelId) throw new Error(`Wazzup-канал ${channelKey || 'по умолчанию'} не задан в Render Environment.`);
+
+  const cleanText = String(text || '').trim();
+  if (!cleanText) throw new Error('Текст сообщения пустой.');
+  const cleanPhone = normalizeWazzupPhone(phone || '');
+  const cleanChatId = normalizeWazzupPhone(chatId || '');
+  const cleanUsername = normalizeWazzupUsername(username || '');
+
+  const payload = {
+    channelId: configured.channelId,
+    chatType: configured.chatType,
+    text: cleanText,
+    crmMessageId: `mavis-executor-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
+    clearUnanswered: false,
+  };
+
+  if (configured.chatType === 'telegram') {
+    if (cleanChatId) {
+      payload.chatId = cleanChatId;
+    } else if (cleanPhone) {
+      payload.phone = cleanPhone;
+    } else if (cleanUsername) {
+      payload.username = cleanUsername;
+    } else {
+      throw new Error('Для Telegram Wazzup не найден телефон/chatId/username клиента.');
+    }
+  } else {
+    const recipientId = cleanChatId || cleanPhone;
+    if (!recipientId) throw new Error(`Для ${configured.label} не найден chatId/телефон клиента.`);
+    payload.chatId = recipientId;
+  }
+
+  const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text };
+  if (payload.chatId) minimalPayload.chatId = payload.chatId;
+  if (payload.phone) minimalPayload.phone = payload.phone;
+  if (payload.username) minimalPayload.username = payload.username;
+  const payloadToSend = configured.chatType === 'telegram' ? minimalPayload : payload;
+
+  const attemptSend = async (attemptPayload) => {
+    const resp = await fetch(`${baseUrl}/message`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(attemptPayload),
+    });
+    const text2 = await resp.text();
+    const json = (() => { try { return JSON.parse(text2); } catch (_) { return {}; } })();
+    return { resp, text: text2, json };
+  };
+
+  let { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
+  if (!response.ok && response.status >= 500) {
+    await new Promise((r) => setTimeout(r, 1000));
+    ({ resp: response, text: responseText, json: data } = await attemptSend(payloadToSend));
+  }
+  if (!response.ok) {
+    const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
+    const err = new Error(`Wazzup ${configured.label}: ${message}`);
+    err.safePayload = { ...payloadToSend, text: '[hidden]' };
+    throw err;
+  }
+  return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data };
+}
+
 app.post('/api/wazzup/send', async (req, res) => {
   try {
-    const apiKey = process.env.WAZZUP_API_KEY || '';
-    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
-    if (!apiKey) {
-      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
-      return;
-    }
-
     const body = req.body || {};
-    const channelKey = body.channelKey || body.channel || '';
-    const configured = getConfiguredWazzupChannel(channelKey);
-    if (!configured || !configured.channelId) {
-      res.status(400).json({ ok: false, error: `Wazzup-канал ${channelKey || 'по умолчанию'} не задан в Render Environment.` });
-      return;
-    }
-
-    const text = String(body.text || '').trim();
-    const phone = normalizeWazzupPhone(body.phone || '');
-    const chatId = normalizeWazzupPhone(body.chatId || '');
-    const username = normalizeWazzupUsername(body.telegramUsername || body.username || '');
-    if (!text) {
-      res.status(400).json({ ok: false, error: 'Текст сообщения пустой.' });
-      return;
-    }
-
-    const payload = {
-      channelId: configured.channelId,
-      chatType: configured.chatType,
-      text,
-      crmMessageId: `mavis-executor-${configured.key}-${body.dealId || 'deal'}-${Date.now()}`,
-      clearUnanswered: false,
-    };
-
-    // Wazzup v3, официальная документация (Sending messages): для Telegram Personal
-    // chatId известен ТОЛЬКО из вебхука входящего сообщения или из ответа Wazzup на предыдущую
-    // отправку. Его нельзя просто подставить как "номер телефона цифрами" — это ломает запрос
-    // (отсюда HTTP 500 в v45). Для исходящего сообщения, когда chatId неизвестен, нужно передавать
-    // phone или username — это специальные поля именно для Telegram Personal.
-    if (configured.chatType === 'telegram') {
-      if (chatId) {
-        payload.chatId = chatId;
-      } else if (phone) {
-        payload.phone = phone;
-      } else if (username) {
-        payload.username = username;
-      } else {
-        res.status(400).json({ ok: false, error: 'Для Telegram Wazzup не найден телефон/chatId/username клиента. Проверь телефон контакта в Bitrix или наличие Telegram-чата.' });
-        return;
-      }
-    } else {
-      const recipientId = chatId || phone;
-      if (!recipientId) {
-        res.status(400).json({ ok: false, error: `Для ${configured.label} не найден chatId/телефон клиента. Проверь телефон контакта в Bitrix.` });
-        return;
-      }
-      payload.chatId = recipientId;
-    }
-    if (body.crmUserId) payload.crmUserId = String(body.crmUserId);
-
-    // ПОДТВЕРЖДЕНО ДИАГНОСТИКОЙ (v51): для Telegram один из полей crmMessageId/clearUnanswered/
-    // crmUserId вызывал HTTP 500 у Wazzup. Минимальный payload (только channelId, chatType,
-    // phone/chatId, text) отправляется и проходит успешно. Поэтому для Telegram минимальный
-    // payload теперь ОСНОВНОЙ, а не запасной вариант — без лишней неудачной попытки и задержки.
-    // Для остальных каналов (Viber/WhatsApp) полный payload работал нормально, оставляем как был.
-    const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text };
-    if (payload.chatId) minimalPayload.chatId = payload.chatId;
-    if (payload.phone) minimalPayload.phone = payload.phone;
-    if (payload.username) minimalPayload.username = payload.username;
-    const payloadToSend = configured.chatType === 'telegram' ? minimalPayload : payload;
-
-    const attemptSend = async (attemptPayload) => {
-      const resp = await fetch(`${baseUrl}/message`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(attemptPayload),
-      });
-      const text = await resp.text();
-      const json = (() => { try { return JSON.parse(text); } catch (_) { return {}; } })();
-      return { resp, text, json };
-    };
-
-    let { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
-    // Запасной вариант на случай документированной у Wazzup транзиентной ошибки MESSAGES_CAN_NOT_ADD:
-    // если основная попытка дала 500, пробуем второй раз тот же payload через секунду.
-    if (!response.ok && response.status >= 500) {
-      await new Promise((r) => setTimeout(r, 1000));
-      ({ resp: response, text: responseText, json: data } = await attemptSend(payloadToSend));
-    }
-    if (!response.ok) {
-      const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
-      res.status(response.status).json({
-        ok: false,
-        error: `Wazzup ${configured.label}: ${message}`,
-        data,
-        safePayload: { ...payloadToSend, text: '[hidden]' },
-      });
-      return;
-    }
-    res.json({ ok: true, channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data });
+    const result = await sendWazzupMessageInternal({
+      channelKey: body.channelKey || body.channel || '',
+      text: body.text,
+      phone: body.phone,
+      chatId: body.chatId,
+      username: body.telegramUsername || body.username,
+      dealId: body.dealId,
+    });
+    res.json({ ok: true, ...result });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.message || String(error) });
+    res.status(error.safePayload ? 502 : 500).json({ ok: false, error: error.message || String(error), safePayload: error.safePayload });
+  }
+});
+
+// --- v54: живой бот в Wazzup-чате (пилот только для тестовой сделки) -----------------------
+
+function normalizePhoneDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+// Находим сделку по номеру телефона контакта. Пилот ограничен одним номером (LIVE_CHAT_TEST_PHONE),
+// поэтому ищем именно сделку из LIVE_CHAT_TEST_DEAL_ID, но всё равно сверяем номер контакта —
+// это явная защита, чтобы бот не начал случайно отвечать по другой сделке/контакту.
+async function findDealForPhone(phoneDigits) {
+  if (!config.liveChatTestDealId) return null;
+  const deal = await bitrixRestCall('crm.deal.get', { id: config.liveChatTestDealId });
+  if (!deal) return null;
+  if (deal.CONTACT_ID) {
+    try {
+      const contact = await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID });
+      const phones = Array.isArray(contact && contact.PHONE) ? contact.PHONE.map((p) => normalizePhoneDigits(p.VALUE)) : [];
+      if (phones.length && !phones.some((p) => p.endsWith(phoneDigits) || phoneDigits.endsWith(p))) {
+        return null; // номер не совпадает с контактом тестовой сделки — не трогаем
+      }
+    } catch (_) { /* если контакт не открылся — на пилоте всё равно работаем по deal id, не блокируем */ }
+  }
+  return deal;
+}
+
+// Лог переписки храним как комментарии в таймлайне сделки с префиксом — переиспользуем как
+// контекст для каждого следующего ответа, без отдельной БД.
+const LIVE_CHAT_LOG_PREFIX = '[MAVIS_LIVE_CHAT]';
+
+async function appendLiveChatLog(dealId, direction, text) {
+  const tag = direction === 'in' ? 'Клиент' : direction === 'out' ? 'Ассистент' : 'Эскалация';
+  const comment = `${LIVE_CHAT_LOG_PREFIX} ${tag}: ${text}`;
+  await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: comment } });
+}
+
+async function loadLiveChatHistory(dealId, limit = 20) {
+  const comments = await bitrixRestList('crm.timeline.comment.list', { filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' }, order: { ID: 'DESC' } }, 100);
+  const relevant = comments
+    .filter((c) => String(c.COMMENT || '').includes(LIVE_CHAT_LOG_PREFIX))
+    .slice(0, limit)
+    .reverse()
+    .map((c) => String(c.COMMENT || '').replace(LIVE_CHAT_LOG_PREFIX, '').trim());
+  return relevant;
+}
+
+async function createEscalationTask(dealId, expertId, reason, clientText) {
+  if (!expertId) return null;
+  return bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: `СРОЧНО: клиент написал в чат, нужен живой ответ — сделка ${dealId}`,
+      DESCRIPTION: `Ассистент не отвечает автоматически.\n\nПричина: ${reason}\n\nСообщение клиента:\n${clientText}`,
+      RESPONSIBLE_ID: expertId,
+      UF_CRM_TASK: [`D_${dealId}`],
+      PRIORITY: 2,
+    },
+  });
+}
+
+app.post('/api/wazzup/webhook', async (req, res) => {
+  // Wazzup при регистрации вебхука шлёт тестовый POST {test: true} и ждёт 200 немедленно.
+  if (req.body && req.body.test) {
+    res.status(200).json({ ok: true });
+    return;
+  }
+  // Всегда отвечаем 200 быстро (Wazzup ждёт 200 в течение 30с), а основную работу делаем
+  // не блокируя ответ надолго — но для простоты и надёжности логики на пилоте обрабатываем
+  // синхронно и просто не делаем тяжёлых лишних шагов.
+  try {
+    if (config.wazzupCrmKey) {
+      const auth = req.headers.authorization || '';
+      if (auth !== `Bearer ${config.wazzupCrmKey}`) {
+        res.status(200).json({ ok: true }); // отвечаем 200, но дальше не обрабатываем чужой запрос
+        return;
+      }
+    }
+
+    if (!config.liveChatEnabled) {
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+    for (const msg of messages) {
+      try {
+        // Только входящие текстовые сообщения от клиента (не эхо исходящих, не статусы).
+        if (msg.isEcho || msg.status !== 'inbound') continue;
+        const text = String(msg.text || '').trim();
+        if (!text) continue; // картинки/документы сюда тоже приходят, но этап 6 (сбор документов) — отдельная логика, не часть живого чата
+
+        const contactPhone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+        const testPhone = normalizePhoneDigits(config.liveChatTestPhone);
+        if (!testPhone || !contactPhone.endsWith(testPhone.slice(-9))) continue; // пилот — только тестовый номер
+
+        const deal = await findDealForPhone(contactPhone);
+        if (!deal) continue;
+        const dealId = deal.ID;
+
+        await appendLiveChatLog(dealId, 'in', text);
+
+        const history = await loadLiveChatHistory(dealId, 20);
+        const dealSummary = `Сделка ${dealId}, услуга: ${deal.UF_CRM_1765113071 || 'не указана'}, стадия: ${deal.STAGE_ID || ''}.`;
+
+        const classifyCfg = aiScenarioConfig('live_chat_classify');
+        const classifyRaw = await callAiChatCompletion({
+          model: config.aiModel,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: `${classifyCfg.instruction}\n\nОтветь ТОЛЬКО JSON: {"decision":"safe_auto_reply"|"needs_human","reason":"короткое объяснение"}` },
+            { role: 'user', content: `${dealSummary}\n\nИстория переписки (последние сообщения):\n${history.join('\n')}\n\nНовое сообщение клиента: ${text}` },
+          ],
+        });
+        let classification = { decision: 'needs_human', reason: 'не удалось разобрать ответ классификатора' };
+        try { classification = JSON.parse(classifyRaw); } catch (_) { /* оставляем безопасный дефолт needs_human */ }
+
+        if (classification.decision !== 'safe_auto_reply') {
+          await appendLiveChatLog(dealId, 'escalation', `${classification.reason || 'требуется живой человек'} (сообщение клиента: ${text})`);
+          await createEscalationTask(dealId, config.executorExpertId, classification.reason || 'классификатор отметил как требующее живого ответа', text);
+          continue;
+        }
+
+        const replyCfg = aiScenarioConfig('live_chat_reply');
+        const replyRaw = await callAiChatCompletion({
+          model: config.aiModel,
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: `${replyCfg.instruction}\n\nОтветь ТОЛЬКО JSON: {"reply":"текст ответа клиенту"}` },
+            { role: 'user', content: `${dealSummary}\n\nИстория переписки (последние сообщения):\n${history.join('\n')}\n\nНовое сообщение клиента: ${text}` },
+          ],
+        });
+        let replyText = '';
+        try { replyText = JSON.parse(replyRaw).reply || ''; } catch (_) { /* пусто => не отправляем */ }
+        if (!replyText) {
+          await appendLiveChatLog(dealId, 'escalation', `ИИ не сформировал ответ — эскалация (сообщение клиента: ${text})`);
+          await createEscalationTask(dealId, config.executorExpertId, 'ИИ не смог сформировать автоответ', text);
+          continue;
+        }
+
+        await sendWazzupMessageInternal({
+          channelKey: 'telegram',
+          text: replyText,
+          chatId: msg.chatId,
+          phone: contactPhone,
+          dealId,
+        });
+        await appendLiveChatLog(dealId, 'out', replyText);
+      } catch (innerError) {
+        console.error('[live-chat-webhook] ошибка обработки одного сообщения:', innerError.message || innerError);
+      }
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error('[live-chat-webhook] общая ошибка:', error.message || error);
+    res.status(200).json({ ok: true }); // всегда 200, чтобы Wazzup не отключил вебхук из-за наших ошибок
   }
 });
 
