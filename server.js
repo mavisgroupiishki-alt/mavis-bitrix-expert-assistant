@@ -67,6 +67,7 @@ const config = {
   emailFrom: process.env.EMAIL_FROM || '',
   emailSenderName: process.env.EMAIL_SENDER_NAME || 'MAVIS GROUP',
   wazzupApiConfigured: Boolean(process.env.WAZZUP_API_KEY),
+  wazzupViberConfigured: Boolean(process.env.WAZZUP_API_KEY && process.env.WAZZUP_VIBER_CHANNEL_ID),
   wazzupChannelConfigured: Boolean(process.env.WAZZUP_CHANNEL_ID || process.env.WAZZUP_TG_CHANNEL_ID || process.env.WAZZUP_TELEGRAM_CHANNEL_ID || process.env.WAZZUP_VIBER_CHANNEL_ID),
   wazzupChatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
   wazzupChannels: [

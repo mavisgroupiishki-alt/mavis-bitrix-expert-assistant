@@ -3125,7 +3125,10 @@ async function sendWazzupMessage({ deal, phone, text, channelKey }) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.ok) {
-    const extra = data && data.data ? ` · детали: ${JSON.stringify(data.data).slice(0, 500)}` : '';
+    const detailsParts = [];
+    if (data && data.data && Object.keys(data.data).length) detailsParts.push(`data: ${JSON.stringify(data.data).slice(0, 300)}`);
+    if (data && data.safePayload) detailsParts.push(`отправлено: ${JSON.stringify(data.safePayload).slice(0, 300)}`);
+    const extra = detailsParts.length ? ` · ${detailsParts.join(' · ')}` : ' · Wazzup вернул пустой ответ без объяснения (это их сторонняя ошибка MESSAGES_CAN_NOT_ADD)';
     throw new Error((data.error || `Wazzup HTTP ${response.status}`) + extra);
   }
   return data;
@@ -5327,9 +5330,10 @@ async function runExecutorAutopilot() {
     if (msg) {
       const channel = preferredChannelKey(deal);
       const phone = getPrimaryClientPhone(deal);
+      const emailSubject = `Ход работы по сделке: ${getService(deal) || deal.TITLE || 'без названия'}`;
       if (channel === 'email') {
         const email = getPrimaryClientEmail(deal);
-        if (email) { await sendEmailViaBitrix(deal, email, 'Ход работы по СПК и аттестации организации', msg); sentInfo += 'Сообщение клиенту отправлено на email.'; }
+        if (email) { await sendEmailViaBitrix(deal, email, emailSubject, msg); sentInfo += 'Сообщение клиенту отправлено на email.'; }
         else sentInfo += 'Email клиента не найден, сообщение клиенту не отправлено.';
       } else if (channel === 'manual') {
         sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано как Telegram/Viber/Email.';
@@ -5338,7 +5342,19 @@ async function runExecutorAutopilot() {
           await sendWazzupMessage({ deal, phone, text: msg, channelKey: channel });
           sentInfo += `Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
         } catch (sendError) {
-          sentInfo += `Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
+          // Если основной канал не Viber и Wazzup настроен — пробуем Viber как запасной вариант,
+          // не оставляя клиента вообще без сообщения из-за временного сбоя одного канала.
+          let fallbackSent = false;
+          if (channel !== 'viber' && APP_CONFIG.wazzupViberConfigured) {
+            try {
+              await sendWazzupMessage({ deal, phone, text: msg, channelKey: 'viber' });
+              sentInfo += `Сообщение клиенту отправлено через Viber (запасной канал, ${messengerLabel(channel)} не сработал).`;
+              fallbackSent = true;
+            } catch (_) {}
+          }
+          if (!fallbackSent) {
+            sentInfo += `Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
+          }
         }
       } else {
         sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
