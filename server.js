@@ -621,15 +621,19 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     return { resp, text: text2, json };
   };
 
-  let { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
-  if (!response.ok && response.status >= 500) {
-    await new Promise((r) => setTimeout(r, 1000));
-    ({ resp: response, text: responseText, json: data } = await attemptSend(payloadToSend));
-  }
+  // v57: убрана повторная попытка с тем же payload при 500. Раньше при ошибке мы повторяли тот же
+  // запрос через секунду — но если первая попытка реально доставила сообщение клиенту, а Wazzup
+  // вернул 500 уже после доставки (известная у них транзиентная ошибка), повтор отправлял
+  // ВТОРОЕ дублирующее сообщение с тем же текстом. Это подтвердилось на практике: клиент получил
+  // одно и то же сообщение и в Telegram, и в Viber (фоллбек сработал из-за ложной "ошибки"
+  // Telegram, хотя сообщение уже дошло). Теперь при ошибке сразу поднимаем исключение — пусть
+  // вызывающий код (с Viber-фоллбеком) решает, что делать, без повтора внутри одного канала.
+  const { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
   if (!response.ok) {
     const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
     const err = new Error(`Wazzup ${configured.label}: ${message}`);
     err.safePayload = { ...payloadToSend, text: '[hidden]' };
+    err.possiblyDelivered = response.status >= 500; // 500 у Wazzup не всегда значит "не доставлено"
     throw err;
   }
   return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data };
@@ -648,7 +652,31 @@ app.post('/api/wazzup/send', async (req, res) => {
     });
     res.json({ ok: true, ...result });
   } catch (error) {
-    res.status(error.safePayload ? 502 : 500).json({ ok: false, error: error.message || String(error), safePayload: error.safePayload });
+    res.status(error.safePayload ? 502 : 500).json({ ok: false, error: error.message || String(error), safePayload: error.safePayload, possiblyDelivered: !!error.possiblyDelivered });
+  }
+});
+
+app.get('/api/wazzup/webhook-status', async (_req, res) => {
+  try {
+    const apiKey = process.env.WAZZUP_API_KEY || '';
+    if (!apiKey) {
+      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
+      return;
+    }
+    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/webhooks`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const text = await response.text();
+    const data = (() => { try { return JSON.parse(text); } catch (_) { return {}; } })();
+    if (!response.ok) {
+      res.status(response.status).json({ ok: false, error: compactWazzupError(data, text.slice(0, 300)) });
+      return;
+    }
+    res.json({ ok: true, data });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message || String(error) });
   }
 });
 

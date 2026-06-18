@@ -2195,7 +2195,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button></div>`;
+    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button> <button class="secondary" data-check-wazzup-webhook="1">Проверить текущий вебхук в Wazzup</button><div id="wazzup-webhook-status"></div></div>`;
   }
   return html;
 }
@@ -3197,7 +3197,9 @@ async function sendWazzupMessage({ deal, phone, text, channelKey }) {
     if (data && data.data && Object.keys(data.data).length) detailsParts.push(`data: ${JSON.stringify(data.data).slice(0, 300)}`);
     if (data && data.safePayload) detailsParts.push(`отправлено: ${JSON.stringify(data.safePayload).slice(0, 300)}`);
     const extra = detailsParts.length ? ` · ${detailsParts.join(' · ')}` : ' · Wazzup вернул пустой ответ без объяснения';
-    throw new Error((data.error || `Wazzup HTTP ${response.status}`) + extra);
+    const err = new Error((data.error || `Wazzup HTTP ${response.status}`) + extra);
+    err.possiblyDelivered = !!data.possiblyDelivered;
+    throw err;
   }
   if (data.usedMinimalPayload) {
     // Диагностика сработала: полный payload давал 500, минимальный (без crmMessageId/
@@ -5421,11 +5423,17 @@ async function runExecutorAutopilot() {
         } catch (sendError) {
           // Если основной канал не Viber и Wazzup настроен — пробуем Viber как запасной вариант,
           // не оставляя клиента вообще без сообщения из-за временного сбоя одного канала.
+          // ВАЖНО: если ошибка основного канала была HTTP 500 (possiblyDelivered=true), есть риск,
+          // что сообщение реально доставилось, и Viber-фоллбек создаст дубликат — это уже
+          // случалось на практике. Предупреждаем явно в отчёте, чтобы это не осталось незамеченным.
           let fallbackSent = false;
           if (channel !== 'viber' && APP_CONFIG.wazzupViberConfigured) {
             try {
               await sendWazzupMessage({ deal, phone, text: msg, channelKey: 'viber' });
               sentInfo += `Сообщение клиенту отправлено через Viber (запасной канал, ${messengerLabel(channel)} не сработал).`;
+              if (sendError.possiblyDelivered) {
+                sentInfo += ` ⚠️ ${messengerLabel(channel)} вернул ошибку сервера, но сообщение туда могло реально дойти — проверь вручную, не получил ли клиент сообщение дважды.`;
+              }
               fallbackSent = true;
             } catch (_) {}
           }
@@ -5604,6 +5612,19 @@ document.getElementById('close-dialog').addEventListener('click', () => { if (st
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
 document.getElementById('deal-details').addEventListener('click', async (e) => {
+  if (e.target.getAttribute('data-check-wazzup-webhook')) {
+    const statusBox = document.getElementById('wazzup-webhook-status');
+    if (statusBox) statusBox.textContent = 'Проверяю...';
+    try {
+      const response = await fetch('/api/wazzup/webhook-status');
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      if (statusBox) statusBox.innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;">${escapeHtml(JSON.stringify(data.data, null, 2))}</pre>`;
+    } catch (err) {
+      if (statusBox) statusBox.textContent = `Ошибка: ${err.message}`;
+    }
+    return;
+  }
   if (!e.target.getAttribute('data-register-wazzup-webhook')) return;
   const btn = e.target;
   btn.disabled = true;
