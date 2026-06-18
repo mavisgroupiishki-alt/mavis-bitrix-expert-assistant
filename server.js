@@ -504,6 +504,17 @@ function publicWazzupChannelList() {
     .map((ch) => ({ key: ch.key, label: ch.label, chatType: ch.chatType, configured: true }));
 }
 
+// Определяем, какому из НАШИХ настроенных каналов (telegram/viber/default) соответствует
+// channelId, присланный Wazzup во входящем сообщении — чтобы отвечать клиенту тем же каналом,
+// которым он сам написал, а не жёстко одним и тем же каналом всегда.
+function findChannelKeyByChannelId(channelId) {
+  for (const key of ['telegram', 'viber', 'default']) {
+    const ch = getConfiguredWazzupChannel(key);
+    if (ch && ch.channelId && String(ch.channelId) === String(channelId)) return key;
+  }
+  return null;
+}
+
 
 app.get('/api/wazzup/channels', async (_req, res) => {
   try {
@@ -772,6 +783,16 @@ app.post('/api/wazzup/webhook', async (req, res) => {
         if (!deal) continue;
         const dealId = deal.ID;
 
+        const replyChannelKey = findChannelKeyByChannelId(msg.channelId);
+        if (!replyChannelKey) {
+          // Сообщение пришло по каналу, который не настроен в Render Environment (например, Viber
+          // не сконфигурирован) — не пытаемся угадать, эскалируем к человеку сразу, не тратя
+          // вызовы ИИ на классификацию/генерацию ответа, который всё равно не сможем отправить.
+          await appendLiveChatLog(dealId, 'escalation', `Канал входящего сообщения (channelId=${msg.channelId}) не настроен в Render — бот не может ответить через него автоматически. Сообщение клиента: ${text}`);
+          await createEscalationTask(dealId, config.executorExpertId, 'входящий канал не настроен для автоответа', text);
+          continue;
+        }
+
         await appendLiveChatLog(dealId, 'in', text);
 
         const history = await loadLiveChatHistory(dealId, 20);
@@ -813,7 +834,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
         }
 
         await sendWazzupMessageInternal({
-          channelKey: 'telegram',
+          channelKey: replyChannelKey,
           text: replyText,
           chatId: msg.chatId,
           phone: contactPhone,
