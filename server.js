@@ -658,7 +658,8 @@ app.post('/api/wazzup/send', async (req, res) => {
 
 app.get('/api/wazzup/webhook-status', async (_req, res) => {
   try {
-    const apiKey = process.env.WAZZUP_API_KEY || '';
+    // Проверяем статус через тот же ключ, которым регистрировали — Sidecar если задан.
+    const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
     if (!apiKey) {
       res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
       return;
@@ -682,11 +683,15 @@ app.get('/api/wazzup/webhook-status', async (_req, res) => {
 
 app.post('/api/wazzup/register-webhook', async (req, res) => {
   try {
-    const apiKey = process.env.WAZZUP_API_KEY || '';
+    // Для регистрации вебхука используем Sidecar API key (если задан) — именно он связан
+    // с нативной Bitrix24-интеграцией Wazzup, и вебхуки в этом режиме приходят только
+    // если зарегистрированы через тот же ключ, что используется интеграцией.
+    const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
     if (!apiKey) {
-      res.status(400).json({ ok: false, error: 'WAZZUP_API_KEY не задан в Render Environment.' });
+      res.status(400).json({ ok: false, error: 'Не задан ни WAZZUP_SIDECAR_KEY, ни WAZZUP_API_KEY в Render Environment.' });
       return;
     }
+    const usingSidecar = !!process.env.WAZZUP_SIDECAR_KEY;
     const webhookUrl = String((req.body && req.body.webhookUrl) || '').trim();
     if (!webhookUrl) {
       res.status(400).json({ ok: false, error: 'webhookUrl не передан.' });
@@ -708,7 +713,7 @@ app.post('/api/wazzup/register-webhook', async (req, res) => {
       res.status(response.status).json({ ok: false, error: `Wazzup: ${message}` });
       return;
     }
-    res.json({ ok: true, data });
+    res.json({ ok: true, data, usingSidecar, keyUsed: usingSidecar ? 'WAZZUP_SIDECAR_KEY' : 'WAZZUP_API_KEY' });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message || String(error) });
   }

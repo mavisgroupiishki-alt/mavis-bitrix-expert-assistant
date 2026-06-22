@@ -5640,7 +5640,8 @@ document.getElementById('deal-details').addEventListener('click', async (e) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
     btn.textContent = 'Зарегистрировано ✓';
-    alert(`Вебхук успешно зарегистрирован в Wazzup: ${webhookUrl}\nТеперь живой бот будет получать сообщения клиента автоматически.`);
+    const keyInfo = data.usingSidecar ? 'через Sidecar key (Bitrix-интеграция)' : 'через прямой API key';
+    alert(`Вебхук успешно зарегистрирован в Wazzup ${keyInfo}: ${webhookUrl}\nТеперь живой бот будет получать сообщения клиента автоматически.`);
   } catch (err) {
     btn.disabled = false;
     btn.textContent = originalText;
