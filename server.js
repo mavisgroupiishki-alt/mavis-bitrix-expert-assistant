@@ -1077,26 +1077,77 @@ async function transcribeAudioUrl(audioUrl, fileName) {
   return String(d.text || d.transcript || '').trim();
 }
 
-async function findCallForDeal(dealId) {
-  // Ищем запись звонка в активностях сделки — повторяем логику findCallRecordingsForDeal из app.js.
-  const activities = await bitrixRestList('crm.activity.list', {
-    filter: { ENTITY_ID: dealId, ENTITY_TYPE_ID: 2, TYPE_ID: 2 }, // TYPE_ID=2 = звонок
-    select: ['ID', 'SUBJECT', 'DESCRIPTION', 'STORAGE_ELEMENT_IDS', 'COMMUNICATIONS', 'DATE_CREATE'],
-    order: { DATE_CREATE: 'DESC' },
-  }, 20);
-  for (const act of activities) {
-    const storageIds = Array.isArray(act.STORAGE_ELEMENT_IDS) ? act.STORAGE_ELEMENT_IDS : [];
-    for (const fileId of storageIds) {
-      try {
-        const cleanId = String(fileId).replace(/\D/g, '');
-        if (!cleanId) continue;
-        const fileInfo = await bitrixRestCall('disk.attachedObject.get', { id: cleanId });
-        const url = fileInfo && (fileInfo.DOWNLOAD_URL || fileInfo.VIEW_URL);
-        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: fileInfo.NAME || 'call.mp3' };
-      } catch (_) { /* пробуем следующий файл */ }
+function serverCollectActivityAudioCandidates(activity) {
+  const out = [];
+  const push = (candidate) => {
+    if (!candidate) return;
+    const c = { ...candidate, activityId: activity.ID, subject: activity.SUBJECT || '', provider: activity.PROVIDER_ID || '' };
+    const key = c.url || c.fileId || c.value;
+    if (!key) return;
+    out.push(c);
+  };
+  const scan = (value, path = '') => {
+    if (value === null || value === undefined) return;
+    if (typeof value === 'string') {
+      const urls = value.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+      urls.forEach((url) => {
+        if (/record|call|audio|mp3|wav|m4a|download|disk|bitrix/i.test(url)) push({ type: 'url', url, value: url, path });
+      });
+      return;
     }
+    if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+      if (/file|record|storage|disk/i.test(path)) push({ type: 'fileId', fileId: String(value), value: String(value), path });
+      return;
+    }
+    if (Array.isArray(value)) return value.forEach((v, i) => scan(v, `${path}[${i}]`));
+    if (typeof value === 'object') {
+      const url = value.DOWNLOAD_URL || value.downloadUrl || value.url || value.URL || value.link || value.LINK;
+      const id = value.ID || value.id || value.FILE_ID || value.fileId || value.file_id || value.VALUE;
+      if (url) push({ type: 'url', url: String(url), value: String(url), path });
+      if (id && /file|record|storage|disk/i.test(`${path} ${Object.keys(value).join(' ')}`)) push({ type: 'fileId', fileId: String(id), value: String(id), path });
+      Object.entries(value).forEach(([k, v]) => scan(v, path ? `${path}.${k}` : k));
+    }
+  };
+  scan(activity, 'activity');
+  const uniq = [];
+  const seen = new Set();
+  out.forEach((x) => {
+    const key = `${x.type}:${x.url || x.fileId}`;
+    if (!seen.has(key)) { seen.add(key); uniq.push(x); }
+  });
+  return uniq;
+}
+
+async function serverResolveCandidateDownloadUrl(candidate) {
+  if (candidate.url) return candidate.url;
+  if (!candidate.fileId) return '';
+  try {
+    const file = await bitrixRestCall('disk.file.get', { id: candidate.fileId });
+    return file && (file.DOWNLOAD_URL || file.downloadUrl || file.download_url || file.url || file.LINK || file.link) || '';
+  } catch (_) { return ''; }
+}
+
+async function findCallForDeal(dealId) {
+  // Точная копия логики findCallRecordingsForDeal из app.js — поддерживает Asterisk/Zruchna и
+  // любые другие провайдеры телефонии, не только стандартный Bitrix TYPE_ID=2.
+  const acts = await bitrixRestList('crm.activity.list', {
+    filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
+    order: { ID: 'DESC' },
+    select: ['*'],
+  }, 80);
+  const callActs = acts.filter((a) => {
+    const text = [a.SUBJECT, a.DESCRIPTION, a.PROVIDER_ID, a.TYPE_ID, a.PROVIDER_TYPE_ID].join(' ').toLowerCase();
+    return /звон|call|voximplant|telephony|телеф|asterisk|zruchna/.test(text) || String(a.TYPE_ID || '') === '2';
+  });
+  const candidates = [];
+  callActs.forEach((a) => candidates.push(...serverCollectActivityAudioCandidates(a)));
+  for (const c of candidates) {
+    c.downloadUrl = await serverResolveCandidateDownloadUrl(c);
   }
-  return null;
+  const ready = candidates.filter((c) => c.downloadUrl || c.url);
+  if (!ready.length) return null;
+  const best = ready[0];
+  return { activityId: best.activityId, subject: best.subject, url: best.downloadUrl || best.url, fileName: `call-${dealId}.mp3` };
 }
 
 function detectServiceFromDeal(deal) {

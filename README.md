@@ -67,7 +67,13 @@ TRANSCRIBE_SEND_MODEL=true
 Важно: v43h использует VibeCode `/v1/audio/transcriptions`. Сначала отправляет model=`bitrix/deepdml/faster-whisper-large-v3-turbo-ct2`; если VibeCode вернет 400 из-за поля model, автоматически повторяет запрос без model, как в официальном примере VibeCode.
 
 
-# MAVIS Bitrix Expert Assistant — v60 фоновый автопилот на весь отдел экспертов
+# MAVIS Bitrix Expert Assistant — v61 фикс поиска звонков Asterisk/Zruchna.io
+
+Фоновый автопилот не находил запись звонка в сделке "ЗД КЛИМАТ" потому что использовал упрощённую логику: искал только стандартные Bitrix-звонки (TYPE_ID=2, ENTITY_ID/ENTITY_TYPE_ID) через поле STORAGE_ELEMENT_IDS. Но телефония через Asterisk интеграцию от Zruchna.io хранит запись иначе.
+
+Заменил на точную копию логики из браузерного app.js (findCallRecordingsForDeal + collectActivityAudioCandidates + resolveCandidateDownloadUrl): использует OWNER_ID/OWNER_TYPE_ID, фильтрует по ключевым словам в теме/провайдере (включая asterisk, zruchna, voximplant, telephony), и рекурсивно сканирует всю структуру активности в поисках URL аудиофайла или fileId для disk.file.get. Это та же логика, которая уже работала в ручном режиме автопилота по кнопке.
+
+## v60 фоновый автопилот на весь отдел экспертов
 
 Автопилот больше не требует нажатия кнопки. Сервер каждые 10 минут сам проверяет воронку "6. Производство" (CATEGORY_ID=28) и для каждой новой сделки на стадии "Эксперт назначен" (у которой ещё не было автопилота) — ищет запись звонка, расшифровывает, анализирует, отправляет клиенту сообщение через Wazzup, пишет краткий комментарий в сделку.
 
