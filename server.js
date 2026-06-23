@@ -101,6 +101,8 @@ const config = {
   // Если задан и здесь — сверяем заголовок, чтобы отбросить случайные/чужие запросы на вебхук.
   wazzupCrmKey: process.env.WAZZUP_CRM_KEY || '',
   liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
+  autopilotEnabled: String(process.env.AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
+  autopilotCategoryId: Number(process.env.AUTOPILOT_CATEGORY_ID || 28),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -998,6 +1000,309 @@ app.all('/install', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'install.html'));
 });
 
+// ============================================================================
+// v60: СЕРВЕРНЫЙ АВТОПИЛОТ — фоновый polling, запускается автоматически
+// без участия эксперта. Мониторит воронку производства, при появлении
+// записи звонка в сделке на стадии "Эксперт назначен" — запускает полный
+// цикл: расшифровка → анализ → сообщение клиенту → комментарий в сделку.
+// ============================================================================
+
+const AUTOPILOT_MARKER = '[MAVIS_AUTOPILOT_DONE]';
+const AUTOPILOT_ERROR_MARKER = '[MAVIS_AUTOPILOT_ERROR]';
+const AUTOPILOT_POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 минут
+
+// Дата запуска сервера — сделки созданные раньше этой даты не трогаем.
+// Это гарантирует, что текущие 14 сделок на стадии "Эксперт назначен"
+// не будут обработаны при первом запуске.
+const AUTOPILOT_START_DATE = new Date();
+
+// Кэш обработанных сделок (dealId → true), чтобы не перечитывать
+// таймлайн каждые 10 минут для уже обработанных сделок.
+const autopilotProcessed = new Set();
+
+async function getExpertStageId() {
+  // Ищем стадию "Эксперт назначен" в воронке 28 динамически.
+  // Кэшируем результат, чтобы не делать запрос каждые 10 минут.
+  if (getExpertStageId._cached) return getExpertStageId._cached;
+  const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
+  const stage = (Array.isArray(stages) ? stages : []).find((s) =>
+    /эксперт.*(назначен|назначён)/i.test(s.NAME || '') ||
+    /назначен.*эксперт/i.test(s.NAME || '')
+  );
+  if (stage) {
+    getExpertStageId._cached = stage.STATUS_ID;
+    console.log(`[autopilot] Найдена стадия "${stage.NAME}" → STATUS_ID=${stage.STATUS_ID}`);
+  }
+  return getExpertStageId._cached || null;
+}
+
+async function dealAlreadyProcessed(dealId) {
+  if (autopilotProcessed.has(String(dealId))) return true;
+  // Проверяем таймлайн сделки на наличие маркера выполненного автопилота.
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT'],
+    order: { ID: 'DESC' },
+  }, 30);
+  const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER) || String(c.COMMENT || '').includes(AUTOPILOT_ERROR_MARKER));
+  if (done) autopilotProcessed.add(String(dealId));
+  return done;
+}
+
+async function transcribeAudioUrl(audioUrl, fileName) {
+  const ai = resolveTranscribeProvider();
+  if (!ai.apiKey) throw new Error('Не задан ключ для расшифровки (TRANSCRIBE_API_KEY / AI_API_KEY).');
+  const audioResp = await fetch(audioUrl);
+  if (!audioResp.ok) throw new Error(`Не удалось скачать аудио: HTTP ${audioResp.status}`);
+  const arrayBuffer = await audioResp.arrayBuffer();
+  const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
+  const safeFileName = String(fileName || 'call.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call.mp3';
+  const configuredModel = config.transcribeModel || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
+  const shouldSendModel = Boolean(config.transcribeSendModel && configuredModel);
+  async function attempt(includeModel) {
+    const form = new FormData();
+    if (includeModel) form.append('model', configuredModel);
+    form.append('file', new Blob([arrayBuffer], { type: contentType }), safeFileName);
+    form.append('language', 'ru');
+    form.append('response_format', 'json');
+    const r = await fetch(`${ai.baseUrl}/audio/transcriptions`, { method: 'POST', headers: { ...ai.authHeader }, body: form });
+    const t = await r.text().catch(() => '');
+    let d = {};
+    try { d = t ? JSON.parse(t) : {}; } catch (_) { d = { raw: t }; }
+    return { r, d };
+  }
+  let { r, d } = await attempt(shouldSendModel);
+  if (!r.ok && r.status === 400 && shouldSendModel) { ({ r, d } = await attempt(false)); }
+  if (!r.ok) throw new Error(`Расшифровка не удалась: HTTP ${r.status} — ${d.raw || JSON.stringify(d).slice(0, 200)}`);
+  return String(d.text || d.transcript || '').trim();
+}
+
+async function findCallForDeal(dealId) {
+  // Ищем запись звонка в активностях сделки — повторяем логику findCallRecordingsForDeal из app.js.
+  const activities = await bitrixRestList('crm.activity.list', {
+    filter: { ENTITY_ID: dealId, ENTITY_TYPE_ID: 2, TYPE_ID: 2 }, // TYPE_ID=2 = звонок
+    select: ['ID', 'SUBJECT', 'DESCRIPTION', 'STORAGE_ELEMENT_IDS', 'COMMUNICATIONS', 'DATE_CREATE'],
+    order: { DATE_CREATE: 'DESC' },
+  }, 20);
+  for (const act of activities) {
+    const storageIds = Array.isArray(act.STORAGE_ELEMENT_IDS) ? act.STORAGE_ELEMENT_IDS : [];
+    for (const fileId of storageIds) {
+      try {
+        const cleanId = String(fileId).replace(/\D/g, '');
+        if (!cleanId) continue;
+        const fileInfo = await bitrixRestCall('disk.attachedObject.get', { id: cleanId });
+        const url = fileInfo && (fileInfo.DOWNLOAD_URL || fileInfo.VIEW_URL);
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: fileInfo.NAME || 'call.mp3' };
+      } catch (_) { /* пробуем следующий файл */ }
+    }
+  }
+  return null;
+}
+
+function detectServiceFromDeal(deal) {
+  const serviceField = process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071';
+  return String(deal[serviceField] || deal.UF_CRM_1765113071 || '').trim();
+}
+
+function detectPreferredChannel(deal) {
+  const field = process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900';
+  const val = String(deal[field] || '').toLowerCase();
+  if (val.includes('телеграм') || val.includes('telegram') || val.includes('tg')) return 'telegram';
+  if (val.includes('вайбер') || val.includes('viber')) return 'viber';
+  if (val.includes('email') || val.includes('почта') || val.includes('mail')) return 'email';
+  return 'telegram'; // дефолт
+}
+
+async function getContactPhone(deal) {
+  if (!deal.CONTACT_ID) return null;
+  try {
+    const contact = await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID });
+    const phones = Array.isArray(contact && contact.PHONE) ? contact.PHONE : [];
+    const phone = phones[0] && phones[0].VALUE ? String(phones[0].VALUE).replace(/\D/g, '') : null;
+    return phone || null;
+  } catch (_) { return null; }
+}
+
+async function buildDealContext(deal, transcript) {
+  // Собираем контекст сделки для ИИ-анализа — аналог collectDealContext из app.js.
+  const service = detectServiceFromDeal(deal);
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT', 'CREATED'],
+    order: { ID: 'DESC' },
+  }, 30);
+  const commentsText = comments.map((c) => `${c.CREATED || ''}: ${c.COMMENT || ''}`).join('\n');
+
+  return {
+    deal: {
+      id: deal.ID,
+      title: deal.TITLE,
+      stage: deal.STAGE_ID,
+      service,
+      sum: deal.OPPORTUNITY,
+      currency: deal.CURRENCY_ID,
+      assignedById: deal.ASSIGNED_BY_ID,
+    },
+    product: { label: service, key: 'auto' },
+    service,
+    call_transcript: transcript,
+    comments: commentsText,
+    channel: detectPreferredChannel(deal),
+    executor_mode: {
+      enabled: true,
+      preferredChannel: detectPreferredChannel(deal),
+    },
+  };
+}
+
+async function runServerAutopilotForDeal(deal) {
+  const dealId = deal.ID;
+  const logPrefix = `[autopilot deal=${dealId}]`;
+  console.log(`${logPrefix} Запускаю автопилот для "${deal.TITLE}"`);
+
+  try {
+    // 1. Ищем запись звонка.
+    const callRecord = await findCallForDeal(dealId);
+    if (!callRecord) {
+      console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
+      return; // НЕ помечаем как ошибку — просто нет звонка ещё, проверим позже.
+    }
+
+    // 2. Расшифровываем.
+    console.log(`${logPrefix} Расшифровываю звонок: ${callRecord.subject || callRecord.url}`);
+    const transcript = await transcribeAudioUrl(callRecord.url, callRecord.fileName);
+    if (!transcript || transcript.length < 30) {
+      throw new Error(`Расшифровка слишком короткая или пустая: "${transcript.slice(0, 100)}"`);
+    }
+
+    // 3. Строим контекст и запускаем ИИ-анализ.
+    console.log(`${logPrefix} Запускаю ИИ-анализ...`);
+    const context = await buildDealContext(deal, transcript);
+    const service = detectServiceFromDeal(deal);
+    // Выбираем сценарий по типу продукта.
+    const scenarioKey = /атт/i.test(service) ? 'executor_attestation_call' : 'executor_attestation_call';
+    const scenarioCfg = aiScenarioConfig(scenarioKey);
+    const productGuidance = productAiGuidance(context.product, scenarioCfg.scenario);
+    const systemPrompt = [
+      'Ты ИИ-ассистент эксперта производства MAVIS GROUP.',
+      'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp). Пиши просто "пришлите мне" / "отправьте мне" без названия канала.',
+      'Возвращай только валидный JSON без markdown.',
+    ].join('\n');
+    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","summary":["..."],"missing":["..."],"risks":["..."],"next_steps":["..."],"tasks":[],"client_message":"...","comment":"краткая выжимка для комментария","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
+
+    const rawText = await callAiChatCompletion({
+      model: config.aiModel,
+      temperature: 0.2,
+      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+    });
+    let aiResult = {};
+    try { aiResult = JSON.parse(rawText); } catch (_) {
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if (match) try { aiResult = JSON.parse(match[0]); } catch (_2) { aiResult = {}; }
+    }
+
+    const clientMessage = String(aiResult.client_message || '').trim();
+    const dealComment = String(aiResult.comment || aiResult.summary && aiResult.summary.join('; ') || 'Автопилот выполнен').trim();
+
+    // 4. Отправляем сообщение клиенту через Wazzup (если есть текст и телефон).
+    if (clientMessage) {
+      const phone = await getContactPhone(deal);
+      const channelKey = detectPreferredChannel(deal);
+      if (phone) {
+        try {
+          await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
+          console.log(`${logPrefix} Сообщение клиенту отправлено через ${channelKey}.`);
+        } catch (sendErr) {
+          console.error(`${logPrefix} Ошибка отправки Wazzup: ${sendErr.message}`);
+          // Не прерываем — пишем комментарий даже если отправка не удалась.
+        }
+      } else {
+        console.warn(`${logPrefix} Нет телефона клиента — сообщение не отправлено.`);
+      }
+    }
+
+    // 5. Пишем краткий комментарий в сделку + маркер "уже обработано".
+    const commentText = `${AUTOPILOT_MARKER}\n${dealComment}`;
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
+    });
+    autopilotProcessed.add(String(dealId));
+    console.log(`${logPrefix} Готово — комментарий добавлен.`);
+
+  } catch (err) {
+    console.error(`${logPrefix} Ошибка: ${err.message}`);
+    // Пишем ошибку в сделку и помечаем как обработанную (чтобы не зациклиться).
+    try {
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId,
+          ENTITY_TYPE: 'deal',
+          COMMENT: `${AUTOPILOT_ERROR_MARKER}\nАвтопилот столкнулся с ошибкой и остановился: ${err.message}`,
+        },
+      });
+    } catch (_) { /* если и комментарий не вышел — просто логируем */ }
+    autopilotProcessed.add(String(dealId)); // помечаем чтобы не повторять
+  }
+}
+
+async function runAutopilotPollingCycle() {
+  if (!config.bitrixWebhookUrl) {
+    console.log('[autopilot] BITRIX_WEBHOOK_URL не задан — фоновый автопилот не запускается.');
+    return;
+  }
+  if (!config.autopilotEnabled) {
+    return; // AUTOPILOT_ENABLED=false — выключен
+  }
+
+  try {
+    const stageId = await getExpertStageId();
+    if (!stageId) {
+      console.warn('[autopilot] Стадия "Эксперт назначен" не найдена в воронке — проверь AUTOPILOT_CATEGORY_ID.');
+      return;
+    }
+
+    // Берём сделки на нужной стадии, созданные после старта сервера.
+    const startDateStr = AUTOPILOT_START_DATE.toISOString().slice(0, 19);
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        STAGE_ID: stageId,
+        '>=DATE_CREATE': startDateStr,
+      },
+      select: ['ID', 'TITLE', 'STAGE_ID', 'CATEGORY_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
+        'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE',
+        process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+        process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900',
+      ],
+    }, 50);
+
+    console.log(`[autopilot] Цикл: найдено ${deals.length} сделок на стадии "${stageId}" после ${startDateStr}.`);
+
+    for (const deal of deals) {
+      if (autopilotProcessed.has(String(deal.ID))) continue;
+      const alreadyDone = await dealAlreadyProcessed(deal.ID);
+      if (alreadyDone) continue;
+      await runServerAutopilotForDeal(deal);
+      // Пауза между сделками чтобы не перегружать ИИ API и Bitrix.
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  } catch (err) {
+    console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
+  }
+}
+
+// Запуск polling после старта сервера.
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
+
+  if (config.bitrixWebhookUrl && config.autopilotEnabled) {
+    console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
+    // Первый запуск через 2 минуты после старта (дать серверу прогреться).
+    setTimeout(() => {
+      runAutopilotPollingCycle();
+      setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
+    }, 2 * 60 * 1000);
+  } else {
+    console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
+  }
 });
