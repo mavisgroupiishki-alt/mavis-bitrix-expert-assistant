@@ -1176,14 +1176,18 @@ async function getContactPhone(deal) {
 }
 
 async function buildDealContext(deal, transcript) {
-  // Собираем контекст сделки для ИИ-анализа — аналог collectDealContext из app.js.
   const service = detectServiceFromDeal(deal);
-  const comments = await bitrixRestList('crm.timeline.comment.list', {
-    filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
-    select: ['ID', 'COMMENT', 'CREATED'],
-    order: { ID: 'DESC' },
-  }, 30);
-  const commentsText = comments.map((c) => `${c.CREATED || ''}: ${c.COMMENT || ''}`).join('\n');
+  // ENTITY_TYPE в crm.timeline.comment.list принимает строку 'deal' (не числовой ID).
+  // Используем также ENTITY_ID без префикса как требует REST API.
+  let commentsText = '';
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+      select: ['ID', 'COMMENT', 'DATE_CREATE'],
+      order: { ID: 'DESC' },
+    }, 30);
+    commentsText = comments.map((c) => `${c.DATE_CREATE || c.CREATED || ''}: ${c.COMMENT || ''}`).join('\n');
+  } catch (_) { commentsText = ''; }
 
   return {
     deal: {
@@ -1231,16 +1235,14 @@ async function runServerAutopilotForDeal(deal) {
     console.log(`${logPrefix} Запускаю ИИ-анализ...`);
     const context = await buildDealContext(deal, transcript);
     const service = detectServiceFromDeal(deal);
-    // Выбираем сценарий по типу продукта.
-    const scenarioKey = /атт/i.test(service) ? 'executor_attestation_call' : 'executor_attestation_call';
-    const scenarioCfg = aiScenarioConfig(scenarioKey);
+    const scenarioCfg = aiScenarioConfig('executor_attestation_call');
     const productGuidance = productAiGuidance(context.product, scenarioCfg.scenario);
     const systemPrompt = [
       'Ты ИИ-ассистент эксперта производства MAVIS GROUP.',
       'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp). Пиши просто "пришлите мне" / "отправьте мне" без названия канала.',
       'Возвращай только валидный JSON без markdown.',
     ].join('\n');
-    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","summary":["..."],"missing":["..."],"risks":["..."],"next_steps":["..."],"tasks":[],"client_message":"...","comment":"краткая выжимка для комментария","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
+    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","status_label":"короткий статус по-русски","summary":["что понял из звонка и сделки"],"missing":["чего не хватает"],"risks":["риски"],"next_steps":["следующие шаги"],"tasks":[],"client_message":"полный текст сообщения клиенту с ходом работы и списком что нужно прислать","comment":"полный ход работы для комментария в Bitrix: что выяснили на звонке, схема специалистов, что нужно от клиента, следующие шаги — это прочитает эксперт","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
