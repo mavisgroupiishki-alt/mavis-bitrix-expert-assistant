@@ -67,7 +67,17 @@ TRANSCRIBE_SEND_MODEL=true
 Важно: v43h использует VibeCode `/v1/audio/transcriptions`. Сначала отправляет model=`bitrix/deepdml/faster-whisper-large-v3-turbo-ct2`; если VibeCode вернет 400 из-за поля model, автоматически повторяет запрос без model, как в официальном примере VibeCode.
 
 
-# MAVIS Bitrix Expert Assistant — v61 фикс поиска звонков Asterisk/Zruchna.io
+# MAVIS Bitrix Expert Assistant — v62 боевой режим на весь отдел экспертов
+
+Кнопка автопилота и фоновый polling были ограничены одной тестовой сделкой (34946). При попытке запустить на другой сделке показывала ошибку "Режим исполнителя разрешён только для сделки 34946".
+
+Добавлен флаг EXECUTOR_ALL_DEALS=true — при его наличии автопилот разрешён для любой сделки воронки производства, не только тестовой. Добавь в Render Environment:
+```
+EXECUTOR_ALL_DEALS=true
+```
+После этого и кнопка в карточке сделки, и фоновый polling будут работать на всех сделках отдела экспертов.
+
+## v61 фикс поиска звонков Asterisk/Zruchna.io
 
 Фоновый автопилот не находил запись звонка в сделке "ЗД КЛИМАТ" потому что использовал упрощённую логику: искал только стандартные Bitrix-звонки (TYPE_ID=2, ENTITY_ID/ENTITY_TYPE_ID) через поле STORAGE_ELEMENT_IDS. Но телефония через Asterisk интеграцию от Zruchna.io хранит запись иначе.
 

@@ -5083,7 +5083,11 @@ async function createTask({ title, responsibleId, description, dealId, deadline 
 
 
 function isExecutorTestDeal(deal) {
-  return Boolean(APP_CONFIG.executorMode && APP_CONFIG.executorTestDealId && String(deal && deal.ID) === String(APP_CONFIG.executorTestDealId));
+  if (!APP_CONFIG.executorMode) return false;
+  // EXECUTOR_ALL_DEALS=true — автопилот разрешён для любой сделки (боевой режим отдела экспертов).
+  // EXECUTOR_TEST_DEAL_ID — автопилот только для одной тестовой сделки (режим разработки/тестирования).
+  if (APP_CONFIG.executorAllDeals) return true;
+  return Boolean(APP_CONFIG.executorTestDealId && String(deal && deal.ID) === String(APP_CONFIG.executorTestDealId));
 }
 
 function preferredChannelKey(deal) {

@@ -80,6 +80,7 @@ const config = {
   // v43: тестовый режим ассистента-исполнителя на одной сделке.
   executorMode: String(process.env.EXECUTOR_MODE || 'false').toLowerCase() === 'true',
   executorTestDealId: process.env.EXECUTOR_TEST_DEAL_ID || '',
+  executorAllDeals: String(process.env.EXECUTOR_ALL_DEALS || 'false').toLowerCase() === 'true',
   executorExpertId: process.env.EXECUTOR_EXPERT_ID || '',
   executorLeaderId: process.env.EXECUTOR_LEADER_ID || process.env.EXECUTOR_EXPERT_ID || '',
   executorProduct: process.env.EXECUTOR_PRODUCT || 'attestation',
