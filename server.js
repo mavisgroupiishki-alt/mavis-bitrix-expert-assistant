@@ -1179,6 +1179,35 @@ async function getContactPhone(deal) {
   } catch (_) { return null; }
 }
 
+async function getContactEmail(deal) {
+  if (!deal.CONTACT_ID) return null;
+  try {
+    const contact = await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID });
+    const emails = Array.isArray(contact && contact.EMAIL) ? contact.EMAIL : [];
+    return emails[0] && emails[0].VALUE ? String(emails[0].VALUE).trim() : null;
+  } catch (_) { return null; }
+}
+
+async function sendEmailThroughBitrix(dealId, responsibleId, toEmail, dealTitle, text) {
+  // Отправляем письмо через Bitrix crm.activity.add (тип EMAIL).
+  // Это стандартный способ отправить email из Bitrix без внешнего SMTP —
+  // письмо уходит с ящика подключённого к Bitrix и фиксируется в таймлайне сделки.
+  await bitrixRestCall('crm.activity.add', {
+    fields: {
+      TYPE_ID: 4, // 4 = Email
+      SUBJECT: `Ход работы по сделке: ${dealTitle}`,
+      DESCRIPTION: text,
+      DESCRIPTION_TYPE: 1, // 1 = text
+      DIRECTION: 2, // 2 = исходящее
+      OWNER_TYPE_ID: 2, // 2 = Deal
+      OWNER_ID: dealId,
+      RESPONSIBLE_ID: responsibleId || 1,
+      COMPLETED: 'N',
+      COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: 0, ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+    },
+  });
+}
+
 async function buildDealContext(deal, transcript) {
   const service = detectServiceFromDeal(deal);
   // ENTITY_TYPE в crm.timeline.comment.list принимает строку 'deal' (не числовой ID).
@@ -1262,20 +1291,51 @@ async function runServerAutopilotForDeal(deal) {
     const clientMessage = String(aiResult.client_message || '').trim();
     const dealComment = String(aiResult.comment || aiResult.summary && aiResult.summary.join('; ') || 'Автопилот выполнен').trim();
 
-    // 4. Отправляем сообщение клиенту через Wazzup (если есть текст и телефон).
+    // 4. Отправляем сообщение клиенту: пробуем предпочитаемый канал из поля сделки,
+    // затем Telegram, затем Viber, затем Email. Останавливаемся на первом успешном.
     if (clientMessage) {
       const phone = await getContactPhone(deal);
-      const channelKey = detectPreferredChannel(deal);
+      const email = await getContactEmail(deal);
+      const preferredChannel = detectPreferredChannel(deal);
+
+      // Порядок попыток: предпочитаемый канал → telegram → viber → email
+      const wazzupChannelsToTry = [];
+      if (preferredChannel !== 'email') {
+        wazzupChannelsToTry.push(preferredChannel);
+        if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
+        if (preferredChannel !== 'viber') wazzupChannelsToTry.push('viber');
+      }
+
+      let sent = false;
+
       if (phone) {
-        try {
-          await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
-          console.log(`${logPrefix} Сообщение клиенту отправлено через ${channelKey}.`);
-        } catch (sendErr) {
-          console.error(`${logPrefix} Ошибка отправки Wazzup: ${sendErr.message}`);
-          // Не прерываем — пишем комментарий даже если отправка не удалась.
+        for (const channelKey of wazzupChannelsToTry) {
+          const ch = getConfiguredWazzupChannel(channelKey);
+          if (!ch || !ch.channelId) continue; // канал не настроен в Render — пропускаем
+          try {
+            await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
+            console.log(`${logPrefix} Сообщение клиенту отправлено через ${channelKey}.`);
+            sent = true;
+            break;
+          } catch (sendErr) {
+            console.warn(`${logPrefix} ${channelKey} не сработал: ${sendErr.message} — пробуем следующий канал.`);
+          }
         }
-      } else {
-        console.warn(`${logPrefix} Нет телефона клиента — сообщение не отправлено.`);
+      }
+
+      // Если все Wazzup-каналы не сработали или телефона нет — пробуем Email.
+      if (!sent && email) {
+        try {
+          await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessage);
+          console.log(`${logPrefix} Сообщение клиенту отправлено через Email: ${email}.`);
+          sent = true;
+        } catch (emailErr) {
+          console.error(`${logPrefix} Email тоже не сработал: ${emailErr.message}`);
+        }
+      }
+
+      if (!sent) {
+        console.warn(`${logPrefix} Не удалось отправить сообщение клиенту ни через один канал.`);
       }
     }
 

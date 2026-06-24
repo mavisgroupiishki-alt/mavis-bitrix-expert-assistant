@@ -1,3 +1,7 @@
+# MAVIS Bitrix Expert Assistant — v65 цепочка каналов Telegram → Viber → Email
+
+Если с клиентом ещё не начат диалог в Telegram/Viber — Wazzup вернёт ошибку. Теперь автопилот пробует каналы по очереди, останавливаясь на первом успешном: предпочитаемый канал из поля сделки → Telegram → Viber → Email (через crm.activity.add в Bitrix, без внешнего SMTP).
+
 # MAVIS Bitrix Expert Assistant — v43h executor Wazzup fix
 
 Что исправлено в v43h:
