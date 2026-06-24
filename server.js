@@ -695,6 +695,33 @@ app.get('/api/wazzup/webhook-status', async (_req, res) => {
   }
 });
 
+app.get('/api/debug/deal-activities/:dealId', async (req, res) => {
+  try {
+    const dealId = req.params.dealId;
+    const acts = await bitrixRestList('crm.activity.list', {
+      filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
+      order: { ID: 'DESC' },
+      select: ['*'],
+    }, 20);
+    // Возвращаем сырые данные для диагностики — какие поля есть у каждой активности.
+    const summary = acts.map((a) => ({
+      ID: a.ID,
+      TYPE_ID: a.TYPE_ID,
+      SUBJECT: a.SUBJECT,
+      PROVIDER_ID: a.PROVIDER_ID,
+      PROVIDER_TYPE_ID: a.PROVIDER_TYPE_ID,
+      STORAGE_ELEMENT_IDS: a.STORAGE_ELEMENT_IDS,
+      hasDescription: Boolean(a.DESCRIPTION),
+      descriptionSlice: String(a.DESCRIPTION || '').slice(0, 200),
+      allKeys: Object.keys(a),
+      urlsFound: JSON.stringify(a).match(/https?:\/\/[^\s"'<>]+/gi) || [],
+    }));
+    res.json({ ok: true, dealId, count: acts.length, activities: summary });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post('/api/deals/siblings', async (req, res) => {
   // Находим другие сделки той же компании на той же стадии "Эксперт назначен".
   // Вызывается ручным автопилотом перед формированием контекста — чтобы объединить
