@@ -5217,61 +5217,35 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
   const r = ai.result || ai;
   const handoff = extra.handoff || null;
   const stageMove = extra.stageMove || null;
-  const planItems = planNextActionsText(r);
   return `
     <div class="result-header">
-      <div class="result-header-title"><h3>Автопилот — ${escapeHtml(getService(deal) || 'услуга не указана')}</h3><span class="result-status ${escapeHtml(r.status || 'partial')}">${escapeHtml(r.status_label || 'анализ выполнен')}</span></div>
+      <div class="result-header-title"><h3>Игорь · Автопилот · ${escapeHtml(getService(deal) || 'услуга не указана')}</h3></div>
       <div class="result-grid">
         <div class="result-field"><span>Сделка</span>${escapeHtml(deal.TITLE || deal.ID)}</div>
-        <div class="result-field"><span>Эксперт-наблюдатель</span>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</div>
-        <div class="result-field"><span>Канал связи</span>${escapeHtml(messengerLabel(preferredChannelKey(deal)))}</div>
-        <div class="result-field"><span>Звонок</span>${transcript ? 'расшифрован' : 'нет расшифровки'}</div>
+        <div class="result-field"><span>Эксперт</span>${escapeHtml(userName(deal.ASSIGNED_BY_ID))}</div>
+        <div class="result-field"><span>Канал</span>${escapeHtml(messengerLabel(preferredChannelKey(deal)))}</div>
       </div>
     </div>
-    ${handoff ? `<div class="result-card ${handoff.criticalCount ? 'card-risk' : 'card-found'}"><h3>1. Проверка передачи</h3><p>${escapeHtml(handoff.statusText)}</p>${handoff.criticalCount ? listHtml(handoff.missingLabels) : ''}</div>` : ''}
-    ${sentInfo ? `<div class="result-card card-ok"><h3>Автодействия выполнены</h3><p>${escapeHtml(sentInfo)}</p></div>` : ''}
-    <div class="result-card card-info"><h3>Что ассистент понял</h3>${listHtml(r.summary || [], 'Нет сводки')}</div>
-    ${r.missing && r.missing.length ? `<div class="result-card card-uncertain"><h3>Чего не хватает</h3>${listHtml(r.missing)}</div>` : ''}
-    ${r.risks && r.risks.length ? `<div class="result-card card-risk"><h3>Риски</h3>${listHtml(r.risks)}</div>` : ''}
+    ${handoff && handoff.criticalCount ? `<div class="result-card card-risk"><h3>⚠️ Проверка передачи</h3><p>${escapeHtml(handoff.statusText)}</p>${listHtml(handoff.missingLabels)}</div>` : ''}
+    ${sentInfo ? `<div class="result-card card-ok"><h3>Статус отправки</h3><p>${escapeHtml(sentInfo)}</p></div>` : ''}
     ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
-    ${planItems.length ? `<div class="result-card card-action"><h3>Что ассистент делает дальше сам</h3>${listHtml(planItems)}</div>` : ''}
-    ${stageMove ? `<div class="result-card ${stageMove.moved ? 'card-ok' : 'card-uncertain'}"><h3>Стадия сделки</h3><p>${escapeHtml(stageMove.text)}</p></div>` : ''}
+    ${r.comment ? `<div class="result-card card-info"><h3>Комментарий эксперту</h3><p style="white-space:pre-wrap">${escapeHtml(r.comment)}</p></div>` : ''}
+    ${stageMove ? `<div class="result-card ${stageMove.moved ? 'card-ok' : 'card-uncertain'}"><h3>Стадия</h3><p>${escapeHtml(stageMove.text)}</p></div>` : ''}
     <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
 }
 
 function executorCommentText(ai, transcript, deal, extra = {}) {
-  // v46: ещё короче. Убран пересказ звонка ("из звонка понял" дублирует саму запись звонка
-  // в активности и сообщение клиенту). Пробелы и риски объединены в один список без повторов,
-  // максимум по 3-4 строки на блок — это рабочий отчёт эксперту, не протокол.
   const r = ai.result || ai;
-  const handoff = extra.handoff;
-  const stageMove = extra.stageMove;
-  const planItems = planNextActionsText(r);
   const lines = [];
-  lines.push(`Автопилот · ${getService(deal) || deal.TITLE || 'сделка ' + deal.ID} · ${r.status_label || r.status || 'анализ выполнен'}`);
+  lines.push(`Игорь · Автопилот · ${new Date().toLocaleDateString('ru-RU')}`);
   lines.push('');
-  if (handoff && handoff.criticalCount) {
-    lines.push(`Передача: ${handoff.statusText}`);
-    lines.push(...handoff.missingLabels.slice(0, 4).map((x) => `— ${x}`));
-    lines.push('');
-  }
-  const gaps = [...(r.missing || []), ...(r.risks || [])].filter(Boolean);
-  if (gaps.length) {
-    lines.push('Главные пробелы/риски:');
-    lines.push(...gaps.slice(0, 4).map((x) => `— ${x}`));
-    lines.push('');
-  }
-  lines.push(`Клиенту: ${r.client_message ? 'сообщение подготовлено и отправлено/в процессе отправки' : 'сообщение не сформировано'}`);
-  if (planItems.length) {
-    lines.push('');
-    lines.push('Делаю дальше сам:');
-    lines.push(...planItems.slice(0, 4).map((x) => `— ${x}`));
-  }
-  lines.push('');
-  lines.push(`Стадия: ${stageMove ? stageMove.text : 'не менялась'}`);
   if (r.comment) {
-    lines.push('');
     lines.push(r.comment);
+  }
+  const sentInfo = extra.sentInfo || '';
+  if (sentInfo) {
+    lines.push('');
+    lines.push(`Отправлено клиенту: ${sentInfo}`);
   }
   return lines.join('\n');
 }
@@ -5501,7 +5475,7 @@ async function runExecutorAutopilot() {
       stageMove = { moved: false, text: decision && decision.reason ? `Остаёмся на текущей стадии. Причина: ${decision.reason}.` : 'ИИ не нашёл оснований двигать стадию сейчас.' };
     }
 
-    const extra = { handoff: handoffInfo, stageMove };
+    const extra = { handoff: handoffInfo, stageMove, sentInfo };
     state.selectedAiPayload = { scenario: 'executor_attestation_call', scenarioLabel: 'Автопилот', result: ai.result };
     state.selectedAnalysis = executorCommentText(ai, transcript, deal, extra);
 

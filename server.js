@@ -320,13 +320,14 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       'Фокус сценария: общий анализ сделки. Сначала дай управленческий статус, затем пробелы, риски и действия.',
     ],
     executor_attestation_call: [
-      'Фокус сценария: ассистент-исполнитель по аттестации организации после первичного звонка. Не режим подсказки, а рабочий маршрут исполнения. Ассистент сам ведёт сделку: пишет клиенту, ставит внутренние дела, двигает стадию, отчитывается эксперту-наблюдателю комментарием. Клиенту никогда не пишешь от имени человека-эксперта без подтверждения — пишешь как ассистент.',
-      'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp и т.п.), даже если клиент сам назвал его в звонке для пересылки чего-то конкретного. Вместо "пришлите в Viber" или "перешлите в Telegram" пиши просто "пришлите мне" / "перешлите мне" — без названия канала. Это исключает противоречие между тем, что сказано в тексте, и тем мессенджером, в котором клиент реально получает сообщение.',
-      'Из звонка и сделки извлеки: вид работ, кто закрывает руководителя, есть ли директор с высшим строительным и 5 годами опыта, есть ли главный инженер и его аттестат, может ли один человек закрыть руководителя и ГИ, есть ли прораб/мастер под каждый вид работ, кого переводим/аттестуем/подбираем, канал связи, сроки и обещания.',
-      'Сформируй конкретный ход работы: что уже сделал ассистент, что пишет клиенту, какие документы запрашивает, какие внутренние дела создаёт (НЕ для клиента — для эксперта/менеджера/руководителя), когда запускать ЛК Белстройцентра, когда ждать документы, когда передавать оформителям, когда собирать папку и что контролировать после подачи.',
-      'По аттестации организации учитывай: Белстройцентр, бумажная подача, перечень копий, заявка через личный кабинет, договор/акты как успешное прохождение, замечания как отдельный этап устранения.',
-      'Реши, нужно ли двигать стадию сделки в Bitrix дальше по воронке прямо сейчас. Двигай стадию только если по итогам звонка зафиксирован реальный переход (например: передача подтверждена и начали вести клиента; документы запрошены и ждём; пакет подан). Не двигай стадию, если есть критичные пробелы (нет вида работ, нет схемы специалистов) — в этом случае оставайся на текущей стадии и фиксируй это как риск.',
-      'tasks — это только внутренние дела для сотрудников MAVIS (expert/manager/leader), никогда не задачи "для клиента". Если нужно действие от клиента — это идёт в client_message, а не в tasks.',
+      'Ты — Игорь, умный ИИ-ассистент MAVIS GROUP. Пиши как живой человек, кратко и по делу.',
+      'Твоя задача после первичного звонка: понять суть из разговора, написать клиенту короткое человеческое сообщение и оставить краткий комментарий эксперту.',
+      '',
+      'client_message — сообщение клиенту (3-6 предложений):\n- Обращение по имени\n- 1-2 предложения что обсудили\n- Чёткий список что нужно прислать (документы)\n- Одна фраза что делаем мы\n- Никогда не упоминай название мессенджера (Viber/Telegram/WhatsApp) — пиши "пришлите мне"',
+      '',
+      'comment — для эксперта в Bitrix (3-5 строк):\n- Что выяснил из звонка (кратко: услуга, кто директор/ГИ, ключевые факты)\n- Что нужно от клиента\n- Что делаем мы дальше\n- Если несколько сделок по компании — упомяни все услуги одной строкой',
+      '',
+      'ВАЖНО: не пиши огромные структурированные отчёты. Никаких разделов "Риски", "Пробелы", "Стадия", "Задачи". Только два поля: client_message и comment.',
     ],
   };
 
@@ -417,6 +418,11 @@ app.post('/api/ai/analyze-deal', async (req, res) => {
     const productGuidance = productAiGuidance(payload.context && payload.context.product, scenarioCfg.scenario);
     const context = clipText(JSON.stringify(payload.context || {}, null, 2), 30000);
     const system = `Ты ИИ-ассистент эксперта производства MAVIS GROUP. Работаешь только как внутренний помощник эксперта, РОП и руководителя. Нельзя обещать клиенту сроки, гарантии или юридически значимые выводы, если их нет в данных. Клиенту ничего не отправляешь автоматически. Возвращай только валидный JSON без markdown.`;
+    const isExecutorCall = scenarioCfg.scenario === 'executor_attestation_call';
+    const jsonSchema = isExecutorCall
+      ? `{"client_message": "сообщение клиенту (3-6 предложений): обращение по имени, что обсудили, что прислать, что делаем мы", "comment": "для эксперта в Bitrix (3-5 строк): что выяснил, что нужно от клиента, что делаем дальше"}`
+      : `{"status":"ok|partial|risk|error","status_label":"короткий статус по-русски","summary":["что понятно / найдено по сценарию"],"missing":["чего не хватает / что нужно уточнить"],"risks":["риски"],"next_steps":["следующие действия"],"tasks":[{"title":"название","responsible":"expert|manager|leader","deadline_hint":"когда","description":"что сделать"}],"client_message":"черновик сообщения клиенту или пустая строка","comment":"короткий комментарий в сделку","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
+
     const user = `${scenarioCfg.label}.
 
 Задача:
@@ -429,18 +435,7 @@ ${productGuidance}
 ${context}
 
 Верни JSON по схеме:
-{
-  "status": "ok|partial|risk|error",
-  "status_label": "короткий статус по-русски",
-  "summary": ["что понятно / найдено по сценарию"],
-  "missing": ["чего не хватает / что нужно уточнить / что не найдено"],
-  "risks": ["риски по срокам, оплатам, документам, передаче"],
-  "next_steps": ["следующие действия эксперта, менеджера или руководителя"],
-  "tasks": [{"title":"название задачи", "responsible":"expert|manager|leader", "deadline_hint":"когда", "description":"что сделать"}],
-  "client_message": "черновик сообщения клиенту, если уместно; если клиенту писать рано — текст уточнения или пустая строка",
-  "comment": "короткий комментарий в сделку для Bitrix",
-  "stage_decision": {"should_move": false, "target_stage_hint": "ключевые слова целевой стадии по-русски, например 'ведём клиента' или 'ждём документы' или пусто", "reason": "почему двигаем или почему остаёмся на текущей стадии"}
-}`;
+${jsonSchema}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -1410,14 +1405,13 @@ async function runServerAutopilotForDeal(deal, stageId) {
       context.multiple_deals_note = `По этой компании одновременно в работе ${siblings.length + 1} услуги. Сформируй один общий ход работы и одно общее сообщение клиенту, упомянув все услуги. Не пиши отдельные сообщения для каждой услуги.`;
     }
 
-    const scenarioCfg = aiScenarioConfig('executor_attestation_call');
-    const productGuidance = productAiGuidance(context.product, scenarioCfg.scenario);
     const systemPrompt = [
-      'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP.',
-      'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp). Пиши просто "пришлите мне" / "отправьте мне" без названия канала.',
+      'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP. Пиши как умный живой человек — кратко, по делу, без воды и бюрократии.',
+      'В client_message: короткое человеческое сообщение клиенту — что обсудили, что нужно от него прислать, что сделаем мы. Без длинных списков. Без названий мессенджеров (Viber/Telegram/WhatsApp) — только "пришлите мне".',
+      'В comment: краткая выжимка для эксперта — что выяснил из звонка, ключевые договорённости, что нужно от клиента. 3-5 строк максимум.',
       'Возвращай только валидный JSON без markdown.',
     ].join('\n');
-    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","status_label":"короткий статус по-русски","summary":["что понял из звонка и сделки"],"missing":["чего не хватает"],"risks":["риски"],"next_steps":["следующие шаги"],"tasks":[],"client_message":"полный текст сообщения клиенту с ходом работы по ВСЕМ услугам компании","comment":"полный ход работы для комментария в Bitrix","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
+    const userPrompt = `Проанализируй звонок и сделку, сформируй ход работы.\n\nКонтекст:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"client_message":"короткое сообщение клиенту (3-6 предложений): что обсудили, что нужно прислать, что сделаем","comment":"краткая выжимка для эксперта (3-5 строк): ключевые факты из звонка и договорённости"}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -1431,10 +1425,12 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     const clientMessage = String(aiResult.client_message || '').trim();
-    const dealComment = String(aiResult.comment || (aiResult.summary && aiResult.summary.join('; ')) || 'Автопилот выполнен').trim();
+    const dealComment = String(aiResult.comment || 'Автопилот выполнен').trim();
     const siblingNote = formatSiblingServicesNote(siblings);
 
     // 5. Отправляем сообщение клиенту: предпочитаемый → Telegram → Viber → Email.
+    let sent = false;
+    let sentChannel = '';
     if (clientMessage) {
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
@@ -1445,7 +1441,6 @@ async function runServerAutopilotForDeal(deal, stageId) {
         if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
         if (preferredChannel !== 'viber') wazzupChannelsToTry.push('viber');
       }
-      let sent = false;
       if (phone) {
         for (const channelKey of wazzupChannelsToTry) {
           const ch = getConfiguredWazzupChannel(channelKey);
@@ -1454,6 +1449,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
             await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
             console.log(`${logPrefix} Сообщение отправлено через ${channelKey}.`);
             sent = true;
+            sentChannel = channelKey;
             break;
           } catch (sendErr) {
             console.warn(`${logPrefix} ${channelKey} не сработал: ${sendErr.message} — пробуем следующий.`);
@@ -1465,6 +1461,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
           await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessage);
           console.log(`${logPrefix} Сообщение отправлено через Email: ${email}.`);
           sent = true;
+          sentChannel = 'email';
         } catch (emailErr) {
           console.error(`${logPrefix} Email не сработал: ${emailErr.message}`);
         }
@@ -1473,9 +1470,27 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     // 6. Комментарий в текущую сделку с явным указанием статуса отправки.
+    const channelLabel = { telegram: 'Telegram', viber: 'Viber', email: 'Email', default: 'мессенджер' };
     const sendStatus = clientMessage
-      ? (sent ? `✅ Сообщение клиенту отправлено.` : `⚠️ Сообщение подготовлено, но не удалось отправить ни через один канал (нет телефона/email или все каналы недоступны).`)
-      : `ℹ️ Сообщение клиенту не формировалось (ИИ не вернул client_message).`;
+      ? (sent
+        ? `✅ Сообщение клиенту отправлено через ${channelLabel[sentChannel] || sentChannel}.`
+        : `⚠️ Сообщение подготовлено, но не удалось отправить ни через один канал. Задача эксперту: отправить ход работы клиенту вручную.`)
+      : `ℹ️ Сообщение клиенту не сформировано — ИИ не вернул текст.`;
+    // Если сообщение не удалось отправить — ставим задачу эксперту.
+    if (clientMessage && !sent) {
+      try {
+        await bitrixRestCall('tasks.task.add', {
+          fields: {
+            TITLE: `Игорь не смог отправить ход работы клиенту — сделка ${dealId} (${deal.TITLE})`,
+            DESCRIPTION: `ИИ-ассистент Игорь подготовил сообщение клиенту, но не смог отправить его ни через один канал (нет телефона/email в карточке или все каналы недоступны).\n\nПожалуйста, отправь клиенту ход работы вручную.\n\nТекст сообщения:\n${clientMessage}`,
+            RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || config.executorExpertId,
+            UF_CRM_TASK: [`D_${dealId}`],
+            PRIORITY: 1,
+          },
+        });
+      } catch (_) {}
+    }
+
     const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
