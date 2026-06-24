@@ -701,7 +701,7 @@ app.get('/api/debug/deal-activities/:dealId', async (req, res) => {
     const acts = await bitrixRestList('crm.activity.list', {
       filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
       order: { ID: 'DESC' },
-      select: ['*'],
+      select: ['*', 'FILES'],
     }, 20);
     // Возвращаем сырые данные для диагностики — какие поля есть у каждой активности.
     const summary = acts.map((a) => ({
@@ -1198,26 +1198,58 @@ async function serverResolveCandidateDownloadUrl(candidate) {
 }
 
 async function findCallForDeal(dealId) {
-  // Точная копия логики findCallRecordingsForDeal из app.js — поддерживает Asterisk/Zruchna и
-  // любые другие провайдеры телефонии, не только стандартный Bitrix TYPE_ID=2.
+  // FILES не возвращается через select: ['*'] в Bitrix REST — нужно запрашивать явно.
+  // VOXIMPLANT_CALL — провайдер телефонии используемый у клиента (выяснено из debug endpoint).
   const acts = await bitrixRestList('crm.activity.list', {
     filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
     order: { ID: 'DESC' },
-    select: ['*'],
-  }, 80);
+    select: ['*', 'FILES'],
+  }, 30);
+
+  // Берём только активности звонков с аудио.
   const callActs = acts.filter((a) => {
-    const text = [a.SUBJECT, a.DESCRIPTION, a.PROVIDER_ID, a.TYPE_ID, a.PROVIDER_TYPE_ID].join(' ').toLowerCase();
-    return /звон|call|voximplant|telephony|телеф|asterisk|zruchna/.test(text) || String(a.TYPE_ID || '') === '2';
+    const typeId = String(a.TYPE_ID || '');
+    const provider = String(a.PROVIDER_ID || '').toLowerCase();
+    return typeId === '2' || provider.includes('call') || provider.includes('voximplant') ||
+           provider.includes('asterisk') || provider.includes('zruchna') || provider.includes('telephony');
   });
-  const candidates = [];
-  callActs.forEach((a) => candidates.push(...serverCollectActivityAudioCandidates(a)));
-  for (const c of candidates) {
-    c.downloadUrl = await serverResolveCandidateDownloadUrl(c);
+
+  for (const act of callActs) {
+    // Способ 1: поле FILES (явно запрошено).
+    const files = Array.isArray(act.FILES) ? act.FILES : [];
+    for (const f of files) {
+      const fileId = f && (f.ID || f.id || f.FILE_ID || f.fileId);
+      if (!fileId) continue;
+      try {
+        const file = await bitrixRestCall('disk.file.get', { id: fileId });
+        const url = file && (file.DOWNLOAD_URL || file.downloadUrl || file.VIEW_URL);
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3` };
+      } catch (_) {}
+      // Fallback: прямой URL из crm_show_file если disk.file.get не сработал.
+      const directUrl = f && (f.DOWNLOAD_URL || f.downloadUrl || f.VIEW_URL || f.url);
+      if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3` };
+    }
+
+    // Способ 2: URL из urlsFound — crm_show_file.php?fileId=N встречается в полях активности.
+    const raw = JSON.stringify(act);
+    const fileIdMatch = raw.match(/crm_show_file\.php\?fileId=(\d+)/);
+    if (fileIdMatch) {
+      try {
+        const file = await bitrixRestCall('disk.file.get', { id: fileIdMatch[1] });
+        const url = file && (file.DOWNLOAD_URL || file.downloadUrl);
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3` };
+      } catch (_) {}
+    }
+
+    // Способ 3: рекурсивный поиск URL аудио в полях (запасной, как раньше).
+    const candidates = serverCollectActivityAudioCandidates(act);
+    for (const c of candidates) {
+      const url = await serverResolveCandidateDownloadUrl(c);
+      if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3` };
+    }
   }
-  const ready = candidates.filter((c) => c.downloadUrl || c.url);
-  if (!ready.length) return null;
-  const best = ready[0];
-  return { activityId: best.activityId, subject: best.subject, url: best.downloadUrl || best.url, fileName: `call-${dealId}.mp3` };
+
+  return null;
 }
 
 function detectServiceFromDeal(deal) {

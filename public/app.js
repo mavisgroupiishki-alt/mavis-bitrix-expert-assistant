@@ -5177,10 +5177,11 @@ async function resolveCandidateDownloadUrl(candidate) {
 }
 
 async function findCallRecordingsForDeal(dealId) {
+  // FILES не возвращается через select: ['*'] — нужно запрашивать явно.
   const acts = await bxList('crm.activity.list', {
     filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
     order: { ID: 'DESC' },
-    select: ['*']
+    select: ['*', 'FILES']
   }, 80);
   const callActs = acts.filter((a) => {
     const text = normalize([a.SUBJECT, a.DESCRIPTION, a.PROVIDER_ID, a.TYPE_ID, a.PROVIDER_TYPE_ID].join(' '));
