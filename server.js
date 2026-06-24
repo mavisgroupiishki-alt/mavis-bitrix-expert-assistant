@@ -126,14 +126,25 @@ async function bitrixRestCall(method, params = {}) {
 
 async function bitrixRestList(method, params = {}, limit = 200) {
   const out = [];
+  const seenIds = new Set();
   let start = 0;
   for (;;) {
     const page = await bitrixRestCall(method, { ...params, start });
     const items = Array.isArray(page) ? page : (page && page.items) || [];
-    out.push(...items);
-    if (!Array.isArray(page) || items.length === 0 || out.length >= limit) break;
+    // Дедупликация по полю ID — Bitrix иногда возвращает одни и те же записи
+    // при пагинации (особенно при малом числе результатов).
+    let newItems = 0;
+    for (const item of items) {
+      const id = item && (item.ID || item.id);
+      if (id && seenIds.has(String(id))) continue;
+      if (id) seenIds.add(String(id));
+      out.push(item);
+      newItems++;
+    }
+    // Останавливаемся если: пришёл не массив, пришло 0 новых элементов,
+    // или меньше 50 (стандартный размер страницы Bitrix) — значит это последняя страница.
+    if (!Array.isArray(page) || newItems === 0 || items.length < 50 || out.length >= limit) break;
     start += items.length;
-    if (out.length >= limit) break;
   }
   return out.slice(0, limit);
 }
@@ -684,6 +695,33 @@ app.get('/api/wazzup/webhook-status', async (_req, res) => {
   }
 });
 
+app.post('/api/deals/siblings', async (req, res) => {
+  // Находим другие сделки той же компании на той же стадии "Эксперт назначен".
+  // Вызывается ручным автопилотом перед формированием контекста — чтобы объединить
+  // все услуги одной компании в один общий ход работы и одно сообщение клиенту.
+  try {
+    const { companyId, categoryId, stageId, excludeDealId } = req.body || {};
+    if (!companyId || !categoryId || !stageId) {
+      return res.json({ ok: true, siblings: [] });
+    }
+    const siblings = await bitrixRestList('crm.deal.list', {
+      filter: { COMPANY_ID: companyId, CATEGORY_ID: categoryId, STAGE_ID: stageId },
+      select: ['ID', 'TITLE', 'STAGE_ID', 'OPPORTUNITY', 'CURRENCY_ID',
+        process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+      ],
+    }, 20);
+    const seen = new Set();
+    const filtered = siblings.filter((s) => {
+      if (seen.has(String(s.ID)) || String(s.ID) === String(excludeDealId)) return false;
+      seen.add(String(s.ID));
+      return true;
+    });
+    res.json({ ok: true, siblings: filtered });
+  } catch (err) {
+    res.json({ ok: true, siblings: [], error: err.message });
+  }
+});
+
 app.post('/api/wazzup/register-webhook', async (req, res) => {
   try {
     // Для регистрации вебхука используем Sidecar API key (если задан) — именно он связан
@@ -1209,25 +1247,25 @@ async function sendEmailThroughBitrix(dealId, responsibleId, toEmail, dealTitle,
 }
 
 async function findSiblingDeals(deal, stageId) {
-  // Ищем другие сделки той же компании на той же стадии "Эксперт назначен".
-  // Это нужно чтобы не слать клиенту 3-4 отдельных сообщения по каждой услуге,
-  // а сформировать один общий ход работы по всем услугам сразу.
   if (!deal.COMPANY_ID) return [];
   try {
-    const siblings = await bitrixRestList('crm.deal.list', {
-      filter: {
-        COMPANY_ID: deal.COMPANY_ID,
-        CATEGORY_ID: config.autopilotCategoryId || 28,
-        STAGE_ID: stageId,
-      },
+    const all = await bitrixRestList('crm.deal.list', {
+      filter: { COMPANY_ID: deal.COMPANY_ID, CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: stageId },
       select: ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
         'OPPORTUNITY', 'CURRENCY_ID',
         process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
         process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900',
       ],
     }, 20);
-    // Исключаем текущую сделку из списка.
-    return siblings.filter((s) => String(s.ID) !== String(deal.ID));
+    // Дедупликация по ID — bitrixRestList может вернуть одну сделку несколько раз
+    // из-за особенностей пагинации Bitrix при небольшом числе записей.
+    const seen = new Set();
+    const unique = all.filter((s) => {
+      if (seen.has(String(s.ID))) return false;
+      seen.add(String(s.ID));
+      return true;
+    });
+    return unique.filter((s) => String(s.ID) !== String(deal.ID));
   } catch (_) { return []; }
 }
 
@@ -1375,8 +1413,11 @@ async function runServerAutopilotForDeal(deal, stageId) {
       if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
     }
 
-    // 6. Комментарий в текущую сделку.
-    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${dealComment}`;
+    // 6. Комментарий в текущую сделку с явным указанием статуса отправки.
+    const sendStatus = clientMessage
+      ? (sent ? `✅ Сообщение клиенту отправлено.` : `⚠️ Сообщение подготовлено, но не удалось отправить ни через один канал (нет телефона/email или все каналы недоступны).`)
+      : `ℹ️ Сообщение клиенту не формировалось (ИИ не вернул client_message).`;
+    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
@@ -1385,6 +1426,9 @@ async function runServerAutopilotForDeal(deal, stageId) {
     // 7. Помечаем сопутствующие сделки — чтобы автопилот не запустился по ним отдельно.
     for (const sibling of siblings) {
       try {
+        // Проверяем что маркер ещё не стоит (защита от дублирования при повторном запуске).
+        const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
+        if (siblingAlreadyDone) continue;
         await bitrixRestCall('crm.timeline.comment.add', {
           fields: {
             ENTITY_ID: sibling.ID, ENTITY_TYPE: 'deal',

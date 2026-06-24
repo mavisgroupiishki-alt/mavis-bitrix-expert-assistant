@@ -378,14 +378,14 @@ async function bindDealTabPlacement({ showAlert = false, force = false } = {}) {
       await bxCall('placement.bind', {
         PLACEMENT: 'CRM_DEAL_DETAIL_TAB',
         HANDLER: handler,
-        TITLE: 'ИИ-ассистент',
-        DESCRIPTION: 'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP',
+        TITLE: 'ИИ-ассистент Игорь',
+        DESCRIPTION: 'ИИ-ассистент Игорь — помощник эксперта внутри карточки сделки MAVIS GROUP',
       });
-      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
+      state.placementRegisterStatus = 'Вкладка “ИИ-ассистент Игорь” зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
       if (showAlert) alert(state.placementRegisterStatus);
       return true;
     }
-    state.placementRegisterStatus = 'Вкладка “ИИ-ассистент” уже зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
+    state.placementRegisterStatus = 'Вкладка “ИИ-ассистент Игорь” уже зарегистрирована. Обнови карточку сделки Ctrl+R / Cmd+R.';
     if (showAlert) alert(state.placementRegisterStatus);
     return true;
   } catch (e) {
@@ -5388,9 +5388,6 @@ async function runExecutorAutopilot() {
     context.executor_mode = {
       enabled: true,
       dealId: String(deal.ID),
-      // Реальная услуга из поля сделки, а не предположение ассистента. Если в звонке клиент
-      // называет другие виды работ/услугу, чем записано в сделке — это расхождение указывается
-      // в "missing"/"risks" ИИ-анализа, а не подменяется жёстким правилом из кода.
       product: realService || profile.label || 'услуга не определена',
       preferredContactFieldCode: APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900',
       preferredChannel: preferredChannelKey(deal),
@@ -5398,6 +5395,36 @@ async function runExecutorAutopilot() {
       knowledge: attestationExecutorKnowledge(),
       note_to_ai: 'Поле "product" взято из реального поля Услуга в Bitrix. Виды работ определяй из звонка и комментариев сделки как они есть, без предположений о том, какие виды работ "должны" быть.',
     };
+
+    // Ищем сопутствующие сделки той же компании на той же стадии — чтобы сформировать
+    // один общий ход работы и одно сообщение клиенту по всем услугам сразу.
+    if (deal.COMPANY_ID && deal.STAGE_ID && deal.CATEGORY_ID) {
+      try {
+        const siblingsResp = await fetch('/api/deals/siblings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            companyId: deal.COMPANY_ID,
+            categoryId: deal.CATEGORY_ID,
+            stageId: deal.STAGE_ID,
+            excludeDealId: deal.ID,
+          }),
+        });
+        const siblingsData = await siblingsResp.json().catch(() => ({}));
+        if (siblingsData.ok && siblingsData.siblings && siblingsData.siblings.length > 0) {
+          const siblings = siblingsData.siblings;
+          context.sibling_deals = siblings.map((s) => ({
+            id: s.ID,
+            title: s.TITLE,
+            service: s[APP_CONFIG.serviceFieldCode || 'UF_CRM_1765113071'] || s.TITLE,
+            sum: s.OPPORTUNITY,
+          }));
+          context.multiple_deals_note = `По этой компании одновременно в работе ${siblings.length + 1} услуги. Сформируй один общий ход работы и одно общее сообщение клиенту, упомянув все услуги. Не пиши отдельные сообщения для каждой услуги.`;
+          out.innerHTML = `<div class="result-card"><h3>Шаг 3 из 6 · Найдено ${siblings.length + 1} сделки по компании — анализирую все вместе...</h3></div>`;
+        }
+      } catch (_) { /* если не нашли сопутствующие — работаем с одной сделкой */ }
+    }
+
     const aiResp = await fetch('/api/ai/analyze-deal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
