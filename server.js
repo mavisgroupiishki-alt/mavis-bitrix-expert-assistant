@@ -1208,6 +1208,38 @@ async function sendEmailThroughBitrix(dealId, responsibleId, toEmail, dealTitle,
   });
 }
 
+async function findSiblingDeals(deal, stageId) {
+  // Ищем другие сделки той же компании на той же стадии "Эксперт назначен".
+  // Это нужно чтобы не слать клиенту 3-4 отдельных сообщения по каждой услуге,
+  // а сформировать один общий ход работы по всем услугам сразу.
+  if (!deal.COMPANY_ID) return [];
+  try {
+    const siblings = await bitrixRestList('crm.deal.list', {
+      filter: {
+        COMPANY_ID: deal.COMPANY_ID,
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        STAGE_ID: stageId,
+      },
+      select: ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
+        'OPPORTUNITY', 'CURRENCY_ID',
+        process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+        process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900',
+      ],
+    }, 20);
+    // Исключаем текущую сделку из списка.
+    return siblings.filter((s) => String(s.ID) !== String(deal.ID));
+  } catch (_) { return []; }
+}
+
+function formatSiblingServicesNote(siblings) {
+  if (!siblings.length) return '';
+  const services = siblings.map((s) => {
+    const svc = String(s[process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'] || s.TITLE || `Сделка ${s.ID}`).trim();
+    return `• ${svc} (сделка ${s.ID})`;
+  }).join('\n');
+  return `\n\n⚠️ Внимание: по этой компании найдено ${siblings.length + 1} сделки на стадии «Эксперт назначен». Ход работы сформирован общий для всех услуг:\n${services}`;
+}
+
 async function buildDealContext(deal, transcript) {
   const service = detectServiceFromDeal(deal);
   // ENTITY_TYPE в crm.timeline.comment.list принимает строку 'deal' (не числовой ID).
@@ -1244,7 +1276,7 @@ async function buildDealContext(deal, transcript) {
   };
 }
 
-async function runServerAutopilotForDeal(deal) {
+async function runServerAutopilotForDeal(deal, stageId) {
   const dealId = deal.ID;
   const logPrefix = `[autopilot deal=${dealId}]`;
   console.log(`${logPrefix} Запускаю автопилот для "${deal.TITLE}"`);
@@ -1254,7 +1286,7 @@ async function runServerAutopilotForDeal(deal) {
     const callRecord = await findCallForDeal(dealId);
     if (!callRecord) {
       console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
-      return; // НЕ помечаем как ошибку — просто нет звонка ещё, проверим позже.
+      return;
     }
 
     // 2. Расшифровываем.
@@ -1264,18 +1296,31 @@ async function runServerAutopilotForDeal(deal) {
       throw new Error(`Расшифровка слишком короткая или пустая: "${transcript.slice(0, 100)}"`);
     }
 
-    // 3. Строим контекст и запускаем ИИ-анализ.
+    // 3. Ищем сделки-компаньоны (другие услуги той же компании на той же стадии).
+    const siblings = stageId ? await findSiblingDeals(deal, stageId) : [];
+    const hasMultipleDeals = siblings.length > 0;
+    if (hasMultipleDeals) {
+      console.log(`${logPrefix} Найдено ${siblings.length} сопутствующих сделок по компании ${deal.COMPANY_ID}: ${siblings.map((s) => s.ID).join(', ')}`);
+    }
+
+    // 4. Строим объединённый контекст.
     console.log(`${logPrefix} Запускаю ИИ-анализ...`);
     const context = await buildDealContext(deal, transcript);
-    const service = detectServiceFromDeal(deal);
+    if (hasMultipleDeals) {
+      context.sibling_deals = siblings.map((s) => ({
+        id: s.ID, title: s.TITLE, service: detectServiceFromDeal(s), sum: s.OPPORTUNITY,
+      }));
+      context.multiple_deals_note = `По этой компании одновременно в работе ${siblings.length + 1} услуги. Сформируй один общий ход работы и одно общее сообщение клиенту, упомянув все услуги. Не пиши отдельные сообщения для каждой услуги.`;
+    }
+
     const scenarioCfg = aiScenarioConfig('executor_attestation_call');
     const productGuidance = productAiGuidance(context.product, scenarioCfg.scenario);
     const systemPrompt = [
-      'Ты ИИ-ассистент эксперта производства MAVIS GROUP.',
+      'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP.',
       'ВАЖНО про канал связи в client_message: НИКОГДА не упоминай название конкретного мессенджера (Viber, Telegram, WhatsApp). Пиши просто "пришлите мне" / "отправьте мне" без названия канала.',
       'Возвращай только валидный JSON без markdown.',
     ].join('\n');
-    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","status_label":"короткий статус по-русски","summary":["что понял из звонка и сделки"],"missing":["чего не хватает"],"risks":["риски"],"next_steps":["следующие шаги"],"tasks":[],"client_message":"полный текст сообщения клиенту с ходом работы и списком что нужно прислать","comment":"полный ход работы для комментария в Bitrix: что выяснили на звонке, схема специалистов, что нужно от клиента, следующие шаги — это прочитает эксперт","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
+    const userPrompt = `${scenarioCfg.label}.\n\nЗадача:\n${scenarioCfg.instruction}\n\nПродуктовые правила:\n${productGuidance}\n\nКонтекст сделки:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"status":"ok|partial|risk","status_label":"короткий статус по-русски","summary":["что понял из звонка и сделки"],"missing":["чего не хватает"],"risks":["риски"],"next_steps":["следующие шаги"],"tasks":[],"client_message":"полный текст сообщения клиенту с ходом работы по ВСЕМ услугам компании","comment":"полный ход работы для комментария в Bitrix","stage_decision":{"should_move":false,"target_stage_hint":"","reason":""}}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -1289,79 +1334,80 @@ async function runServerAutopilotForDeal(deal) {
     }
 
     const clientMessage = String(aiResult.client_message || '').trim();
-    const dealComment = String(aiResult.comment || aiResult.summary && aiResult.summary.join('; ') || 'Автопилот выполнен').trim();
+    const dealComment = String(aiResult.comment || (aiResult.summary && aiResult.summary.join('; ')) || 'Автопилот выполнен').trim();
+    const siblingNote = formatSiblingServicesNote(siblings);
 
-    // 4. Отправляем сообщение клиенту: пробуем предпочитаемый канал из поля сделки,
-    // затем Telegram, затем Viber, затем Email. Останавливаемся на первом успешном.
+    // 5. Отправляем сообщение клиенту: предпочитаемый → Telegram → Viber → Email.
     if (clientMessage) {
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
       const preferredChannel = detectPreferredChannel(deal);
-
-      // Порядок попыток: предпочитаемый канал → telegram → viber → email
       const wazzupChannelsToTry = [];
       if (preferredChannel !== 'email') {
         wazzupChannelsToTry.push(preferredChannel);
         if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
         if (preferredChannel !== 'viber') wazzupChannelsToTry.push('viber');
       }
-
       let sent = false;
-
       if (phone) {
         for (const channelKey of wazzupChannelsToTry) {
           const ch = getConfiguredWazzupChannel(channelKey);
-          if (!ch || !ch.channelId) continue; // канал не настроен в Render — пропускаем
+          if (!ch || !ch.channelId) continue;
           try {
             await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
-            console.log(`${logPrefix} Сообщение клиенту отправлено через ${channelKey}.`);
+            console.log(`${logPrefix} Сообщение отправлено через ${channelKey}.`);
             sent = true;
             break;
           } catch (sendErr) {
-            console.warn(`${logPrefix} ${channelKey} не сработал: ${sendErr.message} — пробуем следующий канал.`);
+            console.warn(`${logPrefix} ${channelKey} не сработал: ${sendErr.message} — пробуем следующий.`);
           }
         }
       }
-
-      // Если все Wazzup-каналы не сработали или телефона нет — пробуем Email.
       if (!sent && email) {
         try {
           await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessage);
-          console.log(`${logPrefix} Сообщение клиенту отправлено через Email: ${email}.`);
+          console.log(`${logPrefix} Сообщение отправлено через Email: ${email}.`);
           sent = true;
         } catch (emailErr) {
-          console.error(`${logPrefix} Email тоже не сработал: ${emailErr.message}`);
+          console.error(`${logPrefix} Email не сработал: ${emailErr.message}`);
         }
       }
-
-      if (!sent) {
-        console.warn(`${logPrefix} Не удалось отправить сообщение клиенту ни через один канал.`);
-      }
+      if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
     }
 
-    // 5. Пишем краткий комментарий в сделку + маркер "уже обработано".
-    const commentText = `${AUTOPILOT_MARKER}\n${dealComment}`;
+    // 6. Комментарий в текущую сделку.
+    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${dealComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
     autopilotProcessed.add(String(dealId));
-    console.log(`${logPrefix} Готово — комментарий добавлен.`);
+
+    // 7. Помечаем сопутствующие сделки — чтобы автопилот не запустился по ним отдельно.
+    for (const sibling of siblings) {
+      try {
+        await bitrixRestCall('crm.timeline.comment.add', {
+          fields: {
+            ENTITY_ID: sibling.ID, ENTITY_TYPE: 'deal',
+            COMMENT: `${AUTOPILOT_MARKER}\nОбработано совместно со сделкой ${dealId} (${deal.TITLE}). Ход работы и сообщение клиенту — в той сделке.`,
+          },
+        });
+        autopilotProcessed.add(String(sibling.ID));
+      } catch (_) {}
+    }
+    console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Помечены сопутствующие сделки: ${siblings.map((s) => s.ID).join(', ')}.` : ''}`);
 
   } catch (err) {
     console.error(`${logPrefix} Ошибка: ${err.message}`);
-    // Пишем ошибку в сделку и помечаем как обработанную (чтобы не зациклиться).
     try {
       await bitrixRestCall('crm.timeline.comment.add', {
-        fields: {
-          ENTITY_ID: dealId,
-          ENTITY_TYPE: 'deal',
-          COMMENT: `${AUTOPILOT_ERROR_MARKER}\nАвтопилот столкнулся с ошибкой и остановился: ${err.message}`,
-        },
+        fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${AUTOPILOT_ERROR_MARKER}\nАвтопилот Игорь столкнулся с ошибкой: ${err.message}` },
       });
-    } catch (_) { /* если и комментарий не вышел — просто логируем */ }
-    autopilotProcessed.add(String(dealId)); // помечаем чтобы не повторять
+    } catch (_) {}
+    autopilotProcessed.add(String(dealId));
   }
 }
+
+
 
 async function runAutopilotPollingCycle() {
   if (!config.bitrixWebhookUrl) {
@@ -1402,7 +1448,7 @@ async function runAutopilotPollingCycle() {
       if (autopilotProcessed.has(String(deal.ID))) continue;
       const alreadyDone = await dealAlreadyProcessed(deal.ID);
       if (alreadyDone) continue;
-      await runServerAutopilotForDeal(deal);
+      await runServerAutopilotForDeal(deal, stageId);
       // Пауза между сделками чтобы не перегружать ИИ API и Bitrix.
       await new Promise((r) => setTimeout(r, 5000));
     }
