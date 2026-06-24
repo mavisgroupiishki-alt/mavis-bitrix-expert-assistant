@@ -1040,14 +1040,18 @@ async function getExpertStageId() {
 async function dealAlreadyProcessed(dealId) {
   if (autopilotProcessed.has(String(dealId))) return true;
   // Проверяем таймлайн сделки на наличие маркера выполненного автопилота.
-  const comments = await bitrixRestList('crm.timeline.comment.list', {
-    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
-    select: ['ID', 'COMMENT'],
-    order: { ID: 'DESC' },
-  }, 30);
-  const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER) || String(c.COMMENT || '').includes(AUTOPILOT_ERROR_MARKER));
-  if (done) autopilotProcessed.add(String(dealId));
-  return done;
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID', 'COMMENT'],
+      order: { ID: 'DESC' },
+    }, 30);
+    const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER) || String(c.COMMENT || '').includes(AUTOPILOT_ERROR_MARKER));
+    if (done) autopilotProcessed.add(String(dealId));
+    return done;
+  } catch (_) {
+    return false; // если не удалось прочитать таймлайн — не блокируем, попробуем обработать
+  }
 }
 
 async function transcribeAudioUrl(audioUrl, fileName) {
@@ -1315,16 +1319,18 @@ async function runAutopilotPollingCycle() {
       return;
     }
 
-    // Берём сделки на нужной стадии, созданные после старта сервера.
+    // Берём сделки на нужной стадии, у которых переход на эту стадию произошёл ПОСЛЕ
+    // старта сервера. MOVED_TIME — дата последней смены стадии, это точнее чем DATE_CREATE
+    // (сделка могла быть создана давно, но перейти на "Эксперт назначен" уже после деплоя).
     const startDateStr = AUTOPILOT_START_DATE.toISOString().slice(0, 19);
     const deals = await bitrixRestList('crm.deal.list', {
       filter: {
         CATEGORY_ID: config.autopilotCategoryId || 28,
         STAGE_ID: stageId,
-        '>=DATE_CREATE': startDateStr,
+        '>=MOVED_TIME': startDateStr,
       },
       select: ['ID', 'TITLE', 'STAGE_ID', 'CATEGORY_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
-        'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE',
+        'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME',
         process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
         process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900',
       ],
