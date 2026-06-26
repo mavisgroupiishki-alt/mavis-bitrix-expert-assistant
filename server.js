@@ -1123,24 +1123,39 @@ const AUTOPILOT_START_DATE = new Date();
 const autopilotProcessed = new Set();
 
 async function getAutopilotStageIds() {
-  // Ищем обе стадии динамически — "Эксперт назначен" и "Сбор информации".
-  // Кэшируем результат, чтобы не делать запрос каждые 10 минут.
   if (getAutopilotStageIds._cached) return getAutopilotStageIds._cached;
   const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
   const allStages = Array.isArray(stages) ? stages : [];
+
   const expertStage = allStages.find((s) =>
-    /эксперт.*(назначен|назначён)/i.test(s.NAME || '') ||
-    /назначен.*эксперт/i.test(s.NAME || '')
+    /эксперт.*(назначен|назначён)/i.test(s.NAME || '') || /назначен.*эксперт/i.test(s.NAME || '')
   );
   const infoStage = allStages.find((s) =>
-    /сбор.*(информ|данн)/i.test(s.NAME || '') ||
-    /(информ|данн).*сбор/i.test(s.NAME || '')
+    /сбор.*(информ|данн)/i.test(s.NAME || '') || /(информ|данн).*сбор/i.test(s.NAME || '')
   );
+  // Кэшируем также ID стадии "Сбор информации" отдельно — нужен для перевода сделки.
+  const prepStage = infoStage || allStages.find((s) => /подготовк|preparation/i.test(s.NAME || '') || String(s.STATUS_ID || '').includes('PREPARATION'));
+  if (prepStage) {
+    getAutopilotStageIds._prepStageId = prepStage.STATUS_ID;
+    console.log(`[autopilot] Стадия "Сбор информации": "${prepStage.NAME}" → ${prepStage.STATUS_ID}`);
+  }
+
   const result = [];
   if (expertStage) { result.push(expertStage.STATUS_ID); console.log(`[autopilot] Стадия 1: "${expertStage.NAME}" → ${expertStage.STATUS_ID}`); }
-  if (infoStage) { result.push(infoStage.STATUS_ID); console.log(`[autopilot] Стадия 2: "${infoStage.NAME}" → ${infoStage.STATUS_ID}`); }
+  if (infoStage && infoStage !== prepStage) { result.push(infoStage.STATUS_ID); console.log(`[autopilot] Стадия 2: "${infoStage.NAME}" → ${infoStage.STATUS_ID}`); }
+  else if (prepStage && !expertStage) result.push(prepStage.STATUS_ID);
+  // Если нашли только одну стадию через regex — добавляем её
+  if (!result.length && allStages.length) {
+    // Fallback: берём C28:NEW и C28:PREPARATION напрямую если известны
+    const byId = allStages.filter((s) => ['C28:NEW', 'C28:PREPARATION'].includes(s.STATUS_ID));
+    byId.forEach((s) => result.push(s.STATUS_ID));
+  }
   if (result.length) getAutopilotStageIds._cached = result;
   return result;
+}
+
+function getPreparationStageId() {
+  return getAutopilotStageIds._prepStageId || 'C28:PREPARATION';
 }
 
 async function dealAlreadyProcessed(dealId) {
@@ -1516,6 +1531,51 @@ function formatSiblingServicesNote(siblings) {
   return `\n\n⚠️ Внимание: по этой компании найдено ${siblings.length + 1} сделки на стадии «Эксперт назначен». Ход работы сформирован общий для всех услуг:\n${services}`;
 }
 
+function getDiminutiveName(fullName) {
+  // Превращает "Елизавета Горбатова" → "Лизочка", "Мария Баженова" → "Машенька" и т.д.
+  const name = String(fullName || '').trim().split(' ')[0]; // берём только имя
+  const diminutives = {
+    'Елизавета': 'Лизочка', 'Елена': 'Леночка', 'Александра': 'Сашенька',
+    'Александр': 'Сашенька', 'Мария': 'Машенька', 'Анна': 'Анечка',
+    'Екатерина': 'Катюша', 'Татьяна': 'Танюша', 'Наталья': 'Наташенька',
+    'Ольга': 'Оленька', 'Ирина': 'Иришка', 'Светлана': 'Светочка',
+    'Юлия': 'Юлечка', 'Надежда': 'Наденька', 'Виктория': 'Викуля',
+    'Дарья': 'Дашенька', 'Валентина': 'Валечка', 'Галина': 'Галочка',
+    'Людмила': 'Людочка', 'Нина': 'Ниночка', 'Вера': 'Верочка',
+    'Алина': 'Алиночка', 'Кристина': 'Кристиночка', 'Диана': 'Дианочка',
+    'Марина': 'Мариночка', 'Ксения': 'Ксюша', 'Полина': 'Полиночка',
+    'Евгения': 'Женечка', 'Евгений': 'Женечка', 'Андрей': 'Андрюша',
+    'Дмитрий': 'Димочка', 'Сергей': 'Серёженька', 'Алексей': 'Лёшенька',
+    'Михаил': 'Мишенька', 'Роман': 'Ромочка', 'Артём': 'Тёмочка',
+    'Николай': 'Колечка', 'Владимир': 'Вовочка', 'Антон': 'Антоша',
+    'Максим': 'Максик', 'Павел': 'Павлик', 'Игорь': 'Игорёк',
+  };
+  return diminutives[name] || `${name}` ; // если не нашли — просто имя
+}
+
+async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage) {
+  // Создаём задачу эксперту на следующий день до 18:00.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(18, 0, 0, 0);
+  const deadline = tomorrow.toISOString().slice(0, 19) + '+03:00';
+
+  const petName = getDiminutiveName(expertName);
+  const taskTitle = `${petName}, я отправил ход работы клиенту 📋`;
+  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊\n\nЧто сделал:\n— Отправил первое сообщение клиенту с кратким ходом работы\n— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}\n— Написал краткую выжимку в комментарий к сделке\n— Перевёл сделку на стадию «Сбор информации»\n\nТвой следующий шаг — дождаться ответа/документов от клиента 🙌`;
+
+  await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: taskTitle,
+      DESCRIPTION: taskDesc,
+      RESPONSIBLE_ID: expertId,
+      DEADLINE: deadline,
+      UF_CRM_TASK: [`D_${dealId}`],
+      PRIORITY: 1,
+    },
+  });
+}
+
 async function buildDealContext(deal, transcript) {
   const service = detectServiceFromDeal(deal);
   const docList = getDocumentListForService(service);
@@ -1666,20 +1726,21 @@ async function runServerAutopilotForDeal(deal, stageId) {
       }
     }
 
-    // 6. Комментарий в текущую сделку с явным указанием статуса отправки.
+    // 6. Комментарий в текущую сделку.
     const channelLabel = { telegram: 'Telegram', viber: 'Viber', email: 'Email', default: 'мессенджер' };
     const sendStatus = clientMessage
       ? (sent
         ? `✅ Сообщение клиенту отправлено через ${channelLabel[sentChannel] || sentChannel}.`
-        : `⚠️ Сообщение подготовлено, но не удалось отправить ни через один канал. Задача эксперту: отправить ход работы клиенту вручную.`)
-      : `ℹ️ Сообщение клиенту не сформировано — ИИ не вернул текст.`;
-    // Если сообщение не удалось отправить — ставим задачу эксперту.
+        : `⚠️ Сообщение подготовлено, но не удалось отправить. Эксперту: отправь вручную.`)
+      : `ℹ️ Сообщение клиенту не сформировано.`;
+
+    // Если не смогли отправить — задача эксперту.
     if (clientMessage && !sent) {
       try {
         await bitrixRestCall('tasks.task.add', {
           fields: {
-            TITLE: `Игорь не смог отправить ход работы клиенту — сделка ${dealId} (${deal.TITLE})`,
-            DESCRIPTION: `ИИ-ассистент Игорь подготовил сообщение клиенту, но не смог отправить его ни через один канал (нет телефона/email в карточке или все каналы недоступны).\n\nПожалуйста, отправь клиенту ход работы вручную.\n\nТекст сообщения:\n${clientMessage}`,
+            TITLE: `Игорь не смог отправить ход работы клиенту — ${deal.TITLE}`,
+            DESCRIPTION: `Игорь подготовил сообщение, но не смог отправить.\n\nТекст:\n${clientMessage}${documentMessage ? '\n\n' + documentMessage : ''}`,
             RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || config.executorExpertId,
             UF_CRM_TASK: [`D_${dealId}`],
             PRIORITY: 1,
@@ -1688,28 +1749,56 @@ async function runServerAutopilotForDeal(deal, stageId) {
       } catch (_) {}
     }
 
-    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}`;
+    // Сообщение клиенту тоже пишем в комментарий.
+    const clientMsgForComment = clientMessage
+      ? `\n\n📨 Отправлено клиенту:\n${clientMessage}${documentMessage ? '\n\n' + documentMessage : ''}`
+      : '';
+    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}${clientMsgForComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
     autopilotProcessed.add(String(dealId));
 
-    // 7. Помечаем сопутствующие сделки — чтобы автопилот не запустился по ним отдельно.
+    // 7. Помечаем сопутствующие сделки.
     for (const sibling of siblings) {
       try {
-        // Проверяем что маркер ещё не стоит (защита от дублирования при повторном запуске).
         const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
         if (siblingAlreadyDone) continue;
         await bitrixRestCall('crm.timeline.comment.add', {
           fields: {
             ENTITY_ID: sibling.ID, ENTITY_TYPE: 'deal',
-            COMMENT: `${AUTOPILOT_MARKER}\nОбработано совместно со сделкой ${dealId} (${deal.TITLE}). Ход работы и сообщение клиенту — в той сделке.`,
+            COMMENT: `${AUTOPILOT_MARKER}\nОбработано совместно со сделкой ${dealId} (${deal.TITLE}). Ход работы в той сделке.`,
           },
         });
         autopilotProcessed.add(String(sibling.ID));
       } catch (_) {}
     }
-    console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Помечены сопутствующие сделки: ${siblings.map((s) => s.ID).join(', ')}.` : ''}`);
+
+    // 8. Переводим сделку на "Сбор информации" если она на "Эксперт назначен".
+    const prepStageId = getPreparationStageId();
+    if (prepStageId && deal.STAGE_ID !== prepStageId) {
+      try {
+        await bitrixRestCall('crm.deal.update', { id: dealId, fields: { STAGE_ID: prepStageId } });
+        console.log(`${logPrefix} Стадия → "${prepStageId}".`);
+      } catch (stageErr) {
+        console.warn(`${logPrefix} Не удалось перевести стадию: ${stageErr.message}`);
+      }
+    }
+
+    // 9. Задача эксперту — отчёт Игоря с ласковым именем.
+    if (deal.ASSIGNED_BY_ID && sent) {
+      try {
+        const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+        const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
+        const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
+        await createExpertFollowUpTask(dealId, deal.ASSIGNED_BY_ID, expertName, clientMessage, documentMessage);
+        console.log(`${logPrefix} Задача эксперту создана (${expertName}).`);
+      } catch (taskErr) {
+        console.warn(`${logPrefix} Задача эксперту не создалась: ${taskErr.message}`);
+      }
+    }
+
+    console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие: ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
 
   } catch (err) {
     console.error(`${logPrefix} Ошибка: ${err.message}`);
