@@ -737,12 +737,11 @@ app.post('/api/autopilot/reset/:dealId', async (req, res) => {
       try { await bitrixRestCall('crm.timeline.comment.delete', { id: c.ID }); } catch (_) {}
     }
     // Принудительно запускаем автопилот для этой сделки прямо сейчас.
-    const stageId = await getExpertStageId();
+    const stageIds = await getAutopilotStageIds();
     const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
     if (deal) {
       res.json({ ok: true, message: `Маркеры сброшены (${toDelete.length} шт.), запускаю автопилот...`, deletedComments: toDelete.length });
-      // Запускаем асинхронно, не блокируем ответ.
-      runServerAutopilotForDeal(deal, stageId).catch((e) => console.error(`[reset] ошибка: ${e.message}`));
+      runServerAutopilotForDeal(deal, deal.STAGE_ID || (stageIds[0] || null)).catch((e) => console.error(`[reset] ошибка: ${e.message}`));
     } else {
       res.json({ ok: false, error: `Сделка ${dealId} не найдена` });
     }
@@ -1115,20 +1114,25 @@ const AUTOPILOT_START_DATE = new Date();
 // таймлайн каждые 10 минут для уже обработанных сделок.
 const autopilotProcessed = new Set();
 
-async function getExpertStageId() {
-  // Ищем стадию "Эксперт назначен" в воронке 28 динамически.
+async function getAutopilotStageIds() {
+  // Ищем обе стадии динамически — "Эксперт назначен" и "Сбор информации".
   // Кэшируем результат, чтобы не делать запрос каждые 10 минут.
-  if (getExpertStageId._cached) return getExpertStageId._cached;
+  if (getAutopilotStageIds._cached) return getAutopilotStageIds._cached;
   const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
-  const stage = (Array.isArray(stages) ? stages : []).find((s) =>
+  const allStages = Array.isArray(stages) ? stages : [];
+  const expertStage = allStages.find((s) =>
     /эксперт.*(назначен|назначён)/i.test(s.NAME || '') ||
     /назначен.*эксперт/i.test(s.NAME || '')
   );
-  if (stage) {
-    getExpertStageId._cached = stage.STATUS_ID;
-    console.log(`[autopilot] Найдена стадия "${stage.NAME}" → STATUS_ID=${stage.STATUS_ID}`);
-  }
-  return getExpertStageId._cached || null;
+  const infoStage = allStages.find((s) =>
+    /сбор.*(информ|данн)/i.test(s.NAME || '') ||
+    /(информ|данн).*сбор/i.test(s.NAME || '')
+  );
+  const result = [];
+  if (expertStage) { result.push(expertStage.STATUS_ID); console.log(`[autopilot] Стадия 1: "${expertStage.NAME}" → ${expertStage.STATUS_ID}`); }
+  if (infoStage) { result.push(infoStage.STATUS_ID); console.log(`[autopilot] Стадия 2: "${infoStage.NAME}" → ${infoStage.STATUS_ID}`); }
+  if (result.length) getAutopilotStageIds._cached = result;
+  return result;
 }
 
 async function dealAlreadyProcessed(dealId) {
@@ -1422,11 +1426,14 @@ function detectServiceFromDeal(deal) {
 }
 
 function detectPreferredChannel(deal) {
-  const field = process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900';
-  const val = String(deal[field] || '').toLowerCase();
+  // Поле канала связи может быть разным в зависимости от настроек Bitrix.
+  // Проверяем оба известных кода — старый и новый (изменился в июне 2026).
+  const field1 = process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140';
+  const field2 = 'UF_CRM_1781189436900'; // старый код
+  const val = String(deal[field1] || deal[field2] || '').toLowerCase().trim();
   if (val.includes('телеграм') || val.includes('telegram') || val.includes('tg')) return 'telegram';
   if (val.includes('вайбер') || val.includes('viber')) return 'viber';
-  if (val.includes('email') || val.includes('почта') || val.includes('mail')) return 'email';
+  if (val.includes('email') || val.includes('почта') || val.includes('mail') || val.includes('e-mail')) return 'email';
   return 'telegram'; // дефолт
 }
 
@@ -1706,37 +1713,43 @@ async function runAutopilotPollingCycle() {
   }
 
   try {
-    const stageId = await getExpertStageId();
-    if (!stageId) {
-      console.warn('[autopilot] Стадия "Эксперт назначен" не найдена в воронке — проверь AUTOPILOT_CATEGORY_ID.');
+    const stageIds = await getAutopilotStageIds();
+    if (!stageIds.length) {
+      console.warn('[autopilot] Стадии не найдены в воронке — проверь AUTOPILOT_CATEGORY_ID.');
       return;
     }
 
-    // Берём сделки на нужной стадии, у которых переход на эту стадию произошёл ПОСЛЕ
-    // старта сервера. MOVED_TIME — дата последней смены стадии, это точнее чем DATE_CREATE
-    // (сделка могла быть создана давно, но перейти на "Эксперт назначен" уже после деплоя).
     const startDateStr = AUTOPILOT_START_DATE.toISOString().slice(0, 19);
-    const deals = await bitrixRestList('crm.deal.list', {
-      filter: {
-        CATEGORY_ID: config.autopilotCategoryId || 28,
-        STAGE_ID: stageId,
-        '>=MOVED_TIME': startDateStr,
-      },
-      select: ['ID', 'TITLE', 'STAGE_ID', 'CATEGORY_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
-        'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME',
-        process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
-        process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781189436900',
-      ],
-    }, 50);
+    // Собираем сделки по каждой стадии отдельно (Bitrix не поддерживает массив в STAGE_ID фильтре).
+    const allDeals = [];
+    const seenIds = new Set();
+    for (const stageId of stageIds) {
+      const deals = await bitrixRestList('crm.deal.list', {
+        filter: {
+          CATEGORY_ID: config.autopilotCategoryId || 28,
+          STAGE_ID: stageId,
+          '>=MOVED_TIME': startDateStr,
+        },
+        select: ['ID', 'TITLE', 'STAGE_ID', 'CATEGORY_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
+          'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME',
+          process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+          process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140',
+          'UF_CRM_1781189436900', // старый код поля канала
+        ],
+      }, 50);
+      for (const d of deals) {
+        if (!seenIds.has(String(d.ID))) { seenIds.add(String(d.ID)); allDeals.push(d); }
+      }
+    }
 
-    console.log(`[autopilot] Цикл: найдено ${deals.length} сделок на стадии "${stageId}" после ${startDateStr}.`);
+    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] после ${startDateStr}.`);
 
-    for (const deal of deals) {
+    for (const deal of allDeals) {
       if (autopilotProcessed.has(String(deal.ID))) continue;
       const alreadyDone = await dealAlreadyProcessed(deal.ID);
       if (alreadyDone) continue;
-      await runServerAutopilotForDeal(deal, stageId);
-      // Пауза между сделками чтобы не перегружать ИИ API и Bitrix.
+      // Передаём первую стадию (Эксперт назначен) как эталон для поиска сопутствующих сделок.
+      await runServerAutopilotForDeal(deal, deal.STAGE_ID);
       await new Promise((r) => setTimeout(r, 5000));
     }
   } catch (err) {

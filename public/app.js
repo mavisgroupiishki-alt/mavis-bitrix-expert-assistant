@@ -5165,15 +5165,15 @@ function isExecutorTestDeal(deal) {
 }
 
 function preferredChannelKey(deal) {
-  const code = APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781189436900';
-  const raw = deal && deal[code];
-  const resolved = resolveFieldValue(code, raw) || String(raw || '');
+  // Проверяем оба известных кода поля канала связи — старый и новый (изменился в июне 2026).
+  const code1 = APP_CONFIG.preferredContactFieldCode || 'UF_CRM_1781874759140';
+  const code2 = 'UF_CRM_1781189436900';
+  const raw = (deal && (deal[code1] || deal[code2])) || '';
+  const resolved = resolveFieldValue(code1, raw) || String(raw || '');
   const text = normalize(resolved);
   if (/viber|вайбер/.test(text)) return 'viber';
   if (/telegram|телеграм|tg/.test(text)) return 'telegram';
   if (/email|почт|e-mail/.test(text)) return 'email';
-  // Важно: если поле связи заполнено не Telegram/Viber/Email (например, туда случайно попала услуга 'АТТ'),
-  // не отправляем сообщение автоматически через первый доступный канал. Иначе ассистент может ошибочно уйти в Wazzup/Viber.
   return 'manual';
 }
 
