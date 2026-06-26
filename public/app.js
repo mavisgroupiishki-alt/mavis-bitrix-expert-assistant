@@ -5303,6 +5303,7 @@ function renderExecutorResult(ai, transcript, deal, sentInfo = '', extra = {}) {
     ${handoff && handoff.criticalCount ? `<div class="result-card card-risk"><h3>⚠️ Проверка передачи</h3><p>${escapeHtml(handoff.statusText)}</p>${listHtml(handoff.missingLabels)}</div>` : ''}
     ${sentInfo ? `<div class="result-card card-ok"><h3>Статус отправки</h3><p>${escapeHtml(sentInfo)}</p></div>` : ''}
     ${r.client_message ? `<div class="result-card"><h3>Сообщение клиенту</h3><div class="message-draft">${escapeHtml(r.client_message)}</div></div>` : ''}
+    ${r.document_message ? `<div class="result-card"><h3>Перечень документов / требования к специалистам</h3><div class="message-draft">${escapeHtml(r.document_message)}</div></div>` : ''}
     ${r.comment ? `<div class="result-card card-info"><h3>Комментарий эксперту</h3><p style="white-space:pre-wrap">${escapeHtml(r.comment)}</p></div>` : ''}
     ${stageMove ? `<div class="result-card ${stageMove.moved ? 'card-ok' : 'card-uncertain'}"><h3>Стадия</h3><p>${escapeHtml(stageMove.text)}</p></div>` : ''}
     <details class="result-card"><summary><strong>Расшифровка звонка</strong></summary><pre class="analysis-pre">${escapeHtml(transcript || 'Расшифровка не получена')}</pre></details>`;
@@ -5532,6 +5533,22 @@ async function runExecutorAutopilot() {
       }
     } else {
       sentInfo = 'ИИ не сформировал сообщение клиенту на этом шаге.';
+    }
+
+    // Второе сообщение — перечень документов или требования к специалистам.
+    const docMsg = ai.result && ai.result.document_message ? String(ai.result.document_message).trim() : '';
+    if (docMsg && msg) {
+      const channel2 = preferredChannelKey(deal);
+      const phone2 = getPrimaryClientPhone(deal);
+      if (channel2 !== 'manual' && channel2 !== 'email' && phone2 && APP_CONFIG.wazzupApiConfigured) {
+        try {
+          await new Promise((r) => setTimeout(r, 1500));
+          await sendWazzupMessage({ deal, phone: phone2, text: docMsg, channelKey: channel2 });
+          sentInfo += ' Перечень документов отправлен вторым сообщением ✅';
+        } catch (_) {
+          sentInfo += ' Перечень документов не удалось отправить вторым сообщением.';
+        }
+      }
     }
 
     out.innerHTML = `<div class="result-card"><h3>Шаг 5 из 6 · Проверяю стадию сделки...</h3></div>`;
