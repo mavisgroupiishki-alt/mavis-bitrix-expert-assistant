@@ -1618,7 +1618,15 @@ async function runServerAutopilotForDeal(deal, stageId) {
   console.log(`${logPrefix} Запускаю автопилот для "${deal.TITLE}"`);
 
   try {
-    // 1. Ищем запись звонка.
+    // 1. Проверяем тип услуги — консультации не обрабатываем.
+    const serviceRaw = detectServiceFromDeal(deal);
+    if (/консультац/i.test(serviceRaw)) {
+      console.log(`${logPrefix} Услуга "${serviceRaw}" — консультация, пропускаю.`);
+      autopilotProcessed.add(String(dealId)); // помечаем чтобы не проверять снова
+      return;
+    }
+
+    // 2. Ищем запись звонка.
     const callRecord = await findCallForDeal(dealId);
     if (!callRecord) {
       console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
