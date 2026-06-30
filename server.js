@@ -1553,7 +1553,7 @@ function getDiminutiveName(fullName) {
   return diminutives[name] || `${name}` ; // если не нашли — просто имя
 }
 
-async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage) {
+async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage, otherDealIds = []) {
   // Создаём задачу эксперту на следующий день до 18:00.
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -1562,7 +1562,10 @@ async function createExpertFollowUpTask(dealId, expertId, expertName, clientMess
 
   const petName = getDiminutiveName(expertName);
   const taskTitle = `${petName}, я отправил ход работы клиенту 📋`;
-  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊\n\nЧто сделал:\n— Отправил первое сообщение клиенту с кратким ходом работы\n— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}\n— Написал краткую выжимку в комментарий к сделке\n— Перевёл сделку на стадию «Сбор информации»\n\nТвой следующий шаг — дождаться ответа/документов от клиента 🙌`;
+  const siblingsLine = otherDealIds && otherDealIds.length
+    ? `\n\nПо этой компании сразу несколько сделок (${[dealId, ...otherDealIds].join(', ')}) — клиенту отправлено одно общее сообщение по всем услугам, но в каждой сделке свой комментарий и своя задача.`
+    : '';
+  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊\n\nЧто сделал:\n— Отправил первое сообщение клиенту с кратким ходом работы\n— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}\n— Написал краткую выжимку в комментарий к сделке\n— Перевёл сделку на стадию «Сбор информации»${siblingsLine}\n\nТвой следующий шаг — дождаться ответа/документов от клиента 🙌`;
 
   await bitrixRestCall('tasks.task.add', {
     fields: {
@@ -1691,8 +1694,8 @@ async function runServerAutopilotForDeal(deal, stageId) {
       const wazzupChannelsToTry = [];
       if (preferredChannel !== 'email') {
         wazzupChannelsToTry.push(preferredChannel);
-        if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
         if (preferredChannel !== 'viber') wazzupChannelsToTry.push('viber');
+        if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
       }
       if (phone) {
         for (const channelKey of wazzupChannelsToTry) {
@@ -1767,22 +1770,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
     });
     autopilotProcessed.add(String(dealId));
 
-    // 7. Помечаем сопутствующие сделки.
-    for (const sibling of siblings) {
-      try {
-        const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
-        if (siblingAlreadyDone) continue;
-        await bitrixRestCall('crm.timeline.comment.add', {
-          fields: {
-            ENTITY_ID: sibling.ID, ENTITY_TYPE: 'deal',
-            COMMENT: `${AUTOPILOT_MARKER}\nОбработано совместно со сделкой ${dealId} (${deal.TITLE}). Ход работы в той сделке.`,
-          },
-        });
-        autopilotProcessed.add(String(sibling.ID));
-      } catch (_) {}
-    }
-
-    // 8. Переводим сделку на "Сбор информации" если она на "Эксперт назначен".
+    // 7. Переводим ОСНОВНУЮ сделку на "Сбор информации".
     const prepStageId = getPreparationStageId();
     if (prepStageId && deal.STAGE_ID !== prepStageId) {
       try {
@@ -1793,20 +1781,62 @@ async function runServerAutopilotForDeal(deal, stageId) {
       }
     }
 
-    // 9. Задача эксперту — отчёт Игоря с ласковым именем.
+    // 8. Задача эксперту по основной сделке — отчёт Игоря с ласковым именем.
+    let mainExpertName = '';
     if (deal.ASSIGNED_BY_ID && sent) {
       try {
         const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
         const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
-        const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
-        await createExpertFollowUpTask(dealId, deal.ASSIGNED_BY_ID, expertName, clientMessage, documentMessage);
-        console.log(`${logPrefix} Задача эксперту создана (${expertName}).`);
+        mainExpertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
+        await createExpertFollowUpTask(dealId, deal.ASSIGNED_BY_ID, mainExpertName, clientMessage, documentMessage, []);
+        console.log(`${logPrefix} Задача эксперту создана (${mainExpertName}).`);
       } catch (taskErr) {
         console.warn(`${logPrefix} Задача эксперту не создалась: ${taskErr.message}`);
       }
     }
 
-    console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие: ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
+    // 9. То же самое (комментарий + стадия + задача) делаем для КАЖДОЙ сопутствующей сделки —
+    // это важно: клиент один, но в каждой сделке-услуге эксперт должен видеть ход работы и
+    // получить свою задачу, а не только ссылку "смотри в другой сделке".
+    const allSiblingIds = siblings.map((s) => s.ID);
+    for (const sibling of siblings) {
+      try {
+        const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
+        if (siblingAlreadyDone) continue;
+
+        const otherIds = [dealId, ...allSiblingIds.filter((id) => String(id) !== String(sibling.ID))];
+        const crossNote = `\n\nЭта сделка обработана вместе со сделками компании: ${otherIds.join(', ')}. Полный контекст и переписка с клиентом — там же.`;
+        const siblingComment = `${AUTOPILOT_MARKER}\n\n${sendStatus}\n\n${dealComment}${crossNote}`;
+        await bitrixRestCall('crm.timeline.comment.add', {
+          fields: { ENTITY_ID: sibling.ID, ENTITY_TYPE: 'deal', COMMENT: siblingComment },
+        });
+        autopilotProcessed.add(String(sibling.ID));
+
+        // Стадия сопутствующей сделки.
+        if (prepStageId && sibling.STAGE_ID !== prepStageId) {
+          try {
+            await bitrixRestCall('crm.deal.update', { id: sibling.ID, fields: { STAGE_ID: prepStageId } });
+          } catch (_) {}
+        }
+
+        // Задача эксперту сопутствующей сделки (может быть другой человек, чем в основной).
+        if (sibling.ASSIGNED_BY_ID && sent) {
+          let siblingExpertName = mainExpertName;
+          if (String(sibling.ASSIGNED_BY_ID) !== String(deal.ASSIGNED_BY_ID)) {
+            try {
+              const su = await bitrixRestCall('user.get', { ID: sibling.ASSIGNED_BY_ID });
+              const suUser = Array.isArray(su) ? su[0] : su;
+              siblingExpertName = suUser ? `${suUser.NAME || ''} ${suUser.LAST_NAME || ''}`.trim() : '';
+            } catch (_) { siblingExpertName = ''; }
+          }
+          try {
+            await createExpertFollowUpTask(sibling.ID, sibling.ASSIGNED_BY_ID, siblingExpertName, clientMessage, documentMessage, otherIds);
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие (комментарий+стадия+задача): ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
 
   } catch (err) {
     console.error(`${logPrefix} Ошибка: ${err.message}`);
