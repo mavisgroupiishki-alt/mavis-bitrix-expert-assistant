@@ -1,6 +1,8 @@
 const express = require('express');
 const path = require('path');
 const helmet = require('helmet');
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1103,6 +1105,248 @@ app.all('/install', (_req, res) => {
 });
 
 // ============================================================================
+// v82: ОБРАБОТКА ПОЧТЫ — клиенты присылают документы на mavis.group@mail.ru,
+// сервер читает новые письма по IMAP, сверяет отправителя с контактами CRM,
+// сохраняет вложения на Bitrix Диск в папку компании, ставит задачу эксперту.
+// ============================================================================
+
+const EMAIL_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 минут
+let commonDriveRootId = null; // кэш ID корневой папки Общего диска
+
+async function getCommonDriveRootId() {
+  if (commonDriveRootId) return commonDriveRootId;
+  // Находим общее хранилище компании (не личный диск пользователя).
+  const storages = await bitrixRestCall('disk.storage.getlist', {});
+  const companyStorage = (Array.isArray(storages) ? storages : []).find((s) =>
+    /common|group|company|общ/i.test(s.NAME || '') || s.ENTITY_TYPE === 'group' || s.ENTITY_TYPE === 'common'
+  ) || (Array.isArray(storages) ? storages[0] : null);
+  if (!companyStorage) throw new Error('Не найдено общее хранилище Bitrix Диска (disk.storage.getlist пусто).');
+
+  const storageInfo = await bitrixRestCall('disk.storage.get', { id: companyStorage.ID });
+  commonDriveRootId = storageInfo.ROOT_OBJECT_ID;
+  console.log(`[email] Корень Общего диска → ID ${commonDriveRootId}`);
+  return commonDriveRootId;
+}
+
+function normalizeCompanyNameForMatch(name) {
+  // Убираем организационно-правовую форму и пунктуацию для нечёткого сравнения названий —
+  // папка на Диске может называться "Эд Сервис", а в CRM компания "ООО "Эд Сервис"".
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\b(ооо|оао|зао|чп|уп|ип|зполиц|чтуп|общество с ограниченной ответственностью|частное предприятие)\b/gi, '')
+    .replace(/[«»"'.,]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function getOrCreateCompanyFolder(companyName) {
+  // Папки компаний лежат прямо в корне Общего диска (не во вложенной структуре).
+  const rootId = await getCommonDriveRootId();
+  const safeName = String(companyName || 'Без названия').replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 200);
+  const targetNormalized = normalizeCompanyNameForMatch(safeName);
+
+  const children = await bitrixRestList('disk.folder.getchildren', { id: rootId }, 500);
+  // Сначала точное совпадение, потом нечёткое (без ООО/кавычек).
+  let folder = children.find((c) => c.TYPE === 'folder' && c.NAME === safeName);
+  if (!folder) {
+    folder = children.find((c) => c.TYPE === 'folder' && normalizeCompanyNameForMatch(c.NAME) === targetNormalized && targetNormalized);
+  }
+  if (!folder) {
+    folder = await bitrixRestCall('disk.folder.addsubfolder', { id: rootId, data: { NAME: safeName } });
+    console.log(`[email] Создана новая папка компании "${safeName}" → ID ${folder.ID}`);
+  } else {
+    console.log(`[email] Найдена существующая папка компании "${folder.NAME}" → ID ${folder.ID}`);
+  }
+  return folder.ID;
+}
+
+async function uploadFileToDiskFolder(folderId, fileName, buffer) {
+  const base64 = buffer.toString('base64');
+  const safeFileName = String(fileName || 'file').replace(/[\\/:*?"<>|]/g, '_').slice(0, 200);
+  const result = await bitrixRestCall('disk.folder.uploadfile', {
+    id: folderId,
+    data: { NAME: safeFileName },
+    fileContent: [safeFileName, base64],
+    generateUniqueName: true,
+  });
+  return result;
+}
+
+async function findContactAndDealsByEmail(senderEmail) {
+  // Сверяем email отправителя с контактами CRM.
+  const cleanEmail = String(senderEmail || '').trim().toLowerCase();
+  if (!cleanEmail) return null;
+  try {
+    const contacts = await bitrixRestList('crm.contact.list', {
+      filter: { EMAIL: cleanEmail },
+      select: ['ID', 'NAME', 'LAST_NAME', 'EMAIL', 'COMPANY_ID'],
+    }, 5);
+    if (!contacts.length) return null;
+    const contact = contacts[0];
+
+    // Находим сделки этого контакта на стадии "Сбор информации" (туда автопилот переводит после звонка).
+    const stageIds = await getAutopilotStageIds();
+    const prepStageId = getPreparationStageId();
+    const targetStages = [...new Set([...stageIds, prepStageId].filter(Boolean))];
+    const allDeals = [];
+    for (const stageId of targetStages) {
+      const deals = await bitrixRestList('crm.deal.list', {
+        filter: { CONTACT_ID: contact.ID, CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: stageId },
+        select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'COMPANY_ID', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      }, 20);
+      allDeals.push(...deals);
+    }
+    const seen = new Set();
+    const uniqueDeals = allDeals.filter((d) => { if (seen.has(d.ID)) return false; seen.add(d.ID); return true; });
+    return { contact, deals: uniqueDeals };
+  } catch (e) {
+    console.warn(`[email] Ошибка поиска контакта по email ${cleanEmail}: ${e.message}`);
+    return null;
+  }
+}
+
+async function getCompanyName(companyId) {
+  if (!companyId) return null;
+  try {
+    const company = await bitrixRestCall('crm.company.get', { id: companyId });
+    return company ? company.TITLE : null;
+  } catch (_) { return null; }
+}
+
+function attachmentMatchesAnyDoc(fileName, docList) {
+  // Простая проверка: имя файла содержит ключевые слова из перечня (диплом, трудовая, аттестат и т.п.)
+  if (!docList || !docList.docs) return true; // если перечня нет — не фильтруем, сохраняем всё
+  const lower = String(fileName || '').toLowerCase();
+  const keywords = ['диплом', 'трудов', 'аттестат', 'паспорт', 'устав', 'свидетельств', 'договор', 'скан', 'копия', 'pdf', 'jpg', 'jpeg', 'png', 'doc'];
+  return keywords.some((k) => lower.includes(k)) || /\.(pdf|jpg|jpeg|png|docx?|xlsx?)$/i.test(lower);
+}
+
+async function createDocumentReceivedTask(dealId, expertId, expertName, companyName, fileNames, folderId) {
+  const petName = getDiminutiveName(expertName);
+  const taskTitle = `${petName}, клиент прислал документы на почту 📨`;
+  const fileList = fileNames.map((f) => `— ${f}`).join('\n');
+  const taskDesc = `${petName}, клиент (${companyName}) прислал документы на почту mavis.group@mail.ru 😊\n\nЯ сохранил их на Диск в папку компании.\n\nЧто пришло:\n${fileList}\n\nПроверь, всё ли пришло и можно ли двигаться дальше по сделке 🙌`;
+
+  await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: taskTitle,
+      DESCRIPTION: taskDesc,
+      RESPONSIBLE_ID: expertId,
+      UF_CRM_TASK: [`D_${dealId}`],
+      PRIORITY: 1,
+    },
+  });
+}
+
+async function processIncomingEmails() {
+  const emailUser = process.env.MAIL_IMAP_USER || '';
+  const emailPass = process.env.MAIL_IMAP_PASSWORD || '';
+  const imapHost = process.env.MAIL_IMAP_HOST || 'imap.mail.ru';
+  const imapPort = Number(process.env.MAIL_IMAP_PORT || 993);
+
+  if (!emailUser || !emailPass) {
+    console.log('[email] MAIL_IMAP_USER / MAIL_IMAP_PASSWORD не заданы — обработка почты выключена.');
+    return;
+  }
+  if (!config.bitrixWebhookUrl) {
+    console.log('[email] BITRIX_WEBHOOK_URL не задан — обработка почты невозможна.');
+    return;
+  }
+
+  let client;
+  try {
+    client = new ImapFlow({
+      host: imapHost,
+      port: imapPort,
+      secure: true,
+      auth: { user: emailUser, pass: emailPass },
+      logger: false,
+    });
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      // Ищем непрочитанные письма.
+      const uids = await client.search({ seen: false });
+      if (!uids || !uids.length) {
+        console.log('[email] Новых писем нет.');
+        return;
+      }
+      console.log(`[email] Найдено ${uids.length} непрочитанных писем.`);
+
+      for (const uid of uids) {
+        try {
+          const msgData = await client.fetchOne(uid, { source: true });
+          if (!msgData || !msgData.source) continue;
+          const parsed = await simpleParser(msgData.source);
+
+          const senderEmail = parsed.from && parsed.from.value && parsed.from.value[0] ? parsed.from.value[0].address : '';
+          const subject = parsed.subject || '';
+          const attachments = (parsed.attachments || []).filter((a) => a.size > 0);
+
+          console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}`);
+
+          if (!attachments.length) {
+            // Письмо без вложений — не обрабатываем (нечего сохранять), но помечаем прочитанным.
+            await client.messageFlagsAdd(uid, ['\\Seen']);
+            continue;
+          }
+
+          const matchInfo = await findContactAndDealsByEmail(senderEmail);
+          if (!matchInfo || !matchInfo.deals.length) {
+            console.log(`[email] Email ${senderEmail} не сопоставлен ни с одной активной сделкой — пропускаю, оставляю непрочитанным для ручной проверки.`);
+            continue; // НЕ помечаем прочитанным — Кристина увидит вручную в почте
+          }
+
+          const { contact, deals } = matchInfo;
+          const companyName = await getCompanyName(contact.COMPANY_ID) || deals[0].TITLE || `Контакт ${contact.ID}`;
+          const folderId = await getOrCreateCompanyFolder(companyName);
+
+          const savedFileNames = [];
+          for (const att of attachments) {
+            try {
+              await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
+              savedFileNames.push(att.filename || 'без имени');
+            } catch (upErr) {
+              console.warn(`[email] Не удалось загрузить файл ${att.filename}: ${upErr.message}`);
+            }
+          }
+
+          if (savedFileNames.length) {
+            // Ставим задачу в каждую сделку контакта (как и с сообщениями — по всем услугам компании).
+            for (const deal of deals) {
+              try {
+                const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+                const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
+                const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
+                await createDocumentReceivedTask(deal.ID, deal.ASSIGNED_BY_ID, expertName, companyName, savedFileNames, folderId);
+                await bitrixRestCall('crm.timeline.comment.add', {
+                  fields: {
+                    ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+                    COMMENT: `📨 Игорь: клиент прислал документы на почту. Сохранено в папку "${companyName}" на Диске:\n${savedFileNames.map((f) => `— ${f}`).join('\n')}`,
+                  },
+                });
+              } catch (taskErr) {
+                console.warn(`[email] Не удалось создать задачу/комментарий по сделке ${deal.ID}: ${taskErr.message}`);
+              }
+            }
+          }
+
+          await client.messageFlagsAdd(uid, ['\\Seen']);
+        } catch (msgErr) {
+          console.error(`[email] Ошибка обработки письма uid=${uid}: ${msgErr.message}`);
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    console.error(`[email] Ошибка IMAP-подключения: ${err.message}`);
+  } finally {
+    if (client) { try { await client.logout(); } catch (_) {} }
+  }
+}
+
+// ============================================================================
 // v60: СЕРВЕРНЫЙ АВТОПИЛОТ — фоновый polling, запускается автоматически
 // без участия эксперта. Мониторит воронку производства, при появлении
 // записи звонка в сделке на стадии "Эксперт назначен" — запускает полный
@@ -1918,5 +2162,15 @@ app.listen(PORT, () => {
     }, 2 * 60 * 1000);
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
+  }
+
+  if (process.env.MAIL_IMAP_USER && process.env.MAIL_IMAP_PASSWORD && config.bitrixWebhookUrl) {
+    console.log(`[email] Обработка почты включена (интервал ${EMAIL_POLL_INTERVAL_MS / 60000} мин).`);
+    setTimeout(() => {
+      processIncomingEmails();
+      setInterval(processIncomingEmails, EMAIL_POLL_INTERVAL_MS);
+    }, 3 * 60 * 1000); // старт через 3 минуты, чтобы не конфликтовать с первым циклом автопилота
+  } else {
+    console.log('[email] Обработка почты выключена. Для включения задай MAIL_IMAP_USER и MAIL_IMAP_PASSWORD в Render.');
   }
 });
