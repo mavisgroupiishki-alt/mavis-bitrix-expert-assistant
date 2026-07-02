@@ -5491,7 +5491,8 @@ async function runExecutorAutopilot() {
 
     out.innerHTML = `<div class="result-card"><h3>Шаг 4 из 6 · Отправляю перечень/ход работы клиенту...</h3></div>`;
     let sentInfo = '';
-    const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() : '';
+    const EMAIL_REMINDER = '\n\n**Все документы отправляйте нам на почту: mavis.group@mail.ru**';
+    const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() + EMAIL_REMINDER : '';
     if (msg) {
       const channel = preferredChannelKey(deal);
       const phone = getPrimaryClientPhone(deal);

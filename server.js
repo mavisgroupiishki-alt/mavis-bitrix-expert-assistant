@@ -326,18 +326,26 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       '',
       'ПРИОРИТЕТ: звонок важнее полей сделки. Если в звонке сказали одно, а в полях другое — верь звонку.',
       '',
-      'ПО СПЕЦИАЛИСТАМ — ключевое правило:',
-      '- Если в звонке говорят что специалистов НЕТ или их ИЩУТ — НЕ проси дипломы/трудовые на несуществующих людей. Вместо этого выясни из звонка кто ищет (мы/клиент/оба) и напиши клиенту ТРЕБОВАНИЯ к специалистам: какой специалист нужен, какое образование, стаж, нужен ли аттестат. Чтобы клиент понимал кого конкретно искать.',
-      '- Если специалисты ЕСТЬ в штате — проси копии дипломов, трудовых, аттестатов на них.',
-      '- Подбор совместный (мы + клиент) — опиши требования И попроси документы на тех кто уже есть.',
+      'ПО СПЕЦИАЛИСТАМ:',
+      '- Если специалисты ЕСТЬ — проси дипломы, трудовые, аттестаты на них.',
+      '- Если специалистов НЕТ или ИЩУТ — пиши требования к кандидатам (должность, образование, стаж, аттестат).',
+      '- Подбор совместный — опиши требования И попроси документы на тех кто уже есть.',
       '',
-      'client_message — первое сообщение клиенту (3-6 предложений): обращение по имени, что обсудили, что нужно от клиента (с учётом правила про специалистов выше), что делаем мы. Никогда не упоминай мессенджер.',
+      'БАЗА ЗНАНИЙ (используй при анализе, не объясняй клиенту):',
+      '- СПК: достаточно одного аттестованного специалиста на основном месте работы. Совместитель — дополнительно.',
+      '- АТТ СМР: нужен руководитель (высшее строительное + стаж ≥5 лет) и ГИ (аттестованный). Совместитель не заменяет основного.',
       '',
-      'document_message — ОТДЕЛЬНОЕ второе сообщение. Если специалисты есть — полный перечень из context.document_list.docs построчно. Если специалистов нет и их ищут — список требований к нужным специалистам (должность, образование, стаж, аттестат). Если в context.document_list.docs есть пункт про средства измерений (СИ) — ОБЯЗАТЕЛЬНО включи его в это сообщение отдельным блоком после документов/требований. Формат: "Перечень документов для [услуга]:" или "Требования к специалистам:" затем список через тире, затем если нужно "Средства измерений:" и список СИ через тире.',
+      'client_message — ОДНО сообщение клиенту. Формат строго такой:',
+      '1. "[Имя], добрый день!" — без упоминания себя, компании, мессенджера',
+      '2. 1-2 предложения что обсудили',
+      '3. Блок "**С нашей стороны:**" — подробно: формируем перечень, проверяем специалистов, готовим пакет, подаём заявку, записываем в орган',
+      '4. Блок "**С вашей стороны:**" — конкретно что нужно (документы или требования к кандидатам). Если нужны СИ — включи их сюда же отдельным пунктом.',
+      '5. "Все документы присылайте нам на почту: **mavis.group@mail.ru**"',
+      '6. "Мы всегда на связи — дополнительно свяжемся с вами [дата через 2 рабочих дня от сегодня], чтобы зафиксировать всё по документам." Суббота/воскресенье → понедельник.',
       '',
-      'comment — для эксперта (3-5 строк): что выяснил из звонка, схема специалистов (есть/нет/ищем), что нужно от клиента, что делаем дальше.',
+      'comment — для эксперта (3-5 строк): что выяснил из звонка, схема специалистов, что нужно от клиента, что делаем дальше.',
       '',
-      'Только три поля в JSON: client_message, document_message, comment.',
+      'Только два поля в JSON: client_message и comment.',
     ],
   };
 
@@ -652,7 +660,15 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
     const err = new Error(`Wazzup ${configured.label}: ${message}`);
     err.safePayload = { ...payloadToSend, text: '[hidden]' };
-    err.possiblyDelivered = response.status >= 500; // 500 у Wazzup не всегда значит "не доставлено"
+    err.possiblyDelivered = response.status >= 500;
+    throw err;
+  }
+  // Wazzup иногда возвращает 200 OK но с ошибкой в теле (например клиент заблокировал).
+  // Проверяем тело ответа на признаки ошибки доставки.
+  if (data && data.error) {
+    const err = new Error(`Wazzup ${configured.label}: ошибка доставки — ${data.error} ${data.error_description || ''}`);
+    err.safePayload = { ...payloadToSend, text: '[hidden]' };
+    err.possiblyDelivered = false;
     throw err;
   }
   return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data };
@@ -1924,14 +1940,16 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     const clientMessage = String(aiResult.client_message || '').trim();
-    const documentMessage = String(aiResult.document_message || '').trim();
+    const EMAIL_REMINDER = '\n\n**Все документы отправляйте нам на почту: mavis.group@mail.ru**';
+    const clientMessageWithEmail = clientMessage ? clientMessage + EMAIL_REMINDER : '';
+    const documentMessage = ''; // объединено в client_message
     const dealComment = String(aiResult.comment || 'Автопилот выполнен').trim();
     const siblingNote = formatSiblingServicesNote(siblings);
 
-    // 5. Отправляем сообщение клиенту: предпочитаемый → Telegram → Viber → Email.
+    // 5. Отправляем сообщение клиенту: предпочитаемый → Viber → Telegram → Email.
     let sent = false;
     let sentChannel = '';
-    if (clientMessage) {
+    if (clientMessageWithEmail) {
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
       const preferredChannel = detectPreferredChannel(deal);
@@ -1946,7 +1964,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
           const ch = getConfiguredWazzupChannel(channelKey);
           if (!ch || !ch.channelId) continue;
           try {
-            await sendWazzupMessageInternal({ channelKey, text: clientMessage, phone, dealId });
+            await sendWazzupMessageInternal({ channelKey, text: clientMessageWithEmail, phone, dealId });
             console.log(`${logPrefix} Сообщение отправлено через ${channelKey}.`);
             sent = true;
             sentChannel = channelKey;
@@ -1958,7 +1976,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
       }
       if (!sent && email) {
         try {
-          await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessage);
+          await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessageWithEmail);
           console.log(`${logPrefix} Сообщение отправлено через Email: ${email}.`);
           sent = true;
           sentChannel = 'email';
@@ -1967,35 +1985,23 @@ async function runServerAutopilotForDeal(deal, stageId) {
         }
       }
       if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
-
-      // Второе сообщение — перечень документов или требования к специалистам.
-      if (sent && documentMessage) {
-        await new Promise((r) => setTimeout(r, 1500)); // небольшая пауза между сообщениями
-        try {
-          const phone2 = await getContactPhone(deal);
-          await sendWazzupMessageInternal({ channelKey: sentChannel, text: documentMessage, phone: phone2, dealId });
-          console.log(`${logPrefix} Второе сообщение (перечень) отправлено через ${sentChannel}.`);
-        } catch (e2) {
-          console.warn(`${logPrefix} Второе сообщение не отправилось: ${e2.message}`);
-        }
-      }
     }
 
     // 6. Комментарий в текущую сделку.
     const channelLabel = { telegram: 'Telegram', viber: 'Viber', email: 'Email', default: 'мессенджер' };
-    const sendStatus = clientMessage
+    const sendStatus = clientMessageWithEmail
       ? (sent
         ? `✅ Сообщение клиенту отправлено через ${channelLabel[sentChannel] || sentChannel}.`
         : `⚠️ Сообщение подготовлено, но не удалось отправить. Эксперту: отправь вручную.`)
       : `ℹ️ Сообщение клиенту не сформировано.`;
 
     // Если не смогли отправить — задача эксперту.
-    if (clientMessage && !sent) {
+    if (clientMessageWithEmail && !sent) {
       try {
         await bitrixRestCall('tasks.task.add', {
           fields: {
             TITLE: `Игорь не смог отправить ход работы клиенту — ${deal.TITLE}`,
-            DESCRIPTION: `Игорь подготовил сообщение, но не смог отправить.\n\nТекст:\n${clientMessage}${documentMessage ? '\n\n' + documentMessage : ''}`,
+            DESCRIPTION: `Игорь подготовил сообщение, но не смог отправить.\n\nТекст:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`,
             RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || config.executorExpertId,
             UF_CRM_TASK: [`D_${dealId}`],
             PRIORITY: 1,
@@ -2005,8 +2011,8 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     // Сообщение клиенту тоже пишем в комментарий.
-    const clientMsgForComment = clientMessage
-      ? `\n\n📨 Отправлено клиенту:\n${clientMessage}${documentMessage ? '\n\n' + documentMessage : ''}`
+    const clientMsgForComment = clientMessageWithEmail
+      ? `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`
       : '';
     const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}${clientMsgForComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
@@ -2082,6 +2088,19 @@ async function runServerAutopilotForDeal(deal, stageId) {
 
     console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие (комментарий+стадия+задача): ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
 
+    // ЭТАП 4: Уточнение ЛК Белстройцентра — только для сделок с аттестацией.
+    const service = detectServiceFromDeal(deal);
+    if (isAttestationService(service)) {
+      const hasNonAttSiblings = hasSiblingNonAttService(siblings);
+      if (hasNonAttSiblings) {
+        // Есть сопутствующие услуги (СПК, ИСО и т.п.) — ставим задачу-триггер,
+        // ждём пока эксперт закроет её, и только потом запускаем Этап 4.
+        await createAttStage4WaitTask(deal, siblings);
+      } else {
+        // Только аттестация — запускаем Этап 4 сразу.
+        await runAttStage4(deal, siblings);
+      }
+    }
   } catch (err) {
     console.error(`${logPrefix} Ошибка: ${err.message}`);
     try {
@@ -2093,6 +2112,193 @@ async function runServerAutopilotForDeal(deal, stageId) {
   }
 }
 
+
+
+// ============================================================================
+// ЭТАП 4: Уточнение ЛК Белстройцентра (только для Аттестации СМР и её разновидностей)
+// Запускается либо сразу после хода работы (если АТТ единственная услуга),
+// либо после того как эксперт закрыл задачу-триггер (если есть сопутствующие услуги).
+// ============================================================================
+
+const ATT_STAGE4_MARKER = '[MAVIS_ATT_STAGE4_DONE]';
+const ATT_STAGE4_TASK_MARKER = '[MAVIS_ATT_STAGE4_TASK]'; // в описании задачи-триггера
+
+function isAttestationService(serviceText) {
+  return /атт|аттест/i.test(String(serviceText || ''));
+}
+
+function hasSiblingNonAttService(siblings) {
+  // Проверяем есть ли среди сопутствующих сделок услуги СПК, ИСО и т.п. (не аттестация).
+  return siblings.some((s) => !isAttestationService(detectServiceFromDeal(s)));
+}
+
+async function checkLkMentionInComments(dealId, allSiblingIds = []) {
+  // Ищем упоминание ЛК Белстройцентра во всех комментариях всех сделок компании.
+  const allDealIds = [dealId, ...allSiblingIds];
+  for (const id of allDealIds) {
+    try {
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: id, ENTITY_TYPE: 'deal' },
+        select: ['ID', 'COMMENT', 'DATE_CREATE'],
+        order: { ID: 'DESC' },
+      }, 30);
+      for (const c of comments) {
+        const text = String(c.COMMENT || '').toLowerCase();
+        if (/лк|личн.*каб|белстройцентр|att\.bsc|логин|пароль.*белст|есть.*кабинет|нет.*кабинет|забыл.*пароль|нет.*лк|есть.*лк/i.test(text)) {
+          return { found: true, comment: c.COMMENT, dealId: id };
+        }
+      }
+    } catch (_) {}
+  }
+  return { found: false };
+}
+
+async function runAttStage4(deal, siblings = []) {
+  const dealId = deal.ID;
+  const logPrefix = `[stage4 deal=${dealId}]`;
+
+  // Проверяем не был ли этап уже выполнен.
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID', 'COMMENT'],
+      order: { ID: 'DESC' },
+    }, 20);
+    if (comments.some((c) => String(c.COMMENT || '').includes(ATT_STAGE4_MARKER))) {
+      console.log(`${logPrefix} Этап 4 уже выполнен — пропускаю.`);
+      return;
+    }
+  } catch (_) {}
+
+  // Анализируем все комментарии по всем сделкам компании — вдруг про ЛК уже спрашивали.
+  const siblingIds = siblings.map((s) => s.ID);
+  const lkCheck = await checkLkMentionInComments(dealId, siblingIds);
+
+  if (lkCheck.found) {
+    console.log(`${logPrefix} Информация про ЛК уже есть в комментариях — не задаю вопрос повторно.`);
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+        COMMENT: `${ATT_STAGE4_MARKER}\nИгорь: информация про ЛК Белстройцентра уже зафиксирована в комментариях — продолжаем работу.`,
+      },
+    });
+    return;
+  }
+
+  // Отправляем клиенту вопрос про ЛК.
+  const phone = await getContactPhone(deal);
+  const lkQuestion = `Здравствуйте! Для подачи заявки на аттестацию нам понадобится личный кабинет на сайте Белстройцентра (att.bsc.by).\n\nПодскажите — есть ли у вас доступ к нему?\n— Если есть — пришлите мне логин и пароль\n— Если нет — мы зарегистрируем вас сами\n— Если есть, но забыли данные — напишите, поможем восстановить`;
+
+  if (phone) {
+    const preferredChannel = detectPreferredChannel(deal);
+    const channels = [];
+    if (preferredChannel !== 'email') {
+      channels.push(preferredChannel);
+      if (preferredChannel !== 'viber') channels.push('viber');
+      if (preferredChannel !== 'telegram') channels.push('telegram');
+    }
+    let sent = false;
+    for (const ch of channels) {
+      const chCfg = getConfiguredWazzupChannel(ch);
+      if (!chCfg || !chCfg.channelId) continue;
+      try {
+        await sendWazzupMessageInternal({ channelKey: ch, text: lkQuestion, phone, dealId });
+        sent = true;
+        console.log(`${logPrefix} Вопрос про ЛК отправлен клиенту через ${ch}.`);
+        break;
+      } catch (_) {}
+    }
+    if (!sent) console.warn(`${logPrefix} Не удалось отправить вопрос про ЛК клиенту.`);
+  }
+
+  // Получаем имя эксперта для задачи.
+  let expertName = '';
+  try {
+    const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+    const user = Array.isArray(u) ? u[0] : u;
+    expertName = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : '';
+  } catch (_) {}
+  const petName = getDiminutiveName(expertName);
+
+  // Ставим задачу эксперту — ждать ответа клиента и записать в комментарий.
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 2);
+  tomorrow.setHours(18, 0, 0, 0);
+  try {
+    await bitrixRestCall('tasks.task.add', {
+      fields: {
+        TITLE: `${petName}, жду ответа клиента про ЛК Белстройцентра`,
+        DESCRIPTION: `${petName}, я отправил клиенту вопрос про личный кабинет на att.bsc.by.\n\nКак клиент ответит — запиши в комментарий к сделке одно из:\n— "Есть ЛК, логин: ... пароль: ..."\n— "Нет ЛК, регистрируем сами"\n— "Забыл доступ, восстанавливаем"\n\nПосле этого я продолжу работу по аттестации автоматически 🙌`,
+        RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+        DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00',
+        UF_CRM_TASK: [`D_${dealId}`],
+        PRIORITY: 1,
+      },
+    });
+  } catch (_) {}
+
+  // Комментарий в сделку.
+  await bitrixRestCall('crm.timeline.comment.add', {
+    fields: {
+      ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+      COMMENT: `${ATT_STAGE4_MARKER}\n📋 Этап 4: отправил клиенту вопрос про ЛК Белстройцентра. Жду ответа — ${petName} запишет его в комментарий к сделке.`,
+    },
+  });
+  console.log(`${logPrefix} Этап 4 запущен, задача эксперту создана.`);
+}
+
+// Маркер задачи-триггера — записывается в description задачи чтобы найти её при polling.
+const pendingAttStage4Tasks = new Map(); // dealId → taskId
+
+async function createAttStage4WaitTask(deal, siblings = []) {
+  // Создаём задачу-триггер для случая когда у компании есть сопутствующие услуги (СПК и т.п.).
+  // Эксперт закрывает эту задачу когда готов начать работу по аттестации.
+  const dealId = deal.ID;
+  let expertName = '';
+  try {
+    const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+    const user = Array.isArray(u) ? u[0] : u;
+    expertName = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : '';
+  } catch (_) {}
+  const petName = getDiminutiveName(expertName);
+  const siblingServices = siblings.map((s) => detectServiceFromDeal(s) || s.TITLE).join(', ');
+
+  const task = await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: `${petName}, начни работу по Аттестации когда будешь готова`,
+      DESCRIPTION: `${ATT_STAGE4_TASK_MARKER}\n${petName}, сейчас в работе несколько услуг по этой компании (${siblingServices}).\n\nКак будешь готова приступить к аттестации — поставь галочку на этой задаче, и я продолжу работу по сделке автоматически 🙌`,
+      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+      UF_CRM_TASK: [`D_${dealId}`],
+      PRIORITY: 0,
+    },
+  });
+  if (task && task.task && task.task.id) {
+    pendingAttStage4Tasks.set(String(dealId), String(task.task.id));
+    console.log(`[stage4] Задача-триггер создана для сделки ${dealId}, taskId=${task.task.id}`);
+  }
+}
+
+async function checkPendingAttStage4Tasks() {
+  // Polling: проверяем все ожидающие задачи-триггеры — не закрыл ли эксперт галочку.
+  for (const [dealId, taskId] of pendingAttStage4Tasks.entries()) {
+    try {
+      const taskData = await bitrixRestCall('tasks.task.get', { taskId });
+      const status = taskData && taskData.task && String(taskData.task.status || '');
+      // Статус 5 = завершена в Bitrix.
+      if (status === '5' || String(taskData?.task?.realStatus || '') === '5') {
+        console.log(`[stage4] Задача-триггер ${taskId} закрыта! Запускаю Этап 4 для сделки ${dealId}.`);
+        pendingAttStage4Tasks.delete(dealId);
+        const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+        if (deal) {
+          const siblings = await findSiblingDeals(deal, deal.STAGE_ID);
+          await runAttStage4(deal, siblings);
+        }
+      }
+    } catch (e) {
+      console.warn(`[stage4] Ошибка проверки задачи ${taskId}: ${e.message}`);
+    }
+  }
+}
 
 
 async function runAutopilotPollingCycle() {
@@ -2143,6 +2349,11 @@ async function runAutopilotPollingCycle() {
       // Передаём первую стадию (Эксперт назначен) как эталон для поиска сопутствующих сделок.
       await runServerAutopilotForDeal(deal, deal.STAGE_ID);
       await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    // Проверяем ожидающие задачи-триггеры Этапа 4 (эксперт поставил галочку).
+    if (pendingAttStage4Tasks.size > 0) {
+      await checkPendingAttStage4Tasks();
     }
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
