@@ -2088,6 +2088,18 @@ async function runServerAutopilotForDeal(deal, stageId) {
 
     console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие (комментарий+стадия+задача): ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
 
+    // Регистрируем сделку для контроля документов (Этап 5).
+    // Только если сообщение реально отправлено клиенту.
+    if (sent) {
+      const companyName = await getCompanyName(deal.COMPANY_ID) || deal.TITLE;
+      pendingDocsCheck.set(String(dealId), {
+        sentAt: new Date(),
+        companyName,
+        service: detectServiceFromDeal(deal),
+      });
+      console.log(`${logPrefix} Сделка добавлена в контроль документов (через 2 раб. дня).`);
+    }
+
     // ЭТАП 4: Уточнение ЛК Белстройцентра — только для сделок с аттестацией.
     const service = detectServiceFromDeal(deal);
     if (isAttestationService(service)) {
@@ -2301,6 +2313,270 @@ async function checkPendingAttStage4Tasks() {
 }
 
 
+// ============================================================================
+// ЭТАП 5: Контроль документов + напоминания
+// После отправки хода работы через 2 рабочих дня проверяем:
+// - пришли ли документы (по папке на Диске)
+// - если нет — ИИ анализирует контекст и решает что делать
+// ============================================================================
+
+const DOCS_REMINDER_MARKER = '[MAVIS_DOCS_REMINDER_DONE]';
+const DOCS_SPECIALIST_TASK_MARKER = '[MAVIS_SPECIALIST_CHECK_DONE]';
+
+// Трекинг сделок ожидающих проверки документов.
+// dealId → { sentAt: Date, companyName: string, service: string, reminderSent: bool, specialistTaskSent: bool }
+const pendingDocsCheck = new Map();
+
+function addWorkingDays(date, days) {
+  const result = new Date(date);
+  let added = 0;
+  while (added < days) {
+    result.setDate(result.getDate() + 1);
+    const dow = result.getDay();
+    if (dow !== 0 && dow !== 6) added++; // пропускаем выходные
+  }
+  return result;
+}
+
+function isWorkingDaysPassed(fromDate, days) {
+  const threshold = addWorkingDays(new Date(fromDate), days);
+  return new Date() >= threshold;
+}
+
+async function analyzeContextForDocsReminder(deal, siblings = []) {
+  // ИИ анализирует весь контекст сделки перед действием — думает, а не просто выполняет.
+  const allDealIds = [deal.ID, ...siblings.map((s) => s.ID)];
+  let allComments = [];
+  for (const id of allDealIds) {
+    try {
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: id, ENTITY_TYPE: 'deal' },
+        select: ['ID', 'COMMENT', 'DATE_CREATE'],
+        order: { ID: 'DESC' },
+      }, 30);
+      allComments.push(...comments.map((c) => `[Сделка ${id}] ${c.DATE_CREATE || ''}: ${c.COMMENT || ''}`));
+    } catch (_) {}
+  }
+
+  const service = detectServiceFromDeal(deal);
+  const docList = getDocumentListForService(service);
+  const context = {
+    deal: { id: deal.ID, title: deal.TITLE, service, stage: deal.STAGE_ID },
+    siblings: siblings.map((s) => ({ id: s.ID, service: detectServiceFromDeal(s) })),
+    document_list: docList,
+    comments: allComments.slice(0, 50).join('\n'),
+    today: new Date().toLocaleDateString('ru-RU'),
+  };
+
+  const systemPrompt = `Ты — Игорь, умный ИИ-ассистент MAVIS GROUP. Анализируй контекст сделки и принимай взвешенное решение.
+Перед любым действием читай ВСЕ комментарии и поля — возможно ситуация уже изменилась.
+Возвращай только валидный JSON без markdown.`;
+
+  const userPrompt = `Проанализируй контекст сделки и реши что делать с контролем документов.
+
+Контекст:
+${JSON.stringify(context, null, 2).slice(0, 15000)}
+
+Ответь JSON:
+{
+  "situation": "краткое описание текущей ситуации по сделке (1-2 предложения)",
+  "has_staff": true/false/null,
+  "staff_searching": "client"/"us"/"both"/null,
+  "staff_found_in_comments": true/false,
+  "docs_likely_sent": true/false,
+  "action": "send_reminder"/"send_specialist_task"/"send_comment"/"do_nothing",
+  "reason": "почему принял именно это решение",
+  "client_message": "текст напоминания клиенту (только если action=send_reminder, иначе пустая строка)",
+  "expert_task_title": "название задачи эксперту (только если action=send_specialist_task или send_reminder, иначе пустая строка)",
+  "expert_task_body": "описание задачи эксперту (только если нужна задача, иначе пустая строка)",
+  "comment": "комментарий в сделку если нужен (только если action=send_comment, иначе пустая строка)"
+}
+
+Правила принятия решения:
+- Если специалисты ЕСТЬ и документы не пришли → action=send_reminder (напомни клиенту)
+- Если специалистов НЕТ и их ищет КЛИЕНТ → action=send_specialist_task (спроси эксперта нашли ли людей)
+- Если специалистов ищем МЫ → action=do_nothing (наша зона ответственности, не беспокоим)
+- Если в комментариях уже есть ответ про документы/людей → action=do_nothing или send_comment
+- Если что-то смущает или непонятно → action=send_comment с вопросом эксперту`;
+
+  try {
+    const rawText = await callAiChatCompletion({
+      model: config.aiModel,
+      temperature: 0.1,
+      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+    });
+    let result = {};
+    try { result = JSON.parse(rawText); } catch (_) {
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if (match) try { result = JSON.parse(match[0]); } catch (_2) {}
+    }
+    return result;
+  } catch (e) {
+    console.warn(`[docsReminder] ИИ-анализ не удался: ${e.message}`);
+    return null;
+  }
+}
+
+async function checkFolderForNewFiles(companyName, afterDate) {
+  // Проверяем появились ли новые файлы в папке компании на Диске после указанной даты.
+  try {
+    const rootId = await getCommonDriveRootId();
+    const children = await bitrixRestList('disk.folder.getchildren', { id: rootId }, 1000);
+    const targetNorm = normalizeCompanyNameForMatch(companyName);
+    const folder = children.find((c) =>
+      c.TYPE === 'folder' && (c.NAME === companyName || normalizeCompanyNameForMatch(c.NAME) === targetNorm)
+    );
+    if (!folder) return false;
+    const files = await bitrixRestList('disk.folder.getchildren', { id: folder.ID }, 500);
+    const afterTs = new Date(afterDate).getTime();
+    return files.some((f) => f.TYPE === 'file' && new Date(f.CREATE_TIME || f.CREATED || 0).getTime() > afterTs);
+  } catch (_) { return false; }
+}
+
+async function runDocsReminderForDeal(dealId, trackInfo) {
+  const logPrefix = `[docsReminder deal=${dealId}]`;
+  console.log(`${logPrefix} Запускаю проверку документов...`);
+
+  try {
+    const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+    if (!deal) { pendingDocsCheck.delete(String(dealId)); return; }
+
+    const siblings = await findSiblingDeals(deal, deal.STAGE_ID);
+
+    // Сначала смотрим на Диске — может документы уже пришли по почте.
+    const companyName = trackInfo.companyName || deal.TITLE;
+    const docsArrived = await checkFolderForNewFiles(companyName, trackInfo.sentAt);
+    if (docsArrived) {
+      console.log(`${logPrefix} Документы уже пришли на почту — напоминание не нужно.`);
+      pendingDocsCheck.delete(String(dealId));
+      return;
+    }
+
+    // ИИ анализирует контекст и решает что делать.
+    const analysis = await analyzeContextForDocsReminder(deal, siblings);
+    if (!analysis) { pendingDocsCheck.delete(String(dealId)); return; }
+
+    console.log(`${logPrefix} ИИ решение: ${analysis.action} — ${analysis.reason}`);
+
+    const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+    const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
+    const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
+    const petName = getDiminutiveName(expertName);
+
+    if (analysis.action === 'send_reminder' && analysis.client_message) {
+      // Отправляем напоминание клиенту.
+      const phone = await getContactPhone(deal);
+      const preferredChannel = detectPreferredChannel(deal);
+      const channels = [];
+      if (preferredChannel !== 'email') {
+        channels.push(preferredChannel);
+        if (preferredChannel !== 'viber') channels.push('viber');
+        if (preferredChannel !== 'telegram') channels.push('telegram');
+      }
+      let sent = false;
+      if (phone) {
+        for (const ch of channels) {
+          const chCfg = getConfiguredWazzupChannel(ch);
+          if (!chCfg || !chCfg.channelId) continue;
+          try {
+            await sendWazzupMessageInternal({ channelKey: ch, text: analysis.client_message, phone, dealId });
+            sent = true;
+            console.log(`${logPrefix} Напоминание отправлено клиенту через ${ch}.`);
+            break;
+          } catch (_) {}
+        }
+      }
+
+      // Задача эксперту.
+      if (analysis.expert_task_title) {
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 2);
+        tomorrow.setHours(18, 0, 0, 0);
+        await bitrixRestCall('tasks.task.add', {
+          fields: {
+            TITLE: analysis.expert_task_title,
+            DESCRIPTION: analysis.expert_task_body || `${petName}, клиент не прислал документы. Отправил напоминание${sent ? '' : ' (не удалось отправить — проверь канал связи)'}. Если не ответит — стоит позвонить.`,
+            RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+            DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00',
+            UF_CRM_TASK: [`D_${dealId}`],
+            PRIORITY: 1,
+          },
+        });
+      }
+
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+          COMMENT: `${DOCS_REMINDER_MARKER}\nИгорь: ${sent ? 'отправил напоминание клиенту про документы' : 'не удалось отправить напоминание клиенту'} (${analysis.situation})`,
+        },
+      });
+
+    } else if (analysis.action === 'send_specialist_task' && analysis.expert_task_title) {
+      // Задача эксперту уточнить нашли ли специалистов.
+      const in3days = addWorkingDays(new Date(), 3);
+      in3days.setHours(18, 0, 0, 0);
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: analysis.expert_task_title || `${petName}, уточни нашли ли специалистов — ${deal.TITLE}`,
+          DESCRIPTION: analysis.expert_task_body || `${petName}, клиент искал специалистов. Прошло 2 рабочих дня — уточни есть ли прогресс и можно ли запрашивать документы 🙌`,
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          DEADLINE: in3days.toISOString().slice(0, 19) + '+03:00',
+          UF_CRM_TASK: [`D_${dealId}`],
+          PRIORITY: 1,
+        },
+      });
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+          COMMENT: `${DOCS_SPECIALIST_TASK_MARKER}\nИгорь: поставил задачу эксперту уточнить статус поиска специалистов (${analysis.situation})`,
+        },
+      });
+
+    } else if (analysis.action === 'send_comment' && analysis.comment) {
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+          COMMENT: `Игорь: ${analysis.comment}`,
+        },
+      });
+
+    } else {
+      console.log(`${logPrefix} Действие не требуется: ${analysis.reason}`);
+    }
+
+    // Удаляем из трекинга — проверка выполнена.
+    pendingDocsCheck.delete(String(dealId));
+
+  } catch (err) {
+    console.error(`${logPrefix} Ошибка: ${err.message}`);
+    pendingDocsCheck.delete(String(dealId));
+  }
+}
+
+async function checkPendingDocsReminders() {
+  for (const [dealId, trackInfo] of pendingDocsCheck.entries()) {
+    // Проверяем уже установленные маркеры (защита от повторного запуска).
+    try {
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+        select: ['ID', 'COMMENT'],
+        order: { ID: 'DESC' },
+      }, 20);
+      const alreadyDone = comments.some((c) =>
+        String(c.COMMENT || '').includes(DOCS_REMINDER_MARKER) ||
+        String(c.COMMENT || '').includes(DOCS_SPECIALIST_TASK_MARKER)
+      );
+      if (alreadyDone) { pendingDocsCheck.delete(dealId); continue; }
+    } catch (_) {}
+
+    if (isWorkingDaysPassed(trackInfo.sentAt, 2)) {
+      await runDocsReminderForDeal(dealId, trackInfo);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
+
 async function runAutopilotPollingCycle() {
   if (!config.bitrixWebhookUrl) {
     console.log('[autopilot] BITRIX_WEBHOOK_URL не задан — фоновый автопилот не запускается.');
@@ -2354,6 +2630,11 @@ async function runAutopilotPollingCycle() {
     // Проверяем ожидающие задачи-триггеры Этапа 4 (эксперт поставил галочку).
     if (pendingAttStage4Tasks.size > 0) {
       await checkPendingAttStage4Tasks();
+    }
+
+    // Проверяем сделки ожидающие контроля документов (Этап 5).
+    if (pendingDocsCheck.size > 0) {
+      await checkPendingDocsReminders();
     }
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
