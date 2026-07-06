@@ -1254,6 +1254,101 @@ async function createDocumentReceivedTask(dealId, expertId, expertName, companyN
   });
 }
 
+async function analyzeDocumentWithVision(fileBuffer, fileName, mimeType) {
+  const ext = String(fileName || '').split('.').pop().toLowerCase();
+  const isImage = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext);
+  const isPdf = ext === 'pdf';
+
+  if (!isImage && !isPdf) {
+    // Для Word/Excel — только по имени файла.
+    return { docType: classifyFileByName(fileName), confidence: 'low', byName: true };
+  }
+
+  try {
+    const base64 = fileBuffer.toString('base64');
+    const mediaType = isImage ? (mimeType || `image/${ext === 'jpg' ? 'jpeg' : ext}`) : 'image/jpeg';
+
+    // PDF конвертируем в base64 и отправляем как image_url (GPT поддерживает PDF через data URL).
+    const dataUrl = `data:${mediaType};base64,${base64}`;
+
+    const ai = resolveTranscribeProvider();
+    const response = await fetch(`${ai.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { ...ai.authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.aiModel,
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: dataUrl },
+            },
+            {
+              type: 'text',
+              text: `Определи что это за документ. Ответь ТОЛЬКО JSON без пояснений:
+{"docType": "диплом"|"трудовая"|"аттестат"|"паспорт"|"устав"|"свидетельство о регистрации"|"договор"|"доверенность"|"приказ"|"справка"|"средство измерений"|"другое", "person": "ФИО если видно или null", "confidence": "high"|"medium"|"low"}`,
+            },
+          ],
+        }],
+      }),
+    });
+
+    const data = await response.json();
+    const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
+    try {
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) return JSON.parse(match[0]);
+    } catch (_) {}
+    return { docType: 'другое', confidence: 'low' };
+  } catch (e) {
+    console.warn(`[email] Vision анализ файла "${fileName}" не удался: ${e.message}`);
+    return { docType: classifyFileByName(fileName), confidence: 'low', byName: true };
+  }
+}
+
+async function checkDocumentCompleteness(deal, receivedDocs, companyName) {
+  // Сверяем полученные документы с перечнем для данной услуги.
+  // receivedDocs = [{ fileName, docType, person, confidence }]
+  const service = detectServiceFromDeal(deal);
+  const docList = getDocumentListForService(service);
+
+  const systemPrompt = `Ты — Игорь, ИИ-ассистент MAVIS GROUP. Проверяешь комплектность документов от клиента.
+Отвечай только JSON.`;
+
+  const userPrompt = `Услуга: ${service}
+Требуемый перечень документов: ${JSON.stringify(docList.docs, null, 2)}
+Полученные документы: ${JSON.stringify(receivedDocs, null, 2)}
+
+Проверь комплектность и ответь JSON:
+{
+  "complete": true/false,
+  "received_summary": "краткое описание что пришло (1-2 предложения)",
+  "missing": ["список чего не хватает"],
+  "extra_notes": "любые важные замечания (например документ нечитаем, не тот человек и т.д.) или null",
+  "expert_comment": "готовый текст комментария эксперту (3-5 строк): что пришло, чего не хватает, что делать дальше"
+}`;
+
+  try {
+    const rawText = await callAiChatCompletion({
+      model: config.aiModel,
+      temperature: 0.1,
+      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+    });
+    let result = {};
+    try { result = JSON.parse(rawText); } catch (_) {
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if (match) try { result = JSON.parse(match[0]); } catch (_2) {}
+    }
+    return result;
+  } catch (e) {
+    console.warn(`[email] Проверка комплектности не удалась: ${e.message}`);
+    return null;
+  }
+}
+
+
 async function processIncomingEmails() {
   const emailUser = process.env.MAIL_IMAP_USER || '';
   const emailPass = process.env.MAIL_IMAP_PASSWORD || '';
@@ -1317,7 +1412,9 @@ async function processIncomingEmails() {
           const companyName = await getCompanyName(contact.COMPANY_ID) || deals[0].TITLE || `Контакт ${contact.ID}`;
           const folderId = await getOrCreateCompanyFolder(companyName);
 
+          // Сохраняем файлы на Диск И анализируем каждый через Vision.
           const savedFileNames = [];
+          const analyzedDocs = [];
           for (const att of attachments) {
             try {
               await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
@@ -1325,24 +1422,63 @@ async function processIncomingEmails() {
             } catch (upErr) {
               console.warn(`[email] Не удалось загрузить файл ${att.filename}: ${upErr.message}`);
             }
+            // Анализируем содержимое через Vision.
+            try {
+              const analysis = await analyzeDocumentWithVision(att.content, att.filename || 'file', att.contentType);
+              analyzedDocs.push({ fileName: att.filename || 'без имени', ...analysis });
+              console.log(`[email] Файл "${att.filename}" → ${analysis.docType} (${analysis.confidence})`);
+            } catch (_) {
+              analyzedDocs.push({ fileName: att.filename || 'без имени', docType: 'другое', confidence: 'low' });
+            }
+            // Небольшая пауза между Vision запросами.
+            await new Promise((r) => setTimeout(r, 1000));
           }
 
           if (savedFileNames.length) {
-            // Ставим задачу в каждую сделку контакта (как и с сообщениями — по всем услугам компании).
             for (const deal of deals) {
               try {
                 const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
                 const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
                 const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
-                await createDocumentReceivedTask(deal.ID, deal.ASSIGNED_BY_ID, expertName, companyName, savedFileNames, folderId);
+                const petName = getDiminutiveName(expertName);
+
+                // Проверяем комплектность для каждой сделки (услуга может отличаться).
+                const completeness = await checkDocumentCompleteness(deal, analyzedDocs, companyName);
+
+                const isComplete = completeness && completeness.complete;
+                const missingList = completeness && completeness.missing && completeness.missing.length
+                  ? completeness.missing.map((m) => `— ${m}`).join('\n')
+                  : '';
+                const expertComment = completeness && completeness.expert_comment
+                  ? completeness.expert_comment
+                  : `Клиент прислал: ${savedFileNames.join(', ')}`;
+
+                // Комментарий в сделку.
+                const commentText = isComplete
+                  ? `✅ ${petName}, комплект документов собран! Можно готовить пакет.\n\n${expertComment}`
+                  : `📨 ${petName}, клиент прислал документы — не полный комплект.\n\n${expertComment}${missingList ? `\n\nНе хватает:\n${missingList}` : ''}`;
+
                 await bitrixRestCall('crm.timeline.comment.add', {
-                  fields: {
-                    ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
-                    COMMENT: `📨 Игорь: клиент прислал документы на почту. Сохранено в папку "${companyName}" на Диске:\n${savedFileNames.map((f) => `— ${f}`).join('\n')}`,
-                  },
+                  fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: commentText },
                 });
+
+                // Если не хватает документов — задача эксперту.
+                if (!isComplete) {
+                  const tomorrow = addWorkingDays(new Date(), 1);
+                  tomorrow.setHours(18, 0, 0, 0);
+                  await bitrixRestCall('tasks.task.add', {
+                    fields: {
+                      TITLE: `${petName}, клиент прислал документы — нужно проверить комплект`,
+                      DESCRIPTION: commentText,
+                      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+                      DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00',
+                      UF_CRM_TASK: [`D_${deal.ID}`],
+                      PRIORITY: 1,
+                    },
+                  });
+                }
               } catch (taskErr) {
-                console.warn(`[email] Не удалось создать задачу/комментарий по сделке ${deal.ID}: ${taskErr.message}`);
+                console.warn(`[email] Ошибка обработки сделки ${deal.ID}: ${taskErr.message}`);
               }
             }
           }
