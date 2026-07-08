@@ -1540,6 +1540,14 @@ async function getAutopilotStageIds() {
   if (expertStage) { result.push(expertStage.STATUS_ID); console.log(`[autopilot] Стадия 1: "${expertStage.NAME}" → ${expertStage.STATUS_ID}`); }
   if (infoStage && infoStage !== prepStage) { result.push(infoStage.STATUS_ID); console.log(`[autopilot] Стадия 2: "${infoStage.NAME}" → ${infoStage.STATUS_ID}`); }
   else if (prepStage && !expertStage) result.push(prepStage.STATUS_ID);
+
+  // Если стадию "Сбор информации" не нашли по regex — берём из переменной PREPARATION_STAGE_ID.
+  const envPrepStage = process.env.PREPARATION_STAGE_ID;
+  if (envPrepStage && !result.includes(envPrepStage)) {
+    result.push(envPrepStage);
+    getAutopilotStageIds._prepStageId = envPrepStage;
+    console.log(`[autopilot] Стадия "Сбор информации" из PREPARATION_STAGE_ID: ${envPrepStage}`);
+  }
   // Если нашли только одну стадию через regex — добавляем её
   if (!result.length && allStages.length) {
     // Fallback: берём C28:NEW и C28:PREPARATION напрямую если известны
@@ -1551,7 +1559,9 @@ async function getAutopilotStageIds() {
 }
 
 function getPreparationStageId() {
-  return getAutopilotStageIds._prepStageId || 'C28:PREPARATION';
+  // Сначала смотрим в переменную окружения (самый надёжный способ).
+  // Добавь в Render: PREPARATION_STAGE_ID=C28:UC_MIFXBB (или какой у вас ID стадии "Сбор информации")
+  return process.env.PREPARATION_STAGE_ID || getAutopilotStageIds._prepStageId || 'C28:PREPARATION';
 }
 
 async function dealAlreadyProcessed(dealId) {
