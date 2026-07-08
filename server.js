@@ -1404,8 +1404,43 @@ async function processIncomingEmails() {
 
           const matchInfo = await findContactAndDealsByEmail(senderEmail);
           if (!matchInfo || !matchInfo.deals.length) {
-            console.log(`[email] Email ${senderEmail} не сопоставлен ни с одной активной сделкой — пропускаю, оставляю непрочитанным для ручной проверки.`);
-            continue; // НЕ помечаем прочитанным — Кристина увидит вручную в почте
+            // Email не найден в CRM — пробуем Vision анализ вложений чтобы найти компанию.
+            if (attachments.length > 0) {
+              console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ вложений...`);
+              let visionCompany = null;
+              for (const att of attachments) {
+                try {
+                  const analysis = await analyzeDocumentWithVision(att.content, att.filename || 'file', att.contentType);
+                  if (analysis.company && analysis.confidence !== 'low') {
+                    visionCompany = analysis.company;
+                    console.log(`[email] Vision нашёл компанию: "${visionCompany}" (confidence: ${analysis.confidence})`);
+                    break;
+                  }
+                } catch (_) {}
+                await new Promise((r) => setTimeout(r, 1000));
+              }
+
+              if (visionCompany) {
+                // Кладём файлы в папку компании на Диске без задачи эксперту.
+                try {
+                  const folderId = await getOrCreateCompanyFolder(visionCompany);
+                  for (const att of attachments) {
+                    try {
+                      await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
+                      console.log(`[email] Файл "${att.filename}" → папка "${visionCompany}" (через Vision)`);
+                    } catch (_) {}
+                  }
+                  await client.messageFlagsAdd(uid, ['\\Seen']);
+                } catch (e) {
+                  console.warn(`[email] Ошибка сохранения через Vision: ${e.message}`);
+                }
+              } else {
+                console.log(`[email] Vision не определил компанию — оставляю непрочитанным для ручной проверки.`);
+              }
+            } else {
+              console.log(`[email] Email ${senderEmail} не найден в CRM и нет вложений — пропускаю.`);
+            }
+            continue;
           }
 
           const { contact, deals } = matchInfo;
