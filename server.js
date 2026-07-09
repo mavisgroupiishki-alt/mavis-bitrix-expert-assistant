@@ -1540,6 +1540,230 @@ async function processIncomingEmails() {
 // цикл: расшифровка → анализ → сообщение клиенту → комментарий в сделку.
 // ============================================================================
 
+// ============================================================================
+// МОНИТОРИНГ НЕРАСПРЕДЕЛЁННЫХ СДЕЛОК
+// Каждые 10 минут проверяет сделки на стадии "Не распределённые" воронки 28.
+// Если сделка висит 4+ рабочих часа (9:00–18:00 пн–пт) — уведомляет Таню Куровскую.
+// Повторяет каждые 4 рабочих часа пока не распределят.
+// ============================================================================
+
+const TANYA_USER_ID = 2182; // Татьяна Куровская
+const NPS_GROUP_ID = 114;   // Группа задач "Сбор NPS"
+const UNASSIGNED_NOTIFIED = new Map(); // dealId → lastNotifiedAt (Date)
+
+function isWorkingHour(date = new Date()) {
+  const day = date.getDay(); // 0=вс, 6=сб
+  const hour = date.getHours();
+  return day >= 1 && day <= 5 && hour >= 9 && hour < 18;
+}
+
+function workingHoursBetween(from, to) {
+  // Считаем рабочие часы (9-18, пн-пт) между двумя датами.
+  let count = 0;
+  const cur = new Date(from);
+  while (cur < to) {
+    if (isWorkingHour(cur)) count++;
+    cur.setHours(cur.getHours() + 1);
+  }
+  return count;
+}
+
+async function findNpsForCompany(companyName, companyId) {
+  // Ищем задачи NPS в группе 114 по названию компании.
+  try {
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: NPS_GROUP_ID },
+      select: ['ID', 'TITLE', 'DESCRIPTION', 'RESPONSIBLE_ID', 'CREATED_DATE', 'UF_AUTO_892018444'],
+      order: { CREATED_DATE: 'DESC' },
+    }, 200);
+
+    // Нормализуем название компании для поиска.
+    const normName = normalizeCompanyNameForMatch(companyName);
+    const companyTasks = tasks.filter((t) => {
+      const title = normalizeCompanyNameForMatch(t.TITLE || '');
+      const desc = normalizeCompanyNameForMatch(t.DESCRIPTION || '');
+      return title.includes(normName) || desc.includes(normName) || (normName && (title.includes(normName.slice(0, 6)) || desc.includes(normName.slice(0, 6))));
+    });
+
+    if (!companyTasks.length) return null;
+
+    // Берём последнюю задачу NPS.
+    const lastTask = companyTasks[0];
+
+    // Ищем оценку NPS в описании (обычно число от 0 до 10).
+    const descText = String(lastTask.DESCRIPTION || lastTask.TITLE || '');
+    const scoreMatch = descText.match(/nps[:\s]*(\d+)|оценк[аи][:\s]*(\d+)|балл[ов]*[:\s]*(\d+)|(\d+)\s*балл|(\d+)\/10/i);
+    const score = scoreMatch ? parseInt(scoreMatch[1] || scoreMatch[2] || scoreMatch[3] || scoreMatch[4] || scoreMatch[5]) : null;
+
+    // Ищем имя эксперта — ответственный за задачу NPS.
+    let expertName = '';
+    try {
+      const u = await bitrixRestCall('user.get', { ID: lastTask.RESPONSIBLE_ID });
+      const user = Array.isArray(u) ? u[0] : u;
+      expertName = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : '';
+    } catch (_) {}
+
+    // Если NPS низкий (≤6) — пробуем найти причину в описании.
+    let reason = null;
+    if (score !== null && score <= 6) {
+      // Спрашиваем ИИ чтобы кратко объяснил причину низкого NPS.
+      try {
+        const rawText = await callAiChatCompletion({
+          model: config.aiModel,
+          temperature: 0.1,
+          messages: [{
+            role: 'user',
+            content: `Из текста NPS-опроса выяви главную причину низкой оценки в одной короткой фразе (до 10 слов). Текст: "${descText.slice(0, 1000)}". Ответь только фразой без кавычек, или "причина не указана".`,
+          }],
+        });
+        reason = rawText.trim().replace(/^["']|["']$/g, '');
+      } catch (_) {}
+    }
+
+    return { score, expertName, reason, taskId: lastTask.ID };
+  } catch (e) {
+    console.warn(`[unassigned] Ошибка поиска NPS: ${e.message}`);
+    return null;
+  }
+}
+
+async function isNewClient(companyId, companyName) {
+  // Клиент новый если у компании нет других закрытых/завершённых сделок в CRM.
+  if (!companyId) return true;
+  try {
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { COMPANY_ID: companyId, 'STAGE_SEMANTIC_ID': 'S' }, // S = успешно закрытые
+      select: ['ID'],
+    }, 5);
+    return deals.length === 0;
+  } catch (_) { return true; }
+}
+
+async function getPreviousExpert(companyId) {
+  // Ищем последнего ответственного по завершённым сделкам этой компании.
+  if (!companyId) return null;
+  try {
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { COMPANY_ID: companyId },
+      select: ['ID', 'ASSIGNED_BY_ID', 'DATE_MODIFY'],
+      order: { DATE_MODIFY: 'DESC' },
+    }, 3);
+    if (!deals.length) return null;
+    const u = await bitrixRestCall('user.get', { ID: deals[0].ASSIGNED_BY_ID });
+    const user = Array.isArray(u) ? u[0] : u;
+    return user ? `${user.NAME || ''}`.trim() : null;
+  } catch (_) { return null; }
+}
+
+async function notifyTanyaAboutUnassignedDeal(deal) {
+  const dealId = deal.ID;
+  const companyId = deal.COMPANY_ID;
+  const companyName = deal.TITLE || `Сделка ${dealId}`;
+
+  // Определяем новый клиент или нет.
+  const isNew = await isNewClient(companyId, companyName);
+  let msgBody = '';
+
+  if (isNew) {
+    msgBody = `Таня, распредели новую сделку! Это новый клиент 🆕\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+  } else {
+    // Ищем NPS и предыдущего эксперта.
+    const nps = await findNpsForCompany(companyName, companyId);
+    const prevExpert = await getPreviousExpert(companyId);
+    const expertLine = prevExpert ? `, с ним работал${prevExpert.endsWith('а') ? 'а' : ''} ${prevExpert}` : '';
+
+    if (!nps) {
+      msgBody = `Таня, распредели новую сделку! Клиент не новый${expertLine}, NPS не найден.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+    } else if (nps.score !== null && nps.score <= 6) {
+      const reasonLine = nps.reason && nps.reason !== 'причина не указана' ? ` — ${nps.reason}` : '';
+      msgBody = `Таня, распредели новую сделку! Клиент не новый — НО у него низкий NPS ${nps.score} баллов${reasonLine}${expertLine}.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+    } else {
+      const scoreText = nps.score !== null ? ` ${nps.score} баллов` : '';
+      msgBody = `Таня, распредели новую сделку! Клиент не новый, его NPS${scoreText}${expertLine}.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+    }
+  }
+
+  // Создаём задачу Тане.
+  const deadline = new Date();
+  deadline.setHours(deadline.getHours() + 2);
+  try {
+    await bitrixRestCall('tasks.task.add', {
+      fields: {
+        TITLE: `Распредели сделку: ${companyName}`,
+        DESCRIPTION: msgBody,
+        RESPONSIBLE_ID: TANYA_USER_ID,
+        DEADLINE: deadline.toISOString().slice(0, 19) + '+03:00',
+        UF_CRM_TASK: [`D_${dealId}`],
+        PRIORITY: 2, // высокий
+      },
+    });
+  } catch (e) {
+    console.warn(`[unassigned] Не удалось создать задачу Тане: ${e.message}`);
+  }
+
+  // Отправляем уведомление в Битрикс (сообщение во внутреннем чате).
+  try {
+    await bitrixRestCall('im.notify.system.add', {
+      USER_ID: TANYA_USER_ID,
+      MESSAGE: msgBody,
+    });
+  } catch (e) {
+    // Пробуем альтернативный метод — личное сообщение через im.message.add.
+    try {
+      await bitrixRestCall('im.message.add', {
+        DIALOG_ID: TANYA_USER_ID,
+        MESSAGE: msgBody,
+      });
+    } catch (e2) {
+      console.warn(`[unassigned] Не удалось отправить уведомление Тане: ${e2.message}`);
+    }
+  }
+
+  console.log(`[unassigned] Таня уведомлена о сделке ${dealId} (${companyName})`);
+}
+
+async function checkUnassignedDeals() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
+
+  try {
+    // Находим стадию "Не распределённые" в воронке 28.
+    const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
+    const newStage = (Array.isArray(stages) ? stages : []).find((s) =>
+      /не распредел/i.test(s.NAME || '') || s.STATUS_ID === 'C28:NEW'
+    );
+    if (!newStage) return;
+
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: newStage.STATUS_ID },
+      select: ['ID', 'TITLE', 'COMPANY_ID', 'DATE_CREATE', 'MOVED_TIME'],
+      order: { DATE_CREATE: 'ASC' },
+    }, 50);
+
+    const now = new Date();
+    for (const deal of deals) {
+      const createdAt = new Date(deal.DATE_CREATE || deal.MOVED_TIME);
+      const workedHours = workingHoursBetween(createdAt, now);
+
+      if (workedHours < 4) continue; // ещё не пора
+
+      const lastNotified = UNASSIGNED_NOTIFIED.get(String(deal.ID));
+      if (lastNotified) {
+        const hoursSinceNotify = workingHoursBetween(lastNotified, now);
+        if (hoursSinceNotify < 4) continue; // уже уведомляли менее 4 рабочих часов назад
+      }
+
+      // Проверяем что сейчас рабочее время прежде чем слать уведомление.
+      if (!isWorkingHour(now)) continue;
+
+      await notifyTanyaAboutUnassignedDeal(deal);
+      UNASSIGNED_NOTIFIED.set(String(deal.ID), now);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  } catch (e) {
+    console.error('[unassigned] Ошибка проверки нераспределённых сделок:', e.message);
+  }
+}
+
 const AUTOPILOT_MARKER = '[MAVIS_AUTOPILOT_DONE]';
 const AUTOPILOT_ERROR_MARKER = '[MAVIS_AUTOPILOT_ERROR]';
 const AUTOPILOT_POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 минут
@@ -2203,10 +2427,14 @@ async function runServerAutopilotForDeal(deal, stageId) {
 
     // 7. Переводим ОСНОВНУЮ сделку на "Сбор информации".
     const prepStageId = getPreparationStageId();
-    if (prepStageId && deal.STAGE_ID !== prepStageId) {
+    // ЗАЩИТА: если ID стадии не задан явно через PREPARATION_STAGE_ID или не найден динамически — не двигаем.
+    const prepStageIdSafe = process.env.PREPARATION_STAGE_ID || getAutopilotStageIds._prepStageId || null;
+    if (!prepStageIdSafe) {
+      console.warn(`${logPrefix} PREPARATION_STAGE_ID не задан — пропускаю перевод стадии. Добавь переменную в Render.`);
+    } else if (prepStageIdSafe && deal.STAGE_ID !== prepStageIdSafe) {
       try {
-        await bitrixRestCall('crm.deal.update', { id: dealId, fields: { STAGE_ID: prepStageId } });
-        console.log(`${logPrefix} Стадия → "${prepStageId}".`);
+        await bitrixRestCall('crm.deal.update', { id: dealId, fields: { STAGE_ID: prepStageIdSafe } });
+        console.log(`${logPrefix} Стадия → "${prepStageIdSafe}".`);
       } catch (stageErr) {
         console.warn(`${logPrefix} Не удалось перевести стадию: ${stageErr.message}`);
       }
@@ -2243,10 +2471,10 @@ async function runServerAutopilotForDeal(deal, stageId) {
         });
         autopilotProcessed.add(String(sibling.ID));
 
-        // Стадия сопутствующей сделки.
-        if (prepStageId && sibling.STAGE_ID !== prepStageId) {
+        // Стадия сопутствующей сделки — только если ID задан явно.
+        if (prepStageIdSafe && sibling.STAGE_ID !== prepStageIdSafe) {
           try {
-            await bitrixRestCall('crm.deal.update', { id: sibling.ID, fields: { STAGE_ID: prepStageId } });
+            await bitrixRestCall('crm.deal.update', { id: sibling.ID, fields: { STAGE_ID: prepStageIdSafe } });
           } catch (_) {}
         }
 
@@ -2817,6 +3045,9 @@ async function runAutopilotPollingCycle() {
     if (pendingDocsCheck.size > 0) {
       await checkPendingDocsReminders();
     }
+
+    // Проверяем нераспределённые сделки — уведомляем Таню если висят 4+ рабочих часа.
+    await checkUnassignedDeals();
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
   }
