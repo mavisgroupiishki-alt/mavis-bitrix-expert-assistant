@@ -322,30 +322,33 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       'Фокус сценария: общий анализ сделки. Сначала дай управленческий статус, затем пробелы, риски и действия.',
     ],
     executor_attestation_call: [
-      'Ты — Игорь, умный ИИ-ассистент MAVIS GROUP. Пиши как живой человек, кратко и по делу.',
+      'Ты — Игорь, ИИ-ассистент производственного отдела MAVIS GROUP. Пиши сообщение от лица компании, не упоминая себя и своё имя.',
       '',
-      'ПРИОРИТЕТ: звонок важнее полей сделки. Если в звонке сказали одно, а в полях другое — верь звонку.',
-      '',
-      'ПО СПЕЦИАЛИСТАМ:',
-      '- Если специалисты ЕСТЬ — проси дипломы, трудовые, аттестаты на них.',
-      '- Если специалистов НЕТ или ИЩУТ — пиши требования к кандидатам (должность, образование, стаж, аттестат).',
-      '- Подбор совместный — опиши требования И попроси документы на тех кто уже есть.',
+      'ПРИОРИТЕТ ИНФОРМАЦИИ: звонок > комментарии менеджера > поля сделки. Имя клиента бери только из звонка — как он представился.',
       '',
       'БАЗА ЗНАНИЙ (используй при анализе, не объясняй клиенту):',
-      '- СПК: достаточно одного аттестованного специалиста на основном месте работы. Совместитель — дополнительно.',
-      '- АТТ СМР: нужен руководитель (высшее строительное + стаж ≥5 лет) и ГИ (аттестованный). Совместитель не заменяет основного.',
+      '- СПК: нужны 2 аттестованных специалиста по основному месту работы. Совместитель — дополнительно. Орган: БИСП или Стройкомплекс.',
+      '- АТТ СМР: руководитель (высшее строительное + стаж ≥5 лет) + ГИ (аттестованный). Подача бумажная в Белстройцентр.',
+      '- ИСО/СУОТ: комиссия из 3 человек (один директор), бриф, пошлина до пятницы перед выездом.',
+      '- АТТ специалиста: диплом + трудовая + 2 фото 3x4. Ориентир по экзамену — в течение месяца.',
+      '- Если специалистов НЕТ/ИЩУТ — описывай требования к кандидатам (должность, образование, стаж, нужен ли аттестат), не проси документы на несуществующих людей.',
+      '- Директор может закрывать должность прораба/ГИ через запись в трудовой книжке.',
       '',
-      'client_message — ОДНО сообщение клиенту. Формат строго такой:',
-      '1. "[Имя], добрый день!" — без упоминания себя, компании, мессенджера',
-      '2. 1-2 предложения что обсудили',
-      '3. Блок "**С нашей стороны:**" — подробно: формируем перечень, проверяем специалистов, готовим пакет, подаём заявку, записываем в орган',
-      '4. Блок "**С вашей стороны:**" — конкретно что нужно (документы или требования к кандидатам). Если нужны СИ — включи их сюда же отдельным пунктом.',
-      '5. "Все документы присылайте нам на почту: **mavis.group@mail.ru**"',
-      '6. "Мы всегда на связи — дополнительно свяжемся с вами [дата через 2 рабочих дня от сегодня], чтобы зафиксировать всё по документам." Суббота/воскресенье → понедельник.',
+      'ДЕДЛАЙНЫ: сначала смотри в поля сделки и комментарии менеджера. Если дат нет — считай сам от даты звонка (+2 рабочих дня на документы, +3 рабочих дня на оплаты). Выходные (сб, вс) пропускай при расчёте — если дедлайн падает на выходной, сдвигай на понедельник.',
       '',
-      'comment — для эксперта (3-5 строк): что выяснил из звонка, схема специалистов, что нужно от клиента, что делаем дальше.',
+      'ФОРМАТ client_message (строго):',
+      '1. "[Имя из звонка], добрый день!" — никаких упоминаний себя, компании, мессенджера',
+      '2. 1-2 предложения что уже понятно/есть (специалисты, СИ, что в порядке)',
+      '3. Блок "**От вас:**" — нумерованный список конкретных действий с датами. Каждый пункт: "До [дата] — [что сделать]". Выходные учитывай.',
+      '4. Блок "**С нашей стороны:**" — нумерованный список что делаем мы пошагово (проверяем специалистов, сверяем СИ, готовим документы, заказываем счета, подаём заявку и т.д.)',
+      '5. Строка: "**Все документы присылайте на почту: mavis.group@mail.ru**" (жирный шрифт, без точки в конце)',
+      '6. Последняя строка: "Мы всегда на связи — дополнительно свяжемся с вами [дата через 2 рабочих дня], чтобы зафиксировать всё по документам."',
       '',
-      'Только два поля в JSON: client_message и comment.',
+      'После сообщения клиенту — отдельным блоком добавь перечень документов из context.document_list.docs (текстом, нумерованный список с заголовком "Перечень документов для [услуга]:"). Если услуга СПК — добавь под перечнем раздел "Средства измерений:" со списком нужных СИ.',
+      '',
+      'comment — для эксперта (3-5 строк): что выяснил из звонка, схема специалистов (кто есть/кого нет/кого ищем), что нужно от клиента, что делаем дальше.',
+      '',
+      'JSON с двумя полями: client_message (сообщение + перечень документов текстом в конце) и comment.',
     ],
   };
 
@@ -1568,6 +1571,70 @@ function workingHoursBetween(from, to) {
   return count;
 }
 
+async function hasRecentUnassignedTask(dealId) {
+  // Проверяем есть ли уже задача по этой сделке созданная за последние 4 рабочих часа.
+  // Это защита от дублирования после рестарта сервера когда UNASSIGNED_NOTIFIED очищается.
+  try {
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: {
+        RESPONSIBLE_ID: TANYA_USER_ID,
+        '>=CREATED_DATE': addWorkingDays(new Date(), -1).toISOString().slice(0, 10),
+        UF_CRM_TASK: `D_${dealId}`,
+      },
+      select: ['ID', 'TITLE', 'CREATED_DATE'],
+    }, 10);
+    const now = new Date();
+    return tasks.some((t) => {
+      const created = new Date(t.CREATED_DATE);
+      return workingHoursBetween(created, now) < 4;
+    });
+  } catch (_) { return false; }
+}
+
+async function generateDocListDocx(deal) {
+  try {
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
+    const service = detectServiceFromDeal(deal);
+    const docList = getDocumentListForService(service);
+    const companyName = deal.TITLE || `Сделка ${deal.ID}`;
+    const children = [
+      new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: `Перечень документов: ${docList.title}`, bold: true, size: 28, font: 'Arial' })] }),
+      new Paragraph({ children: [new TextRun({ text: `Компания: ${companyName}`, size: 22, font: 'Arial', color: '666666' })], spacing: { after: 200 } }),
+      ...docList.docs.map((doc, i) => new Paragraph({ children: [new TextRun({ text: `${i + 1}. ${doc}`, size: 22, font: 'Arial' })], spacing: { before: 80, after: 80 } })),
+    ];
+    if (/спк|стк/i.test(service)) {
+      children.push(
+        new Paragraph({ children: [new TextRun({ text: '', size: 22 })], spacing: { before: 200 } }),
+        new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: 'Средства измерений', bold: true, size: 24, font: 'Arial' })] }),
+        ...['Рулетка (поверка)', 'Линейка металлическая (поверка)', 'Нивелир (поверка)', 'Теодолит (поверка)', 'Уровень строительный (поверка)', 'Штангенциркуль (поверка)', 'Щупы, комплект (поверка)', 'Угольник (поверка)', 'Влагомер (поверка)', 'Гигрометр (поверка)', 'Плотномер (поверка)', 'Рейка 2000/3000 мм (аттестация)', 'Динамометрический ключ (поверка)', '2 манометра (поверка)']
+          .map((si, i) => new Paragraph({ children: [new TextRun({ text: `${i + 1}. ${si}`, size: 22, font: 'Arial', color: '1a5276' })], spacing: { before: 60, after: 60 } }))
+      );
+    }
+    children.push(
+      new Paragraph({ children: [new TextRun({ text: '', size: 22 })], spacing: { before: 300 } }),
+      new Paragraph({ children: [new TextRun({ text: 'Все документы присылайте на почту: mavis.group@mail.ru', bold: true, size: 22, font: 'Arial', color: '1a5276' })] }),
+    );
+    const doc = new Document({ sections: [{ children }], styles: { default: { document: { run: { font: 'Arial', size: 22 } } } } });
+    return await Packer.toBuffer(doc);
+  } catch (e) {
+    console.warn(`[autopilot] Не удалось создать docx перечня: ${e.message}`);
+    return null;
+  }
+}
+
+async function uploadDocxToDisk(buffer, fileName) {
+  try {
+    const base64 = buffer.toString('base64');
+    const result = await bitrixRestCall('disk.folder.uploadfile', {
+      id: 0,
+      data: { NAME: fileName },
+      fileContent: [fileName, base64],
+      generateUniqueName: true,
+    });
+    return result && (result.DOWNLOAD_URL || result.downloadUrl) || null;
+  } catch (_) { return null; }
+}
+
 async function findNpsForCompany(companyName, companyId) {
   // Ищем задачи NPS в группе 114 по названию компании.
   try {
@@ -1749,7 +1816,14 @@ async function checkUnassignedDeals() {
       const lastNotified = UNASSIGNED_NOTIFIED.get(String(deal.ID));
       if (lastNotified) {
         const hoursSinceNotify = workingHoursBetween(lastNotified, now);
-        if (hoursSinceNotify < 4) continue; // уже уведомляли менее 4 рабочих часов назад
+        if (hoursSinceNotify < 4) continue;
+      } else {
+        // Map пуст (рестарт сервера) — проверяем задачи в Bitrix.
+        const hasRecent = await hasRecentUnassignedTask(deal.ID);
+        if (hasRecent) {
+          UNASSIGNED_NOTIFIED.set(String(deal.ID), now); // восстанавливаем в Map
+          continue;
+        }
       }
 
       // Проверяем что сейчас рабочее время прежде чем слать уведомление.
@@ -2390,6 +2464,26 @@ async function runServerAutopilotForDeal(deal, stageId) {
         }
       }
       if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
+
+      // Отправляем docx файл перечня документов вторым сообщением.
+      if (sent && sentChannel !== 'email') {
+        try {
+          const docxBuffer = await generateDocListDocx(deal);
+          if (docxBuffer) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const safeTitle = String(deal.TITLE || 'Перечень').replace(/[^а-яёА-ЯЁa-zA-Z0-9\s]/g, '').trim().slice(0, 50);
+            const fileName = `Перечень_${safeTitle}.docx`;
+            // Загружаем на Диск и отправляем ссылку текстом (Wazzup не умеет прикреплять файлы напрямую).
+            const fileUrl = await uploadDocxToDisk(docxBuffer, fileName);
+            if (fileUrl) {
+              await sendWazzupMessageInternal({ channelKey: sentChannel, text: `📎 Перечень документов: ${fileUrl}`, phone: await getContactPhone(deal), dealId });
+              console.log(`${logPrefix} Docx перечня отправлен через ${sentChannel}.`);
+            }
+          }
+        } catch (docxErr) {
+          console.warn(`${logPrefix} Не удалось отправить docx перечня: ${docxErr.message}`);
+        }
+      }
     }
 
     // 6. Комментарий в текущую сделку.
