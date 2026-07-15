@@ -2490,7 +2490,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     const clientMessage = String(aiResult.client_message || '').trim();
-    const EMAIL_REMINDER = '\n\n**Все документы отправляйте нам на почту: mavis.group@mail.ru**';
+    const EMAIL_REMINDER = '\n\nВсе документы отправляйте нам на почту: mavis.group@mail.ru';
     const clientMessageWithEmail = clientMessage ? clientMessage + EMAIL_REMINDER : '';
     const documentMessage = ''; // объединено в client_message
     const dealComment = String(aiResult.comment || 'Автопилот выполнен').trim();
@@ -3315,7 +3315,7 @@ async function checkDocsReadyStage() {
       const expertFirstName = user ? (user.NAME || '').trim() : 'эксперт';
       const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }) : null;
       const clientName = contactData ? (contactData.NAME || '').trim() : '';
-      const msg = `${clientName ? clientName + ', д' : 'Д'}обрый день!\n\nДокументы по вашей услуге готовы 🎉\n\nМы свяжемся с вами для согласования формата подписания.\n\n**Если вы из Минска** — можете приехать к нам для подписания: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\n**Если вы не из Минска** — распечатайте документы, заверьте и подпишите, затем отправьте курьером или почтой по адресу: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\nПравила заверения:\n— Каждый лист заверяется подписью директора и печатью\n— На последней странице: "Верно. Директор [подпись] [расшифровка] [дата]"\n\nВопросы — всегда на связи!`;
+      const msg = `${clientName ? clientName + ', д' : 'Д'}обрый день!\n\nДокументы по вашей услуге готовы 🎉\n\nМы свяжемся с вами для согласования формата подписания.\n\nЕсли вы из Минска — можете приехать к нам для подписания: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\nЕсли вы не из Минска — распечатайте документы, заверьте и подпишите, затем отправьте курьером или почтой по адресу: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\nПравила заверения:\n— Каждый лист заверяется подписью директора и печатью\n— На последней странице: "Верно. Директор [подпись] [расшифровка] [дата]"\n\nВопросы — всегда на связи!`;
       const channel = detectPreferredChannel(deal);
       const channels = channel !== 'email' ? [channel, channel !== 'viber' ? 'viber' : null, channel !== 'telegram' ? 'telegram' : null].filter(Boolean) : [];
       let sent = false;
@@ -3339,68 +3339,115 @@ async function checkWonStage() {
   try {
     const deals = await bitrixRestList('crm.deal.list', {
       filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: STAGE_IDS.won, '>=MOVED_TIME': AUTOPILOT_START_DATE.toISOString().slice(0, 19) },
-      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'MOVED_TIME', process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140', 'UF_CRM_1781189436900'],
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID', 'MOVED_TIME',
+        process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140', 'UF_CRM_1781189436900'],
     }, 50);
     const now = new Date();
+
+    // Группируем сделки по компании — одно сообщение клиенту на всю компанию.
+    const byCompany = new Map();
     for (const deal of deals) {
-      const phone = await getContactPhone(deal);
-      if (!phone) continue;
-      const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }).catch(() => null) : null;
+      const key = deal.COMPANY_ID ? String(deal.COMPANY_ID) : `contact_${deal.CONTACT_ID}`;
+      if (!byCompany.has(key)) byCompany.set(key, []);
+      byCompany.get(key).push(deal);
+    }
+
+    for (const [, companyDeals] of byCompany.entries()) {
+      // Основная сделка — первая в списке (самая ранняя).
+      const primaryDeal = companyDeals[0];
+      const siblingDeals = companyDeals.slice(1);
+
+      const phone = await getContactPhone(primaryDeal);
+      if (!phone) {
+        // Помечаем все сделки компании даже без телефона.
+        for (const d of companyDeals) stageEventProcessed.set(stageEventKey(d.ID, 'won_congrats'), true);
+        continue;
+      }
+
+      // Имя берём из контакта основной сделки.
+      const contactData = primaryDeal.CONTACT_ID
+        ? await bitrixRestCall('crm.contact.get', { id: primaryDeal.CONTACT_ID }).catch(() => null)
+        : null;
       const clientName = contactData ? (contactData.NAME || '').trim() : '';
-      // Первое поздравление.
+
+      // Первое поздравление — только если ни одна из сделок компании ещё не поздравлена.
       const congMarker = '[MAVIS_WON_CONGRATS]';
-      const alreadyCongrats = await isStageEventProcessed(deal.ID, 'won_congrats', congMarker);
-      if (!alreadyCongrats) {
-        const msg = `${clientName ? clientName + ', п' : 'П'}оздравляем с успешным получением услуги! 🎉\n\nРады, что смогли помочь. Для закрытия с нашей стороны нам нужен скан подписанного акта выполненных работ.\n\nПришлите, пожалуйста, на почту: **mavis.group@mail.ru**`;
-        const channel = detectPreferredChannel(deal);
+      // Проверяем И в памяти И в Bitrix (защита от дублей при быстрых циклах).
+      const anyAlreadyCongrats = (await Promise.all(
+        companyDeals.map((d) => isStageEventProcessed(d.ID, 'won_congrats', congMarker))
+      )).some(Boolean);
+      // Если хоть одна сделка компании уже помечена — не отправляем.
+      if (anyAlreadyCongrats) {
+        // Помечаем все остальные чтобы больше не проверять.
+        for (const d of companyDeals) stageEventProcessed.set(stageEventKey(d.ID, 'won_congrats'), true);
+      }
+
+      if (!anyAlreadyCongrats) {
+        // Берём название услуги из сделок компании.
+        const serviceNames = companyDeals.map((d) => detectServiceFromDeal(d)).filter(Boolean);
+        const serviceLabel = [...new Set(serviceNames)].join(', ') || 'услуги';
+        const msg = `${clientName ? clientName + ', п' : 'П'}оздравляем с успешным получением ${serviceLabel}! 🎉\n\nРады, что смогли помочь. Для закрытия с нашей стороны нам нужен скан подписанного акта выполненных работ.\n\nПришлите, пожалуйста, на почту: mavis.group@mail.ru`;
+        const channel = detectPreferredChannel(primaryDeal);
         const channels = channel !== 'email' ? [channel, channel !== 'viber' ? 'viber' : null, channel !== 'telegram' ? 'telegram' : null].filter(Boolean) : [];
         let sent = false;
         for (const ch of channels) {
           const chCfg = getConfiguredWazzupChannel(ch);
           if (!chCfg || !chCfg.channelId) continue;
-          try { await sendWazzupMessageInternal({ channelKey: ch, text: msg, phone, dealId: deal.ID }); sent = true; break; } catch (_) {}
+          try { await sendWazzupMessageInternal({ channelKey: ch, text: msg, phone, dealId: primaryDeal.ID }); sent = true; break; } catch (_) {}
         }
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${congMarker}\nИгорь: ${sent ? 'поздравил клиента и запросил скан акта' : 'не удалось отправить поздравление'}.` } });
-        wonAckSent.set(String(deal.ID), now);
-        stageEventProcessed.set(stageEventKey(deal.ID, 'won_congrats'), true);
-        console.log(`[stageMonitor] Успешно закрыта → поздравление сделка ${deal.ID}`);
+        // Помечаем ВСЕ сделки компании — чтобы не слать повторно по другим сделкам той же компании.
+        for (const d of companyDeals) {
+          await bitrixRestCall('crm.timeline.comment.add', {
+            fields: { ENTITY_ID: d.ID, ENTITY_TYPE: 'deal',
+              COMMENT: d.ID === primaryDeal.ID
+                ? `${congMarker}\nИгорь: ${sent ? 'поздравил клиента и запросил скан акта' : 'не удалось отправить поздравление'}.`
+                : `${congMarker}\nИгорь: поздравление отправлено в основной сделке ${primaryDeal.ID}.` },
+          });
+          wonAckSent.set(String(d.ID), now);
+          stageEventProcessed.set(stageEventKey(d.ID, 'won_congrats'), true);
+        }
+        console.log(`[stageMonitor] Успешно закрыта → поздравление (1 сообщение на ${companyDeals.length} сделок компании)`);
         continue;
       }
-      // Напоминание каждые 2 рабочих дня если нет акта.
-      const lastRemind = wonAckSent.get(String(deal.ID));
-      if (lastRemind && workingHoursBetween(lastRemind, now) < 16) continue; // 2 рабочих дня = ~16 часов
+
+      // Напоминание — только по основной сделке, только если прошло 2 рабочих дня (18 раб. часов).
+      const lastRemind = wonAckSent.get(String(primaryDeal.ID));
+      if (lastRemind && workingHoursBetween(lastRemind, now) < 18) continue;
+
       const remMarker = '[MAVIS_WON_ACT_REMIND]';
       const comments = await bitrixRestList('crm.timeline.comment.list', {
-        filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' }, select: ['ID', 'COMMENT'], order: { ID: 'DESC' },
+        filter: { ENTITY_ID: primaryDeal.ID, ENTITY_TYPE: 'deal' }, select: ['ID', 'COMMENT'], order: { ID: 'DESC' },
       }, 30).catch(() => []);
       const reminderCount = comments.filter((c) => String(c.COMMENT || '').includes(remMarker)).length;
+
       if (reminderCount >= 3) {
-        // После 3 напоминаний — задача эксперту позвонить.
         const taskMarker = '[MAVIS_WON_CALL_TASK]';
         const alreadyTask = comments.some((c) => String(c.COMMENT || '').includes(taskMarker));
         if (!alreadyTask) {
-          const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+          const u = await bitrixRestCall('user.get', { ID: primaryDeal.ASSIGNED_BY_ID });
           const user = Array.isArray(u) ? u[0] : u;
           const petName = getDiminutiveName(user ? (user.NAME || '').trim() : '');
           const dl = addWorkingDays(now, 1); dl.setHours(18, 0, 0, 0);
-          await bitrixRestCall('tasks.task.add', { fields: { TITLE: `${petName}, запроси акт у клиента — 3 напоминания без ответа`, DESCRIPTION: `${petName}, клиент по сделке "${deal.TITLE}" не прислал скан акта уже неделю. Позвони и уточни.`, RESPONSIBLE_ID: deal.ASSIGNED_BY_ID, DEADLINE: dl.toISOString().slice(0, 19) + '+03:00', UF_CRM_TASK: [`D_${deal.ID}`], PRIORITY: 1 } });
-          await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${taskMarker}\nИгорь: поставил задачу эксперту позвонить клиенту — 3 напоминания про акт без ответа.` } });
+          await bitrixRestCall('tasks.task.add', { fields: { TITLE: `${petName}, запроси акт у клиента — 3 напоминания без ответа`, DESCRIPTION: `${petName}, клиент не прислал скан акта уже неделю. Позвони и уточни.`, RESPONSIBLE_ID: primaryDeal.ASSIGNED_BY_ID, DEADLINE: dl.toISOString().slice(0, 19) + '+03:00', UF_CRM_TASK: [`D_${primaryDeal.ID}`], PRIORITY: 1 } });
+          await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: primaryDeal.ID, ENTITY_TYPE: 'deal', COMMENT: `${taskMarker}\nИгорь: поставил задачу эксперту — 3 напоминания про акт без ответа.` } });
         }
         continue;
       }
-      // Шлём напоминание про акт.
-      const remMsg = `${clientName ? clientName + ', д' : 'Д'}обрый день! Напоминаем — ещё не получили от вас скан подписанного акта.\n\nПришлите, пожалуйста, на почту: **mavis.group@mail.ru**`;
-      const channel = detectPreferredChannel(deal);
+
+      const remMsg = `${clientName ? clientName + ', д' : 'Д'}обрый день! Напоминаем — ещё не получили от вас скан подписанного акта.\n\nПришлите, пожалуйста, на почту: mavis.group@mail.ru`;
+      const channel = detectPreferredChannel(primaryDeal);
       const channels = channel !== 'email' ? [channel, channel !== 'viber' ? 'viber' : null, channel !== 'telegram' ? 'telegram' : null].filter(Boolean) : [];
       let sent = false;
       for (const ch of channels) {
         const chCfg = getConfiguredWazzupChannel(ch);
         if (!chCfg || !chCfg.channelId) continue;
-        try { await sendWazzupMessageInternal({ channelKey: ch, text: remMsg, phone, dealId: deal.ID }); sent = true; break; } catch (_) {}
+        try { await sendWazzupMessageInternal({ channelKey: ch, text: remMsg, phone, dealId: primaryDeal.ID }); sent = true; break; } catch (_) {}
       }
       if (sent) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${remMarker}\nИгорь: напоминание #${reminderCount + 1} про скан акта.` } });
-        wonAckSent.set(String(deal.ID), now);
+        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: primaryDeal.ID, ENTITY_TYPE: 'deal', COMMENT: `${remMarker}\nИгорь: напоминание #${reminderCount + 1} про скан акта.` } });
+        wonAckSent.set(String(primaryDeal.ID), now);
+        // Обновляем время и для сопутствующих сделок чтобы не триггерить по ним.
+        for (const d of siblingDeals) wonAckSent.set(String(d.ID), now);
       }
       await new Promise((r) => setTimeout(r, 2000));
     }
