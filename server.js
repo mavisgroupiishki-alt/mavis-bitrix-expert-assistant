@@ -1363,6 +1363,110 @@ async function runStageMonitoring() {
 }
 
 
+async function sendWeeklyReport() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
+
+  // Только по понедельникам в рабочее время.
+  const now = new Date();
+  if (now.getDay() !== 1) return; // 1 = понедельник
+  if (!isWorkingHour(now)) return;
+
+  const todayKey = `weekly_report_${now.getFullYear()}_${now.getMonth()}_${Math.floor(now.getDate() / 7)}`;
+  if (stageEventProcessed.has(todayKey)) return;
+  stageEventProcessed.set(todayKey, true);
+
+  console.log('[weeklyReport] Формирую еженедельный отчёт...');
+
+  try {
+    const prepStageId = getPreparationStageId();
+    const lines = [`📊 Еженедельный отчёт по сделкам — ${now.toLocaleDateString('ru-RU')}\n`];
+
+    // 1. Сбор информации — давно без документов
+    const collectionDeals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: prepStageId },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
+    }, 100);
+
+    const collectionLines = [];
+    for (const deal of collectionDeals) {
+      if (!isSpkService(deal)) continue;
+      const days = Math.round(workingHoursBetween(new Date(deal.MOVED_TIME), now) / 9);
+      if (days < 2) continue;
+      const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID }).catch(() => null);
+      const expertName = u && (Array.isArray(u) ? u[0] : u) ? (Array.isArray(u) ? u[0] : u).NAME : '—';
+      const warn = days >= 7 ? ' ⚠️' : '';
+      collectionLines.push(`— ${deal.TITLE} — ${expertName} — ${days} дн. без документов${warn}`);
+    }
+    if (collectionLines.length) {
+      lines.push(`📁 Сбор информации (нет документов):\n${collectionLines.join('\n')}\n`);
+    }
+
+    // 2. Подбор специалистов
+    const selectionDeals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: STAGE_IDS.selection },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME', FIELD_WHO_WE_SEARCH],
+    }, 50);
+
+    const selectionLines = [];
+    for (const deal of selectionDeals) {
+      if (!isSpkService(deal)) continue;
+      const days = Math.round(workingHoursBetween(new Date(deal.MOVED_TIME), now) / 9);
+      const who = String(deal[FIELD_WHO_WE_SEARCH] || 'специалист');
+      selectionLines.push(`— ${deal.TITLE} — ищем: ${who} — ${days} дн.`);
+    }
+    if (selectionLines.length) {
+      lines.push(`🔍 Подбор специалистов:\n${selectionLines.join('\n')}\n`);
+    }
+
+    // 3. Ожидают акт
+    const wonDeals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: STAGE_IDS.won, '>=MOVED_TIME': AUTOPILOT_START_DATE.toISOString().slice(0, 19) },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
+    }, 50);
+
+    const wonLines = [];
+    for (const deal of wonDeals) {
+      if (!isSpkService(deal)) continue;
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' }, select: ['ID', 'COMMENT'], order: { ID: 'DESC' },
+      }, 20).catch(() => []);
+      const remCount = comments.filter(c => String(c.COMMENT || '').includes('[MAVIS_WON_ACT_REMIND]')).length;
+      const hasTask = comments.some(c => String(c.COMMENT || '').includes('[MAVIS_WON_CALL_TASK]'));
+      if (hasTask) wonLines.push(`— ${deal.TITLE} — задача эксперту поставлена`);
+      else wonLines.push(`— ${deal.TITLE} — ${remCount} напоминание(й) отправлено`);
+    }
+    if (wonLines.length) {
+      lines.push(`📄 Ожидают скан акта:\n${wonLines.join('\n')}\n`);
+    }
+
+    // 4. Требуют внимания — нераспределённые давно
+    const unassignedDeals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: STAGE_IDS.unassigned },
+      select: ['ID', 'TITLE', 'DATE_CREATE'],
+    }, 20);
+    const attentionLines = [];
+    for (const deal of unassignedDeals) {
+      const hours = workingHoursBetween(new Date(deal.DATE_CREATE), now);
+      if (hours >= 4) attentionLines.push(`— ${deal.TITLE} — не распределена ${Math.round(hours)} раб. часов`);
+    }
+    if (attentionLines.length) {
+      lines.push(`🚨 Требуют внимания (не распределены):\n${attentionLines.join('\n')}\n`);
+    }
+
+    if (lines.length === 1) {
+      lines.push('✅ Всё в порядке — активных проблем нет.');
+    }
+
+    await bitrixRestCall('im.message.add', {
+      DIALOG_ID: TANYA_USER_ID,
+      MESSAGE: lines.join('\n'),
+    });
+    console.log('[weeklyReport] Отчёт отправлен Тане.');
+  } catch (e) {
+    console.error('[weeklyReport] Ошибка:', e.message);
+  }
+}
+
 async function runAutopilotPollingCycle() {
   if (!config.bitrixWebhookUrl) {
     console.log('[autopilot] BITRIX_WEBHOOK_URL не задан — фоновый автопилот не запускается.');
@@ -1425,6 +1529,9 @@ async function runAutopilotPollingCycle() {
 
     // Мониторинг всех стадий воронки (пункты 1, 3, 7, 8, 9).
     await runStageMonitoring();
+
+    // Еженедельный отчёт Тане (каждый понедельник).
+    await sendWeeklyReport().catch(e => console.error('[weeklyReport] Ошибка:', e.message));
 
     // Ежемесячные сверки актов (1 числа) и оригиналов (1 и 15 числа).
     await runMonthlyActsReconciliation().catch(e => console.error('[acts] Ошибка сверки актов:', e.message));
