@@ -1130,6 +1130,7 @@ app.all('/install', (_req, res) => {
 // ============================================================================
 
 const EMAIL_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 минут
+const BITRIX_FILES_POLL_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 часов
 let commonDriveRootId = null; // кэш ID корневой папки Общего диска
 
 async function getCommonDriveRootId() {
@@ -1437,6 +1438,76 @@ async function runAutopilotPollingCycle() {
 }
 
 // Запуск polling после старта сервера.
+// Кэш файлов которые уже выгрузили — дедупликация между запусками
+const bitrixFilesSynced = new Set(); // dealId_fileName
+
+async function syncBitrixFilesToDisk() {
+  if (!config.bitrixWebhookUrl) return;
+  console.log('[bitrixFiles] Запуск синхронизации файлов из Bitrix на Диск...');
+  try {
+    // Берём сделки за последние 2 года из воронки производства
+    const since = new Date();
+    since.setFullYear(since.getFullYear() - 2);
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { '>=DATE_CREATE': since.toISOString().slice(0, 10), CATEGORY_ID: config.autopilotCategoryId || 28 },
+      select: ['ID', 'COMPANY_ID', 'TITLE'],
+      order: { DATE_CREATE: 'DESC' },
+    }, 3000);
+
+    // Группируем по компании
+    const byCompany = new Map();
+    for (const deal of deals) {
+      const key = deal.COMPANY_ID || `d${deal.ID}`;
+      if (!byCompany.has(key)) byCompany.set(key, { companyId: deal.COMPANY_ID, title: deal.TITLE, dealIds: [] });
+      byCompany.get(key).dealIds.push(deal.ID);
+    }
+
+    let totalFiles = 0;
+    for (const [, info] of byCompany.entries()) {
+      let companyName = info.title;
+      if (info.companyId) {
+        const company = await bitrixRestCall('crm.company.get', { id: info.companyId }).catch(() => null);
+        if (company && company.TITLE) companyName = company.TITLE;
+      }
+      const folderId = await getOrCreateCompanyFolder(companyName).catch(() => null);
+      if (!folderId) continue;
+
+      for (const dealId of info.dealIds) {
+        // Файлы из активностей сделки
+        const activities = await bitrixRestList('crm.activity.list', {
+          filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
+          select: ['ID', 'FILES'],
+        }, 30).catch(() => []);
+
+        for (const act of activities) {
+          const actFiles = Array.isArray(act.FILES) ? act.FILES : [];
+          for (const f of actFiles) {
+            const fileId = f && (f.ID || f.id || f.FILE_ID);
+            if (!fileId) continue;
+            const fileKey = `${dealId}_${fileId}`;
+            if (bitrixFilesSynced.has(fileKey)) continue;
+            try {
+              const fileInfo = await bitrixRestCall('disk.file.get', { id: fileId });
+              if (!fileInfo || !fileInfo.DOWNLOAD_URL) continue;
+              const resp = await fetch(fileInfo.DOWNLOAD_URL);
+              if (!resp.ok) continue;
+              const buffer = Buffer.from(await resp.arrayBuffer());
+              await uploadFileToDiskFolder(folderId, fileInfo.NAME || `file_${fileId}`, buffer);
+              bitrixFilesSynced.add(fileKey);
+              totalFiles++;
+            } catch (_) {}
+            await new Promise(r => setTimeout(r, 300));
+          }
+        }
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    console.log(`[bitrixFiles] Синхронизация завершена. Новых файлов: ${totalFiles}`);
+  } catch (e) {
+    console.error('[bitrixFiles] Ошибка синхронизации:', e.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
 
@@ -1459,5 +1530,14 @@ app.listen(PORT, () => {
     }, 3 * 60 * 1000); // старт через 3 минуты, чтобы не конфликтовать с первым циклом автопилота
   } else {
     console.log('[email] Обработка почты выключена. Для включения задай MAIL_IMAP_USER и MAIL_IMAP_PASSWORD в Render.');
+  }
+
+  // Автовыгрузка файлов из Bitrix-сделок на Диск каждые 6 часов.
+  if (config.bitrixWebhookUrl && config.autopilotEnabled) {
+    console.log('[bitrixFiles] Автовыгрузка файлов из Bitrix включена (интервал 6 ч).');
+    setTimeout(() => {
+      syncBitrixFilesToDisk();
+      setInterval(syncBitrixFilesToDisk, BITRIX_FILES_POLL_INTERVAL_MS);
+    }, 10 * 60 * 1000);
   }
 });
