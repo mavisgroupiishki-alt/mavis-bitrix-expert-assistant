@@ -1622,17 +1622,46 @@ async function generateDocListDocx(deal) {
   }
 }
 
+// ✅ НОВАЯ ФУНКЦИЯ: Создать или найти папку по месяцу
+async function getOrCreateMonthFolder(rootId = 0) {
+  try {
+    const now = new Date();
+    const monthFolder = now.toISOString().slice(0, 7); // "YYYY-MM"
+    
+    const children = await bitrixRestList('disk.folder.getchildren', { id: rootId }, 500);
+    let monthFolderObj = children.find((c) => c.TYPE === 'folder' && c.NAME === monthFolder);
+    
+    if (!monthFolderObj) {
+      monthFolderObj = await bitrixRestCall('disk.folder.addsubfolder', { 
+        id: rootId, 
+        data: { NAME: monthFolder } 
+      });
+      console.log(`[disk] Создана папка месяца: ${monthFolder}`);
+    }
+    
+    return monthFolderObj.ID;
+  } catch (e) {
+    console.error(`[disk] Ошибка при создании папки месяца: ${e.message}`);
+    return rootId;
+  }
+}
+
 async function uploadDocxToDisk(buffer, fileName) {
   try {
+    // ✅ ИСПРАВЛЕНО: Загружаем в папку месяца вместо корня
+    const monthFolderId = await getOrCreateMonthFolder(0);
     const base64 = buffer.toString('base64');
     const result = await bitrixRestCall('disk.folder.uploadfile', {
-      id: 0,
+      id: monthFolderId,
       data: { NAME: fileName },
       fileContent: [fileName, base64],
       generateUniqueName: true,
     });
     return result && (result.DOWNLOAD_URL || result.downloadUrl) || null;
-  } catch (_) { return null; }
+  } catch (e) {
+    console.error(`[disk] Ошибка загрузки ${fileName}: ${e.message}`);
+    return null;
+  }
 }
 
 async function findNpsForCompany(companyName, companyId) {
@@ -2182,6 +2211,151 @@ function getDocumentListForService(serviceText) {
   };
 }
 
+// ✅ НОВАЯ ФУНКЦИЯ: Очистка Markdown для мессенджеров
+function cleanMarkdownForMessenger(text) {
+  return String(text || '')
+    .replace(/\*\*(.+?)\*\*/g, '$1')      // **жирный** → жирный
+    .replace(/__(.+?)__/g, '$1')          // __подчеркнутый__ → подчеркнутый
+    .replace(/~~(.+?)~~/g, '$1')          // ~~зачеркнутый~~ → зачеркнутый
+    .replace(/\[(.+?)\]\((.+?)\)/g, '$1') // [ссылка](url) → ссылка
+    .replace(/^#{1,6}\s+/gm, '')          // # Заголовок → Заголовок
+    .trim();
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Шаблоны хода работы для каждой услуги (из регламентов)
+function getClientMessageTemplate(service) {
+  const s = String(service || '').toLowerCase();
+  
+  if (/спк|свидетельств.*техн|техн.*компетент/.test(s)) {
+    return `[Имя], фиксирую порядок работы по свидетельству технической компетентности.
+
+Что есть сейчас:
+- специалисты: [ФИО / должности / актуальность];
+- средства измерений: [есть / частично есть / нужно сверить];
+- орган: [БИСП / Стройкомплекс / определит руководитель];
+- город: [Минск / другой город];
+- крайний срок: [дата].
+
+От вас:
+1. До [дата] - подтвердить специалистов и средства измерений
+2. Оплатить счета и техкарты
+3. Прислать свидетельства о средствах измерений
+
+От нас:
+1. Проверяем специалистов и средства измерений
+2. Готовим техкарту и документы для подачи
+3. Подаем в БИСП/Стройкомплекс
+4. Контролируем статус`;
+  }
+  
+  if (/атт|аттестац/.test(s) && !/специалист/.test(s)) {
+    return `[Имя], фиксирую порядок работы по аттестации организации.
+
+Что у нас есть сейчас:
+- виды работ: [перечень из КП];
+- специалисты: [ФИО / должности / кто закрывает какие виды работ];
+- кого подбираем: [если требуется];
+- крайний срок аттестации: [дата].
+
+От вас:
+1. До [дата] - прислать недостающие документы специалистов
+2. До [дата] - подготовить акты выполненных работ за 5 лет
+3. Оплатить счета и пошлины
+
+От нас:
+1. Проверяем документы специалистов
+2. Готовим аттестационное дело
+3. Подаем в Белстройцентр
+4. Контролируем замечания и статус`;
+  }
+  
+  if (/исо|iso|суот|45001/.test(s)) {
+    return `[Имя], фиксирую порядок работы по [ISO 9001 / сертификату по охране труда / ISO 45001].
+
+Что есть сейчас:
+- сертификаты: [какие именно];
+- формат: [получение / периодическая оценка];
+- сотрудники: [список есть / нужно прислать];
+- комиссия по охране труда: [есть / нужно дать 3 ФИО];
+- ориентировочная дата выезда: [период];
+- крайний срок оплаты пошлины: [дата].
+
+От вас:
+1. До [дата] - прислать актуальный список сотрудников
+2. До [дата] - подтвердить комиссию по охране труда
+3. Оплатить пошлину и счета
+
+От нас:
+1. Подготавливаем документы
+2. Согласуем дату выезда
+3. Проводим аудит и проверку
+4. Выписываем сертификат`;
+  }
+  
+  if (/специалист/.test(s)) {
+    return `[Имя], фиксирую порядок работы по аттестации специалиста [ФИО].
+
+Что есть сейчас:
+- диплом: [есть / нужно прислать];
+- трудовая: [есть / нужно прислать];
+- специализация: [указать];
+- продукт, который закрывает: [аттестация / свидетельство / другое];
+- дата экзамена: [дата].
+
+От вас:
+1. До [дата] - прислать 2 фото 3x4 см
+2. До [дата] - подтвердить документы
+3. Оплатить счет на экзамен
+
+От нас:
+1. Проверяем документы
+2. Готовим заявку и письмо
+3. Записываем на экзамен
+4. Контролируем результат`;
+  }
+  
+  if (/подбор/.test(s)) {
+    return `[Имя], фиксирую порядок по подбору специалиста.
+
+Что есть сейчас:
+- кого подбираем: [должность / специализация];
+- под какой продукт: [аттестация / свидетельство / комплекс];
+- срок подбора: [дата];
+- кого закрываете вы: [если есть];
+- кого переводим/аттестуем: [если требуется].
+
+От вас:
+1. До [дата] - согласуйте кандидата
+2. До [дата] - оформите специалиста на должность
+3. До [дата] - пришлите копию приказа и трудовой
+
+От нас:
+1. Подбираем специалистов из базы
+2. Согласуем кандидата с вами
+3. Готовим документы для оформления
+4. Если нужно - записываем на аттестацию`;
+  }
+  
+  // Дефолт для неизвестной услуги
+  return `[Имя], фиксирую порядок работы по [услуга].
+
+Из звонка выяснили:
+- [основная информация из звонка];
+- [согласованные сроки];
+- [что нужно от клиента].
+
+От вас:
+1. До [дата] - прислать [документы];
+2. Оплатить счета;
+3. [другие действия].
+
+От нас:
+1. Проверяем документы;
+2. Готовим документы;
+3. Подаем в нужный орган;
+4. Контролируем статус.`;
+}
+
 function detectServiceFromDeal(deal) {
   const serviceField = process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071';
   return String(deal[serviceField] || deal.UF_CRM_1765113071 || '').trim();
@@ -2317,7 +2491,16 @@ async function createExpertFollowUpTask(dealId, expertId, expertName, clientMess
   const siblingsLine = otherDealIds && otherDealIds.length
     ? `\n\nПо этой компании сразу несколько сделок (${[dealId, ...otherDealIds].join(', ')}) — клиенту отправлено одно общее сообщение по всем услугам, но в каждой сделке свой комментарий и своя задача.`
     : '';
-  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊\n\nЧто сделал:\n— Отправил первое сообщение клиенту с кратким ходом работы\n— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}\n— Написал краткую выжимку в комментарий к сделке\n— Перевёл сделку на стадию «Сбор информации»${siblingsLine}\n\nТвой следующий шаг — дождаться ответа/документов от клиента 🙌`;
+  // ✅ ИСПРАВЛЕНО: Упоминаем ТОЛЬКО эксперта, убираем менеджера
+  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊
+
+Что сделал:
+— Отправил первое сообщение клиенту с кратким ходом работы
+— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}
+— Написал краткую выжимку в комментарий к сделке
+— Перевёл сделку на стадию «Сбор информации»${siblingsLine}
+
+Твой следующий шаг — дождаться ответа/документов от клиента и проверить что всё приложено по перечню 🙌`;
 
   await bitrixRestCall('tasks.task.add', {
     fields: {
@@ -2420,16 +2603,37 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     const systemPrompt = [
-      'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP. Пиши как умный живой человек — кратко, по делу, без воды и бюрократии.',
-      'В client_message: короткое человеческое сообщение клиенту — что обсудили, что нужно от него прислать, что сделаем мы. Без длинных списков. Без названий мессенджеров (Viber/Telegram/WhatsApp) — только "пришлите мне".',
-      'В comment: краткая выжимка для эксперта — что выяснил из звонка, ключевые договорённости, что нужно от клиента. 3-5 строк максимум.',
-      'Возвращай только валидный JSON без markdown.',
+      'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP.',
+      'Твоя задача — ЗАПОЛНИТЬ шаблон хода работы для услуги на основе звонка и карточки сделки.',
+      'Шаблон уже задан в контексте (template). Ты просто ЗАПОЛНЯЕШЬ [ФИО], [дата], [что нужно] из информации звонка.',
+      'client_message: это заполненный шаблон (с конкретными ФИО, датами, документами). НЕ переписывай шаблон, просто заполни поля.',
+      'comment: краткая выжимка для эксперта (3-5 строк) — ключевые факты из звонка и договорённости.',
+      'Верни только валидный JSON без markdown.',
     ].join('\n');
-    const userPrompt = `Проанализируй звонок и сделку, сформируй ход работы.\n\nКонтекст:\n${JSON.stringify(context, null, 2).slice(0, 28000)}\n\nВерни JSON:\n{"client_message":"короткое сообщение клиенту (3-6 предложений): что обсудили, что нужно прислать, что сделаем","comment":"краткая выжимка для эксперта (3-5 строк): ключевые факты из звонка и договорённости"}`;
+    
+    const template = getClientMessageTemplate(detectServiceFromDeal(deal));
+    
+    const userPrompt = `Ты получил звонок от клиента. Заполни шаблон хода работы на основе информации из звонка и карточки.
+
+ШАБЛОН для заполнения:
+${template}
+
+ИНФОРМАЦИЯ ИЗ ЗВОНКА И СДЕЛКИ:
+${JSON.stringify(context, null, 2).slice(0, 20000)}
+
+ИНСТРУКЦИИ:
+1. В client_message — заполни шаблон конкретными данными из звонка: имена, даты, документы.
+2. Замени [Имя] на реальное имя клиента из звонка.
+3. Замени все [дата] на конкретные даты из звонка или рассчитанные сроки (+1-2 дня для действий клиента).
+4. Замени [что нужно] на конкретные документы/действия из звонка.
+5. Если информации нет в звонке — оставь как [данные из звонка] чтобы эксперт заполнил вручную.
+6. comment: напиши 3-5 строк выжимки главных фактов из звонка и договорённостей.
+
+Верни JSON: {"client_message":"заполненный шаблон","comment":"выжимка для эксперта"}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
-      temperature: 0.2,
+      temperature: 0.1,  // ниже temperature для точного заполнения
       messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
     });
     let aiResult = {};
@@ -2439,8 +2643,10 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     const clientMessage = String(aiResult.client_message || '').trim();
-    const EMAIL_REMINDER = '\n\n**Все документы отправляйте нам на почту: mavis.group@mail.ru**';
-    const clientMessageWithEmail = clientMessage ? clientMessage + EMAIL_REMINDER : '';
+    // ✅ ИСПРАВЛЕНО: Очищаем Markdown перед отправкой
+    const clientMessageCleaned = cleanMarkdownForMessenger(clientMessage);
+    const EMAIL_REMINDER = '\n\nВсе документы отправляйте нам на почту: mavis.group@mail.ru';
+    const clientMessageWithEmail = clientMessageCleaned ? clientMessageCleaned + EMAIL_REMINDER : '';
     const documentMessage = ''; // объединено в client_message
     const dealComment = String(aiResult.comment || 'Автопилот выполнен').trim();
     const siblingNote = formatSiblingServicesNote(siblings);
@@ -2452,11 +2658,24 @@ async function runServerAutopilotForDeal(deal, stageId) {
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
       const preferredChannel = detectPreferredChannel(deal);
+      // ✅ ИСПРАВЛЕНО: Проверяем что каналы реально настроены перед использованием
       const wazzupChannelsToTry = [];
-      if (preferredChannel !== 'email') {
+      if (preferredChannel !== 'email' && getConfiguredWazzupChannel(preferredChannel)) {
         wazzupChannelsToTry.push(preferredChannel);
-        if (preferredChannel !== 'viber') wazzupChannelsToTry.push('viber');
-        if (preferredChannel !== 'telegram') wazzupChannelsToTry.push('telegram');
+      }
+      if (preferredChannel !== 'viber' && getConfiguredWazzupChannel('viber')) {
+        wazzupChannelsToTry.push('viber');
+      }
+      if (preferredChannel !== 'telegram' && getConfiguredWazzupChannel('telegram')) {
+        wazzupChannelsToTry.push('telegram');
+      }
+      // Если ничего не настроено, используем первый доступный
+      if (wazzupChannelsToTry.length === 0) {
+        for (const key of ['telegram', 'viber', 'default']) {
+          if (getConfiguredWazzupChannel(key)) {
+            wazzupChannelsToTry.push(key);
+          }
+        }
       }
       if (phone) {
         for (const channelKey of wazzupChannelsToTry) {
@@ -2484,6 +2703,27 @@ async function runServerAutopilotForDeal(deal, stageId) {
         }
       }
       if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
+
+      // ✅ ИСПРАВЛЕНО: Дублируем сообщение для КАЖДОЙ сопутствующей сделки
+      if (sent && clientMessageWithEmail && phone && siblings.length > 0) {
+        console.log(`${logPrefix} Отправляю дублирующие сообщения для ${siblings.length} сопутствующих сделок...`);
+        for (const sibling of siblings) {
+          try {
+            const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
+            if (siblingAlreadyDone) continue;
+            
+            await sendWazzupMessageInternal({ 
+              channelKey: sentChannel, 
+              text: clientMessageWithEmail, 
+              phone, 
+              dealId: sibling.ID  
+            });
+            console.log(`${logPrefix} sibling=${sibling.ID} Сообщение отправлено через ${sentChannel}`);
+          } catch (siblingErr) {
+            console.warn(`${logPrefix} sibling=${sibling.ID} Ошибка: ${siblingErr.message}`);
+          }
+        }
+      }
 
       // Отправляем docx файл перечня документов вторым сообщением.
       if (sent && sentChannel !== 'email') {
@@ -3514,7 +3754,11 @@ async function runAutopilotPollingCycle() {
       return;
     }
 
-    const startDateStr = AUTOPILOT_START_DATE.toISOString().slice(0, 19);
+    // ✅ ИСПРАВЛЕНО: Динамический лукбэк вместо даты старта сервера
+    const lookbackHours = Number(process.env.AUTOPILOT_LOOKBACK_HOURS || 24);
+    const lookbackDate = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
+    const startDateStr = lookbackDate.toISOString().slice(0, 19);
+    console.log(`[autopilot] Ищу сделки за последние ${lookbackHours} часов, начиная с ${startDateStr}`);
     // Собираем сделки по каждой стадии отдельно (Bitrix не поддерживает массив в STAGE_ID фильтре).
     const allDeals = [];
     const seenIds = new Set();
