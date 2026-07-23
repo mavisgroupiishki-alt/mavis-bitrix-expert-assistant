@@ -2356,6 +2356,75 @@ function getClientMessageTemplate(service) {
 4. Контролируем статус.`;
 }
 
+// ✅ НОВАЯ ФУНКЦИЯ: Обёртка для создания любой задачи с защитой от частого дублирования (4 часа)
+async function createTaskWithDelay(fields, delayHours = 4) {
+  if (!fields.TITLE || !fields.UF_CRM_TASK) {
+    return await bitrixRestCall('tasks.task.add', { fields });
+  }
+  
+  const dealId = fields.UF_CRM_TASK[0].replace('D_', '');
+  const titlePattern = fields.TITLE.slice(0, 40);
+  
+  // Проверяем когда была создана последняя похожая задача
+  const lastTime = await getLastTaskCreatedTime(dealId, titlePattern);
+  if (lastTime) {
+    const now = new Date();
+    const hoursPassed = (now - lastTime) / (1000 * 60 * 60);
+    
+    if (hoursPassed < delayHours) {
+      console.log(`[tasks deal=${dealId}] Похожая задача была ${hoursPassed.toFixed(1)} ч назад (нужно ${delayHours}ч), пропускаю.`);
+      return null;
+    }
+  }
+  
+  // Создаём задачу
+  return await bitrixRestCall('tasks.task.add', { fields });
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Проверить когда в последний раз создавалась задача
+async function getLastTaskCreatedTime(dealId, titlePattern) {
+  try {
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: { 'UF_CRM_TASK': `D_${dealId}` },
+      select: ['ID', 'TITLE', 'CREATED'],
+      order: { CREATED: 'DESC' },
+    }, 10);
+    
+    const lastTask = tasks.find((t) => t.TITLE && t.TITLE.includes(titlePattern.slice(0, 30)));
+    if (!lastTask) return null;
+    
+    // Парсим дату создания
+    const createdStr = lastTask.CREATED || '';
+    if (!createdStr) return null;
+    
+    return new Date(createdStr);
+  } catch (_) {
+    return null;
+  }
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Создавать задачу только если прошло 4+ часа
+async function shouldCreateTaskAgain(dealId, titlePattern, hoursDelay = 4) {
+  const lastTime = await getLastTaskCreatedTime(dealId, titlePattern);
+  if (!lastTime) {
+    // Нет предыдущей задачи - создаём
+    return true;
+  }
+  
+  const now = new Date();
+  const hoursPassed = (now - lastTime) / (1000 * 60 * 60);
+  
+  if (hoursPassed >= hoursDelay) {
+    // Прошло достаточно времени - создаём новую
+    console.log(`[tasks] ${hoursPassed.toFixed(1)} часов с последней задачи для сделки ${dealId} — создаю новую.`);
+    return true;
+  } else {
+    // Слишком мало времени - пропускаем
+    console.log(`[tasks] Последняя задача для сделки ${dealId} была ${hoursPassed.toFixed(1)} часов назад (нужно 4 часа), пропускаю.`);
+    return false;
+  }
+}
+
 function detectServiceFromDeal(deal) {
   const serviceField = process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071';
   return String(deal[serviceField] || deal.UF_CRM_1765113071 || '').trim();
@@ -2480,6 +2549,14 @@ function getDiminutiveName(fullName) {
 }
 
 async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage, otherDealIds = []) {
+  // ✅ ИСПРАВЛЕНО: Создаём задачу только если прошло 4+ часа с последней
+  const taskCheckPattern = `отправил ход работы`;
+  const shouldCreate = await shouldCreateTaskAgain(dealId, taskCheckPattern, 4);  // 4 часа
+  if (!shouldCreate) {
+    console.log(`[autopilot deal=${dealId}] Задача по отправке хода работы создавалась недавно, пропускаю.`);
+    return;
+  }
+
   // Создаём задачу эксперту на следующий день до 18:00.
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -2527,6 +2604,22 @@ async function buildDealContext(deal, transcript) {
     commentsText = comments.map((c) => `${c.DATE_CREATE || c.CREATED || ''}: ${c.COMMENT || ''}`).join('\n');
   } catch (_) { commentsText = ''; }
 
+  // ✅ ИСПРАВЛЕНО: Получаем только ИМЯ контакта (без компании)
+  let contactName = '';
+  let contactPhone = '';
+  let contactEmail = '';
+  try {
+    if (deal.CONTACT_ID) {
+      const contact = await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID });
+      if (contact) {
+        // Берем только имя, не "имя + компания"
+        contactName = String(contact.NAME || contact.FIRST_NAME || '').trim();
+        contactPhone = contact.PHONE && contact.PHONE[0] ? contact.PHONE[0].VALUE : '';
+        contactEmail = contact.EMAIL && contact.EMAIL[0] ? contact.EMAIL[0].VALUE : '';
+      }
+    }
+  } catch (_) { }
+
   return {
     deal: {
       id: deal.ID,
@@ -2536,6 +2629,11 @@ async function buildDealContext(deal, transcript) {
       sum: deal.OPPORTUNITY,
       currency: deal.CURRENCY_ID,
       assignedById: deal.ASSIGNED_BY_ID,
+    },
+    contact: {
+      name: contactName,  // ✅ только имя
+      phone: contactPhone,
+      email: contactEmail,
     },
     product: { label: service, key: 'auto' },
     service,
@@ -2613,23 +2711,51 @@ async function runServerAutopilotForDeal(deal, stageId) {
     
     const template = getClientMessageTemplate(detectServiceFromDeal(deal));
     
-    const userPrompt = `Ты получил звонок от клиента. Заполни шаблон хода работы на основе информации из звонка и карточки.
+    const userPrompt = `Ты получил звонок от клиента ${context.contact.name || 'клиента'}. Заполни шаблон хода работы.
 
-ШАБЛОН для заполнения:
+ШАБЛОН (заполни все плейсхолдеры):
 ${template}
 
 ИНФОРМАЦИЯ ИЗ ЗВОНКА И СДЕЛКИ:
 ${JSON.stringify(context, null, 2).slice(0, 20000)}
 
-ИНСТРУКЦИИ:
-1. В client_message — заполни шаблон конкретными данными из звонка: имена, даты, документы.
-2. Замени [Имя] на реальное имя клиента из звонка.
-3. Замени все [дата] на конкретные даты из звонка или рассчитанные сроки (+1-2 дня для действий клиента).
-4. Замени [что нужно] на конкретные документы/действия из звонка.
-5. Если информации нет в звонке — оставь как [данные из звонка] чтобы эксперт заполнил вручную.
-6. comment: напиши 3-5 строк выжимки главных фактов из звонка и договорённостей.
+СЕГОДНЯ: ${new Date().toISOString().slice(0, 10)}
 
-Верни JSON: {"client_message":"заполненный шаблон","comment":"выжимка для эксперта"}`;
+ИНСТРУКЦИИ ПО ЗАПОЛНЕНИЮ:
+
+1. ИМЕНА:
+   - Замени [Имя] на "${context.contact.name || 'клиента'}" (только имя, без компании)
+   - Если имени нет — убери обращение, оставь просто текст
+
+2. ДАТЫ (КРИТИЧНО!):
+   - Замени [дата] на конкретные даты из звонка
+   - Если в звонке назван срок (например "завтра", "в понедельник") — переведи в формат ДАТА
+   - Если срок в звонке не назван — добавь +2-3 дня от СЕГОДНЯ
+   - ВСЕГДА используй формат: "21 июля" или "22.07.2026" (2026 год, не 2024!)
+   - Примеры: "до 23 июля", "до 24 июля", "к 25 июля"
+
+3. ДОКУМЕНТЫ И ДЕЙСТВИЯ:
+   - Замени [что нужно] / [документы] на КОНКРЕТНЫЕ из звонка:
+     * "копию аттестата"
+     * "скан трудовой"
+     * "фото 3х4"
+     * "приказ о назначении"
+   - НЕ оставляй [что нужно] - это ошибка!
+
+4. ДАННЫЕ ИЗ СДЕЛКИ:
+   - Замени [услуга] на: "${context.service}"
+   - Замени [орган] / [компания] если есть в звонке
+
+5. ФИНАЛЬНАЯ ПРОВЕРКА:
+   - client_message НЕ должен содержать [ или ]
+   - Все даты в 2026 году
+   - Все ФИО и названия конкретные
+   - Текст читается как готовое сообщение клиенту (можно копировать в Telegram/Viber)
+
+6. comment: 3-5 строк выжимки главных фактов из звонка + согласованные сроки
+
+ВЕРНИ ТОЛЬКО JSON (без markdown, без \`\`\`):
+{"client_message":"готовое сообщение БЕЗ плейсхолдеров","comment":"выжимка"}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -3577,7 +3703,8 @@ async function checkWonStage() {
           const user = Array.isArray(u) ? u[0] : u;
           const petName = getDiminutiveName(user ? (user.NAME || '').trim() : '');
           const dl = addWorkingDays(now, 1); dl.setHours(18, 0, 0, 0);
-          await bitrixRestCall('tasks.task.add', { fields: { TITLE: `${petName}, запроси акт у клиента — 3 напоминания без ответа`, DESCRIPTION: `${petName}, клиент по сделке "${deal.TITLE}" не прислал скан акта уже неделю. Позвони и уточни.`, RESPONSIBLE_ID: deal.ASSIGNED_BY_ID, DEADLINE: dl.toISOString().slice(0, 19) + '+03:00', UF_CRM_TASK: [`D_${deal.ID}`], PRIORITY: 1 } });
+          // ✅ ИСПРАВЛЕНО: Используем createTaskWithDelay чтобы не создавать каждые 20 минут
+          await createTaskWithDelay({ TITLE: `${petName}, запроси акт у клиента — 3 напоминания без ответа`, DESCRIPTION: `${petName}, клиент по сделке "${deal.TITLE}" не прислал скан акта уже неделю. Позвони и уточни.`, RESPONSIBLE_ID: deal.ASSIGNED_BY_ID, DEADLINE: dl.toISOString().slice(0, 19) + '+03:00', UF_CRM_TASK: [`D_${deal.ID}`], PRIORITY: 1 }, 4);
           await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${taskMarker}\nИгорь: поставил задачу эксперту позвонить клиенту — 3 напоминания про акт без ответа.` } });
         }
         continue;
