@@ -3979,6 +3979,77 @@ async function runAutopilotPollingCycle() {
 // Запуск polling после старта сервера.
 
 // ✅ ТЕСТОВЫЙ ЭНДПОИНТ для сбора WhatsApp (вызов через браузер)
+
+// ============================================================================
+// 🧪 ТЕСТОВАЯ ФУНКЦИЯ: сбор WhatsApp документов
+// ============================================================================
+
+async function testCollectWhatsAppDocuments() {
+  const WAZZUP_API_URL = 'https://api.wazzup.com/v1';
+  try {
+    const wazzupToken = process.env.WAZZUP_API_TOKEN || '';
+    if (!wazzupToken) return { success: false, error: 'WAZZUP_API_TOKEN не найден' };
+    
+    const testResponse = await fetch(`${WAZZUP_API_URL}/account`, { 
+      method: 'GET', 
+      headers: { 
+        'Authorization': `Bearer ${wazzupToken}`, 
+        'Content-Type': 'application/json' 
+      } 
+    });
+    if (!testResponse.ok) return { success: false, error: `Wazzup: ${testResponse.status}` };
+    
+    const chatsResponse = await fetch(`${WAZZUP_API_URL}/chats?limit=50`, { 
+      method: 'GET', 
+      headers: { 
+        'Authorization': `Bearer ${wazzupToken}`, 
+        'Content-Type': 'application/json' 
+      } 
+    });
+    const chatsData = await chatsResponse.json();
+    const chats = chatsData.data || [];
+    
+    let totalDocuments = 0;
+    const chatsWithFiles = [];
+    
+    for (const chat of chats.slice(0, 5)) {
+      try {
+        const messagesResponse = await fetch(`${WAZZUP_API_URL}/chats/${chat.id}/messages?limit=50`, { 
+          method: 'GET', 
+          headers: { 
+            'Authorization': `Bearer ${wazzupToken}`, 
+            'Content-Type': 'application/json' 
+          } 
+        });
+        if (!messagesResponse.ok) continue;
+        
+        const messagesData = await messagesResponse.json();
+        const messages = messagesData.data || [];
+        const messagesWithFiles = messages.filter((m) => m.files && m.files.length > 0);
+        
+        if (messagesWithFiles.length > 0) {
+          const fileCount = messagesWithFiles.reduce((a, m) => a + m.files.length, 0);
+          totalDocuments += fileCount;
+          chatsWithFiles.push({ phone: chat.phone, files: fileCount });
+        }
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    
+    return { 
+      success: true, 
+      chats: chats.length, 
+      chatsWithFiles: chatsWithFiles.length, 
+      totalDocuments, 
+      details: chatsWithFiles, 
+      status: totalDocuments > 0 ? `✅ ГОТОВО! ${totalDocuments} файлов` : '⚠️ Файлов нет' 
+    };
+  } catch (err) { 
+    return { success: false, error: err.message }; 
+  }
+}
+
+
 app.get('/api/test-whatsapp', async (req, res) => {
   console.log('\n🧪 [ТЕСТ] Запущен тест WhatsApp...');
   try {
