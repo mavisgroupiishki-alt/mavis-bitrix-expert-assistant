@@ -3987,8 +3987,8 @@ async function runAutopilotPollingCycle() {
 async function testCollectWhatsAppDocuments() {
   const WAZZUP_API_URL = 'https://api.wazzup.com/v1';
   try {
-    const wazzupToken = process.env.WAZZUP_API_TOKEN || '';
-    if (!wazzupToken) return { success: false, error: 'WAZZUP_API_TOKEN не найден' };
+    const wazzupToken = process.env.WAZZUP_API_KEY || '';
+    if (!wazzupToken) return { success: false, error: 'WAZZUP_API_KEY не найден' };
     
     const testResponse = await fetch(`${WAZZUP_API_URL}/account`, { 
       method: 'GET', 
