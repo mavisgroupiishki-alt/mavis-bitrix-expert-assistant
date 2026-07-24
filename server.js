@@ -3519,6 +3519,10 @@ async function checkExpertFirstCallReminder() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
+
       const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
       if (workingHoursBetween(movedAt, now) < 4) continue;
       const marker = '[MAVIS_FIRST_CALL_REMINDER]';
@@ -3560,6 +3564,7 @@ async function checkExpertFirstCallReminder() {
   } catch (e) { console.error('[stageMonitor] checkExpertFirstCallReminder:', e.message); }
 }
 
+
 // ---- Пункт 3: 5 и 10 дней без документов на стадии "Сбор информации" ----
 async function checkCollectionStageStuck() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3572,6 +3577,10 @@ async function checkCollectionStageStuck() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
+
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9; // ~9 рабочих часов в дне
       if (!isWorkingHour(now)) continue;
@@ -3611,6 +3620,7 @@ async function checkCollectionStageStuck() {
   } catch (e) { console.error('[stageMonitor] checkCollectionStageStuck:', e.message); }
 }
 
+
 // ---- Пункт 7: "Документы готовы" — сообщение клиенту с правилами заверения ----
 async function checkDocsReadyStage() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3623,6 +3633,15 @@ async function checkDocsReadyStage() {
       const marker = '[MAVIS_DOCS_READY_MSG]';
       const already = await isStageEventProcessed(deal.ID, 'docs_ready', marker);
       if (already) continue;
+      
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) {
+        stageEventProcessed.set(stageEventKey(deal.ID, 'docs_ready'), true);
+        console.log(`[stageMonitor] Документы готовы → сделка ${deal.ID}, но продукт не СПК (${service}) — правила не отправляем`);
+        continue;
+      }
+
       const phone = await getContactPhone(deal);
       if (!phone) { stageEventProcessed.set(stageEventKey(deal.ID, 'docs_ready'), true); continue; }
       const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
@@ -3647,6 +3666,7 @@ async function checkDocsReadyStage() {
   } catch (e) { console.error('[stageMonitor] checkDocsReadyStage:', e.message); }
 }
 
+
 // ---- Пункт 8: "Успешно закрыты" — поздравление + запрос акта ----
 const wonAckSent = new Map(); // dealId → lastRemindAt
 async function checkWonStage() {
@@ -3658,6 +3678,10 @@ async function checkWonStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
+
       const phone = await getContactPhone(deal);
       if (!phone) continue;
       const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }).catch(() => null) : null;
@@ -3733,6 +3757,7 @@ async function checkWonStage() {
   } catch (e) { console.error('[stageMonitor] checkWonStage:', e.message); }
 }
 
+
 // ---- Пункт 9: "Работа с возвратом" — уведомление Тане с анализом звонков ----
 async function checkRefundStage() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3742,6 +3767,10 @@ async function checkRefundStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
     }, 20);
     for (const deal of deals) {
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
+
       const marker = '[MAVIS_REFUND_NOTIFIED]';
       const already = await isStageEventProcessed(deal.ID, 'refund', marker);
       if (already) continue;
@@ -3771,6 +3800,7 @@ async function checkRefundStage() {
   } catch (e) { console.error('[stageMonitor] checkRefundStage:', e.message); }
 }
 
+
 // ---- Пункт 5: "Подбор" — мониторинг этапа ----
 const FIELD_NEEDS_SELECTION    = 'UF_CRM_1781103233'; // "Нужен подбор" Да/Нет
 const FIELD_WHO_WE_SEARCH      = 'UF_CRM_1781875347'; // "Кого ищем (специальность)"
@@ -3786,6 +3816,10 @@ async function checkSelectionStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
+      // ✅ ТОЛЬКО СПК
+      const service = detectServiceFromDeal(deal);
+      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
+
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9;
       if (!isWorkingHour(now)) continue;
@@ -3853,6 +3887,7 @@ async function checkSelectionStage() {
     }
   } catch (e) { console.error('[stageMonitor] checkSelectionStage:', e.message); }
 }
+
 
 
 async function runStageMonitoring() {
