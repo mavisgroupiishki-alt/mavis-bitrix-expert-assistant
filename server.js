@@ -1526,6 +1526,29 @@ async function processIncomingEmails() {
           // Добавляем комментарий в сделку
           if (savedFileNames.length) {
             for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
               try {
                 const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
                 const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
@@ -1707,18 +1730,6 @@ async function findDealsByCompanyName(companyNameQuery) {
     return null;
   }
 }
-
-
-// ✅ ТЕСТОВЫЙ ЭНДПОИНТ для WhatsApp
-app.get('/api/test-whatsapp', async (req, res) => {
-  try {
-    const result = await testCollectWhatsAppDocuments();
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 
 module.exports = { processIncomingEmails };
 
@@ -2024,6 +2035,29 @@ async function checkUnassignedDeals() {
 
     const now = new Date();
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const createdAt = new Date(deal.DATE_CREATE || deal.MOVED_TIME);
       const workedHours = workingHoursBetween(createdAt, now);
 
@@ -2420,7 +2454,7 @@ function getClientMessageTemplate(service) {
 - специалисты: [ФИО / должности / актуальность];
 - средства измерений: [есть / частично есть / нужно сверить];
 - орган: [БИСП / Стройкомплекс / определит руководитель];
-- город: [Минск / другой город];
+- город: [ / другой город];
 - крайний срок: [дата].
 
 От вас:
@@ -3706,6 +3740,29 @@ async function checkExpertFirstCallReminder() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
       if (workingHoursBetween(movedAt, now) < 4) continue;
       const marker = '[MAVIS_FIRST_CALL_REMINDER]';
@@ -3759,6 +3816,29 @@ async function checkCollectionStageStuck() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9; // ~9 рабочих часов в дне
       if (!isWorkingHour(now)) continue;
@@ -3807,6 +3887,29 @@ async function checkDocsReadyStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID', process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140', 'UF_CRM_1781189436900'],
     }, 50);
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const marker = '[MAVIS_DOCS_READY_MSG]';
       const already = await isStageEventProcessed(deal.ID, 'docs_ready', marker);
       if (already) continue;
@@ -3817,7 +3920,7 @@ async function checkDocsReadyStage() {
       const expertFirstName = user ? (user.NAME || '').trim() : 'эксперт';
       const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }) : null;
       const clientName = contactData ? (contactData.NAME || '').trim() : '';
-      const msg = `${clientName ? clientName + ', д' : 'Д'}обрый день!\n\nДокументы по вашей услуге готовы 🎉\n\nМы свяжемся с вами для согласования формата подписания.\n\n**Если вы из Минска** — можете приехать к нам для подписания: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\n**Если вы не из Минска** — распечатайте документы, заверьте и подпишите, затем отправьте курьером или почтой по адресу: г. Минск, ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\nПравила заверения:\n— Каждый лист заверяется подписью директора и печатью\n— На последней странице: "Верно. Директор [подпись] [расшифровка] [дата]"\n\nВопросы — всегда на связи!`;
+      const msg = `${clientName ? clientName + ', д' : 'Д'}обрый день!\n\nДокументы по вашей услуге готовы 🎉\n\nМы свяжемся с вами для согласования формата подписания.\n\nРаспечатайте а** — можете приехать к нам для подписания: г. , ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\n**Если вы не из а** — распечатайте документы, заверьте и подпишите, затем отправьте курьером или почтой по адресу: г. , ул. Домбровская, 9, офис 12.2.2, Башня 2, этаж 12.\n\nПравила заверения:\n— Каждый лист заверяется подписью директора и печатью\n— На последней странице: "Верно. Директор [подпись] [расшифровка] [дата]"\n\nВопросы — всегда на связи!`;
       const channel = detectPreferredChannel(deal);
       const channels = channel !== 'email' ? [channel, channel !== 'viber' ? 'viber' : null, channel !== 'telegram' ? 'telegram' : null].filter(Boolean) : [];
       let sent = false;
@@ -3845,6 +3948,29 @@ async function checkWonStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const phone = await getContactPhone(deal);
       if (!phone) continue;
       const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }).catch(() => null) : null;
@@ -3929,6 +4055,29 @@ async function checkRefundStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
     }, 20);
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const marker = '[MAVIS_REFUND_NOTIFIED]';
       const already = await isStageEventProcessed(deal.ID, 'refund', marker);
       if (already) continue;
@@ -3973,6 +4122,29 @@ async function checkSelectionStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
+  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
+  if (deal.UF_CRM_1784898776915 === 'нет') {
+    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
+    
+    // Создаём задачу уведомление
+    try {
+      await bitrixRestCall('tasks.task.add', {
+        fields: {
+          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
+          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
+          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+          UF_CRM_TASK: [`D_${deal.ID}`],
+          PRIORITY: 1,
+        },
+      });
+      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
+    } catch (taskErr) {
+      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
+    }
+    
+    continue; // Пропускаем сделку полностью
+  }
+
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9;
       if (!isWorkingHour(now)) continue;
@@ -4128,136 +4300,26 @@ async function runAutopilotPollingCycle() {
 
 // Запуск polling после старта сервера.
 
-// ============================================================================
-// 🧪 ТЕСТОВАЯ ФУНКЦИЯ: сбор WhatsApp документов (с логированием)
-// ============================================================================
-
-async function testCollectWhatsAppDocuments() {
-  const WAZZUP_API_URL = 'https://api.wazzup.com/v1';
-  console.log('\n🧪 [ТЕСТ WHATSAPP] Начинаю проверку...');
-  
+// ✅ ЭНДПОИНТ: Получить все поля сделки
+app.get('/api/get-deal-fields', async (req, res) => {
   try {
-    const wazzupToken = process.env.WAZZUP_API_KEY || '';
-    console.log('🧪 [ТЕСТ] Токен найден:', !!wazzupToken);
+    const dealId = req.query.dealId;
+    if (!dealId) return res.status(400).json({ error: 'dealId не указан' });
     
-    if (!wazzupToken) {
-      console.error('❌ [ТЕСТ] WAZZUP_API_KEY не найден');
-      return { 
-        success: false, 
-        error: 'WAZZUP_API_KEY не найден в переменных окружения',
-        solution: 'На Render → Settings → Environment Variables → добавь WAZZUP_API_KEY'
-      };
+    const deals = await bitrixRestList('crm.deal.get', { ID: dealId }, 1, ['*', 'UF_*']);
+    if (!deals || !deals.length) return res.status(404).json({ error: 'Сделка не найдена' });
+    
+    const deal = deals[0];
+    const fields = {};
+    for (const [key, value] of Object.entries(deal)) {
+      if (key.startsWith('UF_CRM_')) fields[key] = value;
     }
     
-    console.log('🧪 [ТЕСТ] Проверяю подключение к Wazzup API...');
-    
-    let testResponse;
-    try {
-      testResponse = await fetch(`${WAZZUP_API_URL}/account`, { 
-        method: 'GET', 
-        headers: { 
-          'Authorization': `Bearer ${wazzupToken}`, 
-          'Content-Type': 'application/json' 
-        }
-      });
-    } catch (fetchErr) {
-      console.error('❌ [ТЕСТ] Ошибка fetch:', fetchErr.message);
-      return { 
-        success: false, 
-        error: `Fetch failed: ${fetchErr.message}`,
-        details: 'Проблема с подключением к Wazzup API. Проверь токен или сервис может быть недоступен.',
-        suggestions: [
-          'Проверь что WAZZUP_API_KEY правильный (из Wazzup → Настройки → API)',
-          'Проверь интернет соединение на Render',
-          'Попробуй позже (может быть Wazzup недоступен)'
-        ]
-      };
-    }
-    
-    console.log('🧪 [ТЕСТ] Wazzup ответил со статусом:', testResponse.status);
-    
-    if (!testResponse.ok) {
-      const errorText = await testResponse.text().catch(() => 'No error details');
-      console.error('❌ [ТЕСТ] Wazzup вернул ошибку:', testResponse.status);
-      return { 
-        success: false, 
-        error: `Wazzup API ошибка ${testResponse.status}`, 
-        details: errorText
-      };
-    }
-    
-    console.log('✅ [ТЕСТ] Подключение к Wazzup работает!');
-    
-    const chatsResponse = await fetch(`${WAZZUP_API_URL}/chats?limit=50`, { 
-      method: 'GET', 
-      headers: { 
-        'Authorization': `Bearer ${wazzupToken}`, 
-        'Content-Type': 'application/json' 
-      }
-    });
-    
-    if (!chatsResponse.ok) {
-      return { success: false, error: `Ошибка получения чатов: ${chatsResponse.status}` };
-    }
-    
-    const chatsData = await chatsResponse.json();
-    const chats = chatsData.data || [];
-    
-    console.log(`✅ [ТЕСТ] Найдено ${chats.length} чатов в Wazzup`);
-    
-    let totalDocuments = 0;
-    const chatsWithFiles = [];
-    
-    for (const chat of chats.slice(0, 5)) {
-      try {
-        const messagesResponse = await fetch(`${WAZZUP_API_URL}/chats/${chat.id}/messages?limit=50`, { 
-          method: 'GET', 
-          headers: { 
-            'Authorization': `Bearer ${wazzupToken}`, 
-            'Content-Type': 'application/json' 
-          }
-        });
-        
-        if (!messagesResponse.ok) continue;
-        
-        const messagesData = await messagesResponse.json();
-        const messages = messagesData.data || [];
-        const messagesWithFiles = messages.filter((m) => m.files && m.files.length > 0);
-        
-        if (messagesWithFiles.length > 0) {
-          const fileCount = messagesWithFiles.reduce((a, m) => a + m.files.length, 0);
-          totalDocuments += fileCount;
-          chatsWithFiles.push({ phone: chat.phone, files: fileCount, messages: messagesWithFiles.length });
-          console.log(`  ✅ Чат ${chat.phone}: ${fileCount} файлов в ${messagesWithFiles.length} сообщениях`);
-        }
-      } catch (e) {
-        console.warn(`  ⚠️ Ошибка при обработке чата: ${e.message}`);
-      }
-      
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    
-    console.log(`✅ [ТЕСТ] Всего документов найдено: ${totalDocuments}`);
-    
-    return { 
-      success: true, 
-      chats: chats.length, 
-      chatsWithFiles: chatsWithFiles.length, 
-      totalDocuments, 
-      details: chatsWithFiles, 
-      status: totalDocuments > 0 ? `✅ ГОТОВО К РАБОТЕ! Найдено ${totalDocuments} файлов` : '⚠️ Файлов не найдено (но подключение работает)'
-    };
-  } catch (err) { 
-    console.error('❌ [ТЕСТ] ОБЩАЯ ОШИБКА:', err.message);
-    console.error(err.stack);
-    return { 
-      success: false, 
-      error: err.message,
-      details: 'Неожиданная ошибка при выполнении теста'
-    }; 
+    res.json({ dealId: deal.ID, title: deal.TITLE, fields });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-}
-
+});
 
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
