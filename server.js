@@ -329,9 +329,7 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       'БАЗА ЗНАНИЙ (используй при анализе, не объясняй клиенту):',
       '- СПК: нужны 2 аттестованных специалиста по основному месту работы. Совместитель — дополнительно. Орган: БИСП или Стройкомплекс.',
       '- АТТ СМР: руководитель (высшее строительное + стаж ≥5 лет) + ГИ (аттестованный). Подача бумажная в Белстройцентр.',
-      '- ИСО (только): 1 человек с сертификатом по охране труда (ОТ).',
-      '- СУОТ (только): комиссия из 3 человек (директор, зам, третий любой). Бриф, пошлина до пятницы перед выездом.',
-      '- ИСО + СУОТ (комплекс): комиссия из 3 человек (директор, зам, третий любой). Бриф, пошлина до пятницы перед выездом.',
+      '- ИСО/СУОТ: комиссия из 3 человек (один директор), бриф, пошлина до пятницы перед выездом.',
       '- АТТ специалиста: диплом + трудовая + 2 фото 3x4. Ориентир по экзамену — в течение месяца.',
       '- Если специалистов НЕТ/ИЩУТ — описывай требования к кандидатам (должность, образование, стаж, нужен ли аттестат), не проси документы на несуществующих людей.',
       '- Директор может закрывать должность прораба/ГИ через запись в трудовой книжке.',
@@ -1369,6 +1367,28 @@ async function processIncomingEmails() {
     return;
   }
 
+  // ✅ ФИЛЬТР СПАМА: Список автоматических отправителей которых игнорируем
+  const SPAM_SENDERS = [
+    /robot@/i,
+    /noreply@/i,
+    /no-reply@/i,
+    /support@/i,
+    /admin@/i,
+    /notification@/i,
+    /alert@/i,
+    /info@yandex/i,
+    /info@npmos/i,
+    /hello@atevi/i, // платёжные напоминания
+    /docudream@edn/i, // электронные торги
+    /auction24/i,
+    /invoice@/i,
+    /billing@/i,
+  ];
+
+  function isSpamSender(email) {
+    return SPAM_SENDERS.some(pattern => pattern.test(email));
+  }
+
   let client;
   try {
     client = new ImapFlow({
@@ -1401,60 +1421,89 @@ async function processIncomingEmails() {
 
           console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}`);
 
-          if (!attachments.length) {
-            // Письмо без вложений — не обрабатываем (нечего сохранять), но помечаем прочитанным.
+          // ✅ ФИЛЬТР СПАМА
+          if (isSpamSender(senderEmail)) {
+            console.log(`[email] ⏭️ Спам от ${senderEmail} — помечаю прочитанным и пропускаю`);
             await client.messageFlagsAdd(uid, ['\\Seen']);
             continue;
           }
 
-          const matchInfo = await findContactAndDealsByEmail(senderEmail);
-          if (!matchInfo || !matchInfo.deals.length) {
-            // Email не найден в CRM — пробуем Vision анализ вложений чтобы найти компанию.
-            if (attachments.length > 0) {
-              console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ вложений...`);
-              let visionCompany = null;
-              for (const att of attachments) {
-                try {
-                  const analysis = await analyzeDocumentWithVision(att.content, att.filename || 'file', att.contentType);
-                  if (analysis.company && analysis.confidence !== 'low') {
-                    visionCompany = analysis.company;
-                    console.log(`[email] Vision нашёл компанию: "${visionCompany}" (confidence: ${analysis.confidence})`);
-                    break;
-                  }
-                } catch (_) {}
-                await new Promise((r) => setTimeout(r, 1000));
-              }
-
-              if (visionCompany) {
-                // Кладём файлы в папку компании на Диске без задачи эксперту.
-                try {
-                  const folderId = await getOrCreateCompanyFolder(visionCompany);
-                  for (const att of attachments) {
-                    try {
-                      await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
-                      console.log(`[email] Файл "${att.filename}" → папка "${visionCompany}" (через Vision)`);
-                    } catch (_) {}
-                  }
-                  await client.messageFlagsAdd(uid, ['\\Seen']);
-                } catch (e) {
-                  console.warn(`[email] Ошибка сохранения через Vision: ${e.message}`);
-                }
-              } else {
-                console.log(`[email] Vision не определил компанию — оставляю непрочитанным для ручной проверки.`);
-              }
-            } else {
-              console.log(`[email] Email ${senderEmail} не найден в CRM и нет вложений — пропускаю.`);
-            }
+          // Письма без вложений не обрабатываем
+          if (!attachments.length) {
+            await client.messageFlagsAdd(uid, ['\\Seen']);
             continue;
           }
 
+          // ✅ 1. ПЕРВЫЙ СПОСОБ: Ищем email в CRM
+          let matchInfo = await findContactAndDealsByEmail(senderEmail);
+          
+          if (!matchInfo || !matchInfo.deals.length) {
+            console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ...`);
+            
+            // ✅ 2. ВТОРОЙ СПОСОБ: Vision анализ вложений
+            let visionCompany = null;
+            let visionConfidence = 'low';
+            
+            for (const att of attachments) {
+              try {
+                // ✅ УЛУЧШЕННЫЙ ПРОМПТ для Vision
+                const analysis = await analyzeDocumentWithVisionForCompany(att.content, att.filename || 'file', att.contentType);
+                
+                if (analysis.company && analysis.confidence !== 'low') {
+                  visionCompany = analysis.company;
+                  visionConfidence = analysis.confidence;
+                  console.log(`[email] ✅ Vision нашёл компанию: "${visionCompany}" (${analysis.confidence})`);
+                  break;
+                }
+              } catch (_) {}
+              await new Promise((r) => setTimeout(r, 500));
+            }
+
+            // ✅ 3. ЕСЛИ Vision сработал - ищем сделку по названию компании в Bitrix
+            if (visionCompany) {
+              console.log(`[email] 🔍 Ищу сделку по названию компании: "${visionCompany}"`);
+              matchInfo = await findDealsByCompanyName(visionCompany);
+            }
+
+            // ✅ 4. ЕСЛИ НИЧЕГО НЕ СРАБОТАЛО - загружаем в "Неопределённые"
+            if (!matchInfo || !matchInfo.deals || !matchInfo.deals.length) {
+              console.log(`[email] ⚠️ Компания не определена — загружаю в папку "Неопределённые"`);
+              
+              try {
+                const undefFolder = await getOrCreateCompanyFolder('Неопределённые документы');
+                const savedFiles = [];
+                
+                for (const att of attachments) {
+                  try {
+                    await uploadFileToDiskFolder(undefFolder, `${new Date().toISOString().slice(0,10)}_${att.filename || 'file'}`, att.content);
+                    savedFiles.push(att.filename || 'файл');
+                    console.log(`[email] 📁 Загружен в "Неопределённые": "${att.filename}"`);
+                  } catch (upErr) {
+                    console.warn(`[email] Ошибка загрузки ${att.filename}: ${upErr.message}`);
+                  }
+                }
+                
+                // Помечаем прочитанным
+                await client.messageFlagsAdd(uid, ['\\Seen']);
+                console.log(`[email] ✅ Загружено ${savedFiles.length} файлов в "Неопределённые"`);
+              } catch (e) {
+                console.warn(`[email] Ошибка загрузки в "Неопределённые": ${e.message}`);
+              }
+              continue;
+            }
+          }
+
+          // ✅ ЕСЛИ СДЕЛКА НАЙДЕНА - обрабатываем как обычно
           const { contact, deals } = matchInfo;
           const companyName = await getCompanyName(contact.COMPANY_ID) || deals[0].TITLE || `Контакт ${contact.ID}`;
           const folderId = await getOrCreateCompanyFolder(companyName);
 
-          // Сохраняем файлы на Диск И анализируем каждый через Vision.
+          console.log(`[email] ✅ Найдена сделка! Загружаю в папку: "${companyName}"`);
+
+          // Сохраняем файлы и анализируем
           const savedFileNames = [];
           const analyzedDocs = [];
+          
           for (const att of attachments) {
             try {
               await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
@@ -1462,18 +1511,19 @@ async function processIncomingEmails() {
             } catch (upErr) {
               console.warn(`[email] Не удалось загрузить файл ${att.filename}: ${upErr.message}`);
             }
-            // Анализируем содержимое через Vision.
+            
+            // Анализируем через Vision
             try {
               const analysis = await analyzeDocumentWithVision(att.content, att.filename || 'file', att.contentType);
               analyzedDocs.push({ fileName: att.filename || 'без имени', ...analysis });
-              console.log(`[email] Файл "${att.filename}" → ${analysis.docType} (${analysis.confidence})`);
+              console.log(`[email] "${att.filename}" → ${analysis.docType} (${analysis.confidence})`);
             } catch (_) {
               analyzedDocs.push({ fileName: att.filename || 'без имени', docType: 'другое', confidence: 'low' });
             }
-            // Небольшая пауза между Vision запросами.
             await new Promise((r) => setTimeout(r, 1000));
           }
 
+          // Добавляем комментарий в сделку
           if (savedFileNames.length) {
             for (const deal of deals) {
               try {
@@ -1482,9 +1532,7 @@ async function processIncomingEmails() {
                 const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
                 const petName = getDiminutiveName(expertName);
 
-                // Проверяем комплектность для каждой сделки (услуга может отличаться).
                 const completeness = await checkDocumentCompleteness(deal, analyzedDocs, companyName);
-
                 const isComplete = completeness && completeness.complete;
                 const missingList = completeness && completeness.missing && completeness.missing.length
                   ? completeness.missing.map((m) => `— ${m}`).join('\n')
@@ -1493,7 +1541,6 @@ async function processIncomingEmails() {
                   ? completeness.expert_comment
                   : `Клиент прислал: ${savedFileNames.join(', ')}`;
 
-                // Комментарий в сделку.
                 const commentText = isComplete
                   ? `✅ ${petName}, комплект документов собран! Можно готовить пакет.\n\n${expertComment}`
                   : `📨 ${petName}, клиент прислал документы — не полный комплект.\n\n${expertComment}${missingList ? `\n\nНе хватает:\n${missingList}` : ''}`;
@@ -1502,7 +1549,6 @@ async function processIncomingEmails() {
                   fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: commentText },
                 });
 
-                // Если не хватает документов — задача эксперту.
                 if (!isComplete) {
                   const tomorrow = addWorkingDays(new Date(), 1);
                   tomorrow.setHours(18, 0, 0, 0);
@@ -1537,6 +1583,145 @@ async function processIncomingEmails() {
     if (client) { try { await client.logout(); } catch (_) {} }
   }
 }
+
+// ✅ НОВАЯ ФУНКЦИЯ: Vision анализ ДЛЯ КОМПАНИИ
+// Отправляет специальный промпт чтобы найти название компании
+async function analyzeDocumentWithVisionForCompany(fileContent, fileName, contentType) {
+  try {
+    // Кодируем в base64
+    const base64Content = Buffer.isBuffer(fileContent) 
+      ? fileContent.toString('base64') 
+      : Buffer.from(fileContent).toString('base64');
+
+    // Определяем тип медиа
+    let mediaType = 'application/pdf';
+    if (contentType) {
+      mediaType = contentType;
+    } else if (fileName) {
+      if (fileName.match(/\.(jpg|jpeg|png|gif)$/i)) mediaType = 'image/jpeg';
+      else if (fileName.match(/\.pdf$/i)) mediaType = 'application/pdf';
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 300,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'document',
+                source: {
+                  type: 'base64',
+                  media_type: mediaType,
+                  data: base64Content,
+                },
+              },
+              {
+                type: 'text',
+                text: `Это деловой документ. Определи:
+1. Название компании/организации в документе (ООО, ИП, АО и т.д.)
+2. Уровень уверенности: high (явно видно), medium (можно определить), low (не ясно)
+
+Ответь ТОЛЬКО JSON: {"company": "название", "confidence": "high|medium|low"}
+
+ВАЖНО: Ищи в начале документа, на бланке, в подписях. Если название компании не видно — вернись {"company": null, "confidence": "low"}`,
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn(`[email] Vision API error: ${response.status}`);
+      return { company: null, confidence: 'low' };
+    }
+
+    const data = await response.json();
+    const textContent = data.content?.find((c) => c.type === 'text')?.text || '';
+
+    try {
+      const result = JSON.parse(textContent);
+      return {
+        company: result.company,
+        confidence: result.confidence || 'low',
+      };
+    } catch (_) {
+      return { company: null, confidence: 'low' };
+    }
+  } catch (err) {
+    console.warn(`[email] Ошибка Vision анализа: ${err.message}`);
+    return { company: null, confidence: 'low' };
+  }
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Поиск сделки по названию компании
+async function findDealsByCompanyName(companyNameQuery) {
+  try {
+    // Нормализуем название
+    const normalized = normalizeCompanyNameForMatch(companyNameQuery);
+
+    if (!normalized) return null;
+
+    // Ищем компанию в CRM (нечёткий поиск)
+    const companies = await bitrixRestList('crm.company.list', {
+      filter: { '~TITLE': normalized },
+      select: ['ID', 'TITLE'],
+    }, 50);
+
+    if (!companies || !companies.length) {
+      console.log(`[email] Компания "${companyNameQuery}" не найдена в CRM`);
+      return null;
+    }
+
+    const company = companies[0];
+    console.log(`[email] Найдена компания: "${company.TITLE}"`);
+
+    // Ищем сделки этой компании
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        COMPANY_ID: company.ID,
+        STAGE_ID: ['C28:5', 'C28:6', 'C28:7'], // Подбор, Сбор информации, Документы готовы
+      },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID'],
+    }, 50);
+
+    if (!deals || !deals.length) {
+      console.log(`[email] Сделки компании "${company.TITLE}" не найдены`);
+      return null;
+    }
+
+    return {
+      contact: { COMPANY_ID: company.ID },
+      deals: deals,
+    };
+  } catch (err) {
+    console.error(`[email] Ошибка поиска сделки: ${err.message}`);
+    return null;
+  }
+}
+
+
+// ✅ ТЕСТОВЫЙ ЭНДПОИНТ для WhatsApp
+app.get('/api/test-whatsapp', async (req, res) => {
+  try {
+    const result = await testCollectWhatsAppDocuments();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+module.exports = { processIncomingEmails };
+
 
 // ============================================================================
 // v60: СЕРВЕРНЫЙ АВТОПИЛОТ — фоновый polling, запускается автоматически
@@ -3521,10 +3706,6 @@ async function checkExpertFirstCallReminder() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
-
       const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
       if (workingHoursBetween(movedAt, now) < 4) continue;
       const marker = '[MAVIS_FIRST_CALL_REMINDER]';
@@ -3566,7 +3747,6 @@ async function checkExpertFirstCallReminder() {
   } catch (e) { console.error('[stageMonitor] checkExpertFirstCallReminder:', e.message); }
 }
 
-
 // ---- Пункт 3: 5 и 10 дней без документов на стадии "Сбор информации" ----
 async function checkCollectionStageStuck() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3579,10 +3759,6 @@ async function checkCollectionStageStuck() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
-
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9; // ~9 рабочих часов в дне
       if (!isWorkingHour(now)) continue;
@@ -3622,7 +3798,6 @@ async function checkCollectionStageStuck() {
   } catch (e) { console.error('[stageMonitor] checkCollectionStageStuck:', e.message); }
 }
 
-
 // ---- Пункт 7: "Документы готовы" — сообщение клиенту с правилами заверения ----
 async function checkDocsReadyStage() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3635,15 +3810,6 @@ async function checkDocsReadyStage() {
       const marker = '[MAVIS_DOCS_READY_MSG]';
       const already = await isStageEventProcessed(deal.ID, 'docs_ready', marker);
       if (already) continue;
-      
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) {
-        stageEventProcessed.set(stageEventKey(deal.ID, 'docs_ready'), true);
-        console.log(`[stageMonitor] Документы готовы → сделка ${deal.ID}, но продукт не СПК (${service}) — правила не отправляем`);
-        continue;
-      }
-
       const phone = await getContactPhone(deal);
       if (!phone) { stageEventProcessed.set(stageEventKey(deal.ID, 'docs_ready'), true); continue; }
       const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
@@ -3668,7 +3834,6 @@ async function checkDocsReadyStage() {
   } catch (e) { console.error('[stageMonitor] checkDocsReadyStage:', e.message); }
 }
 
-
 // ---- Пункт 8: "Успешно закрыты" — поздравление + запрос акта ----
 const wonAckSent = new Map(); // dealId → lastRemindAt
 async function checkWonStage() {
@@ -3680,10 +3845,6 @@ async function checkWonStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
-
       const phone = await getContactPhone(deal);
       if (!phone) continue;
       const contactData = deal.CONTACT_ID ? await bitrixRestCall('crm.contact.get', { id: deal.CONTACT_ID }).catch(() => null) : null;
@@ -3759,7 +3920,6 @@ async function checkWonStage() {
   } catch (e) { console.error('[stageMonitor] checkWonStage:', e.message); }
 }
 
-
 // ---- Пункт 9: "Работа с возвратом" — уведомление Тане с анализом звонков ----
 async function checkRefundStage() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -3769,10 +3929,6 @@ async function checkRefundStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
     }, 20);
     for (const deal of deals) {
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
-
       const marker = '[MAVIS_REFUND_NOTIFIED]';
       const already = await isStageEventProcessed(deal.ID, 'refund', marker);
       if (already) continue;
@@ -3802,7 +3958,6 @@ async function checkRefundStage() {
   } catch (e) { console.error('[stageMonitor] checkRefundStage:', e.message); }
 }
 
-
 // ---- Пункт 5: "Подбор" — мониторинг этапа ----
 const FIELD_NEEDS_SELECTION    = 'UF_CRM_1781103233'; // "Нужен подбор" Да/Нет
 const FIELD_WHO_WE_SEARCH      = 'UF_CRM_1781875347'; // "Кого ищем (специальность)"
@@ -3818,10 +3973,6 @@ async function checkSelectionStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
-      // ✅ ТОЛЬКО СПК
-      const service = detectServiceFromDeal(deal);
-      if (!/спк|свидетельств.*техн|техн.*компетент/.test(service)) continue;
-
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9;
       if (!isWorkingHour(now)) continue;
@@ -3889,7 +4040,6 @@ async function checkSelectionStage() {
     }
   } catch (e) { console.error('[stageMonitor] checkSelectionStage:', e.message); }
 }
-
 
 
 async function runStageMonitoring() {
@@ -3978,36 +4128,82 @@ async function runAutopilotPollingCycle() {
 
 // Запуск polling после старта сервера.
 
-// ✅ ТЕСТОВЫЙ ЭНДПОИНТ для сбора WhatsApp (вызов через браузер)
-
 // ============================================================================
-// 🧪 ТЕСТОВАЯ ФУНКЦИЯ: сбор WhatsApp документов
+// 🧪 ТЕСТОВАЯ ФУНКЦИЯ: сбор WhatsApp документов (с логированием)
 // ============================================================================
 
 async function testCollectWhatsAppDocuments() {
   const WAZZUP_API_URL = 'https://api.wazzup.com/v1';
+  console.log('\n🧪 [ТЕСТ WHATSAPP] Начинаю проверку...');
+  
   try {
     const wazzupToken = process.env.WAZZUP_API_KEY || '';
-    if (!wazzupToken) return { success: false, error: 'WAZZUP_API_KEY не найден' };
+    console.log('🧪 [ТЕСТ] Токен найден:', !!wazzupToken);
     
-    const testResponse = await fetch(`${WAZZUP_API_URL}/account`, { 
-      method: 'GET', 
-      headers: { 
-        'Authorization': `Bearer ${wazzupToken}`, 
-        'Content-Type': 'application/json' 
-      } 
-    });
-    if (!testResponse.ok) return { success: false, error: `Wazzup: ${testResponse.status}` };
+    if (!wazzupToken) {
+      console.error('❌ [ТЕСТ] WAZZUP_API_KEY не найден');
+      return { 
+        success: false, 
+        error: 'WAZZUP_API_KEY не найден в переменных окружения',
+        solution: 'На Render → Settings → Environment Variables → добавь WAZZUP_API_KEY'
+      };
+    }
+    
+    console.log('🧪 [ТЕСТ] Проверяю подключение к Wazzup API...');
+    
+    let testResponse;
+    try {
+      testResponse = await fetch(`${WAZZUP_API_URL}/account`, { 
+        method: 'GET', 
+        headers: { 
+          'Authorization': `Bearer ${wazzupToken}`, 
+          'Content-Type': 'application/json' 
+        }
+      });
+    } catch (fetchErr) {
+      console.error('❌ [ТЕСТ] Ошибка fetch:', fetchErr.message);
+      return { 
+        success: false, 
+        error: `Fetch failed: ${fetchErr.message}`,
+        details: 'Проблема с подключением к Wazzup API. Проверь токен или сервис может быть недоступен.',
+        suggestions: [
+          'Проверь что WAZZUP_API_KEY правильный (из Wazzup → Настройки → API)',
+          'Проверь интернет соединение на Render',
+          'Попробуй позже (может быть Wazzup недоступен)'
+        ]
+      };
+    }
+    
+    console.log('🧪 [ТЕСТ] Wazzup ответил со статусом:', testResponse.status);
+    
+    if (!testResponse.ok) {
+      const errorText = await testResponse.text().catch(() => 'No error details');
+      console.error('❌ [ТЕСТ] Wazzup вернул ошибку:', testResponse.status);
+      return { 
+        success: false, 
+        error: `Wazzup API ошибка ${testResponse.status}`, 
+        details: errorText
+      };
+    }
+    
+    console.log('✅ [ТЕСТ] Подключение к Wazzup работает!');
     
     const chatsResponse = await fetch(`${WAZZUP_API_URL}/chats?limit=50`, { 
       method: 'GET', 
       headers: { 
         'Authorization': `Bearer ${wazzupToken}`, 
         'Content-Type': 'application/json' 
-      } 
+      }
     });
+    
+    if (!chatsResponse.ok) {
+      return { success: false, error: `Ошибка получения чатов: ${chatsResponse.status}` };
+    }
+    
     const chatsData = await chatsResponse.json();
     const chats = chatsData.data || [];
+    
+    console.log(`✅ [ТЕСТ] Найдено ${chats.length} чатов в Wazzup`);
     
     let totalDocuments = 0;
     const chatsWithFiles = [];
@@ -4019,8 +4215,9 @@ async function testCollectWhatsAppDocuments() {
           headers: { 
             'Authorization': `Bearer ${wazzupToken}`, 
             'Content-Type': 'application/json' 
-          } 
+          }
         });
+        
         if (!messagesResponse.ok) continue;
         
         const messagesData = await messagesResponse.json();
@@ -4030,11 +4227,17 @@ async function testCollectWhatsAppDocuments() {
         if (messagesWithFiles.length > 0) {
           const fileCount = messagesWithFiles.reduce((a, m) => a + m.files.length, 0);
           totalDocuments += fileCount;
-          chatsWithFiles.push({ phone: chat.phone, files: fileCount });
+          chatsWithFiles.push({ phone: chat.phone, files: fileCount, messages: messagesWithFiles.length });
+          console.log(`  ✅ Чат ${chat.phone}: ${fileCount} файлов в ${messagesWithFiles.length} сообщениях`);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn(`  ⚠️ Ошибка при обработке чата: ${e.message}`);
+      }
+      
       await new Promise((r) => setTimeout(r, 500));
     }
+    
+    console.log(`✅ [ТЕСТ] Всего документов найдено: ${totalDocuments}`);
     
     return { 
       success: true, 
@@ -4042,23 +4245,19 @@ async function testCollectWhatsAppDocuments() {
       chatsWithFiles: chatsWithFiles.length, 
       totalDocuments, 
       details: chatsWithFiles, 
-      status: totalDocuments > 0 ? `✅ ГОТОВО! ${totalDocuments} файлов` : '⚠️ Файлов нет' 
+      status: totalDocuments > 0 ? `✅ ГОТОВО К РАБОТЕ! Найдено ${totalDocuments} файлов` : '⚠️ Файлов не найдено (но подключение работает)'
     };
   } catch (err) { 
-    return { success: false, error: err.message }; 
+    console.error('❌ [ТЕСТ] ОБЩАЯ ОШИБКА:', err.message);
+    console.error(err.stack);
+    return { 
+      success: false, 
+      error: err.message,
+      details: 'Неожиданная ошибка при выполнении теста'
+    }; 
   }
 }
 
-
-app.get('/api/test-whatsapp', async (req, res) => {
-  console.log('\n🧪 [ТЕСТ] Запущен тест WhatsApp...');
-  try {
-    const result = await testCollectWhatsAppDocuments();
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
