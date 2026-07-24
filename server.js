@@ -3977,6 +3977,18 @@ async function runAutopilotPollingCycle() {
 }
 
 // Запуск polling после старта сервера.
+
+// ✅ ТЕСТОВЫЙ ЭНДПОИНТ для сбора WhatsApp (вызов через браузер)
+app.get('/api/test-whatsapp', async (req, res) => {
+  console.log('\n🧪 [ТЕСТ] Запущен тест WhatsApp...');
+  try {
+    const result = await testCollectWhatsAppDocuments();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
 
