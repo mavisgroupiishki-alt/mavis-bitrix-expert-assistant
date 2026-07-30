@@ -122,6 +122,17 @@ const config = {
   foremanFieldPhone: process.env.FOREMAN_FIELD_PHONE || '',
   foremanFieldCertNumber: process.env.FOREMAN_FIELD_CERT_NUMBER || '',
   foremanFieldProductionDeal: process.env.FOREMAN_FIELD_PRODUCTION_DEAL || '',
+
+  // v47: ИИгорь — автоматическая связка производственных сделок с воронкой прорабов.
+  // Поле в сделке производства, где хранится ID/ссылка на сделку прораба из воронки 32.
+  foremanProductionSpecialistField: process.env.FOREMAN_PRODUCTION_SPECIALIST_FIELD || process.env.FOREMAN_PRODUCTION_FOREMAN_FIELD || 'UF_CRM_1784528226',
+  foremanAutomationEnabled: String(process.env.FOREMAN_AUTOMATION_ENABLED || 'false').toLowerCase() === 'true',
+  foremanPollIntervalMinutes: Number(process.env.FOREMAN_POLL_INTERVAL_MINUTES || 60),
+  foremanLookbackDays: Number(process.env.FOREMAN_LOOKBACK_DAYS || 45),
+  foremanCreateSuggestionTasks: String(process.env.FOREMAN_CREATE_SUGGESTION_TASKS || 'true').toLowerCase() !== 'false',
+  foremanTasksEnabled: String(process.env.FOREMAN_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
+  foremanSuggestionScanEnabled: String(process.env.FOREMAN_SUGGESTION_SCAN_ENABLED || 'true').toLowerCase() !== 'false',
+  foremanMaxProductionDeals: Number(process.env.FOREMAN_MAX_PRODUCTION_DEALS || 300),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -132,9 +143,13 @@ async function bitrixRestCall(method, params = {}) {
   // Все серверные задачи выключены по умолчанию, чтобы не было дублей каждые 30 минут.
   // Если когда-то нужно вернуть серверные задачи — явно поставь SERVER_TASKS_ENABLED=true.
   if (String(method || '').toLowerCase() === 'tasks.task.add' && !config.serverTasksEnabled) {
-    const title = params && params.fields ? params.fields.TITLE : '';
-    console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
-    return { task: { id: null, blocked: true } };
+    const title = params && params.fields ? String(params.fields.TITLE || '') : '';
+    const isForemanTask = /^ИИгорь:/i.test(title) && config.foremanTasksEnabled;
+    if (!isForemanTask) {
+      console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
+      return { task: { id: null, blocked: true } };
+    }
+    console.log(`[tasks] allowed as foreman task: ${title || 'без названия'}`);
   }
   if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
   const response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
@@ -4278,6 +4293,390 @@ async function runAutopilotPollingCycle() {
   }
 }
 
+
+
+// v47: ИИгорь — автоматический диспетчер прорабов.
+// Работает на сервере через BITRIX_WEBHOOK_URL: читает поле "Специалист" в производственной сделке,
+// переводит прораба в "Занят", возвращает в "Свободен" после успешного закрытия сделки, и один раз
+// предлагает кандидатов эксперту, если в сделке выявлена потребность в подборе с нашей стороны.
+const FOREMAN_BUSY_MARKER = '[MAVIS_FOREMAN_BUSY]';
+const FOREMAN_FREE_MARKER = '[MAVIS_FOREMAN_FREE]';
+const FOREMAN_SUGGEST_MARKER = '[MAVIS_FOREMAN_SUGGEST]';
+let foremanAutomationRunning = false;
+
+function fgText(value) {
+  if (value === null || value === undefined || value === false) return '';
+  if (Array.isArray(value)) return value.map(fgText).filter(Boolean).join(' ');
+  if (typeof value === 'object') {
+    const keys = ['VALUE', 'value', 'ID', 'id', 'TITLE', 'title', 'NAME', 'name', 'URL', 'url'];
+    return keys.map((k) => fgText(value[k])).filter(Boolean).join(' ') || JSON.stringify(value);
+  }
+  return String(value || '').trim();
+}
+
+function fgNormalize(value) {
+  return fgText(value).toLowerCase().replace(/ё/g, 'е').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function fgExtractDealIds(value) {
+  const ids = new Set();
+  const walk = (v) => {
+    if (v === null || v === undefined || v === false) return;
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (typeof v === 'object') {
+      ['VALUE','value','ID','id','dealId','DEAL_ID','ENTITY_ID','entityId','url','URL'].forEach((k) => walk(v[k]));
+      return;
+    }
+    const text = String(v || '');
+    // Привязка может прийти как "37394" или как ссылка /crm/deal/details/37394/.
+    const dealLink = text.match(/deal\/details\/(\d+)/i);
+    if (dealLink) ids.add(dealLink[1]);
+    const pure = text.trim().match(/^\d{3,}$/);
+    if (pure) ids.add(pure[0]);
+  };
+  walk(value);
+  return [...ids];
+}
+
+function fgDate(value) {
+  const text = fgText(value);
+  if (!text) return null;
+  const d = new Date(text);
+  if (!Number.isNaN(d.getTime())) return d;
+  const m = text.match(/(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2,4})/);
+  if (m) {
+    const year = Number(m[3].length === 2 ? `20${m[3]}` : m[3]);
+    const d2 = new Date(year, Number(m[2]) - 1, Number(m[1]));
+    if (!Number.isNaN(d2.getTime())) return d2;
+  }
+  return null;
+}
+
+function fgDaysUntil(date) {
+  if (!date) return null;
+  const start = new Date(); start.setHours(0,0,0,0);
+  const end = new Date(date); end.setHours(0,0,0,0);
+  return Math.ceil((end - start) / 86400000);
+}
+
+function fgDateRu(date) {
+  if (!date) return 'не указана';
+  return date.toLocaleDateString('ru-RU');
+}
+
+function fgForemanCfg() {
+  return {
+    foremanCategoryId: Number(config.foremanCategoryId || 32),
+    productionCategoryId: Number(config.productionCategoryId || 28),
+    stageFree: config.foremanStageFree || 'C32:PREPARATION',
+    stageBusy: config.foremanStageBusy || 'C32:PREPAYMENT_INVOIC',
+    stageExpiring: config.foremanStageCertExpiring || 'C32:EXECUTING',
+    fieldWorkType: config.foremanFieldWorkType || 'UF_CRM_1784269813234',
+    fieldPhone: config.foremanFieldPhone || 'UF_CRM_1784212767689',
+    fieldCertExpires: config.foremanFieldCertExpires || 'CLOSEDATE',
+    fieldProductionSpecialist: config.foremanProductionSpecialistField || 'UF_CRM_1784528226',
+  };
+}
+
+function fgForemanCertDate(foreman, cfg) {
+  return fgDate(foreman && (foreman[cfg.fieldCertExpires] || foreman.CLOSEDATE));
+}
+
+function fgForemanIsExpiring(foreman, cfg) {
+  const left = fgDaysUntil(fgForemanCertDate(foreman, cfg));
+  return left !== null && left <= 62;
+}
+
+function fgNormWorkType(value) {
+  const t = fgNormalize(value);
+  if (/фасад/.test(t)) return 'фасады';
+  if (/общестрой|общестро|смр|строительн/.test(t)) return 'общестрой';
+  if (/электр|электромонтаж/.test(t)) return 'электрика';
+  if (/автоматизац/.test(t)) return 'автоматизация';
+  if (/слабот|связ|сигнализац/.test(t)) return 'слаботочные сети';
+  if (/водоснаб|канализац|\bвк\b/.test(t)) return 'водоснабжение/канализация';
+  if (/отопл|вентиляц|\bов\b/.test(t)) return 'отопление/вентиляция';
+  if (/благоустрой/.test(t)) return 'благоустройство';
+  if (/дорог/.test(t)) return 'дороги';
+  if (/геодез/.test(t)) return 'геодезия';
+  return t;
+}
+
+function fgDealText(deal, comments = '') {
+  const parts = [];
+  for (const [key, value] of Object.entries(deal || {})) {
+    if (key === 'COMMENTS' || key === 'TITLE' || key === 'STAGE_ID' || key.startsWith('UF_CRM_')) {
+      const text = fgText(value);
+      if (text) parts.push(text);
+    }
+  }
+  if (comments) parts.push(comments);
+  return fgNormalize(parts.join(' '));
+}
+
+function fgDetectNeed(text) {
+  const need = /нужен.*(прораб|мастер|специалист|человек|подбор)|требуется.*(прораб|мастер|специалист|человек|подбор)|подобрать.*(прораб|мастер|специалист|человек)|подбор.*(с нашей|мавис|mavis|наш[еёи])|нет.*(прораб|мастер|специалист)|ищем.*(прораб|мастер|специалист)|с нашей стороны|наша помощь|понадобится.*помощ/.test(text);
+  const clientDoes = /самостоятельно|сам[аиы]? ищ|будут искать.*сами|клиент.*сам|силами клиента|без подбор/.test(text);
+  if (clientDoes && !/с нашей стороны|мавис|mavis|наш[еёи]|наша помощь|понадобится.*помощ/.test(text)) return { need: false, reason: 'по свежим данным клиент ищет специалиста самостоятельно / без подбора MAVIS' };
+  if (need) return { need: true, reason: 'по полям/комментариям есть потребность в подборе специалиста с нашей стороны' };
+  return { need: false, reason: 'явной потребности в подборе прораба с нашей стороны нет' };
+}
+
+function fgDetectWorks(text) {
+  const works = [];
+  const add = (x) => { if (!works.includes(x)) works.push(x); };
+  if (/общестрой|общестро|общестроительн|\bсмр\b/.test(text)) add('общестрой');
+  if (/фасад/.test(text)) add('фасады');
+  if (/электр|электромонтаж/.test(text)) add('электрика');
+  if (/автоматизац/.test(text)) add('автоматизация');
+  if (/слабот|связ|сигнализац/.test(text)) add('слаботочные сети');
+  if (/водоснаб|канализац|\bвк\b/.test(text)) add('водоснабжение/канализация');
+  if (/отопл|вентиляц|\bов\b/.test(text)) add('отопление/вентиляция');
+  if (/благоустрой/.test(text)) add('благоустройство');
+  if (/дорог/.test(text)) add('дороги');
+  if (/геодез/.test(text)) add('геодезия');
+  return works;
+}
+
+async function fgLoadForemen(cfg) {
+  const rows = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.foremanCategoryId, CLOSED: 'N' },
+    order: { TITLE: 'ASC' },
+    select: ['ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CLOSEDATE','DATE_MODIFY', cfg.fieldWorkType, cfg.fieldPhone, cfg.fieldCertExpires],
+  }, 1000);
+  const map = new Map(rows.map((d) => [String(d.ID), d]));
+  return { rows, map };
+}
+
+async function fgLoadProductionDeals(cfg) {
+  const select = ['ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CATEGORY_ID','ASSIGNED_BY_ID','COMPANY_ID','CONTACT_ID','COMMENTS','DATE_MODIFY','MOVED_TIME', cfg.fieldProductionSpecialist, config.serviceFieldCode || 'UF_CRM_1765113071'];
+  const active = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.productionCategoryId, CLOSED: 'N' },
+    order: { DATE_MODIFY: 'DESC' },
+    select,
+  }, config.foremanMaxProductionDeals || 300);
+  const since = new Date(Date.now() - (config.foremanLookbackDays || 45) * 86400000).toISOString().slice(0, 19);
+  const closedWon = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.productionCategoryId, CLOSED: 'Y', STAGE_SEMANTIC_ID: 'S', '>=DATE_MODIFY': since },
+    order: { DATE_MODIFY: 'DESC' },
+    select,
+  }, config.foremanMaxProductionDeals || 300);
+  return { active, closedWon };
+}
+
+async function fgLoadDealComments(dealId, limit = 20) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+      select: ['ID','COMMENT','CREATED'],
+    }, limit);
+    return comments.map((c) => fgText(c.COMMENT)).filter(Boolean).join('\n');
+  } catch (_) {
+    return '';
+  }
+}
+
+async function fgTimelineHasMarker(dealId, marker, limit = 50) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+      select: ['ID','COMMENT'],
+    }, limit);
+    return comments.some((c) => String(c.COMMENT || '').includes(marker));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function fgAddCommentOnce(dealId, marker, comment) {
+  if (await fgTimelineHasMarker(dealId, marker)) return false;
+  await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${marker}\n${comment}` } });
+  return true;
+}
+
+async function fgSetDealStageIfNeeded(deal, targetStage) {
+  if (!deal || !targetStage || String(deal.STAGE_ID) === String(targetStage)) return false;
+  await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: { STAGE_ID: targetStage } });
+  deal.STAGE_ID = targetStage;
+  return true;
+}
+
+function fgForemanCandidateText(f, cfg) {
+  const date = fgForemanCertDate(f, cfg);
+  const left = fgDaysUntil(date);
+  return `${f.TITLE || `Прораб ${f.ID}`} — ${fgText(f[cfg.fieldWorkType]) || 'вид работ не указан'}, тел. ${fgText(f[cfg.fieldPhone]) || 'не указан'}, аттестат до ${fgDateRu(date)}${left !== null ? ` (${left} дн.)` : ''}, сделка прораба: https://mavisgroup.bitrix24.by/crm/deal/details/${f.ID}/`;
+}
+
+async function fgExistingSuggestionTask(dealId) {
+  try {
+    const raw = await bitrixRestCall('tasks.task.list', {
+      filter: { UF_CRM_TASK: `D_${dealId}`, '%TITLE': 'ИИгорь' },
+      select: ['ID','TITLE','STATUS','UF_CRM_TASK'],
+    });
+    const tasks = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tasks) ? raw.tasks : []);
+    return tasks.find((t) => !['5','6'].includes(String(t.status || t.STATUS || '')) && /прораб/i.test(t.title || t.TITLE || '')) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fgCreateSuggestionTask(deal, candidateList, works) {
+  if (!config.foremanCreateSuggestionTasks || !config.foremanTasksEnabled) return null;
+  const existing = await fgExistingSuggestionTask(deal.ID);
+  if (existing) return { existing: true, task: existing };
+  const deadline = new Date(); deadline.setDate(deadline.getDate() + 1); deadline.setHours(12, 0, 0, 0);
+  const result = await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: `ИИгорь: предложены прорабы — ${works.join(', ')}`,
+      DESCRIPTION: `По сделке ${deal.TITLE || deal.ID} выявлена потребность в подборе прораба с нашей стороны.\n\n${candidateList}\n\nВыберите подходящего кандидата и зафиксируйте его в поле “Специалист”. После этого ИИгорь сам переведёт прораба в статус “Занят”.`,
+      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+      DEADLINE: deadline.toISOString(),
+      UF_CRM_TASK: [`D_${deal.ID}`],
+    },
+  });
+  return { existing: false, task: result };
+}
+
+async function runForemanAutomationCycle(source = 'manual') {
+  if (foremanAutomationRunning) return { ok: false, skipped: true, message: 'Цикл ИИгоря уже выполняется' };
+  foremanAutomationRunning = true;
+  const cfg = fgForemanCfg();
+  const summary = {
+    ok: true,
+    source,
+    cfg,
+    activeProductionDeals: 0,
+    closedWonDealsChecked: 0,
+    occupiedLinks: 0,
+    movedBusy: 0,
+    busyCommentsAdded: 0,
+    released: 0,
+    movedExpiring: 0,
+    movedFree: 0,
+    suggestionsCreated: 0,
+    suggestionsSkipped: 0,
+    log: [],
+  };
+  try {
+    if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан — серверный автомат ИИгоря не может обращаться к Bitrix.');
+    const { rows: foremen, map: foremanMap } = await fgLoadForemen(cfg);
+    const { active, closedWon } = await fgLoadProductionDeals(cfg);
+    summary.activeProductionDeals = active.length;
+    summary.closedWonDealsChecked = closedWon.length;
+
+    const occupiedByForeman = new Map();
+    for (const deal of active) {
+      const ids = fgExtractDealIds(deal[cfg.fieldProductionSpecialist]);
+      for (const foremanId of ids) {
+        if (!occupiedByForeman.has(foremanId)) occupiedByForeman.set(foremanId, []);
+        occupiedByForeman.get(foremanId).push(deal);
+      }
+    }
+    summary.occupiedLinks = [...occupiedByForeman.values()].reduce((acc, arr) => acc + arr.length, 0);
+
+    // 1) Активные производственные сделки с заполненным полем “Специалист” занимают прораба.
+    for (const [foremanId, deals] of occupiedByForeman.entries()) {
+      const f = foremanMap.get(String(foremanId));
+      if (!f) {
+        summary.log.push(`Прораб ${foremanId} указан в производстве, но не найден в воронке ${cfg.foremanCategoryId}`);
+        continue;
+      }
+      const firstDeal = deals[0];
+      const moved = await fgSetDealStageIfNeeded(f, cfg.stageBusy);
+      if (moved) summary.movedBusy++;
+      const marker = `${FOREMAN_BUSY_MARKER} foreman=${foremanId}`;
+      const links = deals.map((d) => `— ${d.TITLE || 'без названия'}: https://mavisgroup.bitrix24.by/crm/deal/details/${d.ID}/`).join('\n');
+      const added = await fgAddCommentOnce(foremanId, marker,
+        `ИИгорь: прораб занят в производственной сделке.\n\n${links}\n\nПоле производства: ${cfg.fieldProductionSpecialist}.`);
+      if (added) summary.busyCommentsAdded++;
+      summary.log.push(`${foremanId} | ${f.TITLE || '-'} | занят в ${deals.length} производственной сделке(ах)${moved ? ' → перевёл в Занят' : ''}`);
+    }
+
+    // 2) Успешно закрытые производственные сделки освобождают прораба, если он больше нигде активно не занят.
+    for (const deal of closedWon) {
+      const ids = fgExtractDealIds(deal[cfg.fieldProductionSpecialist]);
+      for (const foremanId of ids) {
+        if (occupiedByForeman.has(String(foremanId))) continue;
+        const f = foremanMap.get(String(foremanId));
+        if (!f) continue;
+        if (String(f.STAGE_ID) !== String(cfg.stageBusy)) continue;
+        const target = fgForemanIsExpiring(f, cfg) ? cfg.stageExpiring : cfg.stageFree;
+        await fgSetDealStageIfNeeded(f, target);
+        const marker = `${FOREMAN_FREE_MARKER} foreman=${foremanId} prod=${deal.ID}`;
+        await fgAddCommentOnce(foremanId, marker,
+          `ИИгорь: производственная сделка успешно завершена, прораб больше не найден в активных производственных сделках.\n\nОсвобождён после сделки: ${deal.TITLE || deal.ID}\nСсылка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/\nНовый статус: ${target === cfg.stageExpiring ? 'Аттестация истекает' : 'Свободен'}.`);
+        summary.released++;
+        summary.log.push(`${foremanId} | ${f.TITLE || '-'} | производство ${deal.ID} закрыто успешно → ${target}`);
+      }
+    }
+
+    // 3) Все НЕ занятые актуализируем по дате аттестата.
+    for (const f of foremen) {
+      if (occupiedByForeman.has(String(f.ID))) continue;
+      if (String(f.STAGE_ID) === String(cfg.stageBusy)) continue; // не трогаем ручной “Занят”, если нет подтверждённого закрытия
+      const target = fgForemanIsExpiring(f, cfg) ? cfg.stageExpiring : cfg.stageFree;
+      const moved = await fgSetDealStageIfNeeded(f, target);
+      if (moved && target === cfg.stageExpiring) summary.movedExpiring++;
+      if (moved && target === cfg.stageFree) summary.movedFree++;
+    }
+
+    // 4) По активным производственным сделкам без привязанного специалиста — одна задача с кандидатами.
+    if (config.foremanSuggestionScanEnabled) {
+      const freeCandidates = foremen.filter((f) => String(f.STAGE_ID) === String(cfg.stageFree) && !fgForemanIsExpiring(f, cfg));
+      for (const deal of active) {
+        const alreadyLinked = fgExtractDealIds(deal[cfg.fieldProductionSpecialist]).length > 0;
+        if (alreadyLinked) continue;
+        const comments = await fgLoadDealComments(deal.ID, 15);
+        const text = fgDealText(deal, comments);
+        const need = fgDetectNeed(text);
+        if (!need.need) continue;
+        const works = fgDetectWorks(text);
+        if (!works.length) {
+          summary.suggestionsSkipped++;
+          continue;
+        }
+        const candidates = freeCandidates.filter((f) => {
+          const w = fgNormWorkType(f[cfg.fieldWorkType]);
+          return works.some((rw) => w.includes(rw) || rw.includes(w));
+        }).slice(0, 5);
+        if (!candidates.length) {
+          const marker = `${FOREMAN_SUGGEST_MARKER} no-candidate prod=${deal.ID}`;
+          await fgAddCommentOnce(deal.ID, marker, `ИИгорь: потребность в подборе прораба есть (${need.reason}), но свободных подходящих кандидатов по виду работ ${works.join(', ')} не найдено.`);
+          summary.suggestionsSkipped++;
+          continue;
+        }
+        const candidateList = candidates.map((f, i) => `${i + 1}. ${fgForemanCandidateText(f, cfg)}`).join('\n');
+        const marker = `${FOREMAN_SUGGEST_MARKER} prod=${deal.ID}`;
+        const added = await fgAddCommentOnce(deal.ID, marker, `ИИгорь: обнаружил потребность в подборе прораба с нашей стороны.\nПричина: ${need.reason}.\nВид работ: ${works.join(', ')}.\n\nПодходящие свободные кандидаты:\n${candidateList}`);
+        const taskRes = await fgCreateSuggestionTask(deal, candidateList, works);
+        if (added && taskRes && !taskRes.existing) summary.suggestionsCreated++;
+        else summary.suggestionsSkipped++;
+      }
+    }
+
+    return summary;
+  } catch (err) {
+    summary.ok = false;
+    summary.error = err.message || String(err);
+    console.error('[foreman-auto] ошибка:', summary.error);
+    return summary;
+  } finally {
+    foremanAutomationRunning = false;
+  }
+}
+
+app.post('/api/foreman/auto-sync', async (_req, res) => {
+  const result = await runForemanAutomationCycle('manual-api');
+  res.status(result.ok ? 200 : 500).json(result);
+});
+
+app.get('/api/foreman/auto-sync', async (_req, res) => {
+  const result = await runForemanAutomationCycle('manual-api');
+  res.status(result.ok ? 200 : 500).json(result);
+});
+
 // Запуск polling после старта сервера.
 
 // ✅ ЭНДПОИНТ: Получить все поля сделки
@@ -4313,6 +4712,17 @@ app.listen(PORT, () => {
     }, 2 * 60 * 1000);
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
+  }
+
+  if (config.foremanAutomationEnabled && config.bitrixWebhookUrl) {
+    const intervalMs = Math.max(15, config.foremanPollIntervalMinutes || 60) * 60 * 1000;
+    console.log(`[foreman-auto] ИИгорь включён: поле специалиста ${config.foremanProductionSpecialistField}, интервал ${intervalMs / 60000} мин.`);
+    setTimeout(() => {
+      runForemanAutomationCycle('startup').catch((e) => console.error('[foreman-auto] startup:', e.message || e));
+      setInterval(() => runForemanAutomationCycle('interval').catch((e) => console.error('[foreman-auto] interval:', e.message || e)), intervalMs);
+    }, 4 * 60 * 1000);
+  } else {
+    console.log('[foreman-auto] ИИгорь выключен. Для включения задай FOREMAN_AUTOMATION_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
 
   if (process.env.MAIL_IMAP_USER && process.env.MAIL_IMAP_PASSWORD && config.bitrixWebhookUrl) {
