@@ -88,6 +88,11 @@ const config = {
   executorProduct: process.env.EXECUTOR_PRODUCT || 'attestation',
   preferredContactFieldCode: process.env.PREFERRED_CONTACT_FIELD_CODE || '',
   callTranscriptionEnabled: String(process.env.CALL_TRANSCRIPTION_ENABLED || 'false').toLowerCase() === 'true',
+  aiControlFieldCode: process.env.AI_CONTROL_FIELD_CODE || process.env.STOP_AI_FIELD_CODE || 'UF_CRM_1784898776915',
+  serverTasksEnabled: String(process.env.SERVER_TASKS_ENABLED || 'false').toLowerCase() === 'true',
+  stageMonitoringEnabled: String(process.env.STAGE_MONITORING_ENABLED || 'false').toLowerCase() === 'true',
+  requireAssignedExpertCall: String(process.env.REQUIRE_ASSIGNED_EXPERT_CALL || 'true').toLowerCase() !== 'false',
+  strictPreferredChannel: String(process.env.STRICT_PREFERRED_CHANNEL || 'true').toLowerCase() !== 'false',
   transcribeProvider: process.env.TRANSCRIBE_PROVIDER || process.env.AI_PROVIDER || 'vibe',
   transcribeModel: process.env.TRANSCRIBE_MODEL || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2',
   transcribeSendModel: String(process.env.TRANSCRIBE_SEND_MODEL || 'true').toLowerCase() !== 'false',
@@ -112,6 +117,14 @@ const config = {
 // когда никто не открыл Bitrix в браузере (там работа идёт через BX24.callMethod, что недоступно
 // здесь). Используется только живым ботом (вебхук-обработчик), не основным приложением.
 async function bitrixRestCall(method, params = {}) {
+  // v44: ассистент-исполнитель НЕ создаёт задачи автоматически.
+  // Все серверные задачи выключены по умолчанию, чтобы не было дублей каждые 30 минут.
+  // Если когда-то нужно вернуть серверные задачи — явно поставь SERVER_TASKS_ENABLED=true.
+  if (String(method || '').toLowerCase() === 'tasks.task.add' && !config.serverTasksEnabled) {
+    const title = params && params.fields ? params.fields.TITLE : '';
+    console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
+    return { task: { id: null, blocked: true } };
+  }
   if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
   const response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
     method: 'POST',
@@ -324,7 +337,7 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
     executor_attestation_call: [
       'Ты — Игорь, ИИ-ассистент производственного отдела MAVIS GROUP. Пиши сообщение от лица компании, не упоминая себя и своё имя.',
       '',
-      'ПРИОРИТЕТ ИНФОРМАЦИИ: звонок > комментарии менеджера > поля сделки. Имя клиента бери только из звонка — как он представился.',
+      'ПРИОРИТЕТ ИНФОРМАЦИИ: звонок > комментарии менеджера > поля сделки. Не используй имя клиента в приветствии — начинай сообщение нейтрально: «Добрый день!».',
       '',
       'БАЗА ЗНАНИЙ (используй при анализе, не объясняй клиенту):',
       '- СПК: нужны 2 аттестованных специалиста по основному месту работы. Совместитель — дополнительно. Орган: БИСП или Стройкомплекс.',
@@ -337,7 +350,7 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       'ДЕДЛАЙНЫ: сначала смотри в поля сделки и комментарии менеджера. Если дат нет — считай сам от даты звонка (+2 рабочих дня на документы, +3 рабочих дня на оплаты). Выходные (сб, вс) пропускай при расчёте — если дедлайн падает на выходной, сдвигай на понедельник.',
       '',
       'ФОРМАТ client_message (строго):',
-      '1. "[Имя из звонка], добрый день!" — никаких упоминаний себя, компании, мессенджера',
+      '1. "Добрый день!" — без имени клиента и без упоминаний себя, компании, мессенджера',
       '2. 1-2 предложения что уже понятно/есть (специалисты, СИ, что в порядке)',
       '3. Блок "**От вас:**" — нумерованный список конкретных действий с датами. Каждый пункт: "До [дата] — [что сделать]". Выходные учитывай.',
       '4. Блок "**С нашей стороны:**" — нумерованный список что делаем мы пошагово (проверяем специалистов, сверяем СИ, готовим документы, заказываем счета, подаём заявку и т.д.)',
@@ -368,7 +381,7 @@ function aiScenarioConfig(scenarioRaw) {
     },
     workplan: {
       label: 'ИИ-ход работы',
-      instruction: 'Сформируй ход работы по сделке для эксперта. Нужно: действия MAVIS GROUP, действия клиента, что уточнить, дедлайны/контрольные точки, риски сдвига сроков, черновик сообщения клиенту человеческим языком, комментарий в сделку, рекомендуемые задачи. Не обещай клиенту сроки, если они не указаны в данных.'
+      instruction: 'Сформируй ход работы по сделке для эксперта. Нужно: действия MAVIS GROUP, действия клиента, что уточнить, дедлайны/контрольные точки, риски сдвига сроков, черновик сообщения клиенту человеческим языком, комментарий в сделку, рекомендуемые действия. Не обещай клиенту сроки, если они не указаны в данных.'
     },
     documents: {
       label: 'ИИ-проверка документов',
@@ -380,7 +393,7 @@ function aiScenarioConfig(scenarioRaw) {
     },
     executor_attestation_call: {
       label: 'Автопилот АТТ: анализ первичного звонка',
-      instruction: 'Ты ассистент-исполнитель по сделке аттестации организации. На основании сделки, КП/комментариев и расшифровки первичного звонка сформируй рабочий маршрут исполнения. Обязательно: 1) кратко что понял из передачи и звонка; 2) схема специалистов: директор/руководитель, ГИ, прораб/мастер по видам работ, кого переводим/аттестуем/подбираем; 3) какие данные отсутствуют; 4) ход работы для клиента; 5) сообщение клиенту; 6) комментарий Кристине; 7) список ВНУТРЕННИХ дел/задач с ответственными expert|manager|leader и дедлайнами (никогда задач "для клиента"); 8) этап по ЛК Белстройцентра: запрос письма/ссылки, регистрация/заявка, номер заявки или остановка при капче/ошибке; 9) решение по стадии сделки в Bitrix: двигать дальше по воронке или оставить как есть, с понятной причиной.'
+      instruction: 'Ты ассистент-исполнитель по сделке аттестации организации. На основании сделки, КП/комментариев и расшифровки первичного звонка сформируй рабочий маршрут исполнения. Обязательно: 1) кратко что понял из передачи и звонка; 2) схема специалистов: директор/руководитель, ГИ, прораб/мастер по видам работ, кого переводим/аттестуем/подбираем; 3) какие данные отсутствуют; 4) ход работы для клиента; 5) сообщение клиенту; 6) комментарий Кристине; 7) список следующих действий ассистента без постановки задач в Bitrix; 8) этап по ЛК Белстройцентра: запрос письма/ссылки, регистрация/заявка, номер заявки или остановка при капче/ошибке; 9) решение по стадии сделки в Bitrix: двигать дальше по воронке или оставить как есть, с понятной причиной.'
     },
     live_chat_classify: {
       label: 'Живой бот: классификатор безопасности входящего сообщения',
@@ -603,6 +616,20 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
 
   const configured = getConfiguredWazzupChannel(channelKey);
   if (!configured || !configured.channelId) throw new Error(`Wazzup-канал ${channelKey || 'по умолчанию'} не задан в Render Environment.`);
+
+  if (dealId) {
+    const deal = await loadFreshDeal(dealId);
+    if (isDealAiDisabled(deal)) throw new Error('Поле ИИ=Нет — отправка клиенту заблокирована.');
+    if (config.strictPreferredChannel) {
+      const preferred = detectPreferredChannel(deal);
+      if (!preferred || preferred === 'email') {
+        throw new Error(`Строгий режим канала: в сделке не выбран Telegram/Viber для Wazzup (выбрано: ${preferred || 'не распознано'}).`);
+      }
+      if (configured.key !== preferred) {
+        throw new Error(`Строгий режим канала: выбран ${preferredChannelLabel(preferred)}, поэтому ${configured.label} не используем.`);
+      }
+    }
+  }
 
   const cleanText = String(text || '').trim();
   if (!cleanText) throw new Error('Текст сообщения пустой.');
@@ -848,6 +875,39 @@ app.post('/api/wazzup/register-webhook', async (req, res) => {
 
 function normalizePhoneDigits(value) {
   return String(value || '').replace(/\D/g, '');
+}
+
+function normalizeControlValue(value) {
+  if (Array.isArray(value)) return value.map(normalizeControlValue).join(' ');
+  if (value && typeof value === 'object') return Object.values(value).map(normalizeControlValue).join(' ');
+  return String(value === undefined || value === null ? '' : value).toLowerCase().trim();
+}
+
+function isNoValue(value) {
+  const v = normalizeControlValue(value);
+  return /^(нет|no|false|0|n|off|выкл|отключено|не трогать)$/i.test(v) || v.includes('ии нет') || v.includes('не трогать');
+}
+
+function isDealAiDisabled(deal) {
+  if (!deal) return false;
+  const codes = [...new Set([config.aiControlFieldCode, 'UF_CRM_1784898776915'].filter(Boolean))];
+  return codes.some((code) => Object.prototype.hasOwnProperty.call(deal, code) && isNoValue(deal[code]));
+}
+
+async function loadFreshDeal(dealOrId) {
+  const id = typeof dealOrId === 'object' ? dealOrId.ID : dealOrId;
+  if (!id) return dealOrId || null;
+  try {
+    const fresh = await bitrixRestCall('crm.deal.get', { id });
+    return typeof dealOrId === 'object' ? { ...dealOrId, ...(fresh || {}) } : fresh;
+  } catch (_) {
+    return dealOrId || null;
+  }
+}
+
+async function isDealAiDisabledAsync(dealOrId) {
+  const deal = await loadFreshDeal(dealOrId);
+  return isDealAiDisabled(deal);
 }
 
 // Находим сделку по номеру телефона контакта. Пилот ограничен одним номером (LIVE_CHAT_TEST_PHONE),
@@ -1526,28 +1586,10 @@ async function processIncomingEmails() {
           // Добавляем комментарий в сделку
           if (savedFileNames.length) {
             for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
               try {
                 const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
@@ -2035,28 +2077,10 @@ async function checkUnassignedDeals() {
 
     const now = new Date();
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const createdAt = new Date(deal.DATE_CREATE || deal.MOVED_TIME);
       const workedHours = workingHoursBetween(createdAt, now);
@@ -2242,26 +2266,69 @@ async function serverResolveCandidateDownloadUrl(candidate) {
   } catch (_) { return ''; }
 }
 
-async function findCallForDeal(dealId) {
+function activityDateValue(act) {
+  const raw = act.END_TIME || act.START_TIME || act.DEADLINE || act.CREATED || act.DATE_CREATE || act.LAST_UPDATED || act.LAST_ACTIVITY_TIME;
+  const d = raw ? new Date(raw) : null;
+  return d && !Number.isNaN(d.getTime()) ? d : null;
+}
+
+function activityActorIds(act) {
+  const ids = [];
+  const push = (v) => { if (v !== undefined && v !== null && String(v).trim()) ids.push(String(v).trim()); };
+  ['RESPONSIBLE_ID', 'AUTHOR_ID', 'CREATED_BY_ID', 'EDITOR_ID', 'LAST_UPDATED_BY', 'ASSOCIATED_ENTITY_ID'].forEach((k) => push(act[k]));
+  const scan = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (/user.*id|responsible|author|created_by/i.test(k)) push(v);
+      if (v && typeof v === 'object') scan(v);
+    }
+  };
+  scan(act.SETTINGS);
+  scan(act.PROVIDER_PARAMS);
+  return [...new Set(ids)];
+}
+
+function activityPassesExpertGate(act, deal, opts = {}) {
+  const assignedId = String(opts.assignedById || (deal && deal.ASSIGNED_BY_ID) || '').trim();
+  const minDateRaw = opts.minDate || (deal && deal.MOVED_TIME) || '';
+  const minDate = minDateRaw ? new Date(minDateRaw) : null;
+  const actDate = activityDateValue(act);
+  if (minDate && actDate && !Number.isNaN(minDate.getTime())) {
+    // Даём 2 минуты люфта на расхождения часовых поясов/API.
+    if (actDate.getTime() < minDate.getTime() - 2 * 60 * 1000) return { ok: false, reason: 'звонок был до передачи/перестановки на стадию эксперта' };
+  }
+  if (config.requireAssignedExpertCall && assignedId) {
+    const actorIds = activityActorIds(act);
+    if (actorIds.length && !actorIds.includes(assignedId)) return { ok: false, reason: `звонок не ответственного эксперта: actors=${actorIds.join(',')}, assigned=${assignedId}` };
+  }
+  return { ok: true, reason: 'ok' };
+}
+
+async function findCallForDeal(dealId, opts = {}) {
+  const deal = opts.deal || null;
   // FILES не возвращается через select: ['*'] в Bitrix REST — нужно запрашивать явно.
-  // VOXIMPLANT_CALL — провайдер телефонии используемый у клиента (выяснено из debug endpoint).
   const acts = await bitrixRestList('crm.activity.list', {
     filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
     order: { ID: 'DESC' },
     select: ['*', 'FILES'],
-  }, 30);
+  }, 80);
 
-  // Берём только активности звонков с аудио.
   const callActs = acts.filter((a) => {
     const typeId = String(a.TYPE_ID || '');
     const provider = String(a.PROVIDER_ID || '').toLowerCase();
+    const text = String([a.SUBJECT, a.DESCRIPTION, a.PROVIDER_TYPE_ID].join(' ')).toLowerCase();
     return typeId === '2' || provider.includes('call') || provider.includes('voximplant') ||
-           provider.includes('asterisk') || provider.includes('zruchna') || provider.includes('telephony');
+           provider.includes('asterisk') || provider.includes('zruchna') || provider.includes('telephony') ||
+           /звон|call|телеф/.test(text);
   });
 
   for (const act of callActs) {
+    const gate = activityPassesExpertGate(act, deal, opts);
+    if (!gate.ok) {
+      console.log(`[findCall deal=${dealId} act=${act.ID}] skip: ${gate.reason}`);
+      continue;
+    }
     const logAct = `[findCall deal=${dealId} act=${act.ID}]`;
-    // Способ 1: поле FILES (явно запрошено).
     const files = Array.isArray(act.FILES) ? act.FILES : [];
     console.log(`${logAct} FILES count=${files.length}`);
     for (const f of files) {
@@ -2271,13 +2338,12 @@ async function findCallForDeal(dealId) {
         const file = await bitrixRestCall('disk.file.get', { id: fileId });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl || file.VIEW_URL);
         console.log(`${logAct} disk.file.get id=${fileId} → url=${url ? 'OK' : 'пусто'}`);
-        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3` };
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act };
       } catch (e) { console.log(`${logAct} disk.file.get id=${fileId} → ошибка: ${e.message}`); }
       const directUrl = f && (f.DOWNLOAD_URL || f.downloadUrl || f.VIEW_URL || f.url);
-      if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3` };
+      if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3`, activity: act };
     }
 
-    // Способ 2: URL из urlsFound — crm_show_file.php?fileId=N встречается в полях активности.
     const raw = JSON.stringify(act);
     const fileIdMatch = raw.match(/crm_show_file\.php\?fileId=(\d+)/);
     console.log(`${logAct} crm_show_file fileId=${fileIdMatch ? fileIdMatch[1] : 'не найден'}`);
@@ -2286,16 +2352,15 @@ async function findCallForDeal(dealId) {
         const file = await bitrixRestCall('disk.file.get', { id: fileIdMatch[1] });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl);
         console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → url=${url ? 'OK' : 'пусто'}`);
-        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3` };
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act };
       } catch (e) { console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → ошибка: ${e.message}`); }
     }
 
-    // Способ 3: рекурсивный поиск (запасной).
     const candidates = serverCollectActivityAudioCandidates(act);
     console.log(`${logAct} candidates=${candidates.length}`);
     for (const c of candidates) {
       const url = await serverResolveCandidateDownloadUrl(c);
-      if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3` };
+      if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3`, activity: act };
     }
   }
 
@@ -2433,6 +2498,13 @@ function getDocumentListForService(serviceText) {
 }
 
 // ✅ НОВАЯ ФУНКЦИЯ: Очистка Markdown для мессенджеров
+function stripClientGreeting(text) {
+  return String(text || '')
+    .replace(/^\s*(?:[А-ЯЁA-Z][а-яёa-z]+|Клиент|Анна|Надежда|Нина|Ольга|Мария|Елена|Кристина)\s*,?\s*(?:добрый день|здравствуйте)[!.,—-]*\s*/i, 'Добрый день! ')
+    .replace(/^\s*(добрый день|здравствуйте)[!.,—-]*/i, 'Добрый день!')
+    .trim();
+}
+
 function cleanMarkdownForMessenger(text) {
   return String(text || '')
     .replace(/\*\*(.+?)\*\*/g, '$1')      // **жирный** → жирный
@@ -2665,15 +2737,30 @@ function getShortServiceName(serviceRaw) {
 }
 
 function detectPreferredChannel(deal) {
-  // Поле канала связи может быть разным в зависимости от настроек Bitrix.
-  // Проверяем оба известных кода — старый и новый (изменился в июне 2026).
-  const field1 = process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140';
-  const field2 = 'UF_CRM_1781189436900'; // старый код
-  const val = String(deal[field1] || deal[field2] || '').toLowerCase().trim();
-  if (val.includes('телеграм') || val.includes('telegram') || val.includes('tg')) return 'telegram';
-  if (val.includes('вайбер') || val.includes('viber')) return 'viber';
-  if (val.includes('email') || val.includes('почта') || val.includes('mail') || val.includes('e-mail')) return 'email';
-  return 'telegram'; // дефолт
+  // v44: строгая ориентация на поле "Предпочитаемый способ связи".
+  // Если поле пустое или там не Telegram/Viber/Email — клиенту НЕ отправляем ничего.
+  const candidates = [];
+  const configured = config.preferredContactFieldCode || process.env.PREFERRED_CONTACT_FIELD_CODE || '';
+  if (configured) candidates.push(configured);
+  candidates.push('UF_CRM_1781189436900', 'UF_CRM_1781874759140');
+
+  let raw = '';
+  for (const code of [...new Set(candidates.filter(Boolean))]) {
+    if (deal && Object.prototype.hasOwnProperty.call(deal, code) && deal[code] !== undefined && deal[code] !== null && String(deal[code]).trim() !== '') {
+      raw = deal[code];
+      break;
+    }
+  }
+
+  const val = normalizeControlValue(raw);
+  if (/\b(телеграм|telegram|tg)\b/i.test(val)) return 'telegram';
+  if (/\b(вайбер|viber)\b/i.test(val)) return 'viber';
+  if (/\b(email|e-mail|почта|mail)\b/i.test(val)) return 'email';
+  return null;
+}
+
+function preferredChannelLabel(channel) {
+  return { telegram: 'Telegram', viber: 'Viber', email: 'Email' }[channel] || 'не определён';
 }
 
 async function getContactPhone(deal) {
@@ -2875,6 +2962,13 @@ async function runServerAutopilotForDeal(deal, stageId) {
   console.log(`${logPrefix} Запускаю автопилот для "${deal.TITLE}"`);
 
   try {
+    deal = await loadFreshDeal(deal);
+    if (isDealAiDisabled(deal)) {
+      console.log(`${logPrefix} Поле ИИ=Нет — ничего не делаю: без сообщений, комментариев, задач и движения стадии.`);
+      autopilotProcessed.add(String(dealId));
+      return;
+    }
+
     // 1. Проверяем тип услуги — консультации не обрабатываем.
     // Стадии "Возврат" и "Работа с возвратом" — Игорь категорически не работает.
     if (deal.STAGE_ID === STAGE_IDS.return || deal.STAGE_ID === STAGE_IDS.refund) {
@@ -2891,7 +2985,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     // 2. Ищем запись звонка.
-    const callRecord = await findCallForDeal(dealId);
+    const callRecord = await findCallForDeal(dealId, { deal, assignedById: deal.ASSIGNED_BY_ID, minDate: deal.MOVED_TIME });
     if (!callRecord) {
       console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
       return;
@@ -2991,7 +3085,7 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
 
     const clientMessage = String(aiResult.client_message || '').trim();
     // ✅ ИСПРАВЛЕНО: Очищаем Markdown перед отправкой
-    const clientMessageCleaned = cleanMarkdownForMessenger(clientMessage);
+    const clientMessageCleaned = cleanMarkdownForMessenger(stripClientGreeting(clientMessage));
     const EMAIL_REMINDER = '\n\nВсе документы отправляйте нам на почту: mavis.group@mail.ru';
     const clientMessageWithEmail = clientMessageCleaned ? clientMessageCleaned + EMAIL_REMINDER : '';
     const documentMessage = ''; // объединено в client_message
@@ -3005,51 +3099,38 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
       const preferredChannel = detectPreferredChannel(deal);
-      // ✅ ИСПРАВЛЕНО: Проверяем что каналы реально настроены перед использованием
-      const wazzupChannelsToTry = [];
-      if (preferredChannel !== 'email' && getConfiguredWazzupChannel(preferredChannel)) {
-        wazzupChannelsToTry.push(preferredChannel);
-      }
-      if (preferredChannel !== 'viber' && getConfiguredWazzupChannel('viber')) {
-        wazzupChannelsToTry.push('viber');
-      }
-      if (preferredChannel !== 'telegram' && getConfiguredWazzupChannel('telegram')) {
-        wazzupChannelsToTry.push('telegram');
-      }
-      // Если ничего не настроено, используем первый доступный
-      if (wazzupChannelsToTry.length === 0) {
-        for (const key of ['telegram', 'viber', 'default']) {
-          if (getConfiguredWazzupChannel(key)) {
-            wazzupChannelsToTry.push(key);
-          }
-        }
-      }
-      if (phone) {
-        for (const channelKey of wazzupChannelsToTry) {
-          const ch = getConfiguredWazzupChannel(channelKey);
-          if (!ch || !ch.channelId) continue;
+      if (!preferredChannel) {
+        console.warn(`${logPrefix} Сообщение подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано.`);
+      } else if (preferredChannel === 'email') {
+        if (email) {
           try {
-            await sendWazzupMessageInternal({ channelKey, text: clientMessageWithEmail, phone, dealId });
-            console.log(`${logPrefix} Сообщение отправлено через ${channelKey}.`);
+            await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessageWithEmail);
+            console.log(`${logPrefix} Сообщение отправлено через Email: ${email}.`);
             sent = true;
-            sentChannel = channelKey;
-            break;
+            sentChannel = 'email';
+          } catch (emailErr) {
+            console.error(`${logPrefix} Email не сработал: ${emailErr.message}`);
+          }
+        } else {
+          console.warn(`${logPrefix} Email выбран как предпочитаемый канал, но email клиента не найден.`);
+        }
+      } else if (phone) {
+        const ch = getConfiguredWazzupChannel(preferredChannel);
+        if (!ch || !ch.channelId) {
+          console.warn(`${logPrefix} Канал ${preferredChannel} выбран в сделке, но не настроен в Render.`);
+        } else {
+          try {
+            await sendWazzupMessageInternal({ channelKey: preferredChannel, text: clientMessageWithEmail, phone, dealId });
+            console.log(`${logPrefix} Сообщение отправлено через ${preferredChannel}.`);
+            sent = true;
+            sentChannel = preferredChannel;
           } catch (sendErr) {
-            console.warn(`${logPrefix} ${channelKey} не сработал: ${sendErr.message} — пробуем следующий.`);
+            console.warn(`${logPrefix} ${preferredChannel} не сработал: ${sendErr.message}. Запасные каналы не используем.`);
           }
         }
+      } else {
+        console.warn(`${logPrefix} ${preferredChannel} выбран, но телефон клиента не найден.`);
       }
-      if (!sent && email) {
-        try {
-          await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, email, deal.TITLE, clientMessageWithEmail);
-          console.log(`${logPrefix} Сообщение отправлено через Email: ${email}.`);
-          sent = true;
-          sentChannel = 'email';
-        } catch (emailErr) {
-          console.error(`${logPrefix} Email не сработал: ${emailErr.message}`);
-        }
-      }
-      if (!sent) console.warn(`${logPrefix} Не удалось отправить сообщение ни через один канал.`);
 
       // ✅ ИСПРАВЛЕНО: Дублируем сообщение для КАЖДОЙ сопутствующей сделки
       if (sent && clientMessageWithEmail && phone && siblings.length > 0) {
@@ -3313,24 +3394,18 @@ async function runAttStage4(deal, siblings = []) {
 
   if (phone) {
     const preferredChannel = detectPreferredChannel(deal);
-    const channels = [];
-    if (preferredChannel !== 'email') {
-      channels.push(preferredChannel);
-      if (preferredChannel !== 'viber') channels.push('viber');
-      if (preferredChannel !== 'telegram') channels.push('telegram');
-    }
     let sent = false;
-    for (const ch of channels) {
-      const chCfg = getConfiguredWazzupChannel(ch);
-      if (!chCfg || !chCfg.channelId) continue;
-      try {
-        await sendWazzupMessageInternal({ channelKey: ch, text: lkQuestion, phone, dealId });
-        sent = true;
-        console.log(`${logPrefix} Вопрос про ЛК отправлен клиенту через ${ch}.`);
-        break;
-      } catch (_) {}
+    if (preferredChannel && preferredChannel !== 'email') {
+      const chCfg = getConfiguredWazzupChannel(preferredChannel);
+      if (chCfg && chCfg.channelId) {
+        try {
+          await sendWazzupMessageInternal({ channelKey: preferredChannel, text: lkQuestion, phone, dealId });
+          sent = true;
+          console.log(`${logPrefix} Вопрос про ЛК отправлен клиенту через ${preferredChannel}.`);
+        } catch (e) { console.warn(`${logPrefix} Не удалось отправить вопрос про ЛК через ${preferredChannel}: ${e.message}`); }
+      }
     }
-    if (!sent) console.warn(`${logPrefix} Не удалось отправить вопрос про ЛК клиенту.`);
+    if (!sent) console.warn(`${logPrefix} Вопрос про ЛК подготовлен, но не отправлен: канал связи не распознан/не настроен.`);
   }
 
   // Получаем имя эксперта для задачи.
@@ -3740,28 +3815,10 @@ async function checkExpertFirstCallReminder() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
       if (workingHoursBetween(movedAt, now) < 4) continue;
@@ -3816,28 +3873,10 @@ async function checkCollectionStageStuck() {
     }, 100);
     const now = new Date();
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9; // ~9 рабочих часов в дне
@@ -3887,28 +3926,10 @@ async function checkDocsReadyStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID', process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140', 'UF_CRM_1781189436900'],
     }, 50);
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const marker = '[MAVIS_DOCS_READY_MSG]';
       const already = await isStageEventProcessed(deal.ID, 'docs_ready', marker);
@@ -3948,28 +3969,10 @@ async function checkWonStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const phone = await getContactPhone(deal);
       if (!phone) continue;
@@ -4055,28 +4058,10 @@ async function checkRefundStage() {
       select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'MOVED_TIME'],
     }, 20);
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const marker = '[MAVIS_REFUND_NOTIFIED]';
       const already = await isStageEventProcessed(deal.ID, 'refund', marker);
@@ -4084,7 +4069,7 @@ async function checkRefundStage() {
       // Пытаемся найти последний звонок и выжать проблему через ИИ.
       let problemSummary = 'причина не определена — проверь последние звонки вручную';
       try {
-        const callRecord = await findCallForDeal(deal.ID);
+        const callRecord = await findCallForDeal(deal.ID, { deal, assignedById: deal.ASSIGNED_BY_ID, minDate: deal.MOVED_TIME });
         if (callRecord) {
           const transcript = await transcribeAudioUrl(callRecord.url, callRecord.fileName);
           if (transcript && transcript.length > 50) {
@@ -4122,28 +4107,10 @@ async function checkSelectionStage() {
     }, 50);
     const now = new Date();
     for (const deal of deals) {
-  // ✅ ПРОВЕРКА ПОЛЯ ИИ - не трогаем сделку если там "нет"
-  if (deal.UF_CRM_1784898776915 === 'нет') {
-    console.log(`[AI] Сделка ${deal.ID} помечена "ИИ не трогать" - пропускаю`);
-    
-    // Создаём задачу уведомление
-    try {
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: '🚫 Увидел что в эту сделку я больше не лезу',
-          DESCRIPTION: 'Если нужна моя помощь - отключи ограничение в поле "ИИ"',
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          UF_CRM_TASK: [`D_${deal.ID}`],
-          PRIORITY: 1,
-        },
-      });
-      console.log(`[AI] Задача создана для сделки ${deal.ID}`);
-    } catch (taskErr) {
-      console.warn(`[AI] Не смог создать задачу: ${taskErr.message}`);
-    }
-    
-    continue; // Пропускаем сделку полностью
-  }
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
 
       const movedAt = new Date(deal.MOVED_TIME);
       const workDays = workingHoursBetween(movedAt, now) / 9;
@@ -4260,6 +4227,7 @@ async function runAutopilotPollingCycle() {
           process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
           process.env.PREFERRED_CONTACT_FIELD_CODE || 'UF_CRM_1781874759140',
           'UF_CRM_1781189436900', // старый код поля канала
+          config.aiControlFieldCode, 'UF_CRM_1784898776915',
         ],
       }, 50);
       for (const d of deals) {
@@ -4288,8 +4256,9 @@ async function runAutopilotPollingCycle() {
       await checkPendingDocsReminders();
     }
 
-    // Мониторинг всех стадий воронки (пункты 1, 3, 7, 8, 9).
-    await runStageMonitoring();
+    // v44: мониторинг стадий с автонапоминаниями/задачами выключен по умолчанию.
+    // Иначе ассистент начинает писать/ставить задачи по факту движения стадии без звонка эксперта.
+    if (config.stageMonitoringEnabled) await runStageMonitoring();
 
     // Проверяем нераспределённые сделки — уведомляем Таню если висят 4+ рабочих часа.
     await checkUnassignedDeals();

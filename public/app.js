@@ -2195,7 +2195,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v43h: ассистент-исполнитель без задач + исправленная отправка Wazzup включены для этой сделки.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button> <button class="secondary" data-check-wazzup-webhook="1">Проверить текущий вебхук в Wazzup</button><div id="wazzup-webhook-status"></div></div>`;
+    return html + `<div class="executor-banner"><strong>v44: безопасный исполнитель — только после звонка ответственного эксперта, без задач, строгий канал связи, стоп-поле ИИ=Нет.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button> <button class="secondary" data-check-wazzup-webhook="1">Проверить текущий вебхук в Wazzup</button><div id="wazzup-webhook-status"></div></div>`;
   }
   return html;
 }
@@ -5140,6 +5140,10 @@ async function createWorkPlanTasks() {
 }
 
 async function createTask({ title, responsibleId, description, dealId, deadline = null, auditorIds = [], accompliceIds = [], silent = false }) {
+  if (state && state.executorAutopilotRunning) {
+    console.log('[tasks] executor mode: task creation blocked', title);
+    return false;
+  }
   const fields = {
     TITLE: title,
     RESPONSIBLE_ID: Number(responsibleId),
@@ -5155,6 +5159,66 @@ async function createTask({ title, responsibleId, description, dealId, deadline 
   if (!silent) alert('Задача создана.');
 }
 
+
+function controlValueText(value) {
+  if (Array.isArray(value)) return value.map(controlValueText).join(' ');
+  if (value && typeof value === 'object') return Object.values(value).map(controlValueText).join(' ');
+  return String(value === undefined || value === null ? '' : value).toLowerCase().trim();
+}
+
+function isNoControlValue(value) {
+  const v = controlValueText(value);
+  return /^(нет|no|false|0|n|off|выкл|отключено|не трогать)$/i.test(v) || v.includes('ии нет') || v.includes('не трогать');
+}
+
+function isAiDisabledForDeal(deal) {
+  const codes = [APP_CONFIG.aiControlFieldCode || 'UF_CRM_1784898776915', 'UF_CRM_1784898776915'];
+  return [...new Set(codes)].some((code) => deal && Object.prototype.hasOwnProperty.call(deal, code) && isNoControlValue(deal[code]));
+}
+
+function stripClientGreeting(text) {
+  return String(text || '')
+    .replace(/^\s*(?:[А-ЯЁA-Z][а-яёa-z]+|Клиент|Анна|Надежда|Нина|Ольга|Мария|Елена|Кристина)\s*,?\s*(?:добрый день|здравствуйте)[!.,—-]*\s*/i, 'Добрый день! ')
+    .replace(/^\s*(добрый день|здравствуйте)[!.,—-]*/i, 'Добрый день!')
+    .trim();
+}
+
+function activityDateValueFront(act) {
+  const raw = act && (act.END_TIME || act.START_TIME || act.DEADLINE || act.CREATED || act.DATE_CREATE || act.LAST_UPDATED || act.LAST_ACTIVITY_TIME);
+  const d = raw ? new Date(raw) : null;
+  return d && !Number.isNaN(d.getTime()) ? d : null;
+}
+
+function activityActorIdsFront(act) {
+  const ids = [];
+  const push = (v) => { if (v !== undefined && v !== null && String(v).trim()) ids.push(String(v).trim()); };
+  ['RESPONSIBLE_ID', 'AUTHOR_ID', 'CREATED_BY_ID', 'EDITOR_ID', 'LAST_UPDATED_BY', 'ASSOCIATED_ENTITY_ID'].forEach((k) => push(act && act[k]));
+  const scan = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    Object.entries(obj).forEach(([k, v]) => {
+      if (/user.*id|responsible|author|created_by/i.test(k)) push(v);
+      if (v && typeof v === 'object') scan(v);
+    });
+  };
+  scan(act && act.SETTINGS);
+  scan(act && act.PROVIDER_PARAMS);
+  return [...new Set(ids)];
+}
+
+function activityPassesExpertGateFront(act, deal) {
+  const assignedId = String((deal && deal.ASSIGNED_BY_ID) || '').trim();
+  const minDateRaw = (deal && deal.MOVED_TIME) || '';
+  const minDate = minDateRaw ? new Date(minDateRaw) : null;
+  const actDate = activityDateValueFront(act);
+  if (minDate && actDate && !Number.isNaN(minDate.getTime()) && actDate.getTime() < minDate.getTime() - 2 * 60 * 1000) {
+    return { ok: false, reason: 'звонок был до передачи/перестановки на стадию эксперта' };
+  }
+  if (assignedId) {
+    const actors = activityActorIdsFront(act);
+    if (actors.length && !actors.includes(assignedId)) return { ok: false, reason: `звонок не ответственного эксперта: ${actors.join(',')}` };
+  }
+  return { ok: true, reason: 'ok' };
+}
 
 function isExecutorTestDeal(deal) {
   if (!APP_CONFIG.executorMode) return false;
@@ -5201,7 +5265,7 @@ function collectActivityAudioCandidates(activity) {
   const out = [];
   const push = (candidate) => {
     if (!candidate) return;
-    const c = { ...candidate, activityId: activity.ID, subject: activity.SUBJECT || '', provider: activity.PROVIDER_ID || '' };
+    const c = { ...candidate, activityId: activity.ID, subject: activity.SUBJECT || '', provider: activity.PROVIDER_ID || '', activityDate: activity.END_TIME || activity.START_TIME || activity.DATE_CREATE || activity.CREATED || '', activityResponsibleId: activity.RESPONSIBLE_ID || '', activityAuthorId: activity.AUTHOR_ID || activity.CREATED_BY_ID || '', activity };
     const key = c.url || c.fileId || c.value;
     if (!key) return;
     out.push(c);
@@ -5250,21 +5314,29 @@ async function resolveCandidateDownloadUrl(candidate) {
   }
 }
 
-async function findCallRecordingsForDeal(dealId) {
+async function findCallRecordingsForDeal(dealOrId) {
+  const deal = typeof dealOrId === 'object' ? dealOrId : (state.selectedDeal || null);
+  const dealId = typeof dealOrId === 'object' ? dealOrId.ID : dealOrId;
   // FILES не возвращается через select: ['*'] — нужно запрашивать явно.
   const acts = await bxList('crm.activity.list', {
     filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
     order: { ID: 'DESC' },
     select: ['*', 'FILES']
   }, 80);
-  const callActs = acts.filter((a) => {
+  const callActsRaw = acts.filter((a) => {
     const text = normalize([a.SUBJECT, a.DESCRIPTION, a.PROVIDER_ID, a.TYPE_ID, a.PROVIDER_TYPE_ID].join(' '));
     return /звон|call|voximplant|telephony|телеф/.test(text) || String(a.TYPE_ID || '') === '2';
+  });
+  const skipped = [];
+  const callActs = callActsRaw.filter((a) => {
+    const gate = activityPassesExpertGateFront(a, deal);
+    if (!gate.ok) skipped.push({ ID: a.ID, SUBJECT: a.SUBJECT, reason: gate.reason });
+    return gate.ok;
   });
   const candidates = [];
   callActs.forEach((a) => candidates.push(...collectActivityAudioCandidates(a)));
   for (const c of candidates) c.downloadUrl = await resolveCandidateDownloadUrl(c);
-  return { activities: callActs, candidates: candidates.filter((c) => c.downloadUrl || c.url), rawCandidates: candidates };
+  return { activities: callActs, skippedActivities: skipped, candidates: candidates.filter((c) => c.downloadUrl || c.url), rawCandidates: candidates };
 }
 
 async function showCallRecordings() {
@@ -5274,7 +5346,7 @@ async function showCallRecordings() {
   out.classList.remove('hidden');
   out.innerHTML = `<div class="result-card"><h3>Ищем записи звонков...</h3><p class="muted">Проверяем дела/активности текущей сделки.</p></div>`;
   try {
-    const found = await findCallRecordingsForDeal(deal.ID);
+    const found = await findCallRecordingsForDeal(deal);
     const rows = found.activities.length ? found.activities.map((a) => `<tr><td>${escapeHtml(a.ID)}</td><td>${escapeHtml(a.SUBJECT || '—')}</td><td>${escapeHtml(a.PROVIDER_ID || '—')}</td><td>${escapeHtml(a.CREATED || a.START_TIME || '—')}</td></tr>`).join('') : '<tr><td colspan="4">Активности звонка не найдены</td></tr>';
     const cand = found.rawCandidates.length ? found.rawCandidates.map((c) => `<li><strong>${escapeHtml(c.type)}</strong> · activity ${escapeHtml(c.activityId || '')} · ${escapeHtml(c.path || '')}<br><span class="muted small-note">${escapeHtml(c.downloadUrl || c.url || c.fileId || c.error || 'URL не получен')}</span></li>`).join('') : '<li>Кандидаты аудиофайлов пока не найдены. После тестового звонка нажми кнопку ещё раз.</li>';
     out.innerHTML = `
@@ -5379,7 +5451,12 @@ async function runExecutorAutopilot() {
     out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот не запущен</h3><p>Режим исполнителя разрешён только для сделки <code>${escapeHtml(APP_CONFIG.executorTestDealId || 'не задано')}</code>. Текущая сделка: <code>${escapeHtml(deal.ID)}</code>.</p></div>`;
     return;
   }
-  out.innerHTML = `<div class="result-card"><h3>Шаг 1 из 6 · Ищу запись звонка...</h3></div>`;
+  if (isAiDisabledForDeal(deal)) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот заблокирован</h3><p>В поле <strong>ИИ</strong> выбрано <strong>Нет</strong>. Ассистент не будет отправлять сообщения, писать комментарии, двигать стадии или создавать задачи по этой сделке.</p></div>`;
+    return;
+  }
+  state.executorAutopilotRunning = true;
+  out.innerHTML = `<div class="result-card"><h3>Шаг 1 из 6 · Ищу запись звонка ответственного эксперта...</h3></div>`;
   try {
     await ensureDealMeta(deal.ID);
 
@@ -5387,7 +5464,7 @@ async function runExecutorAutopilot() {
     // должна быть итоговой оценкой, учитывающей и то, что выяснилось из самого звонка, а не только
     // то, что было зафиксировано продажами заранее — иначе пробелы, закрытые в разговоре с клиентом,
     // ошибочно показываются как открытые.
-    const found = await findCallRecordingsForDeal(deal.ID);
+    const found = await findCallRecordingsForDeal(deal);
     if (!found.candidates.length) throw new Error('Запись звонка пока не найдена в активностях сделки. После звонка обнови сделку и нажми автопилот ещё раз.');
     let transcript = '';
     let selectedCandidate = null;
@@ -5422,9 +5499,7 @@ async function runExecutorAutopilot() {
         salesDealId: audit ? audit.salesDealId : '',
         salesManagerId: audit ? audit.salesManagerId : '',
       };
-      if (criticalCount && handoffInfo.salesManagerId) {
-        try { await createHandoffTaskForDeal(deal.ID, true); } catch (_) {}
-      }
+      // v44: ассистент-исполнитель не ставит задачи менеджеру. Только фиксирует в отчёте, что не хватает.
     } catch (e) {
       handoffInfo = { statusText: `проверка передачи не выполнена: ${e.message || String(e)}`, missingLabels: [], criticalCount: 0 };
     }
@@ -5443,7 +5518,7 @@ async function runExecutorAutopilot() {
       preferredChannel: preferredChannelKey(deal),
       expertObserverId: APP_CONFIG.executorExpertId || String(deal.ASSIGNED_BY_ID || ''),
       knowledge: attestationExecutorKnowledge(),
-      note_to_ai: 'Поле "product" взято из реального поля Услуга в Bitrix. Виды работ определяй из звонка и комментариев сделки как они есть, без предположений о том, какие виды работ "должны" быть.',
+      note_to_ai: 'Поле "product" взято из реального поля Услуга в Bitrix. Виды работ определяй из звонка и комментариев сделки как они есть, без предположений. Сообщение клиенту начинай только с «Добрый день!» без имени клиента. Не предлагай задачи в Bitrix: ассистент-исполнитель сам делает возможные действия и отчитывается о выполнении/ошибках.',
     };
     // document_list — реальный перечень копий для данной услуги (из официальных перечней MAVIS GROUP).
     // Игорь должен использовать ИМЕННО этот список при перечислении документов клиенту.
@@ -5492,7 +5567,7 @@ async function runExecutorAutopilot() {
     out.innerHTML = `<div class="result-card"><h3>Шаг 4 из 6 · Отправляю перечень/ход работы клиенту...</h3></div>`;
     let sentInfo = '';
     const EMAIL_REMINDER = '\n\n**Все документы отправляйте нам на почту: mavis.group@mail.ru**';
-    const msg = ai.result && ai.result.client_message ? String(ai.result.client_message).trim() + EMAIL_REMINDER : '';
+    const msg = ai.result && ai.result.client_message ? stripClientGreeting(String(ai.result.client_message).trim()) + EMAIL_REMINDER : '';
     if (msg) {
       const channel = preferredChannelKey(deal);
       const phone = getPrimaryClientPhone(deal);
@@ -5509,25 +5584,7 @@ async function runExecutorAutopilot() {
           sentInfo += `Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
           if (sendResult._diagnosticNote) sentInfo += ` [Диагностика: ${sendResult._diagnosticNote}]`;
         } catch (sendError) {
-          // Если основной канал не Viber и Wazzup настроен — пробуем Viber как запасной вариант,
-          // не оставляя клиента вообще без сообщения из-за временного сбоя одного канала.
-          // ВАЖНО: если ошибка основного канала была HTTP 500 (possiblyDelivered=true), есть риск,
-          // что сообщение реально доставилось, и Viber-фоллбек создаст дубликат — это уже
-          // случалось на практике. Предупреждаем явно в отчёте, чтобы это не осталось незамеченным.
-          let fallbackSent = false;
-          if (channel !== 'viber' && APP_CONFIG.wazzupViberConfigured) {
-            try {
-              await sendWazzupMessage({ deal, phone, text: msg, channelKey: 'viber' });
-              sentInfo += `Сообщение клиенту отправлено через Viber (запасной канал, ${messengerLabel(channel)} не сработал).`;
-              if (sendError.possiblyDelivered) {
-                sentInfo += ` ⚠️ ${messengerLabel(channel)} вернул ошибку сервера, но сообщение туда могло реально дойти — проверь вручную, не получил ли клиент сообщение дважды.`;
-              }
-              fallbackSent = true;
-            } catch (_) {}
-          }
-          if (!fallbackSent) {
-            sentInfo += `Сообщение клиенту подготовлено, но Wazzup не отправил его: ${sendError.message || String(sendError)}.`;
-          }
+          sentInfo += `Сообщение клиенту подготовлено, но ${messengerLabel(channel)} не отправил его: ${sendError.message || String(sendError)}. Запасные каналы не используем, потому что работаем строго по полю «Предпочитаемый способ связи».`;
         }
       } else {
         sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
@@ -5585,7 +5642,9 @@ async function runExecutorAutopilot() {
     await hydrateDealMeta(deal);
     if (stageMove.moved) await openDeal(String(deal.ID));
   } catch (error) {
-    out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот остановился</h3><p>${escapeHtml(error.message || String(error))}</p></div><div class="result-card card-action"><h3>Что проверить</h3><ul><li>В Render включены <code>EXECUTOR_MODE=true</code>, <code>EXECUTOR_TEST_DEAL_ID=34946</code>, <code>CALL_TRANSCRIPTION_ENABLED=true</code>.</li><li>В сделке уже есть активность звонка с записью.</li><li>Для расшифровки задан <code>TRANSCRIBE_API_KEY</code> или <code>AI_API_KEY</code>, а провайдер поддерживает <code>/audio/transcriptions</code>.</li></ul></div>`;
+    out.innerHTML = `<div class="result-card card-risk"><h3>Автопилот остановился</h3><p>${escapeHtml(error.message || String(error))}</p></div><div class="result-card card-action"><h3>Что проверить</h3><ul><li>В Render включены <code>EXECUTOR_MODE=true</code>, <code>EXECUTOR_TEST_DEAL_ID=34946</code>, <code>CALL_TRANSCRIPTION_ENABLED=true</code>.</li><li>В сделке есть завершённый звонок именно ответственного эксперта после передачи сделки на стадию эксперта.</li><li>Для расшифровки задан <code>TRANSCRIBE_API_KEY</code> или <code>AI_API_KEY</code>, а провайдер поддерживает <code>/audio/transcriptions</code>.</li></ul></div>`;
+  } finally {
+    state.executorAutopilotRunning = false;
   }
 }
 
