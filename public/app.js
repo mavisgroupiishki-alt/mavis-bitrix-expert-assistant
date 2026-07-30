@@ -6041,8 +6041,217 @@ document.getElementById('accept-ai-feedback').addEventListener('click', acceptAI
 document.getElementById('correct-ai-feedback').addEventListener('click', correctAIFeedback);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
+
+
+// v46: ИИгорь — рабочий диспетчер прорабов.
+// Собран по диагностике портала MAVIS: воронка прорабов CATEGORY_ID=32.
+function foremanCfg() {
+  return {
+    categoryId: Number(APP_CONFIG.foremanCategoryId || 32),
+    stageFree: APP_CONFIG.foremanStageFree || 'C32:PREPARATION',
+    stageBusy: APP_CONFIG.foremanStageBusy || 'C32:PREPAYMENT_INVOIC',
+    stageExpiring: APP_CONFIG.foremanStageCertExpiring || 'C32:EXECUTING',
+    fieldWorkType: APP_CONFIG.foremanFieldWorkType || 'UF_CRM_1784269813234',
+    fieldPhone: APP_CONFIG.foremanFieldPhone || 'UF_CRM_1784212767689',
+    fieldCertExpires: APP_CONFIG.foremanFieldCertExpires || 'CLOSEDATE',
+    fieldCertNumber: APP_CONFIG.foremanFieldCertNumber || '',
+    productionCategoryId: Number(APP_CONFIG.productionCategoryId || 28),
+  };
+}
+function normForemanWorkType(v) {
+  const t = normalize(String(v || ''));
+  if (/фасад/.test(t)) return 'фасады';
+  if (/общестрой|общестро|смр|строительн/.test(t)) return 'общестрой';
+  if (/электр|электромонтаж/.test(t)) return 'электрика';
+  if (/автоматизац/.test(t)) return 'автоматизация';
+  if (/слабот|связ|сигнализац/.test(t)) return 'слаботочные сети';
+  if (/водоснаб|канализац|вк/.test(t)) return 'водоснабжение/канализация';
+  if (/отопл|вентиляц|ов/.test(t)) return 'отопление/вентиляция';
+  if (/благоустрой/.test(t)) return 'благоустройство';
+  if (/дорог/.test(t)) return 'дороги';
+  if (/геодез/.test(t)) return 'геодезия';
+  return String(v || '').trim().toLowerCase();
+}
+function dealTextForForeman(deal) {
+  if (!deal) return '';
+  const parts = [];
+  for (const [k, v] of Object.entries(deal || {})) {
+    if (v === null || v === undefined || v === false || typeof v === 'object') continue;
+    const sv = String(v || '').trim();
+    if (!sv) continue;
+    if (k === 'COMMENTS' || k === 'TITLE' || k.startsWith('UF_CRM_') || k === 'STAGE_ID') parts.push(sv);
+  }
+  return normalize(parts.join(' '));
+}
+function detectRequiredForemanWorksFromDeal(deal) {
+  const text = dealTextForForeman(deal);
+  const works = [];
+  const add = (x) => { if (!works.includes(x)) works.push(x); };
+  if (/общестрой|общестро|общестроительн/.test(text)) add('общестрой');
+  if (/фасад/.test(text)) add('фасады');
+  if (/электр|электромонтаж/.test(text)) add('электрика');
+  if (/автоматизац/.test(text)) add('автоматизация');
+  if (/слабот|связ|сигнализац/.test(text)) add('слаботочные сети');
+  if (/водоснаб|канализац|\bвк\b/.test(text)) add('водоснабжение/канализация');
+  if (/отопл|вентиляц|\bов\b/.test(text)) add('отопление/вентиляция');
+  if (/благоустрой/.test(text)) add('благоустройство');
+  if (/дорог/.test(text)) add('дороги');
+  if (/геодез/.test(text)) add('геодезия');
+  return works;
+}
+function detectForemanNeedFromDeal(deal) {
+  const text = dealTextForForeman(deal);
+  const need = /нужен.*(прораб|мастер|специалист|человек|подбор)|требуется.*(прораб|мастер|специалист|человек|подбор)|подобрать.*(прораб|мастер|специалист|человек)|подбор.*(с нашей|мавис|mavis|наш[еёи])|нет.*(прораб|мастер|специалист)|ищем.*(прораб|мастер|специалист)|с нашей стороны/.test(text);
+  const clientDoes = /самостоятельно|сам[аиы]? ищ|клиент.*сам|силами клиента/.test(text);
+  if (clientDoes && !/с нашей стороны|мавис|mavis|наш[еёи]/.test(text)) return { need: false, reason: 'по тексту похоже, что клиент решает подбор самостоятельно' };
+  if (need) return { need: true, reason: 'в полях/комментариях есть триггеры подбора прораба с нашей стороны' };
+  return { need: false, reason: 'явной потребности в подборе прораба не найдено' };
+}
+function foremanCertDate(deal, cfg) {
+  return parseBitrixDate(deal[cfg.fieldCertExpires] || deal.CLOSEDATE);
+}
+function foremanIsCertExpiring(deal, cfg) {
+  const left = daysUntil(foremanCertDate(deal, cfg));
+  return left !== null && left <= 62;
+}
+function foremanIsFreeCandidate(deal, cfg) {
+  if (String(deal.STAGE_ID) !== String(cfg.stageFree)) return false;
+  if (foremanIsCertExpiring(deal, cfg)) return false;
+  return true;
+}
+async function foremanLoadDeals() {
+  const cfg = foremanCfg();
+  const deals = await bxList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.categoryId, CLOSED: 'N' },
+    select: ['*', 'UF_*'],
+    order: { TITLE: 'ASC' },
+  }, 0);
+  return { cfg, deals };
+}
+async function foremanAddComment(dealId, text) {
+  return bxCall('crm.timeline.comment.add', { fields: { ENTITY_ID: Number(dealId), ENTITY_TYPE: 'deal', COMMENT: text } });
+}
+async function foremanSyncStatuses() {
+  const out = document.getElementById('analysis-result');
+  out.classList.remove('hidden');
+  out.innerHTML = '<div class="result-card"><h3>ИИгорь · актуализация воронки прорабов</h3><p>Проверяю даты аттестатов и статусы...</p></div>';
+  try {
+    const { cfg, deals } = await foremanLoadDeals();
+    let movedExp = 0, movedFree = 0, keptBusy = 0, skipped = 0;
+    const log = [];
+    for (const d of deals) {
+      const current = String(d.STAGE_ID || '');
+      const date = foremanCertDate(d, cfg);
+      const left = daysUntil(date);
+      let target = null;
+      let reason = '';
+      if (current === cfg.stageBusy) {
+        keptBusy++;
+        log.push(`${d.ID} | ${d.TITLE} | уже занят — не трогаю`);
+        continue;
+      }
+      if (left !== null && left <= 62) {
+        target = cfg.stageExpiring;
+        reason = `аттестат заканчивается ${formatDiagDate(date)} (${left} дн.)`;
+      } else {
+        target = cfg.stageFree;
+        reason = left === null ? 'дата аттестата не найдена, но прораб не занят — ставлю свободен' : `аттестат актуален (${left} дн.)`;
+      }
+      if (!target || current === target) { skipped++; log.push(`${d.ID} | ${d.TITLE} | без изменения — ${reason}`); continue; }
+      await bxCall('crm.deal.update', { id: Number(d.ID), fields: { STAGE_ID: target } });
+      if (target === cfg.stageExpiring) movedExp++; else if (target === cfg.stageFree) movedFree++;
+      log.push(`${d.ID} | ${d.TITLE} | ${current} → ${target} | ${reason}`);
+    }
+    out.innerHTML = `<div class="result-card card-ok"><h3>ИИгорь · воронка прорабов актуализирована</h3><p><strong>Занятых не трогал:</strong> ${keptBusy}<br><strong>Перенесено в “Аттестат заканчивается”:</strong> ${movedExp}<br><strong>Перенесено в “Свободен”:</strong> ${movedFree}<br><strong>Без изменений:</strong> ${skipped}</p></div><div class="result-card"><h3>Лог</h3><pre class="analysis-pre">${escapeHtml(log.slice(0,200).join('\n'))}</pre></div><div class="result-card card-risk"><h3>Важно</h3><p>Автоматическая занятость по производственным сделкам заработает надёжно после добавления поля связи “Подобранный прораб” / ссылки на сделку прораба в сделке производства. Сейчас ИИгорь не снимает статус “Занят”, чтобы случайно не освободить занятого человека.</p></div>`;
+  } catch (err) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Актуализация не выполнена</h3><p>${escapeHtml(err.message || String(err))}</p></div>`;
+  }
+}
+async function foremanExistingSuggestionTask(dealId) {
+  try {
+    const raw = await bxCall('tasks.task.list', {
+      filter: { UF_CRM_TASK: `D_${dealId}`, '%TITLE': 'ИИгорь' },
+      select: ['ID','TITLE','STATUS','DEADLINE','UF_CRM_TASK']
+    });
+    const tasks = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tasks) ? raw.tasks : []);
+    return tasks.find((t) => !['5','6'].includes(String(t.status || t.STATUS || '')) && /прораб/i.test(t.title || t.TITLE || '')) || null;
+  } catch (_) { return null; }
+}
+function foremanCandidateText(f, cfg) {
+  const work = diagValue(cfg.fieldWorkType, f[cfg.fieldWorkType]);
+  const phone = diagValue(cfg.fieldPhone, f[cfg.fieldPhone]);
+  const date = foremanCertDate(f, cfg);
+  const left = daysUntil(date);
+  return `${f.TITLE || `Прораб ${f.ID}`} — ${work || 'вид работ не указан'}, тел. ${phone || 'не указан'}, аттестат до ${formatDiagDate(date)}${left !== null ? ` (${left} дн.)` : ''}, сделка прораба: /crm/deal/details/${f.ID}/`;
+}
+async function foremanSuggestForCurrentDeal() {
+  const out = document.getElementById('analysis-result');
+  out.classList.remove('hidden');
+  if (!state.selectedDeal) return;
+  const deal = state.selectedDeal;
+  out.innerHTML = '<div class="result-card"><h3>ИИгорь · подбор прораба</h3><p>Анализирую текущую производственную сделку и свободных прорабов...</p></div>';
+  try {
+    const cfg = foremanCfg();
+    if (Number(deal.CATEGORY_ID) !== Number(cfg.productionCategoryId)) {
+      out.innerHTML = `<div class="result-card card-risk"><h3>ИИгорь работает из производственной сделки</h3><p>Текущая воронка: ${escapeHtml(deal.CATEGORY_ID)}. Для подбора открой сделку производства, где нужен прораб.</p></div>`;
+      return;
+    }
+    await hydrateDealMeta(deal);
+    const comments = (state.commentsByDeal.get(String(deal.ID)) || []).map((c) => c.COMMENT || c.comment || '').join('\n');
+    const combined = { ...deal, COMMENTS: `${deal.COMMENTS || ''}\n${comments}` };
+    const need = detectForemanNeedFromDeal(combined);
+    const requiredWorks = detectRequiredForemanWorksFromDeal(combined);
+    if (!need.need) {
+      const text = `ИИгорь · подбор прораба\n\nПо сделке ${deal.TITLE || deal.ID} явная потребность в подборе прораба с нашей стороны не найдена.\nПричина: ${need.reason}.\n\nЗадачу не создаю.`;
+      await foremanAddComment(deal.ID, text);
+      out.innerHTML = `<div class="result-card card-action"><h3>Потребность не подтверждена</h3><p>${escapeHtml(need.reason)}. Комментарий в сделку записан, задачу не создавал.</p></div>`;
+      return;
+    }
+    if (!requiredWorks.length) {
+      const text = `ИИгорь · подбор прораба\n\nПотребность в подборе есть, но вид работ не определён из полей/комментариев.\nНужно уточнить вид работ: общестрой, фасады, электрика, ВК, ОВ, благоустройство и т.д.\n\nЗадачу с кандидатами не создаю, потому что нет критерия подбора.`;
+      await foremanAddComment(deal.ID, text);
+      out.innerHTML = `<div class="result-card card-risk"><h3>Не определён вид работ</h3><p>Потребность есть, но нельзя подобрать прораба без вида работ. Комментарий в сделку записан.</p></div>`;
+      return;
+    }
+    const { deals: foremen } = await foremanLoadDeals();
+    const candidates = foremen.filter((f) => foremanIsFreeCandidate(f, cfg)).filter((f) => {
+      const work = normForemanWorkType(diagValue(cfg.fieldWorkType, f[cfg.fieldWorkType]));
+      return requiredWorks.some((rw) => work.includes(rw) || rw.includes(work));
+    });
+    if (!candidates.length) {
+      const text = `ИИгорь · подбор прораба\n\nПотребность подтверждена: ${need.reason}.\nНужный вид работ: ${requiredWorks.join(', ')}.\nСвободных подходящих прорабов с актуальным аттестатом не найдено.\n\nЗадачу не создаю, требуется ручной поиск/актуализация базы прорабов.`;
+      await foremanAddComment(deal.ID, text);
+      out.innerHTML = `<div class="result-card card-risk"><h3>Свободных кандидатов не найдено</h3><p>Нужные виды работ: ${escapeHtml(requiredWorks.join(', '))}. Комментарий в сделку записан.</p></div>`;
+      return;
+    }
+    const existing = await foremanExistingSuggestionTask(deal.ID);
+    const top = candidates.slice(0, 5);
+    const candidateList = top.map((f, i) => `${i + 1}. ${foremanCandidateText(f, cfg)}`).join('\n');
+    const commentText = `ИИгорь · подбор прораба\n\nПотребность подтверждена: ${need.reason}.\nНужный вид работ: ${requiredWorks.join(', ')}.\n\nПодходящие свободные прорабы:\n${candidateList}\n\n${existing ? 'Задача уже была создана ранее, дубль не создаю.' : 'Создаю одну задачу эксперту с предложением кандидатов.'}`;
+    await foremanAddComment(deal.ID, commentText);
+    if (!existing) {
+      const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(12,0,0,0);
+      await createTask({
+        title: `ИИгорь: предложены прорабы — ${requiredWorks.join(', ')}`,
+        responsibleId: deal.ASSIGNED_BY_ID,
+        description: `По сделке ${deal.TITLE || deal.ID} выявлена потребность в подборе прораба с нашей стороны.\n\n${candidateList}\n\nВыбери подходящего кандидата и зафиксируй его в сделке производства. После привязки ИИгорь переведёт прораба в статус “Занят”.`,
+        dealId: deal.ID,
+        deadline: tomorrow,
+        silent: true,
+      });
+    }
+    out.innerHTML = `<div class="result-card card-ok"><h3>Прорабы подобраны</h3><p>Нужные виды работ: ${escapeHtml(requiredWorks.join(', '))}<br>Найдено кандидатов: ${candidates.length}<br>${existing ? 'Дубль задачи не создан — задача уже есть.' : 'Создана одна задача эксперту.'}</p></div><div class="result-card"><h3>Кандидаты</h3><pre class="analysis-pre">${escapeHtml(candidateList)}</pre></div>`;
+  } catch (err) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Подбор не выполнен</h3><p>${escapeHtml(err.message || String(err))}</p></div>`;
+  }
+}
+
 const foremanDiagnosticsBtn = document.getElementById('foreman-diagnostics');
 if (foremanDiagnosticsBtn) foremanDiagnosticsBtn.addEventListener('click', showForemanDiagnostics);
+const foremanSyncBtn = document.getElementById('foreman-sync');
+if (foremanSyncBtn) foremanSyncBtn.addEventListener('click', foremanSyncStatuses);
+const foremanSuggestBtn = document.getElementById('foreman-suggest');
+if (foremanSuggestBtn) foremanSuggestBtn.addEventListener('click', foremanSuggestForCurrentDeal);
 const pilotChecklistBtn = document.getElementById('show-pilot-checklist');
 if (pilotChecklistBtn) pilotChecklistBtn.addEventListener('click', showPilotChecklist);
 const managerDashboard = document.getElementById('manager-dashboard');
