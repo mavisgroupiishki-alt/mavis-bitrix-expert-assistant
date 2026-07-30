@@ -111,6 +111,17 @@ const config = {
   liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotEnabled: String(process.env.AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotCategoryId: Number(process.env.AUTOPILOT_CATEGORY_ID || 28),
+
+  // v45: ИИгорь — диагностика воронки прорабов.
+  foremanCategoryId: Number(process.env.FOREMAN_CATEGORY_ID || 32),
+  foremanStageFree: process.env.FOREMAN_STAGE_FREE || '',
+  foremanStageBusy: process.env.FOREMAN_STAGE_BUSY || '',
+  foremanStageCertExpiring: process.env.FOREMAN_STAGE_CERT_EXPIRING || '',
+  foremanFieldWorkType: process.env.FOREMAN_FIELD_WORK_TYPE || '',
+  foremanFieldCertExpires: process.env.FOREMAN_FIELD_CERT_EXPIRES || '',
+  foremanFieldPhone: process.env.FOREMAN_FIELD_PHONE || '',
+  foremanFieldCertNumber: process.env.FOREMAN_FIELD_CERT_NUMBER || '',
+  foremanFieldProductionDeal: process.env.FOREMAN_FIELD_PRODUCTION_DEAL || '',
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,

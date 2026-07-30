@@ -2195,7 +2195,7 @@ function detailHtml(deal) {
   ];
   const html = fields.map(([k, v]) => `<div class="detail"><span>${escapeHtml(k)}</span>${escapeHtml(v)}</div>`).join('');
   if (isExecutorTestDeal(deal)) {
-    return html + `<div class="executor-banner"><strong>v44: безопасный исполнитель — только после звонка ответственного эксперта, без задач, строгий канал связи, стоп-поле ИИ=Нет.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button> <button class="secondary" data-check-wazzup-webhook="1">Проверить текущий вебхук в Wazzup</button><div id="wazzup-webhook-status"></div></div>`;
+    return html + `<div class="executor-banner"><strong>v45: безопасный исполнитель + диагностика ИИгоря по воронке прорабов.</strong><br>Продукт: Аттестация организации. Канал связи: ${escapeHtml(messengerLabel(preferredChannelKey(deal)))}. Эксперт-наблюдатель: ${escapeHtml(userName(deal.ASSIGNED_BY_ID))}. После записи звонка нажми “Автопилот АТТ: звонок → ход работы”.<br><br><button class="secondary" data-register-wazzup-webhook="1">Зарегистрировать вебхук живого бота в Wazzup (один раз)</button> <button class="secondary" data-check-wazzup-webhook="1">Проверить текущий вебхук в Wazzup</button><div id="wazzup-webhook-status"></div></div>`;
   }
   return html;
 }
@@ -5112,6 +5112,211 @@ async function showDealFields() {
   out.innerHTML = `<pre class="analysis-pre">${escapeHtml(lines.join('\n'))}</pre>`;
   out.classList.remove('hidden');
 }
+function stageCode(stage) {
+  return stage.STATUS_ID || stage.statusId || stage.ID || stage.id || '';
+}
+function stageTitle(stage) {
+  return stage.NAME || stage.name || stage.TITLE || stage.title || stageCode(stage);
+}
+function stageSort(stage) {
+  return Number(stage.SORT || stage.sort || 0);
+}
+function nonEmptyValue(v) {
+  if (v === null || v === undefined || v === '' || v === false) return false;
+  if (Array.isArray(v)) return v.some(nonEmptyValue);
+  if (typeof v === 'object') return Object.keys(v).length > 0;
+  return true;
+}
+function diagValue(code, raw) {
+  const resolved = resolveFieldValue(code, raw);
+  if (resolved) return resolved;
+  if (raw === null || raw === undefined) return '';
+  if (typeof raw === 'object') {
+    try { return JSON.stringify(raw); } catch (_) { return '[object]'; }
+  }
+  return String(raw);
+}
+function parseBitrixDate(raw) {
+  const v = Array.isArray(raw) ? raw.find(Boolean) : raw;
+  if (!v || typeof v === 'object') return null;
+  const s = String(v).trim();
+  let d = null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) d = new Date(s);
+  else if (/^\d{2}\.\d{2}\.\d{4}/.test(s)) {
+    const [dd, mm, yyyy] = s.split(/[.\s]/);
+    d = new Date(`${yyyy}-${mm}-${dd}T00:00:00`);
+  }
+  if (!d || Number.isNaN(d.getTime())) return null;
+  return d;
+}
+function daysUntil(date) {
+  if (!date) return null;
+  const start = new Date(); start.setHours(0,0,0,0);
+  const d = new Date(date); d.setHours(0,0,0,0);
+  return Math.round((d.getTime() - start.getTime()) / 86400000);
+}
+function rankForemanField(code, values, mode) {
+  const label = normalize(fieldLabel(code));
+  const hay = normalize([code, label, ...values.slice(0, 20)].join(' '));
+  let score = 0;
+  if (mode === 'workType') {
+    if (/вид.*работ|работ.*вид|направлен|специализац|профиль/.test(label)) score += 50;
+    if (/общестрой|общестро|фасад|электр|вентиляц|отоплен|водоснаб|канализац|благоустрой|дорог|геодез|сантех/.test(hay)) score += 25;
+  }
+  if (mode === 'certDate') {
+    if (/аттестат.*(заканч|оконч|срок|действ)|срок.*аттест|дата.*аттест|окончан/.test(label)) score += 60;
+    const dateCount = values.map((v) => parseBitrixDate(v)).filter(Boolean).length;
+    if (dateCount) score += Math.min(25, dateCount * 5);
+  }
+  if (mode === 'phone') {
+    if (/телефон|номер телефона|моб/.test(label)) score += 60;
+    if (values.some((v) => /\+?375\d{9}|\b\d{11,12}\b/.test(String(v)))) score += 25;
+  }
+  if (mode === 'certNumber') {
+    if (/номер.*аттестат|аттестат.*номер|№.*аттест/.test(label)) score += 60;
+    if (/аттестат/.test(label)) score += 15;
+  }
+  if (mode === 'productionDeal') {
+    if (/сделк.*производ|производ.*сделк|привязан|занят.*сделк|компан.*занят/.test(label)) score += 60;
+    if (values.some((v) => /crm\/deal\/details\/\d+|D_\d+|deal\/.+\d+/.test(String(v)))) score += 25;
+  }
+  return score;
+}
+function detectForemanFields(deals) {
+  const ufCodes = new Set();
+  deals.forEach((d) => Object.keys(d || {}).forEach((code) => { if (code.startsWith('UF_CRM_')) ufCodes.add(code); }));
+  const candidates = {};
+  for (const code of ufCodes) {
+    const values = deals.map((d) => diagValue(code, d[code])).filter((v) => String(v || '').trim()).slice(0, 50);
+    if (!values.length) continue;
+    candidates[code] = { code, label: fieldLabel(code), values };
+  }
+  const best = (mode) => Object.values(candidates)
+    .map((c) => ({ ...c, score: rankForemanField(c.code, c.values, mode) }))
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score)[0] || null;
+  return {
+    workType: APP_CONFIG.foremanFieldWorkType ? { code: APP_CONFIG.foremanFieldWorkType, label: fieldLabel(APP_CONFIG.foremanFieldWorkType), forced: true } : best('workType'),
+    certDate: APP_CONFIG.foremanFieldCertExpires ? { code: APP_CONFIG.foremanFieldCertExpires, label: fieldLabel(APP_CONFIG.foremanFieldCertExpires), forced: true } : best('certDate'),
+    phone: APP_CONFIG.foremanFieldPhone ? { code: APP_CONFIG.foremanFieldPhone, label: fieldLabel(APP_CONFIG.foremanFieldPhone), forced: true } : best('phone'),
+    certNumber: APP_CONFIG.foremanFieldCertNumber ? { code: APP_CONFIG.foremanFieldCertNumber, label: fieldLabel(APP_CONFIG.foremanFieldCertNumber), forced: true } : best('certNumber'),
+    productionDeal: APP_CONFIG.foremanFieldProductionDeal ? { code: APP_CONFIG.foremanFieldProductionDeal, label: fieldLabel(APP_CONFIG.foremanFieldProductionDeal), forced: true } : best('productionDeal'),
+    filledUf: Object.values(candidates).sort((a,b) => a.code.localeCompare(b.code)),
+  };
+}
+function bestForemanStage(stages, kind) {
+  const env = kind === 'free' ? APP_CONFIG.foremanStageFree : kind === 'busy' ? APP_CONFIG.foremanStageBusy : APP_CONFIG.foremanStageCertExpiring;
+  if (env) return stages.find((s) => String(stageCode(s)) === String(env)) || { STATUS_ID: env, NAME: env, forced: true };
+  const checks = {
+    free: [/^свободен/i, /свобод/i],
+    busy: [/^занят$/i, /занят/i],
+    expiring: [/аттестат.*заканч|заканч.*аттест|срок.*аттест/i],
+  }[kind] || [];
+  return stages.find((s) => checks.some((re) => re.test(stageTitle(s)))) || null;
+}
+function inferForemanStatus(deal, detected, stages) {
+  const currentStage = stages.find((s) => stageCode(s) === deal.STAGE_ID);
+  const certField = detected.certDate && detected.certDate.code;
+  const date = certField ? parseBitrixDate(deal[certField]) : null;
+  const left = daysUntil(date);
+  const stageNameText = normalize(stageTitle(currentStage || {}));
+  const isBusy = /занят/.test(stageNameText) && !/не/.test(stageNameText);
+  const isFree = /свобод/.test(stageNameText);
+  const isExpiring = left !== null && left <= 62;
+  return { date, daysLeft: left, isBusy, isFree, isExpiring, currentStageName: stageTitle(currentStage || { STATUS_ID: deal.STAGE_ID }) };
+}
+function formatDiagDate(date) {
+  return date ? date.toLocaleDateString('ru-RU') : '—';
+}
+function foremanDealLine(deal, detected, stages) {
+  const st = inferForemanStatus(deal, detected, stages);
+  const work = detected.workType ? diagValue(detected.workType.code, deal[detected.workType.code]) : '';
+  const phone = detected.phone ? diagValue(detected.phone.code, deal[detected.phone.code]) : '';
+  const certNo = detected.certNumber ? diagValue(detected.certNumber.code, deal[detected.certNumber.code]) : '';
+  const flags = [];
+  if (st.isBusy) flags.push('занят');
+  if (st.isFree) flags.push('свободен');
+  if (st.isExpiring) flags.push('аттестат ≤ 2 мес');
+  return `<div class="result-card"><h3>${escapeHtml(deal.TITLE || `Прораб ${deal.ID}`)} · ${escapeHtml(st.currentStageName)}</h3><p><strong>Вид работ:</strong> ${escapeHtml(work || 'не найдено')}<br><strong>Аттестат до:</strong> ${escapeHtml(formatDiagDate(st.date))}${st.daysLeft !== null ? ` (${st.daysLeft} дн.)` : ''}<br><strong>Телефон:</strong> ${escapeHtml(phone || 'не найдено')}<br><strong>Номер аттестата:</strong> ${escapeHtml(certNo || 'не найдено')}<br><strong>Флаги:</strong> ${escapeHtml(flags.join(', ') || '—')}</p></div>`;
+}
+function renderFieldCandidate(title, candidate) {
+  if (!candidate) return `<div class="result-card card-risk"><h3>${escapeHtml(title)}</h3><p>Не определено автоматически</p></div>`;
+  const sample = candidate.values && candidate.values.length ? candidate.values.slice(0, 3).join(' / ') : '';
+  return `<div class="result-card card-ok"><h3>${escapeHtml(title)}</h3><p><code>${escapeHtml(candidate.code)}</code><br>${escapeHtml(candidate.label || 'без подписи')}${candidate.forced ? '<br><strong>задано через Render</strong>' : ''}${sample ? `<br><small>Примеры: ${escapeHtml(sample)}</small>` : ''}</p></div>`;
+}
+async function showForemanDiagnostics() {
+  const out = document.getElementById('analysis-result');
+  out.classList.remove('hidden');
+  out.innerHTML = '<div class="result-card"><h3>ИИгорь · Диагностика воронки прорабов</h3><p>Загружаю стадии, сделки и поля...</p></div>';
+  try {
+    if (!state.fields || !Object.keys(state.fields).length) {
+      try { state.fields = await bxCall('crm.deal.fields', {}); state.enumMaps = buildEnumMaps(state.fields); } catch (_) {}
+    }
+    const categoryId = Number(APP_CONFIG.foremanCategoryId || 32);
+    const stagesRaw = await bxCall('crm.dealcategory.stage.list', { id: categoryId });
+    const stages = (Array.isArray(stagesRaw) ? stagesRaw : []).sort((a, b) => stageSort(a) - stageSort(b));
+    const deals = await bxList('crm.deal.list', {
+      filter: { CATEGORY_ID: categoryId, CLOSED: 'N' },
+      select: ['*', 'UF_*'],
+      order: { TITLE: 'ASC' },
+    }, 0);
+    const detected = detectForemanFields(deals);
+    const stageFree = bestForemanStage(stages, 'free');
+    const stageBusy = bestForemanStage(stages, 'busy');
+    const stageExp = bestForemanStage(stages, 'expiring');
+    const stageCounts = new Map();
+    deals.forEach((d) => stageCounts.set(String(d.STAGE_ID || ''), (stageCounts.get(String(d.STAGE_ID || '')) || 0) + 1));
+    const expiring = deals.filter((d) => inferForemanStatus(d, detected, stages).isExpiring);
+
+    const envLines = [
+      `FOREMAN_CATEGORY_ID=${categoryId}`,
+      `FOREMAN_STAGE_FREE=${stageFree ? stageCode(stageFree) : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_STAGE_BUSY=${stageBusy ? stageCode(stageBusy) : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_STAGE_CERT_EXPIRING=${stageExp ? stageCode(stageExp) : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_FIELD_WORK_TYPE=${detected.workType ? detected.workType.code : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_FIELD_CERT_EXPIRES=${detected.certDate ? detected.certDate.code : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_FIELD_PHONE=${detected.phone ? detected.phone.code : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_FIELD_CERT_NUMBER=${detected.certNumber ? detected.certNumber.code : 'НЕ_НАЙДЕНО'}`,
+      `FOREMAN_FIELD_PRODUCTION_DEAL=${detected.productionDeal ? detected.productionDeal.code : 'НЕ_НАЙДЕНО'}`,
+    ];
+
+    let html = '';
+    html += `<div class="result-card card-action"><h3>ИИгорь · Диагностика воронки прорабов</h3><p><strong>Воронка:</strong> ${categoryId}<br><strong>Активных сделок-прорабов:</strong> ${deals.length}<br><strong>Аттестат заканчивается ≤ 2 мес:</strong> ${expiring.length}</p></div>`;
+    html += '<div class="result-card"><h3>Стадии воронки 32</h3><pre class="analysis-pre">' + escapeHtml(stages.map((s) => `${stageCode(s)} | ${stageTitle(s)} | ${stageCounts.get(String(stageCode(s))) || 0} сделок`).join('\n')) + '</pre></div>';
+    html += '<div class="dashboard-grid">';
+    html += renderFieldCandidate('Стадия “Свободен”', stageFree ? { code: stageCode(stageFree), label: stageTitle(stageFree), forced: stageFree.forced } : null);
+    html += renderFieldCandidate('Стадия “Занят”', stageBusy ? { code: stageCode(stageBusy), label: stageTitle(stageBusy), forced: stageBusy.forced } : null);
+    html += renderFieldCandidate('Стадия “Аттестат заканчивается”', stageExp ? { code: stageCode(stageExp), label: stageTitle(stageExp), forced: stageExp.forced } : null);
+    html += renderFieldCandidate('Поле “Вид работ”', detected.workType);
+    html += renderFieldCandidate('Поле “Аттестат заканчивается”', detected.certDate);
+    html += renderFieldCandidate('Поле “Телефон”', detected.phone);
+    html += renderFieldCandidate('Поле “Номер аттестата”', detected.certNumber);
+    html += renderFieldCandidate('Поле связи с производственной сделкой', detected.productionDeal);
+    html += '</div>';
+
+    html += `<div class="result-card card-action"><h3>Переменные Render для ИИгоря</h3><p>Скопируй только те, где код найден корректно. Где <code>НЕ_НАЙДЕНО</code> — поле нужно уточнить вручную или создать.</p><pre class="analysis-pre">${escapeHtml(envLines.join('\n'))}</pre></div>`;
+
+    const sampleDeals = deals.slice(0, 12);
+    html += `<div class="result-card"><h3>Первые сделки-прорабы для проверки</h3><p>Проверь глазами, правильно ли подтянулись вид работ и дата аттестата.</p></div>`;
+    html += sampleDeals.map((d) => foremanDealLine(d, detected, stages)).join('');
+
+    if (expiring.length) {
+      html += `<div class="result-card card-risk"><h3>Аттестаты заканчиваются в ближайшие 2 месяца</h3><pre class="analysis-pre">${escapeHtml(expiring.slice(0, 30).map((d) => {
+        const st = inferForemanStatus(d, detected, stages);
+        return `${d.ID} | ${d.TITLE} | до ${formatDiagDate(st.date)} | ${st.daysLeft} дн. | стадия: ${st.currentStageName}`;
+      }).join('\n'))}</pre></div>`;
+    }
+
+    html += `<div class="result-card"><h3>Заполненные UF-поля по прорабам</h3><p>Это нужно, если автоматическое определение поля ошиблось.</p><pre class="analysis-pre">${escapeHtml(detected.filledUf.slice(0, 80).map((f) => `${f.code} | ${f.label || 'без подписи'} | примеры: ${f.values.slice(0, 3).join(' / ')}`).join('\n'))}</pre></div>`;
+
+    html += `<div class="result-card card-action"><h3>Что я буду делать после диагностики</h3><p>1) По найденным кодам соберу модуль актуализации прорабов.<br>2) ИИгорь будет переводить занятых/свободных/с истекающим аттестатом.<br>3) В производственных сделках будет анализировать поля, звонки и комментарии, и создавать <strong>одну</strong> задачу эксперту только если реально нужен прораб с нашей стороны.</p></div>`;
+
+    out.innerHTML = html;
+  } catch (err) {
+    out.innerHTML = `<div class="result-card card-risk"><h3>Диагностика прорабов не выполнена</h3><p>${escapeHtml(err.message || String(err))}</p><p>Проверь, есть ли у приложения доступ к CRM и что воронка прорабов действительно CATEGORY_ID=32.</p></div>`;
+  }
+}
+
 
 async function createWorkPlanTasks() {
   if (!state.selectedDeal) return;
@@ -5836,6 +6041,8 @@ document.getElementById('accept-ai-feedback').addEventListener('click', acceptAI
 document.getElementById('correct-ai-feedback').addEventListener('click', correctAIFeedback);
 document.getElementById('mark-checked').addEventListener('click', markChecked);
 document.getElementById('show-fields').addEventListener('click', showDealFields);
+const foremanDiagnosticsBtn = document.getElementById('foreman-diagnostics');
+if (foremanDiagnosticsBtn) foremanDiagnosticsBtn.addEventListener('click', showForemanDiagnostics);
 const pilotChecklistBtn = document.getElementById('show-pilot-checklist');
 if (pilotChecklistBtn) pilotChecklistBtn.addEventListener('click', showPilotChecklist);
 const managerDashboard = document.getElementById('manager-dashboard');
