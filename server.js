@@ -140,6 +140,11 @@ const config = {
   // Если задан FOREMAN_ROBOT_TOKEN, его нужно передавать в body/query робота как token.
   foremanRobotToken: process.env.FOREMAN_ROBOT_TOKEN || '',
   foremanPropagateToCompanyDeals: String(process.env.FOREMAN_PROPAGATE_TO_COMPANY_DEALS || 'true').toLowerCase() !== 'false',
+  // v53: антидубль для бизнес-процессов Bitrix. Когда сервер сам проставляет прораба
+  // в соседние сделки компании, бизнес-процесс на этих сделках тоже может запуститься.
+  // Эти флаги не дают создавать 4–5 одинаковых уведомлений/комментариев.
+  foremanAddPropagationComments: String(process.env.FOREMAN_ADD_PROPAGATION_COMMENTS || 'false').toLowerCase() === 'true',
+  foremanSkipPropagatedWebhookMinutes: Number(process.env.FOREMAN_SKIP_PROPAGATED_WEBHOOK_MINUTES || 20),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -4704,6 +4709,29 @@ async function runForemanAutomationCycle(source = 'manual') {
 const FOREMAN_LINK_MARKER = '[MAVIS_FOREMAN_ROBOT_LINK]';
 const FOREMAN_RELEASE_MARKER = '[MAVIS_FOREMAN_ROBOT_RELEASE]';
 const FOREMAN_PROPAGATE_MARKER = '[MAVIS_FOREMAN_ROBOT_PROPAGATE]';
+// v53: временная память, чтобы webhook, который Bitrix запускает из-за нашего же crm.deal.update
+// по соседней сделке, не создавал новые комментарии и не распространял прораба по кругу.
+const foremanRobotPropagatedSkip = new Map();
+
+function fgPropSkipKey(dealId, foremanId) {
+  return `${dealId}:${foremanId}`;
+}
+
+function fgRememberPropagatedDeal(dealId, foremanId) {
+  const ttlMin = Number(config.foremanSkipPropagatedWebhookMinutes || 20);
+  foremanRobotPropagatedSkip.set(fgPropSkipKey(dealId, foremanId), Date.now() + Math.max(1, ttlMin) * 60000);
+}
+
+function fgIsRecentlyPropagatedDeal(dealId, foremanId) {
+  const key = fgPropSkipKey(dealId, foremanId);
+  const until = foremanRobotPropagatedSkip.get(key);
+  if (!until) return false;
+  if (until < Date.now()) {
+    foremanRobotPropagatedSkip.delete(key);
+    return false;
+  }
+  return true;
+}
 
 function fgReqDealId(req) {
   const src = Object.assign({}, req.query || {}, req.body || {});
@@ -4822,6 +4850,16 @@ async function fgHandleForemanLinked(dealId, source = 'robot') {
       continue;
     }
 
+    // v53: если этот webhook запустился из-за того, что сам ИИгорь проставил прораба
+    // в соседнюю активную сделку компании, не создаём новый комментарий и не запускаем
+    // распространение по кругу.
+    const propagatedMarker = `${FOREMAN_PROPAGATE_MARKER} prod=${deal.ID} foreman=${foremanId}`;
+    const isAutoPropagatedCall = fgIsRecentlyPropagatedDeal(deal.ID, foremanId) || await fgTimelineHasMarker(deal.ID, propagatedMarker, 20);
+    if (isAutoPropagatedCall) {
+      summary.skipped.push(`Сделка ${deal.ID}: webhook пропущен, потому что прораб уже был автопроставлен ИИгорем из другой сделки компании.`);
+      continue;
+    }
+
     const moved = await fgSetDealStageIfNeeded(foreman, cfg.stageBusy);
     const marker = `${FOREMAN_LINK_MARKER} foreman=${foremanId} prod=${deal.ID}`;
     const comment = `ИИгорь: прораб привязан к производственной сделке.\n\nКомпания: ${companyName || deal.COMPANY_ID || 'не указана'}\nСделка производства: ${deal.TITLE || deal.ID}\nУслуга: ${service || 'не указана'}\nОтветственный эксперт: ${expertName || deal.ASSIGNED_BY_ID || 'не указан'}\nСсылка на производство: ${fgDealUrl(deal.ID)}\n\nНовый статус прораба: Занят.`;
@@ -4829,16 +4867,20 @@ async function fgHandleForemanLinked(dealId, source = 'robot') {
     summary.foremen.push({ foremanId: String(foremanId), title: foreman.TITLE, movedBusy: moved, commentAdded: added });
 
     // Проставляем этого же прораба во все активные сделки этой же компании, если там поле пустое.
+    // v53: по умолчанию делаем это тихо, без комментария в каждую сделку, чтобы не спавнить уведомления.
     for (const s of siblingDeals) {
       const existing = fgExtractDealIds(s[cfg.fieldProductionSpecialist]);
       if (existing.length) {
         summary.skipped.push(`Сделка ${s.ID}: поле специалист уже заполнено (${existing.join(',')})`);
         continue;
       }
+      fgRememberPropagatedDeal(s.ID, foremanId);
       await fgUpdateDealSpecialist(s.ID, foremanId, cfg);
-      summary.propagated.push({ dealId: String(s.ID), title: s.TITLE, foremanId: String(foremanId) });
+      summary.propagated.push({ dealId: String(s.ID), title: s.TITLE, foremanId: String(foremanId), silent: !config.foremanAddPropagationComments });
       const siblingMarker = `${FOREMAN_PROPAGATE_MARKER} prod=${s.ID} foreman=${foremanId}`;
-      await fgAddCommentOnce(s.ID, siblingMarker, `ИИгорь: автоматически проставил прораба из другой активной сделки этой компании.\n\nПрораб: ${foreman.TITLE || foremanId}\nИсточник: ${deal.TITLE || deal.ID}\nСсылка на источник: ${fgDealUrl(deal.ID)}`);
+      if (config.foremanAddPropagationComments) {
+        await fgAddCommentOnce(s.ID, siblingMarker, `ИИгорь: автоматически проставил прораба из другой активной сделки этой компании.\n\nПрораб: ${foreman.TITLE || foremanId}\nИсточник: ${deal.TITLE || deal.ID}\nСсылка на источник: ${fgDealUrl(deal.ID)}`);
+      }
     }
   }
 
