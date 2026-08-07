@@ -133,13 +133,10 @@ const config = {
   foremanTasksEnabled: String(process.env.FOREMAN_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
   foremanSuggestionScanEnabled: String(process.env.FOREMAN_SUGGESTION_SCAN_ENABLED || 'true').toLowerCase() !== 'false',
   foremanMaxProductionDeals: Number(process.env.FOREMAN_MAX_PRODUCTION_DEALS || 300),
-
-  // v48: почта/акты — строгая маршрутизация, чистые папки компаний и дублирование актов в папку эксперта.
-  emailCompanyRootFolderId: process.env.EMAIL_COMPANY_ROOT_FOLDER_ID || process.env.COMPANY_DOCS_ROOT_FOLDER_ID || process.env.DISK_COMPANY_ROOT_FOLDER_ID || '',
-  emailExpertActsRootFolderId: process.env.EMAIL_EXPERT_ACTS_ROOT_FOLDER_ID || process.env.EXPERT_ACTS_ROOT_FOLDER_ID || '',
-  emailUnsortedFolderName: process.env.EMAIL_UNSORTED_FOLDER_NAME || 'Неопределённые документы',
-  emailActFolderName: process.env.EMAIL_ACT_FOLDER_NAME || 'Акты',
-  emailStrictDealRouting: String(process.env.EMAIL_STRICT_DEAL_ROUTING || 'true').toLowerCase() !== 'false',
+  // v51: Роботы Bitrix запускают ИИгоря сразу при привязке/закрытии сделки.
+  // Если задан FOREMAN_ROBOT_TOKEN, его нужно передавать в body/query робота как token.
+  foremanRobotToken: process.env.FOREMAN_ROBOT_TOKEN || '',
+  foremanPropagateToCompanyDeals: String(process.env.FOREMAN_PROPAGATE_TO_COMPANY_DEALS || 'true').toLowerCase() !== 'false',
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -1227,11 +1224,6 @@ let commonDriveRootId = null; // кэш ID корневой папки Обще�
 
 async function getCommonDriveRootId() {
   if (commonDriveRootId) return commonDriveRootId;
-  if (config.emailCompanyRootFolderId) {
-    commonDriveRootId = String(config.emailCompanyRootFolderId).trim();
-    console.log(`[email] Корень документов задан через ENV → ID ${commonDriveRootId}`);
-    return commonDriveRootId;
-  }
   // Находим общее хранилище компании (не личный диск пользователя).
   const storages = await bitrixRestCall('disk.storage.getlist', {});
   const companyStorage = (Array.isArray(storages) ? storages : []).find((s) =>
@@ -1245,95 +1237,32 @@ async function getCommonDriveRootId() {
   return commonDriveRootId;
 }
 
-function stripHtmlText(value) {
-  return String(value || '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\[[^\]]+\]/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&quot;/gi, '"')
-    .replace(/&laquo;/gi, '«')
-    .replace(/&raquo;/gi, '»')
-    .replace(/&amp;/gi, '&')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function cleanCompanyNameForFolder(name) {
-  let raw = stripHtmlText(name)
-    .replace(/[\\/:*?"<>|]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!raw) return 'Без названия';
-
-  // Если в названии есть кавычки, чаще всего чистое название внутри них: ООО «ГудБуд» → ГудБуд.
-  const quoted = raw.match(/[«"]\s*([^»"]{2,120}?)\s*[»"]/);
-  if (quoted && quoted[1]) raw = quoted[1];
-
-  const legalForms = [
-    'общество с ограниченной ответственностью', 'общество с дополнительной ответственностью',
-    'закрытое акционерное общество', 'открытое акционерное общество',
-    'частное предприятие', 'частное торговое унитарное предприятие', 'частное строительное унитарное предприятие',
-    'частное производственное унитарное предприятие', 'частное унитарное предприятие',
-    'республиканское унитарное предприятие', 'коммунальное унитарное предприятие', 'унитарное предприятие',
-    'государственное предприятие', 'государственная компания', 'государственное учреждение',
-    'производственное объединение', 'производственное предприятие',
-    'индивидуальный предприниматель', 'ооо', 'одо', 'оао', 'зао', 'чуп', 'чтуп', 'чступ', 'чпуп', 'руп', 'куп', 'уп', 'ип', 'гп'
-  ];
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const form of legalForms) {
-      const re = new RegExp(`^(?:${form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})\\s+`, 'i');
-      if (re.test(raw)) {
-        raw = raw.replace(re, '').trim();
-        changed = true;
-      }
-    }
-  }
-  raw = raw
-    .replace(/^[«»"'“”.,;:()\-\s]+|[«»"'“”.,;:()\-\s]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return (raw || 'Без названия').slice(0, 120);
-}
-
 function normalizeCompanyNameForMatch(name) {
-  // Убираем организационно-правовую форму и пунктуацию для нечёткого сравнения названий.
-  return cleanCompanyNameForFolder(name)
+  // Убираем организационно-правовую форму и пунктуацию для нечёткого сравнения названий —
+  // папка на Диске может называться "Эд Сервис", а в CRM компания "ООО "Эд Сервис"".
+  return String(name || '')
     .toLowerCase()
-    .replace(/[«»"'.,;:()\-_/\\]/g, ' ')
+    .replace(/\b(ооо|оао|зао|чп|уп|ип|зполиц|чтуп|общество с ограниченной ответственностью|частное предприятие)\b/gi, '')
+    .replace(/[«»"'.,]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-async function getOrCreateSubfolder(rootId, folderName) {
-  const safeName = cleanCompanyNameForFolder(folderName);
+async function getOrCreateCompanyFolder(companyName) {
+  // Папки компаний лежат прямо в корне Общего диска (не во вложенной структуре).
+  const rootId = await getCommonDriveRootId();
+  const safeName = String(companyName || 'Без названия').replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 200);
+  const targetNormalized = normalizeCompanyNameForMatch(safeName);
+
   const children = await bitrixRestList('disk.folder.getchildren', { id: rootId }, 500);
+  // Сначала точное совпадение, потом нечёткое (без ООО/кавычек).
   let folder = children.find((c) => c.TYPE === 'folder' && c.NAME === safeName);
   if (!folder) {
-    const targetNormalized = normalizeCompanyNameForMatch(safeName);
     folder = children.find((c) => c.TYPE === 'folder' && normalizeCompanyNameForMatch(c.NAME) === targetNormalized && targetNormalized);
   }
   if (!folder) {
     folder = await bitrixRestCall('disk.folder.addsubfolder', { id: rootId, data: { NAME: safeName } });
-    console.log(`[disk] Создана папка "${safeName}" → ID ${folder.ID}`);
-  }
-  return folder.ID;
-}
-
-async function getOrCreateCompanyFolder(companyName) {
-  // Папки компаний лежат в корне документов/общего диска, но название теперь чистое: ООО «ГудБуд» → ГудБуд.
-  const rootId = await getCommonDriveRootId();
-  const cleanName = cleanCompanyNameForFolder(companyName || 'Без названия');
-  const targetNormalized = normalizeCompanyNameForMatch(cleanName);
-
-  const children = await bitrixRestList('disk.folder.getchildren', { id: rootId }, 500);
-  let folder = children.find((c) => c.TYPE === 'folder' && c.NAME === cleanName);
-  if (!folder) folder = children.find((c) => c.TYPE === 'folder' && normalizeCompanyNameForMatch(c.NAME) === targetNormalized && targetNormalized);
-  if (!folder) {
-    folder = await bitrixRestCall('disk.folder.addsubfolder', { id: rootId, data: { NAME: cleanName } });
-    console.log(`[email] Создана новая папка компании "${cleanName}" → ID ${folder.ID}`);
+    console.log(`[email] Создана новая папка компании "${safeName}" → ID ${folder.ID}`);
   } else {
     console.log(`[email] Найдена существующая папка компании "${folder.NAME}" → ID ${folder.ID}`);
   }
@@ -1352,154 +1281,35 @@ async function uploadFileToDiskFolder(folderId, fileName, buffer) {
   return result;
 }
 
-function parseRussianMonth(month) {
-  const m = String(month || '').toLowerCase();
-  const map = { январ: 0, феврал: 1, март: 2, апрел: 3, ма: 4, июн: 5, июл: 6, август: 7, сентябр: 8, октябр: 9, ноябр: 10, декабр: 11 };
-  const key = Object.keys(map).find((k) => m.startsWith(k));
-  return key === undefined ? null : map[key];
-}
-
-function extractActDateFromText(text, fallbackDate = null) {
-  const raw = stripHtmlText(text || '');
-  let m = raw.match(/(?:акт[^\n\r]{0,80}?от\s*)?(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})/i);
-  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
-  m = raw.match(/(?:акт[^\n\r]{0,80}?от\s*)?(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(20\d{2})/i);
-  if (m) {
-    const mon = parseRussianMonth(m[2]);
-    if (mon !== null) return new Date(Number(m[3]), mon, Number(m[1]));
-  }
-  m = raw.match(/(?:акт[^\n\r]{0,80}?от\s*)?(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?!\s+20\d{2})/i);
-  if (m) {
-    const mon = parseRussianMonth(m[2]);
-    if (mon !== null) {
-      const y = fallbackDate instanceof Date && !Number.isNaN(fallbackDate.getTime()) ? fallbackDate.getFullYear() : new Date().getFullYear();
-      return new Date(y, mon, Number(m[1]));
-    }
-  }
-  if (fallbackDate instanceof Date && !Number.isNaN(fallbackDate.getTime())) return fallbackDate;
-  return null;
-}
-
-function formatYearMonth(date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 7);
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  return `${y}-${m}`;
-}
-
-function isLikelyActEmail(subject, bodyText, attachments) {
-  const text = `${subject || ''} ${bodyText || ''} ${(attachments || []).map((a) => a.filename || '').join(' ')}`.toLowerCase();
-  return /\bакт\b|акты|авр|выполненн\w* работ|оказанн\w* услуг|подписанн\w* акт/i.test(text);
-}
-
-async function getOrCreateExpertActsFolder(expertName, actDate, companyName) {
-  const commonRoot = await getCommonDriveRootId();
-  let rootId = config.emailExpertActsRootFolderId || '';
-  if (!rootId) {
-    rootId = await getOrCreateSubfolder(commonRoot, config.emailActFolderName + ' по экспертам');
-  }
-  const expertFolderId = await getOrCreateSubfolder(rootId, expertName || 'Без эксперта');
-  const monthFolderId = await getOrCreateSubfolder(expertFolderId, formatYearMonth(actDate));
-  return await getOrCreateSubfolder(monthFolderId, companyName || 'Без компании');
-}
-
-async function getOrCreateCompanyActsFolder(companyName, actDate) {
-  const companyFolderId = await getOrCreateCompanyFolder(companyName || 'Без компании');
-  const actsRoot = await getOrCreateSubfolder(companyFolderId, config.emailActFolderName || 'Акты');
-  return await getOrCreateSubfolder(actsRoot, formatYearMonth(actDate));
-}
-
-async function getActiveProductionDealsByFilter(filter, limit = 50) {
-  return await bitrixRestList('crm.deal.list', {
-    filter: { CATEGORY_ID: config.autopilotCategoryId || 28, CLOSED: 'N', ...filter },
-    order: { DATE_MODIFY: 'DESC' },
-    select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'COMPANY_ID', 'CONTACT_ID', 'DATE_MODIFY', 'STAGE_ID', 'STAGE_SEMANTIC_ID', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
-  }, limit);
-}
-
-async function getCompanyTitleCached(companyId, cache) {
-  if (!companyId) return '';
-  const key = String(companyId);
-  if (cache.has(key)) return cache.get(key);
-  const title = await getCompanyName(companyId) || '';
-  cache.set(key, title);
-  return title;
-}
-
-async function chooseBestEmailDeal(deals, context = {}) {
-  const unique = [];
-  const seen = new Set();
-  for (const d of deals || []) {
-    if (!d || !d.ID || seen.has(String(d.ID))) continue;
-    seen.add(String(d.ID));
-    unique.push(d);
-  }
-  if (!unique.length) return [];
-  if (unique.length === 1) return unique;
-
-  const companyCache = new Map();
-  const targetCompany = normalizeCompanyNameForMatch(context.visionCompany || context.companyHint || '');
-  const subjectBody = normalizeCompanyNameForMatch(`${context.subject || ''} ${context.bodyText || ''}`);
-  const now = Date.now();
-  const scored = [];
-  for (const deal of unique) {
-    const companyTitle = await getCompanyTitleCached(deal.COMPANY_ID, companyCache);
-    const normCompany = normalizeCompanyNameForMatch(companyTitle || deal.TITLE || '');
-    let score = 0;
-    if (targetCompany && (normCompany === targetCompany || normCompany.includes(targetCompany) || targetCompany.includes(normCompany))) score += 100;
-    if (subjectBody && normCompany && subjectBody.includes(normCompany)) score += 60;
-    if (String(deal.CLOSED || 'N') !== 'Y') score += 30;
-    const modified = deal.DATE_MODIFY ? new Date(deal.DATE_MODIFY).getTime() : 0;
-    if (modified) score += Math.max(0, 20 - Math.floor((now - modified) / (1000 * 60 * 60 * 24 * 7)));
-    scored.push({ deal, score, companyTitle });
-  }
-  scored.sort((a, b) => b.score - a.score || new Date(b.deal.DATE_MODIFY || 0) - new Date(a.deal.DATE_MODIFY || 0));
-
-  // Строгая маршрутизация: если есть явное совпадение по компании/тексту — берём его. Иначе берём самую свежую активную сделку, но одну.
-  if (config.emailStrictDealRouting) return [scored[0].deal];
-  return scored.map((x) => x.deal);
-}
-
-async function findContactAndDealsByEmail(senderEmail, context = {}) {
-  // Сверяем email отправителя с контактами и компаниями CRM. Возвращаем одну лучшую активную сделку, чтобы не класть акт к чужому эксперту.
+async function findContactAndDealsByEmail(senderEmail) {
+  // Сверяем email отправителя с контактами CRM.
   const cleanEmail = String(senderEmail || '').trim().toLowerCase();
   if (!cleanEmail) return null;
   try {
-    const allDeals = [];
-    let contact = null;
-
     const contacts = await bitrixRestList('crm.contact.list', {
       filter: { EMAIL: cleanEmail },
       select: ['ID', 'NAME', 'LAST_NAME', 'EMAIL', 'COMPANY_ID'],
-    }, 20);
-    if (contacts.length) {
-      contact = contacts[0];
-      for (const c of contacts) {
-        const byContact = await getActiveProductionDealsByFilter({ CONTACT_ID: c.ID }, 50);
-        allDeals.push(...byContact);
-        if (c.COMPANY_ID) {
-          const byCompany = await getActiveProductionDealsByFilter({ COMPANY_ID: c.COMPANY_ID }, 50);
-          allDeals.push(...byCompany);
-        }
-      }
-    }
+    }, 5);
+    if (!contacts.length) return null;
+    const contact = contacts[0];
 
-    // Частая причина пропуска писем: email заполнен не в контакте, а в компании.
-    const companiesByEmail = await bitrixRestList('crm.company.list', {
-      filter: { EMAIL: cleanEmail },
-      select: ['ID', 'TITLE', 'EMAIL'],
-    }, 20);
-    for (const company of companiesByEmail) {
-      const byCompany = await getActiveProductionDealsByFilter({ COMPANY_ID: company.ID }, 50);
-      allDeals.push(...byCompany);
-      if (!contact) contact = { COMPANY_ID: company.ID };
+    // Находим сделки этого контакта на стадии "Сбор информации" (туда автопилот переводит после звонка).
+    const stageIds = await getAutopilotStageIds();
+    const prepStageId = getPreparationStageId();
+    const targetStages = [...new Set([...stageIds, prepStageId].filter(Boolean))];
+    const allDeals = [];
+    for (const stageId of targetStages) {
+      const deals = await bitrixRestList('crm.deal.list', {
+        filter: { CONTACT_ID: contact.ID, CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: stageId },
+        select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'COMPANY_ID', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      }, 20);
+      allDeals.push(...deals);
     }
-
-    const deals = await chooseBestEmailDeal(allDeals, context);
-    if (!deals.length) return null;
-    return { contact: contact || { COMPANY_ID: deals[0].COMPANY_ID }, deals, matchedBy: companiesByEmail.length ? 'company_email' : 'contact_email' };
+    const seen = new Set();
+    const uniqueDeals = allDeals.filter((d) => { if (seen.has(d.ID)) return false; seen.add(d.ID); return true; });
+    return { contact, deals: uniqueDeals };
   } catch (e) {
-    console.warn(`[email] Ошибка поиска контакта/компании по email ${cleanEmail}: ${e.message}`);
+    console.warn(`[email] Ошибка поиска контакта по email ${cleanEmail}: ${e.message}`);
     return null;
   }
 }
@@ -1571,7 +1381,7 @@ async function analyzeDocumentWithVision(fileBuffer, fileName, mimeType) {
             {
               type: 'text',
               text: `Определи что это за документ. Ответь ТОЛЬКО JSON без пояснений:
-{"docType": "акт"|"диплом"|"трудовая"|"аттестат"|"паспорт"|"устав"|"свидетельство о регистрации"|"договор"|"доверенность"|"приказ"|"справка"|"средство измерений"|"другое", "person": "ФИО если видно или null", "confidence": "high"|"medium"|"low"}`,
+{"docType": "диплом"|"трудовая"|"аттестат"|"паспорт"|"устав"|"свидетельство о регистрации"|"договор"|"доверенность"|"приказ"|"справка"|"средство измерений"|"другое", "person": "ФИО если видно или null", "confidence": "high"|"medium"|"low"}`,
             },
           ],
         }],
@@ -1647,162 +1457,209 @@ async function processIncomingEmails() {
     return;
   }
 
+  // ✅ ФИЛЬТР СПАМА: Список автоматических отправителей которых игнорируем
   const SPAM_SENDERS = [
-    /robot@/i, /noreply@/i, /no-reply@/i, /support@/i, /admin@/i, /notification@/i,
-    /alert@/i, /info@yandex/i, /info@npmos/i, /hello@atevi/i, /docudream@edn/i,
-    /auction24/i, /invoice@/i, /billing@/i,
+    /robot@/i,
+    /noreply@/i,
+    /no-reply@/i,
+    /support@/i,
+    /admin@/i,
+    /notification@/i,
+    /alert@/i,
+    /info@yandex/i,
+    /info@npmos/i,
+    /hello@atevi/i, // платёжные напоминания
+    /docudream@edn/i, // электронные торги
+    /auction24/i,
+    /invoice@/i,
+    /billing@/i,
   ];
-  function isSpamSender(email) { return SPAM_SENDERS.some((pattern) => pattern.test(email)); }
+
+  function isSpamSender(email) {
+    return SPAM_SENDERS.some(pattern => pattern.test(email));
+  }
 
   let client;
   try {
-    client = new ImapFlow({ host: imapHost, port: imapPort, secure: true, auth: { user: emailUser, pass: emailPass }, logger: false });
+    client = new ImapFlow({
+      host: imapHost,
+      port: imapPort,
+      secure: true,
+      auth: { user: emailUser, pass: emailPass },
+      logger: false,
+    });
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
+      // Ищем непрочитанные письма.
       const uids = await client.search({ seen: false });
-      if (!uids || !uids.length) { console.log('[email] Новых писем нет.'); return; }
+      if (!uids || !uids.length) {
+        console.log('[email] Новых писем нет.');
+        return;
+      }
       console.log(`[email] Найдено ${uids.length} непрочитанных писем.`);
 
       for (const uid of uids) {
         try {
-          const msgData = await client.fetchOne(uid, { source: true, envelope: true });
+          const msgData = await client.fetchOne(uid, { source: true });
           if (!msgData || !msgData.source) continue;
           const parsed = await simpleParser(msgData.source);
 
           const senderEmail = parsed.from && parsed.from.value && parsed.from.value[0] ? parsed.from.value[0].address : '';
           const subject = parsed.subject || '';
-          const bodyText = stripHtmlText(parsed.text || parsed.html || '');
           const attachments = (parsed.attachments || []).filter((a) => a.size > 0);
-          const emailDate = parsed.date instanceof Date ? parsed.date : new Date();
-          const isAct = isLikelyActEmail(subject, bodyText, attachments);
 
-          console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}, акт=${isAct ? 'да' : 'нет'}`);
+          console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}`);
 
+          // ✅ ФИЛЬТР СПАМА
           if (isSpamSender(senderEmail)) {
-            console.log(`[email] ⏭️ Спам/сервисное письмо от ${senderEmail} — помечаю прочитанным и пропускаю`);
+            console.log(`[email] ⏭️ Спам от ${senderEmail} — помечаю прочитанным и пропускаю`);
             await client.messageFlagsAdd(uid, ['\\Seen']);
             continue;
           }
-          if (!attachments.length) { await client.messageFlagsAdd(uid, ['\\Seen']); continue; }
 
-          let visionCompany = null;
-          let visionActDate = null;
-
-          // Для актов сначала пытаемся вытащить компанию и дату из самого вложения, а не из имени файла/старой даты.
-          if (isAct) {
-            for (const att of attachments) {
-              try {
-                const analysis = await analyzeDocumentWithVisionForCompany(att.content, att.filename || 'file', att.contentType);
-                if (analysis.company && analysis.confidence !== 'low' && !visionCompany) visionCompany = analysis.company;
-                if (analysis.actDate && !visionActDate) visionActDate = extractActDateFromText(String(analysis.actDate), emailDate);
-                if (visionCompany && visionActDate) break;
-              } catch (_) {}
-              await new Promise((r) => setTimeout(r, 400));
-            }
+          // Письма без вложений не обрабатываем
+          if (!attachments.length) {
+            await client.messageFlagsAdd(uid, ['\\Seen']);
+            continue;
           }
 
-          const matchContext = { subject, bodyText, visionCompany };
-          let matchInfo = await findContactAndDealsByEmail(senderEmail, matchContext);
-
-          if ((!matchInfo || !matchInfo.deals || !matchInfo.deals.length) && !visionCompany) {
-            console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ компании...`);
+          // ✅ 1. ПЕРВЫЙ СПОСОБ: Ищем email в CRM
+          let matchInfo = await findContactAndDealsByEmail(senderEmail);
+          
+          if (!matchInfo || !matchInfo.deals.length) {
+            console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ...`);
+            
+            // ✅ 2. ВТОРОЙ СПОСОБ: Vision анализ вложений
+            let visionCompany = null;
+            let visionConfidence = 'low';
+            
             for (const att of attachments) {
               try {
+                // ✅ УЛУЧШЕННЫЙ ПРОМПТ для Vision
                 const analysis = await analyzeDocumentWithVisionForCompany(att.content, att.filename || 'file', att.contentType);
+                
                 if (analysis.company && analysis.confidence !== 'low') {
                   visionCompany = analysis.company;
-                  if (analysis.actDate && !visionActDate) visionActDate = extractActDateFromText(String(analysis.actDate), emailDate);
+                  visionConfidence = analysis.confidence;
                   console.log(`[email] ✅ Vision нашёл компанию: "${visionCompany}" (${analysis.confidence})`);
                   break;
                 }
               } catch (_) {}
               await new Promise((r) => setTimeout(r, 500));
             }
-          }
 
-          if ((!matchInfo || !matchInfo.deals || !matchInfo.deals.length) && visionCompany) {
-            console.log(`[email] 🔍 Ищу сделку по названию компании: "${visionCompany}"`);
-            matchInfo = await findDealsByCompanyName(visionCompany, matchContext);
-          }
-
-          if (!matchInfo || !matchInfo.deals || !matchInfo.deals.length) {
-            console.log(`[email] ⚠️ Сделка не определена — загружаю в папку "${config.emailUnsortedFolderName}"`);
-            try {
-              const undefFolder = await getOrCreateCompanyFolder(config.emailUnsortedFolderName);
-              for (const att of attachments) {
-                await uploadFileToDiskFolder(undefFolder, `${new Date().toISOString().slice(0,10)}_${att.filename || 'file'}`, att.content);
-              }
-              await client.messageFlagsAdd(uid, ['\\Seen']);
-              console.log(`[email] ✅ Загружено ${attachments.length} файлов в "${config.emailUnsortedFolderName}"`);
-            } catch (e) {
-              console.warn(`[email] Ошибка загрузки в неопределённые: ${e.message}`);
+            // ✅ 3. ЕСЛИ Vision сработал - ищем сделку по названию компании в Bitrix
+            if (visionCompany) {
+              console.log(`[email] 🔍 Ищу сделку по названию компании: "${visionCompany}"`);
+              matchInfo = await findDealsByCompanyName(visionCompany);
             }
-            continue;
+
+            // ✅ 4. ЕСЛИ НИЧЕГО НЕ СРАБОТАЛО - загружаем в "Неопределённые"
+            if (!matchInfo || !matchInfo.deals || !matchInfo.deals.length) {
+              console.log(`[email] ⚠️ Компания не определена — загружаю в папку "Неопределённые"`);
+              
+              try {
+                const undefFolder = await getOrCreateCompanyFolder('Неопределённые документы');
+                const savedFiles = [];
+                
+                for (const att of attachments) {
+                  try {
+                    await uploadFileToDiskFolder(undefFolder, `${new Date().toISOString().slice(0,10)}_${att.filename || 'file'}`, att.content);
+                    savedFiles.push(att.filename || 'файл');
+                    console.log(`[email] 📁 Загружен в "Неопределённые": "${att.filename}"`);
+                  } catch (upErr) {
+                    console.warn(`[email] Ошибка загрузки ${att.filename}: ${upErr.message}`);
+                  }
+                }
+                
+                // Помечаем прочитанным
+                await client.messageFlagsAdd(uid, ['\\Seen']);
+                console.log(`[email] ✅ Загружено ${savedFiles.length} файлов в "Неопределённые"`);
+              } catch (e) {
+                console.warn(`[email] Ошибка загрузки в "Неопределённые": ${e.message}`);
+              }
+              continue;
+            }
           }
 
-          const deals = matchInfo.deals.slice(0, 1); // v48: одна лучшая сделка, чтобы не отправлять акт чужому эксперту.
-          const deal = deals[0];
-          if (await isDealAiDisabledAsync(deal)) {
-            console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — письмо не обрабатываю.`);
-            continue;
-          }
+          // ✅ ЕСЛИ СДЕЛКА НАЙДЕНА - обрабатываем как обычно
+          const { contact, deals } = matchInfo;
+          const companyName = await getCompanyName(contact.COMPANY_ID) || deals[0].TITLE || `Контакт ${contact.ID}`;
+          const folderId = await getOrCreateCompanyFolder(companyName);
 
-          const companyName = await getCompanyName(deal.COMPANY_ID || (matchInfo.contact && matchInfo.contact.COMPANY_ID)) || visionCompany || deal.TITLE || `Сделка ${deal.ID}`;
-          const companyFolderId = isAct
-            ? await getOrCreateCompanyActsFolder(companyName, visionActDate || extractActDateFromText(`${subject} ${bodyText} ${attachments.map((a) => a.filename || '').join(' ')}`, emailDate))
-            : await getOrCreateCompanyFolder(companyName);
+          console.log(`[email] ✅ Найдена сделка! Загружаю в папку: "${companyName}"`);
 
-          const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
-          const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
-          const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
-          const petName = getDiminutiveName(expertName);
-          const actDate = visionActDate || extractActDateFromText(`${subject} ${bodyText} ${attachments.map((a) => a.filename || '').join(' ')}`, emailDate);
-          const actMonth = formatYearMonth(actDate);
-          const expertActFolderId = isAct ? await getOrCreateExpertActsFolder(expertName, actDate, companyName) : null;
-
-          console.log(`[email] ✅ Найдена сделка ${deal.ID}. Компания: "${companyName}" → папка компании; эксперт: ${expertName || deal.ASSIGNED_BY_ID}${isAct ? `; месяц акта ${actMonth}` : ''}`);
-
+          // Сохраняем файлы и анализируем
           const savedFileNames = [];
           const analyzedDocs = [];
+          
           for (const att of attachments) {
-            const fileName = att.filename || 'без имени';
             try {
-              await uploadFileToDiskFolder(companyFolderId, fileName, att.content);
-              if (expertActFolderId) await uploadFileToDiskFolder(expertActFolderId, fileName, att.content);
-              savedFileNames.push(fileName);
+              await uploadFileToDiskFolder(folderId, att.filename || 'file', att.content);
+              savedFileNames.push(att.filename || 'без имени');
             } catch (upErr) {
-              console.warn(`[email] Не удалось загрузить файл ${fileName}: ${upErr.message}`);
+              console.warn(`[email] Не удалось загрузить файл ${att.filename}: ${upErr.message}`);
             }
-
-            if (!isAct) {
-              try {
-                const analysis = await analyzeDocumentWithVision(att.content, fileName, att.contentType);
-                analyzedDocs.push({ fileName, ...analysis });
-                console.log(`[email] "${fileName}" → ${analysis.docType} (${analysis.confidence})`);
-              } catch (_) {
-                analyzedDocs.push({ fileName, docType: 'другое', confidence: 'low' });
-              }
-              await new Promise((r) => setTimeout(r, 1000));
+            
+            // Анализируем через Vision
+            try {
+              const analysis = await analyzeDocumentWithVision(att.content, att.filename || 'file', att.contentType);
+              analyzedDocs.push({ fileName: att.filename || 'без имени', ...analysis });
+              console.log(`[email] "${att.filename}" → ${analysis.docType} (${analysis.confidence})`);
+            } catch (_) {
+              analyzedDocs.push({ fileName: att.filename || 'без имени', docType: 'другое', confidence: 'low' });
             }
+            await new Promise((r) => setTimeout(r, 1000));
           }
 
+          // Добавляем комментарий в сделку
           if (savedFileNames.length) {
-            if (isAct) {
-              const commentText = `📎 ИИгорь: акт получен с почты и разложен по папкам.\n\nКомпания: ${cleanCompanyNameForFolder(companyName)}\nДата/месяц акта: ${actDate ? actDate.toLocaleDateString('ru-RU') : 'не распознана'} (${actMonth})\nЭксперт: ${expertName || deal.ASSIGNED_BY_ID}\nФайлы:\n${savedFileNames.map((f) => `— ${f}`).join('\n')}\n\nСохранил в папку компании и в папку эксперта.`;
-              await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: commentText } });
-            } else {
-              const completeness = await checkDocumentCompleteness(deal, analyzedDocs, companyName);
-              const isComplete = completeness && completeness.complete;
-              const missingList = completeness && completeness.missing && completeness.missing.length ? completeness.missing.map((m) => `— ${m}`).join('\n') : '';
-              const expertComment = completeness && completeness.expert_comment ? completeness.expert_comment : `Клиент прислал: ${savedFileNames.join(', ')}`;
-              const commentText = isComplete
-                ? `✅ ${petName}, комплект документов собран! Можно готовить пакет.\n\n${expertComment}`
-                : `📨 ${petName}, клиент прислал документы — не полный комплект.\n\n${expertComment}${missingList ? `\n\nНе хватает:\n${missingList}` : ''}`;
-              await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: commentText } });
-              if (!isComplete) {
-                const tomorrow = addWorkingDays(new Date(), 1); tomorrow.setHours(18, 0, 0, 0);
-                await bitrixRestCall('tasks.task.add', { fields: { TITLE: `${petName}, клиент прислал документы — нужно проверить комплект`, DESCRIPTION: commentText, RESPONSIBLE_ID: deal.ASSIGNED_BY_ID, DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00', UF_CRM_TASK: [`D_${deal.ID}`], PRIORITY: 1 } });
+            for (const deal of deals) {
+      if (await isDealAiDisabledAsync(deal)) {
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        continue;
+      }
+
+              try {
+                const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+                const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
+                const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
+                const petName = getDiminutiveName(expertName);
+
+                const completeness = await checkDocumentCompleteness(deal, analyzedDocs, companyName);
+                const isComplete = completeness && completeness.complete;
+                const missingList = completeness && completeness.missing && completeness.missing.length
+                  ? completeness.missing.map((m) => `— ${m}`).join('\n')
+                  : '';
+                const expertComment = completeness && completeness.expert_comment
+                  ? completeness.expert_comment
+                  : `Клиент прислал: ${savedFileNames.join(', ')}`;
+
+                const commentText = isComplete
+                  ? `✅ ${petName}, комплект документов собран! Можно готовить пакет.\n\n${expertComment}`
+                  : `📨 ${petName}, клиент прислал документы — не полный комплект.\n\n${expertComment}${missingList ? `\n\nНе хватает:\n${missingList}` : ''}`;
+
+                await bitrixRestCall('crm.timeline.comment.add', {
+                  fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: commentText },
+                });
+
+                if (!isComplete) {
+                  const tomorrow = addWorkingDays(new Date(), 1);
+                  tomorrow.setHours(18, 0, 0, 0);
+                  await bitrixRestCall('tasks.task.add', {
+                    fields: {
+                      TITLE: `${petName}, клиент прислал документы — нужно проверить комплект`,
+                      DESCRIPTION: commentText,
+                      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+                      DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00',
+                      UF_CRM_TASK: [`D_${deal.ID}`],
+                      PRIORITY: 1,
+                    },
+                  });
+                }
+              } catch (taskErr) {
+                console.warn(`[email] Ошибка обработки сделки ${deal.ID}: ${taskErr.message}`);
               }
             }
           }
@@ -1865,12 +1722,11 @@ async function analyzeDocumentWithVisionForCompany(fileContent, fileName, conten
                 type: 'text',
                 text: `Это деловой документ. Определи:
 1. Название компании/организации в документе (ООО, ИП, АО и т.д.)
-2. Дату акта/документа, если это акт выполненных работ/оказанных услуг. Формат даты верни YYYY-MM-DD.
-3. Уровень уверенности: high (явно видно), medium (можно определить), low (не ясно)
+2. Уровень уверенности: high (явно видно), medium (можно определить), low (не ясно)
 
-Ответь ТОЛЬКО JSON: {"company": "название или null", "actDate": "YYYY-MM-DD или null", "confidence": "high|medium|low"}
+Ответь ТОЛЬКО JSON: {"company": "название", "confidence": "high|medium|low"}
 
-ВАЖНО: Ищи компанию в начале документа, на бланке, в подписях. Дату акта бери именно из текста акта, не из имени файла. Если название компании не видно — верни {"company": null, "actDate": null, "confidence": "low"}`,
+ВАЖНО: Ищи в начале документа, на бланке, в подписях. Если название компании не видно — вернись {"company": null, "confidence": "low"}`,
               },
             ],
           },
@@ -1890,7 +1746,6 @@ async function analyzeDocumentWithVisionForCompany(fileContent, fileName, conten
       const result = JSON.parse(textContent);
       return {
         company: result.company,
-        actDate: result.actDate || result.date || null,
         confidence: result.confidence || 'low',
       };
     } catch (_) {
@@ -1903,43 +1758,45 @@ async function analyzeDocumentWithVisionForCompany(fileContent, fileName, conten
 }
 
 // ✅ НОВАЯ ФУНКЦИЯ: Поиск сделки по названию компании
-async function findDealsByCompanyName(companyNameQuery, context = {}) {
+async function findDealsByCompanyName(companyNameQuery) {
   try {
+    // Нормализуем название
     const normalized = normalizeCompanyNameForMatch(companyNameQuery);
+
     if (!normalized) return null;
 
-    const queries = [...new Set([companyNameQuery, cleanCompanyNameForFolder(companyNameQuery), normalized.split(' ')[0]].filter((x) => String(x || '').trim().length >= 3))];
-    const companiesAll = [];
-    const seenCompanies = new Set();
-    for (const q of queries) {
-      const companies = await bitrixRestList('crm.company.list', { filter: { '~TITLE': q }, select: ['ID', 'TITLE'] }, 50);
-      for (const c of companies || []) {
-        if (seenCompanies.has(String(c.ID))) continue;
-        const cn = normalizeCompanyNameForMatch(c.TITLE || '');
-        if (cn === normalized || cn.includes(normalized) || normalized.includes(cn) || cn.includes(normalized.split(' ')[0])) {
-          seenCompanies.add(String(c.ID));
-          companiesAll.push(c);
-        }
-      }
-    }
+    // Ищем компанию в CRM (нечёткий поиск)
+    const companies = await bitrixRestList('crm.company.list', {
+      filter: { '~TITLE': normalized },
+      select: ['ID', 'TITLE'],
+    }, 50);
 
-    if (!companiesAll.length) {
+    if (!companies || !companies.length) {
       console.log(`[email] Компания "${companyNameQuery}" не найдена в CRM`);
       return null;
     }
 
-    const allDeals = [];
-    for (const company of companiesAll) {
-      const byCompany = await getActiveProductionDealsByFilter({ COMPANY_ID: company.ID }, 50);
-      allDeals.push(...byCompany);
-    }
-    if (!allDeals.length) {
-      console.log(`[email] Активные производственные сделки компании "${companyNameQuery}" не найдены`);
+    const company = companies[0];
+    console.log(`[email] Найдена компания: "${company.TITLE}"`);
+
+    // Ищем сделки этой компании
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        COMPANY_ID: company.ID,
+        STAGE_ID: ['C28:5', 'C28:6', 'C28:7'], // Подбор, Сбор информации, Документы готовы
+      },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID'],
+    }, 50);
+
+    if (!deals || !deals.length) {
+      console.log(`[email] Сделки компании "${company.TITLE}" не найдены`);
       return null;
     }
 
-    const deals = await chooseBestEmailDeal(allDeals, { ...context, visionCompany: companyNameQuery });
-    return { contact: { COMPANY_ID: deals[0].COMPANY_ID }, deals, matchedBy: 'vision_company' };
+    return {
+      contact: { COMPANY_ID: company.ID },
+      deals: deals,
+    };
   } catch (err) {
     console.error(`[email] Ошибка поиска сделки: ${err.message}`);
     return null;
@@ -4815,11 +4672,239 @@ async function runForemanAutomationCycle(source = 'manual') {
 }
 
 
-app.post('/api/email/process-now', async (_req, res) => {
+// v51: точечные обработчики для роботов Bitrix.
+// Робот передаёт только deal_id, сервер сам подтягивает сделку, прораба и соседние активные сделки компании.
+const FOREMAN_LINK_MARKER = '[MAVIS_FOREMAN_ROBOT_LINK]';
+const FOREMAN_RELEASE_MARKER = '[MAVIS_FOREMAN_ROBOT_RELEASE]';
+const FOREMAN_PROPAGATE_MARKER = '[MAVIS_FOREMAN_ROBOT_PROPAGATE]';
+
+function fgReqDealId(req) {
+  const src = Object.assign({}, req.query || {}, req.body || {});
+  const keys = ['deal_id', 'dealId', 'DEAL_ID', 'id', 'ID', 'entityId', 'ENTITY_ID'];
+  for (const k of keys) {
+    const v = src[k];
+    if (v !== undefined && v !== null && String(v).trim()) {
+      const m = String(v).match(/\d+/);
+      if (m) return m[0];
+    }
+  }
+  // На случай если Bitrix пришлёт ссылку или текстом.
+  const raw = JSON.stringify(src);
+  const m = raw.match(/deal\/details\/(\d+)/i) || raw.match(/"(?:deal_id|dealId|DEAL_ID|ID)"\s*:\s*"?(\d+)/i);
+  return m ? m[1] : '';
+}
+
+function fgCheckRobotToken(req) {
+  if (!config.foremanRobotToken) return true;
+  const token = String((req.query && req.query.token) || (req.body && req.body.token) || '').trim();
+  return token && token === config.foremanRobotToken;
+}
+
+function fgDealUrl(dealId) {
+  return `https://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+}
+
+async function fgGetDealById(dealId, cfg) {
+  const select = [
+    'ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CATEGORY_ID','ASSIGNED_BY_ID',
+    'COMPANY_ID','CONTACT_ID','COMMENTS','DATE_MODIFY','MOVED_TIME','OPPORTUNITY',
+    cfg.fieldProductionSpecialist,
+    config.serviceFieldCode || 'UF_CRM_1765113071',
+  ];
+  const d = await bitrixRestCall('crm.deal.get', { id: dealId });
+  // crm.deal.get возвращает все поля, но ниже оставляем совместимость с select-логикой.
+  return d;
+}
+
+async function fgGetCompanyName(companyId) {
+  if (!companyId) return '';
   try {
-    await processIncomingEmails();
-    res.json({ ok: true, message: 'Почта проверена вручную.' });
+    const c = await bitrixRestCall('crm.company.get', { id: companyId });
+    return fgText(c && (c.TITLE || c.COMPANY_TITLE || c.NAME));
+  } catch (_) { return ''; }
+}
+
+async function fgGetUserLabel(userId) {
+  if (!userId) return '';
+  try {
+    const res = await bitrixRestCall('user.get', { ID: userId });
+    const u = Array.isArray(res) ? res[0] : res;
+    if (!u) return String(userId);
+    return [u.NAME, u.LAST_NAME].map(fgText).filter(Boolean).join(' ') || fgText(u.EMAIL) || String(userId);
+  } catch (_) { return String(userId); }
+}
+
+function fgProductionService(deal) {
+  const raw = fgText(deal && deal[config.serviceFieldCode || 'UF_CRM_1765113071']);
+  if (raw) return raw;
+  const title = fgText(deal && deal.TITLE);
+  const parts = title.split(/\s+[—-]\s+/);
+  return parts.length > 1 ? parts.slice(1).join(' — ') : '';
+}
+
+async function fgFindActiveCompanyDeals(companyId, cfg, excludeDealId = '') {
+  if (!companyId) return [];
+  return await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.productionCategoryId, COMPANY_ID: companyId, CLOSED: 'N' },
+    order: { DATE_MODIFY: 'DESC' },
+    select: [
+      'ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CATEGORY_ID','ASSIGNED_BY_ID','COMPANY_ID',
+      cfg.fieldProductionSpecialist,
+      config.serviceFieldCode || 'UF_CRM_1765113071',
+    ],
+  }, 500).then(rows => rows.filter(d => String(d.ID) !== String(excludeDealId)));
+}
+
+async function fgFindActiveDealsWithForeman(foremanId, cfg, excludeDealId = '') {
+  const rows = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: cfg.productionCategoryId, CLOSED: 'N' },
+    order: { DATE_MODIFY: 'DESC' },
+    select: ['ID','TITLE','STAGE_ID','CLOSED','CATEGORY_ID','ASSIGNED_BY_ID','COMPANY_ID', cfg.fieldProductionSpecialist],
+  }, config.foremanMaxProductionDeals || 500);
+  return rows.filter((d) => String(d.ID) !== String(excludeDealId) && fgExtractDealIds(d[cfg.fieldProductionSpecialist]).map(String).includes(String(foremanId)));
+}
+
+async function fgUpdateDealSpecialist(dealId, foremanId, cfg) {
+  await bitrixRestCall('crm.deal.update', { id: dealId, fields: { [cfg.fieldProductionSpecialist]: String(foremanId) } });
+}
+
+async function fgHandleForemanLinked(dealId, source = 'robot') {
+  const cfg = fgForemanCfg();
+  const summary = { ok: true, event: 'foreman_linked', source, dealId: String(dealId), foremen: [], propagated: [], skipped: [], comments: [] };
+  const deal = await fgGetDealById(dealId, cfg);
+  if (!deal || String(deal.CATEGORY_ID) !== String(cfg.productionCategoryId)) {
+    throw new Error(`Сделка ${dealId} не найдена или не из воронки производства ${cfg.productionCategoryId}`);
+  }
+  const foremanIds = fgExtractDealIds(deal[cfg.fieldProductionSpecialist]);
+  if (!foremanIds.length) {
+    summary.ok = false;
+    summary.message = `В сделке ${dealId} поле ${cfg.fieldProductionSpecialist} пустое — прораб не привязан.`;
+    return summary;
+  }
+
+  const companyName = await fgGetCompanyName(deal.COMPANY_ID);
+  const expertName = await fgGetUserLabel(deal.ASSIGNED_BY_ID);
+  const service = fgProductionService(deal);
+  const siblingDeals = config.foremanPropagateToCompanyDeals ? await fgFindActiveCompanyDeals(deal.COMPANY_ID, cfg, deal.ID) : [];
+
+  for (const foremanId of foremanIds) {
+    let foreman = null;
+    try { foreman = await bitrixRestCall('crm.deal.get', { id: foremanId }); } catch (_) {}
+    if (!foreman || String(foreman.CATEGORY_ID) !== String(cfg.foremanCategoryId)) {
+      summary.skipped.push(`Прораб ${foremanId} не найден в воронке ${cfg.foremanCategoryId}`);
+      continue;
+    }
+
+    const moved = await fgSetDealStageIfNeeded(foreman, cfg.stageBusy);
+    const marker = `${FOREMAN_LINK_MARKER} foreman=${foremanId} prod=${deal.ID}`;
+    const comment = `ИИгорь: прораб привязан к производственной сделке.\n\nКомпания: ${companyName || deal.COMPANY_ID || 'не указана'}\nСделка производства: ${deal.TITLE || deal.ID}\nУслуга: ${service || 'не указана'}\nОтветственный эксперт: ${expertName || deal.ASSIGNED_BY_ID || 'не указан'}\nСсылка на производство: ${fgDealUrl(deal.ID)}\n\nНовый статус прораба: Занят.`;
+    const added = await fgAddCommentOnce(foremanId, marker, comment);
+    summary.foremen.push({ foremanId: String(foremanId), title: foreman.TITLE, movedBusy: moved, commentAdded: added });
+
+    // Проставляем этого же прораба во все активные сделки этой же компании, если там поле пустое.
+    for (const s of siblingDeals) {
+      const existing = fgExtractDealIds(s[cfg.fieldProductionSpecialist]);
+      if (existing.length) {
+        summary.skipped.push(`Сделка ${s.ID}: поле специалист уже заполнено (${existing.join(',')})`);
+        continue;
+      }
+      await fgUpdateDealSpecialist(s.ID, foremanId, cfg);
+      summary.propagated.push({ dealId: String(s.ID), title: s.TITLE, foremanId: String(foremanId) });
+      const siblingMarker = `${FOREMAN_PROPAGATE_MARKER} prod=${s.ID} foreman=${foremanId}`;
+      await fgAddCommentOnce(s.ID, siblingMarker, `ИИгорь: автоматически проставил прораба из другой активной сделки этой компании.\n\nПрораб: ${foreman.TITLE || foremanId}\nИсточник: ${deal.TITLE || deal.ID}\nСсылка на источник: ${fgDealUrl(deal.ID)}`);
+    }
+  }
+
+  return summary;
+}
+
+async function fgHandleProductionClosed(dealId, source = 'robot') {
+  const cfg = fgForemanCfg();
+  const summary = { ok: true, event: 'production_deal_closed', source, dealId: String(dealId), released: [], stillBusy: [], skipped: [] };
+  const deal = await fgGetDealById(dealId, cfg);
+  if (!deal || String(deal.CATEGORY_ID) !== String(cfg.productionCategoryId)) {
+    throw new Error(`Сделка ${dealId} не найдена или не из воронки производства ${cfg.productionCategoryId}`);
+  }
+  const foremanIds = fgExtractDealIds(deal[cfg.fieldProductionSpecialist]);
+  if (!foremanIds.length) {
+    summary.skipped.push(`В сделке ${dealId} поле ${cfg.fieldProductionSpecialist} пустое.`);
+    return summary;
+  }
+
+  for (const foremanId of foremanIds) {
+    let foreman = null;
+    try { foreman = await bitrixRestCall('crm.deal.get', { id: foremanId }); } catch (_) {}
+    if (!foreman || String(foreman.CATEGORY_ID) !== String(cfg.foremanCategoryId)) {
+      summary.skipped.push(`Прораб ${foremanId} не найден в воронке ${cfg.foremanCategoryId}`);
+      continue;
+    }
+
+    const activeLinks = await fgFindActiveDealsWithForeman(foremanId, cfg, deal.ID);
+    if (activeLinks.length) {
+      summary.stillBusy.push({ foremanId: String(foremanId), title: foreman.TITLE, activeDeals: activeLinks.map(d => ({ id: d.ID, title: d.TITLE })) });
+      const marker = `${FOREMAN_RELEASE_MARKER} still-busy foreman=${foremanId} prod=${deal.ID}`;
+      await fgAddCommentOnce(foremanId, marker, `ИИгорь: производственная сделка закрыта, но прораб НЕ освобождён, потому что ещё привязан к активным сделкам.\n\nЗакрытая сделка: ${deal.TITLE || deal.ID}\nАктивные сделки:\n${activeLinks.map(d => `— ${d.TITLE || d.ID}: ${fgDealUrl(d.ID)}`).join('\n')}`);
+      continue;
+    }
+
+    const target = fgForemanIsExpiring(foreman, cfg) ? cfg.stageExpiring : cfg.stageFree;
+    await fgSetDealStageIfNeeded(foreman, target);
+    const marker = `${FOREMAN_RELEASE_MARKER} foreman=${foremanId} prod=${deal.ID}`;
+    await fgAddCommentOnce(foremanId, marker, `ИИгорь: производственная сделка успешно завершена, активных сделок с этим прорабом больше нет.\n\nОсвобождён после сделки: ${deal.TITLE || deal.ID}\nСсылка: ${fgDealUrl(deal.ID)}\nНовый статус: ${target === cfg.stageExpiring ? 'Аттестат заканчивается' : 'Свободен'}.`);
+    summary.released.push({ foremanId: String(foremanId), title: foreman.TITLE, targetStage: target });
+  }
+
+  return summary;
+}
+
+app.post('/api/foreman/robot-linked', async (req, res) => {
+  try {
+    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await fgHandleForemanLinked(dealId, 'robot-linked');
+    res.status(result.ok ? 200 : 422).json(result);
   } catch (e) {
+    console.error('[foreman-robot-linked]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+app.get('/api/foreman/robot-linked', async (req, res) => {
+  try {
+    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await fgHandleForemanLinked(dealId, 'robot-linked-get');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[foreman-robot-linked-get]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+app.post('/api/foreman/robot-closed', async (req, res) => {
+  try {
+    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await fgHandleProductionClosed(dealId, 'robot-closed');
+    res.json(result);
+  } catch (e) {
+    console.error('[foreman-robot-closed]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+app.get('/api/foreman/robot-closed', async (req, res) => {
+  try {
+    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await fgHandleProductionClosed(dealId, 'robot-closed-get');
+    res.json(result);
+  } catch (e) {
+    console.error('[foreman-robot-closed-get]', e.message || e);
     res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
