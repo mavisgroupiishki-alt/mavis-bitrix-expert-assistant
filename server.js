@@ -117,6 +117,9 @@ const config = {
   foremanStageFree: process.env.FOREMAN_STAGE_FREE || '',
   foremanStageBusy: process.env.FOREMAN_STAGE_BUSY || '',
   foremanStageCertExpiring: process.env.FOREMAN_STAGE_CERT_EXPIRING || '',
+  // v52: стадия, куда переводим прораба после закрытия производственной сделки.
+  // Не заменяет FOREMAN_STAGE_FREE, чтобы свободные кандидаты продолжали искаться только в 'Свободен'.
+  foremanStageAfterClose: process.env.FOREMAN_STAGE_AFTER_CLOSE || process.env.FOREMAN_STAGE_CONTROL_DISMISSAL || '',
   foremanFieldWorkType: process.env.FOREMAN_FIELD_WORK_TYPE || '',
   foremanFieldCertExpires: process.env.FOREMAN_FIELD_CERT_EXPIRES || '',
   foremanFieldPhone: process.env.FOREMAN_FIELD_PHONE || '',
@@ -4375,6 +4378,7 @@ function fgForemanCfg() {
     stageFree: config.foremanStageFree || 'C32:PREPARATION',
     stageBusy: config.foremanStageBusy || 'C32:PREPAYMENT_INVOIC',
     stageExpiring: config.foremanStageCertExpiring || 'C32:EXECUTING',
+    stageAfterClose: config.foremanStageAfterClose || '',
     fieldWorkType: config.foremanFieldWorkType || 'UF_CRM_1784269813234',
     fieldPhone: config.foremanFieldPhone || 'UF_CRM_1784212767689',
     fieldCertExpires: config.foremanFieldCertExpires || 'CLOSEDATE',
@@ -4505,6 +4509,29 @@ async function fgSetDealStageIfNeeded(deal, targetStage) {
   await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: { STAGE_ID: targetStage } });
   deal.STAGE_ID = targetStage;
   return true;
+}
+
+async function fgFindForemanStageByName(cfg, patterns) {
+  try {
+    const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: cfg.foremanCategoryId });
+    const list = Array.isArray(stages) ? stages : (stages && Array.isArray(stages.result) ? stages.result : []);
+    const found = list.find((s) => patterns.some((rx) => rx.test(fgNormalize(s.NAME || s.name || s.TITLE || s.title || ''))));
+    return found ? (found.STATUS_ID || found.statusId || found.ID || found.id || '') : '';
+  } catch (e) {
+    console.warn(`[foreman] не удалось получить стадии воронки прорабов: ${e.message || e}`);
+    return '';
+  }
+}
+
+async function fgResolveForemanAfterCloseStage(foreman, cfg) {
+  // После закрытия производства теперь прораб уходит на контроль увольнения, а не в 'Свободен'.
+  // Переменная приоритетнее авто-поиска, чтобы не зависеть от названия стадии.
+  if (cfg.stageAfterClose) return cfg.stageAfterClose;
+  const byName = await fgFindForemanStageByName(cfg, [/контроль.*увольнен/, /увольнен/]);
+  if (byName) return byName;
+  // Без стадии 'Контроль увольнения' сохраняем старую безопасную логику, но пишем предупреждение.
+  console.warn('[foreman] FOREMAN_STAGE_AFTER_CLOSE не задана и стадия Контроль увольнения не найдена — fallback на старую логику.');
+  return fgForemanIsExpiring(foreman, cfg) ? cfg.stageExpiring : cfg.stageFree;
 }
 
 function fgForemanCandidateText(f, cfg) {
@@ -4847,10 +4874,10 @@ async function fgHandleProductionClosed(dealId, source = 'robot') {
       continue;
     }
 
-    const target = fgForemanIsExpiring(foreman, cfg) ? cfg.stageExpiring : cfg.stageFree;
+    const target = await fgResolveForemanAfterCloseStage(foreman, cfg);
     await fgSetDealStageIfNeeded(foreman, target);
     const marker = `${FOREMAN_RELEASE_MARKER} foreman=${foremanId} prod=${deal.ID}`;
-    await fgAddCommentOnce(foremanId, marker, `ИИгорь: производственная сделка успешно завершена, активных сделок с этим прорабом больше нет.\n\nОсвобождён после сделки: ${deal.TITLE || deal.ID}\nСсылка: ${fgDealUrl(deal.ID)}\nНовый статус: ${target === cfg.stageExpiring ? 'Аттестат заканчивается' : 'Свободен'}.`);
+    await fgAddCommentOnce(foremanId, marker, `ИИгорь: производственная сделка успешно завершена, активных сделок с этим прорабом больше нет.\n\nОсвобождён после сделки: ${deal.TITLE || deal.ID}\nСсылка: ${fgDealUrl(deal.ID)}\nНовый статус: ${target === cfg.stageAfterClose ? 'Контроль увольнения' : (target === cfg.stageExpiring ? 'Аттестат заканчивается' : 'Свободен')}.`);
     summary.released.push({ foremanId: String(foremanId), title: foreman.TITLE, targetStage: target });
   }
 
