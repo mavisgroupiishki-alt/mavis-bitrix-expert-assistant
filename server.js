@@ -129,6 +129,9 @@ const config = {
   // v47: ИИгорь — автоматическая связка производственных сделок с воронкой прорабов.
   // Поле в сделке производства, где хранится ID/ссылка на сделку прораба из воронки 32.
   foremanProductionSpecialistField: process.env.FOREMAN_PRODUCTION_SPECIALIST_FIELD || process.env.FOREMAN_PRODUCTION_FOREMAN_FIELD || 'UF_CRM_1784528226',
+  // v54: если создали новое множественное поле 'Специалисты', ставим true.
+  // Тогда ИИгорь не заменяет старого прораба, а добавляет нового в массив значений.
+  foremanProductionSpecialistFieldMultiple: String(process.env.FOREMAN_PRODUCTION_SPECIALIST_FIELD_MULTIPLE || 'false').toLowerCase() === 'true',
   foremanAutomationEnabled: String(process.env.FOREMAN_AUTOMATION_ENABLED || 'false').toLowerCase() === 'true',
   foremanPollIntervalMinutes: Number(process.env.FOREMAN_POLL_INTERVAL_MINUTES || 60),
   foremanLookbackDays: Number(process.env.FOREMAN_LOOKBACK_DAYS || 45),
@@ -145,6 +148,16 @@ const config = {
   // Эти флаги не дают создавать 4–5 одинаковых уведомлений/комментариев.
   foremanAddPropagationComments: String(process.env.FOREMAN_ADD_PROPAGATION_COMMENTS || 'false').toLowerCase() === 'true',
   foremanSkipPropagatedWebhookMinutes: Number(process.env.FOREMAN_SKIP_PROPAGATED_WEBHOOK_MINUTES || 20),
+
+  // v55: пушинг актов — при успешном закрытии производства создать задачу на сбор оригинала акта.
+  actsTasksEnabled: String(process.env.ACTS_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
+  actsProjectId: Number(process.env.ACTS_PROJECT_ID || 36),
+  actsResponsibleId: process.env.ACTS_RESPONSIBLE_ID || process.env.TANYA_USER_ID || '2182',
+  actsAuditorIds: parseIdList(process.env.ACTS_AUDITOR_IDS || ''),
+  // Если знаешь ID стадии "Сбор" в проекте Акты счета — укажи. Если пусто, задача создаётся в проекте без принудительной стадии.
+  actsCollectionStageId: process.env.ACTS_COLLECTION_STAGE_ID || '',
+  actsTaskTitlePrefix: process.env.ACTS_TASK_TITLE_PREFIX || 'СОБРАТЬ АКТ',
+  actsDuplicateWindowDays: Number(process.env.ACTS_DUPLICATE_WINDOW_DAYS || 120),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -157,11 +170,12 @@ async function bitrixRestCall(method, params = {}) {
   if (String(method || '').toLowerCase() === 'tasks.task.add' && !config.serverTasksEnabled) {
     const title = params && params.fields ? String(params.fields.TITLE || '') : '';
     const isForemanTask = /^ИИгорь:/i.test(title) && config.foremanTasksEnabled;
-    if (!isForemanTask) {
+    const isActsTask = (title.includes('[MAVIS_ACTS_ORIGINAL]') || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title)) && config.actsTasksEnabled;
+    if (!isForemanTask && !isActsTask) {
       console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
       return { task: { id: null, blocked: true } };
     }
-    console.log(`[tasks] allowed as foreman task: ${title || 'без названия'}`);
+    console.log(`[tasks] allowed as ${isActsTask ? 'acts' : 'foreman'} task: ${title || 'без названия'}`);
   }
   if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
   const response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
@@ -4819,8 +4833,22 @@ async function fgFindActiveDealsWithForeman(foremanId, cfg, excludeDealId = '') 
   return rows.filter((d) => String(d.ID) !== String(excludeDealId) && fgExtractDealIds(d[cfg.fieldProductionSpecialist]).map(String).includes(String(foremanId)));
 }
 
-async function fgUpdateDealSpecialist(dealId, foremanId, cfg) {
-  await bitrixRestCall('crm.deal.update', { id: dealId, fields: { [cfg.fieldProductionSpecialist]: String(foremanId) } });
+function fgFormatSpecialistFieldValue(ids, cfg) {
+  const clean = [...new Set((Array.isArray(ids) ? ids : [ids]).map((x) => String(x || '').match(/\d+/)?.[0]).filter(Boolean))];
+  // Для старого одиночного поля оставляем старое поведение: одно значение.
+  if (!config.foremanProductionSpecialistFieldMultiple) return clean[0] || '';
+  // Для нового множественного CRM-поля Bitrix обычно принимает массив значений.
+  // Если поле настроено как 'Привязка к элементам CRM' и только сделки, числовых ID достаточно.
+  return clean;
+}
+
+async function fgUpdateDealSpecialist(dealOrId, foremanId, cfg) {
+  const deal = (typeof dealOrId === 'object' && dealOrId) ? dealOrId : await fgGetDealById(dealOrId, cfg);
+  const existing = fgExtractDealIds(deal && deal[cfg.fieldProductionSpecialist]);
+  const merged = [...new Set([...existing.map(String), String(foremanId)].filter(Boolean))];
+  const value = fgFormatSpecialistFieldValue(merged, cfg);
+  await bitrixRestCall('crm.deal.update', { id: deal.ID || dealOrId, fields: { [cfg.fieldProductionSpecialist]: value } });
+  return merged;
 }
 
 async function fgHandleForemanLinked(dealId, source = 'robot') {
@@ -4866,17 +4894,22 @@ async function fgHandleForemanLinked(dealId, source = 'robot') {
     const added = await fgAddCommentOnce(foremanId, marker, comment);
     summary.foremen.push({ foremanId: String(foremanId), title: foreman.TITLE, movedBusy: moved, commentAdded: added });
 
-    // Проставляем этого же прораба во все активные сделки этой же компании, если там поле пустое.
-    // v53: по умолчанию делаем это тихо, без комментария в каждую сделку, чтобы не спавнить уведомления.
+    // Проставляем этого же прораба во все активные сделки этой же компании.
+    // v54: если поле множественное — ДОБАВЛЯЕМ прораба к уже выбранным, а не заменяем.
+    // Если поле старое одиночное — не трогаем сделки, где специалист уже заполнен, чтобы не стереть выбранного прораба.
     for (const s of siblingDeals) {
-      const existing = fgExtractDealIds(s[cfg.fieldProductionSpecialist]);
-      if (existing.length) {
-        summary.skipped.push(`Сделка ${s.ID}: поле специалист уже заполнено (${existing.join(',')})`);
+      const existing = fgExtractDealIds(s[cfg.fieldProductionSpecialist]).map(String);
+      if (existing.includes(String(foremanId))) {
+        summary.skipped.push(`Сделка ${s.ID}: этот прораб уже указан (${foremanId})`);
+        continue;
+      }
+      if (existing.length && !config.foremanProductionSpecialistFieldMultiple) {
+        summary.skipped.push(`Сделка ${s.ID}: старое одиночное поле специалист уже заполнено (${existing.join(',')})`);
         continue;
       }
       fgRememberPropagatedDeal(s.ID, foremanId);
-      await fgUpdateDealSpecialist(s.ID, foremanId, cfg);
-      summary.propagated.push({ dealId: String(s.ID), title: s.TITLE, foremanId: String(foremanId), silent: !config.foremanAddPropagationComments });
+      const mergedIds = await fgUpdateDealSpecialist(s, foremanId, cfg);
+      summary.propagated.push({ dealId: String(s.ID), title: s.TITLE, foremanId: String(foremanId), fieldValues: mergedIds, silent: !config.foremanAddPropagationComments });
       const siblingMarker = `${FOREMAN_PROPAGATE_MARKER} prod=${s.ID} foreman=${foremanId}`;
       if (config.foremanAddPropagationComments) {
         await fgAddCommentOnce(s.ID, siblingMarker, `ИИгорь: автоматически проставил прораба из другой активной сделки этой компании.\n\nПрораб: ${foreman.TITLE || foremanId}\nИсточник: ${deal.TITLE || deal.ID}\nСсылка на источник: ${fgDealUrl(deal.ID)}`);
@@ -4925,6 +4958,142 @@ async function fgHandleProductionClosed(dealId, source = 'robot') {
 
   return summary;
 }
+
+
+// v55: пушинг актов — задача на сбор оригинала акта после закрытия производства.
+const ACTS_ORIGINAL_MARKER = '[MAVIS_ACTS_ORIGINAL]';
+
+function actsCleanText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function actsMoney(value) {
+  const n = Number(String(value || '').replace(',', '.'));
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return `${Math.round(n * 100) / 100}`.replace('.', ',');
+}
+
+function actsDealUrl(dealId) {
+  return `https://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+}
+
+async function actsFindExistingTask(dealId) {
+  const crmRef = `D_${dealId}`;
+  const marker = `${ACTS_ORIGINAL_MARKER} deal=${dealId}`;
+
+  // Сначала ищем по CRM-привязке. Это самый точный вариант.
+  try {
+    const linked = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId, UF_CRM_TASK: crmRef },
+      select: ['ID','TITLE','DESCRIPTION','STATUS','REAL_STATUS','GROUP_ID','UF_CRM_TASK','CREATED_DATE'],
+      order: { ID: 'DESC' },
+    }, 50);
+    const found = linked.find((t) => String(t.description || t.DESCRIPTION || '').includes(ACTS_ORIGINAL_MARKER) || String(t.title || t.TITLE || '').includes(config.actsTaskTitlePrefix));
+    if (found) return found;
+  } catch (e) {
+    console.warn(`[acts] поиск дубля по UF_CRM_TASK не сработал: ${e.message}`);
+  }
+
+  // Фолбэк: ищем по маркеру в свежих задачах проекта.
+  try {
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId },
+      select: ['ID','TITLE','DESCRIPTION','STATUS','REAL_STATUS','GROUP_ID','UF_CRM_TASK','CREATED_DATE'],
+      order: { ID: 'DESC' },
+    }, 1000);
+    return tasks.find((t) => String(t.description || t.DESCRIPTION || '').includes(marker)) || null;
+  } catch (e) {
+    console.warn(`[acts] поиск дубля в проекте не сработал: ${e.message}`);
+    return null;
+  }
+}
+
+async function actsCreateCollectionTaskForDeal(dealId, source = 'robot') {
+  if (!config.actsTasksEnabled) return { ok: false, skipped: true, message: 'ACTS_TASKS_ENABLED=false' };
+  if (!config.actsProjectId) throw new Error('ACTS_PROJECT_ID не задан');
+  if (!config.actsResponsibleId) throw new Error('ACTS_RESPONSIBLE_ID/TANYA_USER_ID не задан');
+
+  const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+  if (!deal || String(deal.CATEGORY_ID) !== String(config.productionCategoryId || 28)) {
+    throw new Error(`Сделка ${dealId} не найдена или не из воронки производства ${config.productionCategoryId || 28}`);
+  }
+
+  // Не создаём задачу на открытую сделку. Бизнес-процесс должен запускаться при закрытии.
+  if (String(deal.CLOSED || '').toUpperCase() !== 'Y' && String(deal.STAGE_SEMANTIC_ID || '').toUpperCase() !== 'S') {
+    return { ok: false, skipped: true, dealId: String(dealId), message: 'Сделка ещё не закрыта успешно — задачу на акт не создаю.' };
+  }
+
+  const existing = await actsFindExistingTask(dealId);
+  if (existing) {
+    return { ok: true, duplicate: true, dealId: String(dealId), taskId: String(existing.id || existing.ID), message: 'Задача на сбор акта уже есть, дубль не создаю.' };
+  }
+
+  const companyName = await fgGetCompanyName(deal.COMPANY_ID);
+  const expertName = await fgGetUserLabel(deal.ASSIGNED_BY_ID);
+  const service = fgProductionService(deal) || 'услуга не указана';
+  const amount = actsMoney(deal.OPPORTUNITY);
+
+  const titleParts = [
+    config.actsTaskTitlePrefix,
+    companyName || actsCleanText(deal.TITLE) || `сделка ${dealId}`,
+    service,
+    amount ? `${amount} руб` : '',
+  ].filter(Boolean);
+
+  const title = `${titleParts.join(' — ')} [MAVIS_ACTS_ORIGINAL]`;
+  const description = `${ACTS_ORIGINAL_MARKER} deal=${dealId}\n\nНужно получить физический оригинал акта по закрытой работе.\n\nКомпания: ${companyName || deal.COMPANY_ID || 'не указана'}\nЗакрытая сделка производства: ${deal.TITLE || dealId}\nУслуга: ${service}\nСумма: ${amount || 'не указана'}\nОтветственный эксперт: ${expertName || deal.ASSIGNED_BY_ID || 'не указан'}\nСсылка на сделку: ${actsDealUrl(dealId)}\n\nВажно: акт считается вернувшимся только когда эта задача будет переведена в стадию «Архив».`;
+
+  const fields = {
+    TITLE: title,
+    DESCRIPTION: description,
+    RESPONSIBLE_ID: String(config.actsResponsibleId),
+    GROUP_ID: Number(config.actsProjectId),
+    UF_CRM_TASK: [`D_${dealId}`],
+  };
+  if (config.actsAuditorIds.length) fields.AUDITORS = config.actsAuditorIds;
+  if (config.actsCollectionStageId) fields.STAGE_ID = config.actsCollectionStageId;
+
+  const created = await bitrixRestCall('tasks.task.add', { fields });
+  const taskId = created && created.task && (created.task.id || created.task.ID);
+
+  try {
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: dealId,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `${ACTS_ORIGINAL_MARKER}\nСоздана задача на сбор оригинала акта: ${taskId ? `#${taskId}` : 'ID не вернулся'}\nОтветственный за сбор: ${config.actsResponsibleId}\nПроект: Акты счета #${config.actsProjectId}`,
+      },
+    });
+  } catch (e) {
+    console.warn(`[acts] комментарий в сделку не добавлен: ${e.message}`);
+  }
+
+  return { ok: true, event: 'acts_collection_task_created', source, dealId: String(dealId), taskId: taskId ? String(taskId) : null, title };
+}
+
+app.post('/api/acts/robot-closed', async (req, res) => {
+  try {
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await actsCreateCollectionTaskForDeal(dealId, 'robot-closed');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[acts-robot-closed]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+app.get('/api/acts/robot-closed', async (req, res) => {
+  try {
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const result = await actsCreateCollectionTaskForDeal(dealId, 'robot-closed-get');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[acts-robot-closed-get]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
 
 app.post('/api/foreman/robot-linked', async (req, res) => {
   try {
