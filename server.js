@@ -5469,7 +5469,17 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   if (!config.actsTasksEnabled) return { ok: false, skipped: true, message: 'ACTS_TASKS_ENABLED=false' };
   if (!config.actsProjectId) throw new Error('ACTS_PROJECT_ID не задан');
 
-  const raw = await bitrixRestCall('tasks.task.get', { taskId });
+  // Bitrix24 does NOT return UF_CRM_TASK / UF_TASK_WEBDAV_FILES from tasks.task.get by default.
+  // They must be explicitly selected, otherwise the task loses both its CRM deal binding
+  // and its attached Disk files at this stage of the acts flow.
+  const raw = await bitrixRestCall('tasks.task.get', {
+    taskId,
+    select: [
+      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
+      'RESPONSIBLE_ID', 'CREATED_DATE', 'CHANGED_DATE',
+      'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES'
+    ],
+  });
   const task = raw && (raw.task || raw.TASK || raw);
   if (!task) throw new Error(`Задача ${taskId} не найдена`);
 
@@ -5486,6 +5496,9 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   const dealIds = actsExtractDealIdsFromTask(task);
   const files = await actsResolveTaskFiles(task);
   const fileForClient = actsPickBestFileForClient(files);
+  const crmBindingForLog = actsTaskField(task, ['ufCrmTask','UF_CRM_TASK','UF_CRM_TASKS','crm','CRM']);
+  const webdavForLog = actsTaskField(task, ['ufTaskWebdavFiles','UF_TASK_WEBDAV_FILES']);
+  console.log(`[acts] task=${taskId}: CRM=${JSON.stringify(crmBindingForLog || [])}; dealIds=${JSON.stringify(dealIds)}; webdav=${JSON.stringify(webdavForLog || [])}; files=${files.map(f => f.name || f.id).join(', ') || 'нет'}`);
   const title = actsTaskField(task, ['title','TITLE']) || '';
   const doneMarker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
   const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
