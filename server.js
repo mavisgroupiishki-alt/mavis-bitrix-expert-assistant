@@ -158,6 +158,11 @@ const config = {
   actsCollectionStageId: process.env.ACTS_COLLECTION_STAGE_ID || '',
   actsTaskTitlePrefix: process.env.ACTS_TASK_TITLE_PREFIX || 'СОБРАТЬ АКТ',
   actsDuplicateWindowDays: Number(process.env.ACTS_DUPLICATE_WINDOW_DAYS || 120),
+  // v57: когда задача в проекте "Акты счета" перешла в "Сделано", отправляем акт клиенту.
+  actsSendToClientEnabled: String(process.env.ACTS_SEND_TO_CLIENT_ENABLED || 'true').toLowerCase() !== 'false',
+  actsSendChannel: process.env.ACTS_SEND_CHANNEL || 'viber',
+  actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
+  actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -661,7 +666,7 @@ app.get('/api/wazzup/channels', async (_req, res) => {
 // Вынесено в отдельную функцию, чтобы её мог использовать и маршрут /api/wazzup/send (ручная
 // отправка через автопилот), и обработчик вебхука живого бота (автоответ клиенту) — одна и та же
 // проверенная логика (минимальный payload для Telegram, повтор при 500).
-async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId }) {
+async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId, ignoreStrictPreferredChannel = false }) {
   const apiKey = process.env.WAZZUP_API_KEY || '';
   const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
   if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
@@ -672,7 +677,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
   if (dealId) {
     const deal = await loadFreshDeal(dealId);
     if (isDealAiDisabled(deal)) throw new Error('Поле ИИ=Нет — отправка клиенту заблокирована.');
-    if (config.strictPreferredChannel) {
+    if (config.strictPreferredChannel && !ignoreStrictPreferredChannel) {
       const preferred = detectPreferredChannel(deal);
       if (!preferred || preferred === 'email') {
         throw new Error(`Строгий режим канала: в сделке не выбран Telegram/Viber для Wazzup (выбрано: ${preferred || 'не распознано'}).`);
@@ -751,6 +756,58 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     const err = new Error(`Wazzup ${configured.label}: ошибка доставки — ${data.error} ${data.error_description || ''}`);
     err.safePayload = { ...payloadToSend, text: '[hidden]' };
     err.possiblyDelivered = false;
+    throw err;
+  }
+  return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data };
+}
+
+
+async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, username, dealId, fileName }) {
+  const apiKey = process.env.WAZZUP_API_KEY || '';
+  const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+  if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
+
+  const configured = getConfiguredWazzupChannel(channelKey || 'viber');
+  if (!configured || !configured.channelId) throw new Error(`Wazzup-канал ${channelKey || 'viber'} не задан в Render Environment.`);
+
+  const url = String(contentUri || '').trim();
+  if (!url) throw new Error('contentUri файла пустой — Wazzup не сможет забрать файл.');
+
+  const cleanPhone = normalizeWazzupPhone(phone || '');
+  const cleanChatId = normalizeWazzupPhone(chatId || '');
+  const cleanUsername = normalizeWazzupUsername(username || '');
+
+  const payload = {
+    channelId: configured.channelId,
+    chatType: configured.chatType,
+    contentUri: url,
+    crmMessageId: `mavis-acts-file-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
+    clearUnanswered: false,
+  };
+
+  if (configured.chatType === 'telegram') {
+    if (cleanChatId) payload.chatId = cleanChatId;
+    else if (cleanPhone) payload.phone = cleanPhone;
+    else if (cleanUsername) payload.username = cleanUsername;
+    else throw new Error('Для Telegram Wazzup не найден телефон/chatId/username клиента.');
+  } else {
+    const recipientId = cleanChatId || cleanPhone;
+    if (!recipientId) throw new Error(`Для ${configured.label} не найден chatId/телефон клиента.`);
+    payload.chatId = recipientId;
+  }
+
+  const resp = await fetch(`${baseUrl}/message`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const responseText = await resp.text();
+  const data = (() => { try { return JSON.parse(responseText); } catch (_) { return {}; } })();
+  if (!resp.ok || (data && data.error)) {
+    const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${resp.status} без тела ответа`);
+    const err = new Error(`Wazzup ${configured.label} файл ${fileName || ''}: ${message}`);
+    err.safePayload = { ...payload, contentUri: '[hidden]' };
+    err.possiblyDelivered = resp.status >= 500;
     throw err;
   }
   return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data };
@@ -5243,6 +5300,63 @@ async function actsResolveTaskFiles(task) {
   return files;
 }
 
+
+function actsPickBestFileForClient(files) {
+  const usable = (files || []).filter((f) => f && f.url);
+  if (!usable.length) return null;
+  const actLike = usable.find((f) => /акт|act/i.test(String(f.name || '')));
+  return actLike || usable[0];
+}
+
+function actsBuildClientMessage(deal, task, file) {
+  const service = detectServiceFromDeal(deal) || 'закрытой услуге';
+  const company = actsCleanText(deal.COMPANY_TITLE || deal.COMPANY_NAME || deal.TITLE || '');
+  const custom = String(config.actsClientMessage || '').trim();
+  if (custom) {
+    return custom
+      .replace(/\{company\}/g, company || 'вашей компании')
+      .replace(/\{service\}/g, service)
+      .replace(/\{deal_id\}/g, String(deal.ID || ''))
+      .replace(/\{file\}/g, String(file && file.name || 'акт'));
+  }
+  return `Добрый день!\n\nНаправляем акт по услуге «${service}».\nПожалуйста, проверьте, подпишите и верните оригинал акта в MAVIS GROUP.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
+}
+
+async function actsSendActToClientViaWazzup({ deal, task, file }) {
+  if (!config.actsSendToClientEnabled) {
+    return { skipped: true, message: 'ACTS_SEND_TO_CLIENT_ENABLED=false' };
+  }
+  if (!file || !file.url) {
+    return { ok: false, skipped: true, message: 'В задаче нет файла с прямой ссылкой для отправки клиенту.' };
+  }
+  const phone = await getContactPhone(deal);
+  if (!phone) {
+    return { ok: false, skipped: true, message: 'В основной карточке контакта сделки не найден телефон для Viber.' };
+  }
+
+  const text = actsBuildClientMessage(deal, task, file);
+  const textResult = await sendWazzupMessageInternal({
+    channelKey: config.actsSendChannel || 'viber',
+    text,
+    phone,
+    dealId: deal.ID,
+    ignoreStrictPreferredChannel: true,
+  });
+  const fileResult = await sendWazzupFileInternal({
+    channelKey: config.actsSendChannel || 'viber',
+    contentUri: file.url,
+    phone,
+    dealId: deal.ID,
+    fileName: file.name,
+  });
+  return {
+    ok: true,
+    channel: (fileResult.channel && fileResult.channel.label) || (textResult.channel && textResult.channel.label) || config.actsSendChannel,
+    phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
+    file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
+  };
+}
+
 async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   if (!config.actsTasksEnabled) return { ok: false, skipped: true, message: 'ACTS_TASKS_ENABLED=false' };
   if (!config.actsProjectId) throw new Error('ACTS_PROJECT_ID не задан');
@@ -5256,8 +5370,14 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
     return { ok: false, skipped: true, taskId: String(taskId), groupId: String(groupId || ''), message: `Задача не из проекта Акты счета #${config.actsProjectId}` };
   }
 
+  const taskStageId = actsTaskField(task, ['stageId','STAGE_ID','stage_id']);
+  if (config.actsDoneStageId && String(taskStageId || '') !== String(config.actsDoneStageId)) {
+    return { ok: false, skipped: true, taskId: String(taskId), stageId: String(taskStageId || ''), message: `Задача не на стадии Сделано (${config.actsDoneStageId})` };
+  }
+
   const dealIds = actsExtractDealIdsFromTask(task);
   const files = await actsResolveTaskFiles(task);
+  const fileForClient = actsPickBestFileForClient(files);
   const title = actsTaskField(task, ['title','TITLE']) || '';
   const marker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
 
@@ -5265,27 +5385,47 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
     return { ok: false, skipped: true, taskId: String(taskId), title, files, message: 'Не нашёл ID сделки производства в задаче. Проверь, что задача создана ИИгорем или в описании есть ссылка/ID сделки.' };
   }
 
-  const comments = [];
+  const results = [];
   for (const dealId of dealIds) {
     const already = await fgTimelineHasMarker(dealId, marker, 50);
     if (already) {
-      comments.push({ dealId: String(dealId), duplicate: true });
+      results.push({ dealId: String(dealId), duplicate: true, message: 'Эта задача уже была обработана ранее, повторно клиенту не отправляю.' });
       continue;
     }
+
+    let deal = null;
+    try {
+      deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+    } catch (e) {
+      results.push({ dealId: String(dealId), ok: false, error: `Не смог получить сделку: ${e.message}` });
+      continue;
+    }
+
+    let sendResult = null;
+    try {
+      sendResult = await actsSendActToClientViaWazzup({ deal, task, file: fileForClient });
+    } catch (e) {
+      sendResult = { ok: false, error: e.message || String(e), possiblyDelivered: Boolean(e.possiblyDelivered) };
+    }
+
     const fileLines = files.length
       ? files.map((f) => `— ${f.name || f.id}${f.url ? `\n  ${f.url}` : ''}`).join('\n')
       : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
+    const sendLines = sendResult && sendResult.ok
+      ? `✅ Клиенту отправлено в ${sendResult.channel || config.actsSendChannel}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nТелефон: ${sendResult.phone || 'скрыт'}`
+      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: телефон основного контакта сделки, Viber-канал Wazzup и прямую ссылку на файл в задаче.`;
+
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
         ENTITY_ID: dealId,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${marker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\nДальше можно забирать акт из этой задачи и раскладывать/прикреплять по регламенту.`,
+        COMMENT: `${marker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
       },
     });
-    comments.push({ dealId: String(dealId), commentAdded: true });
+    results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
   }
 
-  return { ok: true, event: 'acts_task_done_processed', source, taskId: String(taskId), title, dealIds: dealIds.map(String), files, comments };
+  return { ok: true, event: 'acts_task_done_processed_and_sent', source, taskId: String(taskId), title, dealIds: dealIds.map(String), files, fileForClient, results };
 }
 
 app.post('/api/acts/task-done', async (req, res) => {
