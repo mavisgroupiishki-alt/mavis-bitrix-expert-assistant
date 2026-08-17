@@ -4319,21 +4319,35 @@ async function runAutopilotPollingCycle() {
       return;
     }
 
-    // ✅ ИСПРАВЛЕНО: Динамический лукбэк вместо даты старта сервера
-    const lookbackHours = Number(process.env.AUTOPILOT_LOOKBACK_HOURS || 24);
-    const lookbackDate = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
-    const startDateStr = lookbackDate.toISOString().slice(0, 19);
-    console.log(`[autopilot] Ищу сделки за последние ${lookbackHours} часов, начиная с ${startDateStr}`);
+    // v59: для пилота не фильтруем сделку по MOVED_TIME/дате создания.
+    // ИИгорь должен подхватить тестовую сделку, даже если она была создана или переведена
+    // на текущую стадию больше 24 часов назад. При этом не допускаем массовую обработку
+    // старых сделок: если задан тестовый ID, ищем только его. Массовый режим разрешается
+    // только явно через EXECUTOR_ALL_DEALS=true.
+    const targetTestDealId = String(config.executorTestDealId || config.liveChatTestDealId || '').trim();
+    const testOnlyMode = Boolean(targetTestDealId && !config.executorAllDeals);
+
+    if (testOnlyMode) {
+      console.log(`[autopilot] Тестовый режим: ищу сделку ID ${targetTestDealId} по текущей стадии без ограничения 24 часа.`);
+    } else if (config.executorAllDeals) {
+      console.log('[autopilot] EXECUTOR_ALL_DEALS=true: ищу все сделки на целевых стадиях без ограничения по времени.');
+    } else {
+      console.warn('[autopilot] Не задан EXECUTOR_TEST_DEAL_ID/LIVE_CHAT_TEST_DEAL_ID и EXECUTOR_ALL_DEALS=false — цикл пропущен для защиты от массовой обработки.');
+      return;
+    }
+
     // Собираем сделки по каждой стадии отдельно (Bitrix не поддерживает массив в STAGE_ID фильтре).
     const allDeals = [];
     const seenIds = new Set();
     for (const stageId of stageIds) {
+      const filter = {
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        STAGE_ID: stageId,
+      };
+      if (testOnlyMode) filter.ID = targetTestDealId;
+
       const deals = await bitrixRestList('crm.deal.list', {
-        filter: {
-          CATEGORY_ID: config.autopilotCategoryId || 28,
-          STAGE_ID: stageId,
-          '>=MOVED_TIME': startDateStr,
-        },
+        filter,
         select: ['ID', 'TITLE', 'STAGE_ID', 'CATEGORY_ID', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID',
           'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME',
           process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
@@ -4347,7 +4361,7 @@ async function runAutopilotPollingCycle() {
       }
     }
 
-    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] после ${startDateStr}.`);
+    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}]${testOnlyMode ? ` для тестовой сделки ID ${targetTestDealId}` : ''}.`);
 
     for (const deal of allDeals) {
       if (autopilotProcessed.has(String(deal.ID))) continue;
