@@ -5505,7 +5505,7 @@ async function actsSendActToClientViaWazzup(args) {
   return actsSendActToClientByPreferredChannel(args);
 }
 
-async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
+async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = {}) {
   if (!config.actsTasksEnabled) return { ok: false, skipped: true, message: 'ACTS_TASKS_ENABLED=false' };
   if (!config.actsProjectId) throw new Error('ACTS_PROJECT_ID не задан');
 
@@ -5529,7 +5529,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   }
 
   const taskStageId = actsTaskField(task, ['stageId','STAGE_ID','stage_id']);
-  if (config.actsDoneStageId && String(taskStageId || '') !== String(config.actsDoneStageId)) {
+  if (!options.allowHistoricalDone && config.actsDoneStageId && String(taskStageId || '') !== String(config.actsDoneStageId)) {
     return { ok: false, skipped: true, taskId: String(taskId), stageId: String(taskStageId || ''), message: `Задача не на стадии Сделано (${config.actsDoneStageId})` };
   }
 
@@ -5647,8 +5647,48 @@ function actsTaskMatchesPilotDeal(task, targetDealId) {
   return actsExtractDealIdsFromTask(task).map(String).includes(String(targetDealId));
 }
 
+const ACTS_HISTORY_GRACE_MS = 2 * 60 * 1000;
+const ACTS_FIRST_SCAN_LOOKBACK_MS = 15 * 60 * 1000;
+let actsPollLastScanAt = Date.now() - ACTS_FIRST_SCAN_LOOKBACK_MS;
+
+function actsParseDateMs(value) {
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+async function actsTaskEnteredDoneStageSince(taskId, doneStageId, sinceMs) {
+  try {
+    const raw = await bitrixRestCall('tasks.task.history.list', {
+      taskId: Number(taskId),
+      filter: { FIELD: 'STAGE_ID' },
+      order: { createdDate: 'DESC' },
+    });
+    const list = raw && Array.isArray(raw.list) ? raw.list
+      : (raw && Array.isArray(raw.items) ? raw.items : []);
+    const hit = list.find((ev) => {
+      const field = String(ev && (ev.field || ev.FIELD) || '').toUpperCase();
+      const value = ev && (ev.value || ev.VALUE) || {};
+      const to = value && (value.to ?? value.TO);
+      const created = actsParseDateMs(ev && (ev.createdDate || ev.CREATED_DATE));
+      return field === 'STAGE_ID' && String(to ?? '') === String(doneStageId) && created >= sinceMs;
+    });
+    if (!hit) return null;
+    const value = hit.value || hit.VALUE || {};
+    return {
+      eventId: hit.id || hit.ID || '',
+      createdDate: hit.createdDate || hit.CREATED_DATE || '',
+      from: value.from ?? value.FROM ?? '',
+      to: value.to ?? value.TO ?? '',
+    };
+  } catch (e) {
+    console.warn(`[acts-poll] task=${taskId}: не смог прочитать историю стадий: ${e.message || e}`);
+    return null;
+  }
+}
+
 async function runActsDonePollingCycle() {
   if (!config.bitrixWebhookUrl || !config.actsTasksEnabled || !config.actsSendToClientEnabled || !config.actsDonePollEnabled) return;
+  const cycleStartedAt = Date.now();
   try {
     const doneStageId = await actsResolveDoneStageId();
     if (!doneStageId) return;
@@ -5659,19 +5699,18 @@ async function runActsDonePollingCycle() {
       return;
     }
 
-    // v63: не фильтруем STAGE_ID на стороне Bitrix. На некоторых порталах/состояниях Kanban
-    // серверный фильтр по стадии возвращал 0, хотя карточка визуально уже была в нужной колонке.
-    // Забираем задачи проекта и сравниваем реальный STAGE_ID локально.
+    // v64: ищем только недавно изменённые задачи проекта, поэтому новая задача не может
+    // потеряться из-за общего лимита первых 200 карточек. CHANGED_DATE поддерживает >= фильтр.
+    const scanSinceMs = Math.max(0, actsPollLastScanAt - ACTS_HISTORY_GRACE_MS);
+    const scanSinceIso = new Date(scanSinceMs).toISOString();
     const projectTasks = await bitrixRestList('tasks.task.list', {
-      filter: { GROUP_ID: config.actsProjectId },
+      filter: { GROUP_ID: config.actsProjectId, '>=CHANGED_DATE': scanSinceIso },
       order: { CHANGED_DATE: 'DESC' },
       select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CHANGED_DATE'],
-    }, 200);
+    }, 1000);
 
     const stageOf = (task) => String(actsTaskField(task, ['stageId','STAGE_ID','stage_id']) ?? '');
-    const tasks = projectTasks.filter((task) => stageOf(task) === String(doneStageId));
-
-    const candidates = tasks.filter((task) => {
+    const recentActTasks = projectTasks.filter((task) => {
       const title = String(actsTaskField(task, ['title','TITLE']) || '');
       const description = String(actsTaskField(task, ['description','DESCRIPTION']) || '');
       const isActTask = title.includes(ACTS_ORIGINAL_MARKER) || description.includes(ACTS_ORIGINAL_MARKER) || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title);
@@ -5679,34 +5718,59 @@ async function runActsDonePollingCycle() {
       return allDealsMode ? true : actsTaskMatchesPilotDeal(task, targetDealId);
     });
 
-    console.log(`[acts-poll] Проект #${config.actsProjectId}: всего получено ${projectTasks.length} задач; на стадии ${doneStageId} — ${tasks.length}; к обработке ${candidates.length}${allDealsMode ? '' : ` для тестовой сделки ${targetDealId}`}.`);
-    if (!tasks.length) {
-      const preview = projectTasks.slice(0, 12).map((task) => ({
+    const candidates = [];
+    for (const task of recentActTasks) {
+      const taskId = String(actsTaskField(task, ['id','ID']) || '');
+      if (!taskId) continue;
+      if (stageOf(task) === String(doneStageId)) {
+        candidates.push({ task, reason: 'current-stage', history: null });
+        continue;
+      }
+      // Если Bitrix уже успел переставить/закрыть карточку, проверяем историю:
+      // был ли реальный переход STAGE_ID -> doneStageId после прошлого цикла.
+      const history = await actsTaskEnteredDoneStageSince(taskId, doneStageId, scanSinceMs);
+      if (history) candidates.push({ task, reason: 'history-stage-transition', history });
+    }
+
+    console.log(`[acts-poll] Проект #${config.actsProjectId}: с ${scanSinceIso} изменено ${projectTasks.length} задач; актовых ${recentActTasks.length}; входов в стадию ${doneStageId} — ${candidates.length}${allDealsMode ? '' : ` для тестовой сделки ${targetDealId}`}.`);
+
+    if (!candidates.length) {
+      const preview = recentActTasks.slice(0, 12).map((task) => ({
         id: actsTaskField(task, ['id','ID']),
         stage: stageOf(task),
         status: actsTaskField(task, ['status','STATUS','realStatus','REAL_STATUS']),
+        changed: actsTaskField(task, ['changedDate','CHANGED_DATE','changed_date']),
         crm: actsTaskField(task, ['ufCrmTask','UF_CRM_TASK','uf_crm_task']),
         title: String(actsTaskField(task, ['title','TITLE']) || '').slice(0, 90),
       }));
-      console.log(`[acts-poll] Последние задачи проекта (для диагностики стадии): ${JSON.stringify(preview)}`);
+      console.log(`[acts-poll] Недавно изменённые актовые задачи: ${JSON.stringify(preview)}`);
     }
+
     const now = Date.now();
-    for (const task of candidates) {
+    for (const item of candidates) {
+      const task = item.task;
       const taskId = String(actsTaskField(task, ['id','ID']) || '');
       if (!taskId) continue;
       const lastAttempt = actsPollRecentAttempts.get(taskId) || 0;
       if (now - lastAttempt < 10 * 60 * 1000) continue;
       actsPollRecentAttempts.set(taskId, now);
       try {
-        const result = await actsHandleTaskDone(taskId, 'task-done-poll');
+        if (item.reason === 'history-stage-transition') {
+          console.log(`[acts-poll] task=${taskId}: переход в «Сделано» подтверждён историей ${item.history.from}→${item.history.to} at ${item.history.createdDate}; текущая стадия=${stageOf(task)}.`);
+        }
+        const result = await actsHandleTaskDone(taskId, 'task-done-poll', { allowHistoricalDone: item.reason === 'history-stage-transition' });
         const compact = result && result.results ? result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) : [];
-        console.log(`[acts-poll] task=${taskId}: ${JSON.stringify({ ok: result && result.ok, deals: compact })}`);
+        console.log(`[acts-poll] task=${taskId}: ${JSON.stringify({ ok: result && result.ok, trigger: item.reason, deals: compact })}`);
       } catch (e) {
         console.error(`[acts-poll] task=${taskId}: ${e.message || e}`);
       }
     }
   } catch (e) {
     console.error('[acts-poll] Ошибка цикла:', e.message || e);
+  } finally {
+    // overlap на 2 минуты уже добавляется в начале следующего цикла, поэтому ничего не теряем
+    // при небольшом рассинхроне времени Render/Bitrix.
+    actsPollLastScanAt = cycleStartedAt;
   }
 }
 
@@ -5796,7 +5860,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v60 is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v64 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, testDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsProject=${config.actsProjectId}.`);
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
