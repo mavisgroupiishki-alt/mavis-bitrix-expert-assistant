@@ -160,7 +160,10 @@ const config = {
   actsDuplicateWindowDays: Number(process.env.ACTS_DUPLICATE_WINDOW_DAYS || 120),
   // v57: когда задача в проекте "Акты счета" перешла в "Сделано", отправляем акт клиенту.
   actsSendToClientEnabled: String(process.env.ACTS_SEND_TO_CLIENT_ENABLED || 'true').toLowerCase() !== 'false',
-  actsSendChannel: process.env.ACTS_SEND_CHANNEL || 'viber',
+  // v58: канал отправки акта больше НЕ задаём жёстко. Берём из поля "Предпочитаемый способ связи":
+  // Email -> письмо, Telegram -> Wazzup Telegram, Viber -> Wazzup Viber.
+  // ACTS_SEND_CHANNEL оставлен только как legacy/fallback для старых ручных тестов, в основной логике не используется.
+  actsSendChannel: process.env.ACTS_SEND_CHANNEL || '',
   actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
   actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
 };
@@ -5322,28 +5325,101 @@ function actsBuildClientMessage(deal, task, file) {
   return `Добрый день!\n\nНаправляем акт по услуге «${service}».\nПожалуйста, проверьте, подпишите и верните оригинал акта в MAVIS GROUP.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
 }
 
-async function actsSendActToClientViaWazzup({ deal, task, file }) {
+function maskEmailForLog(email) {
+  const e = String(email || '').trim();
+  const parts = e.split('@');
+  if (parts.length !== 2) return e ? '***' : '';
+  const name = parts[0];
+  const domain = parts[1];
+  return `${name.slice(0, 2)}***@${domain}`;
+}
+
+function actsBuildEmailStorageElementIds(file) {
+  // Для письма из Bitrix стараемся приложить тот же Disk-файл, который был прикреплён к задаче.
+  // В задачах Bitrix webdav-вложения часто приходят как attached object: n123456.
+  // crm.activity.add обычно принимает STORAGE_TYPE_ID=3 и STORAGE_ELEMENT_IDS=["n123456"].
+  const ids = [];
+  const attachedId = String(file && file.attachedId || '').replace(/^n/i, '').trim();
+  const fileId = String(file && file.id || '').replace(/^n/i, '').trim();
+  if (/^\d+$/.test(attachedId)) ids.push(`n${attachedId}`);
+  if (/^\d+$/.test(fileId) && !ids.includes(`n${fileId}`)) ids.push(`n${fileId}`);
+  return ids;
+}
+
+async function sendActEmailThroughBitrix(dealId, responsibleId, toEmail, dealTitle, text, file) {
+  const fields = {
+    TYPE_ID: 4,
+    SUBJECT: `Акт по сделке: ${dealTitle || dealId}`,
+    DESCRIPTION: text + (file && file.url ? `
+
+Ссылка на файл акта: ${file.url}` : ''),
+    DESCRIPTION_TYPE: 1,
+    DIRECTION: 2,
+    OWNER_TYPE_ID: 2,
+    OWNER_ID: dealId,
+    RESPONSIBLE_ID: responsibleId || 1,
+    COMPLETED: 'N',
+    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: 0, ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+  };
+
+  const storageIds = actsBuildEmailStorageElementIds(file);
+  if (storageIds.length) {
+    fields.STORAGE_TYPE_ID = 3; // Disk
+    fields.STORAGE_ELEMENT_IDS = storageIds;
+  }
+
+  return await bitrixRestCall('crm.activity.add', { fields });
+}
+
+async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   if (!config.actsSendToClientEnabled) {
     return { skipped: true, message: 'ACTS_SEND_TO_CLIENT_ENABLED=false' };
   }
   if (!file || !file.url) {
     return { ok: false, skipped: true, message: 'В задаче нет файла с прямой ссылкой для отправки клиенту.' };
   }
-  const phone = await getContactPhone(deal);
-  if (!phone) {
-    return { ok: false, skipped: true, message: 'В основной карточке контакта сделки не найден телефон для Viber.' };
+
+  const preferredChannel = detectPreferredChannel(deal);
+  if (!preferredChannel) {
+    return { ok: false, skipped: true, message: 'В сделке не распознано поле «Предпочитаемый способ связи». Нужно выбрать Email / Telegram / Viber.' };
   }
 
   const text = actsBuildClientMessage(deal, task, file);
+
+  if (preferredChannel === 'email') {
+    const email = await getContactEmail(deal);
+    if (!email) {
+      return { ok: false, skipped: true, channel: 'Email', message: 'В сделке выбран Email, но у основного контакта не найден email.' };
+    }
+    await sendActEmailThroughBitrix(deal.ID, deal.ASSIGNED_BY_ID, email, deal.TITLE, text, file);
+    return {
+      ok: true,
+      channel: 'Email',
+      email: maskEmailForLog(email),
+      file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
+      note: 'Письмо создано через Bitrix. Если Bitrix не приложил файл как вложение, в тексте письма есть ссылка на файл акта.',
+    };
+  }
+
+  const phone = await getContactPhone(deal);
+  if (!phone) {
+    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но у основного контакта не найден телефон.` };
+  }
+
+  const ch = getConfiguredWazzupChannel(preferredChannel);
+  if (!ch || !ch.channelId) {
+    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но этот Wazzup-канал не настроен в Render.` };
+  }
+
   const textResult = await sendWazzupMessageInternal({
-    channelKey: config.actsSendChannel || 'viber',
+    channelKey: preferredChannel,
     text,
     phone,
     dealId: deal.ID,
-    ignoreStrictPreferredChannel: true,
+    ignoreStrictPreferredChannel: false,
   });
   const fileResult = await sendWazzupFileInternal({
-    channelKey: config.actsSendChannel || 'viber',
+    channelKey: preferredChannel,
     contentUri: file.url,
     phone,
     dealId: deal.ID,
@@ -5351,10 +5427,15 @@ async function actsSendActToClientViaWazzup({ deal, task, file }) {
   });
   return {
     ok: true,
-    channel: (fileResult.channel && fileResult.channel.label) || (textResult.channel && textResult.channel.label) || config.actsSendChannel,
+    channel: (fileResult.channel && fileResult.channel.label) || (textResult.channel && textResult.channel.label) || preferredChannelLabel(preferredChannel),
     phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
     file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
   };
+}
+
+// legacy-name wrapper, чтобы старые ручные вызовы/логи не ломались
+async function actsSendActToClientViaWazzup(args) {
+  return actsSendActToClientByPreferredChannel(args);
 }
 
 async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
@@ -5403,7 +5484,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
 
     let sendResult = null;
     try {
-      sendResult = await actsSendActToClientViaWazzup({ deal, task, file: fileForClient });
+      sendResult = await actsSendActToClientByPreferredChannel({ deal, task, file: fileForClient });
     } catch (e) {
       sendResult = { ok: false, error: e.message || String(e), possiblyDelivered: Boolean(e.possiblyDelivered) };
     }
@@ -5412,8 +5493,8 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
       ? files.map((f) => `— ${f.name || f.id}${f.url ? `\n  ${f.url}` : ''}`).join('\n')
       : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
     const sendLines = sendResult && sendResult.ok
-      ? `✅ Клиенту отправлено в ${sendResult.channel || config.actsSendChannel}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nТелефон: ${sendResult.phone || 'скрыт'}`
-      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: телефон основного контакта сделки, Viber-канал Wazzup и прямую ссылку на файл в задаче.`;
+      ? `✅ Клиенту отправлено через ${sendResult.channel || 'предпочитаемый канал'}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.phone || sendResult.email || 'скрыт'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
+      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый способ связи», телефон/email основного контакта, настройки Wazzup Telegram/Viber и прямую ссылку на файл в задаче.`;
 
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
@@ -5425,7 +5506,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
   }
 
-  return { ok: true, event: 'acts_task_done_processed_and_sent', source, taskId: String(taskId), title, dealIds: dealIds.map(String), files, fileForClient, results };
+  return { ok: true, event: 'acts_task_done_processed_and_sent_by_preferred_channel', source, taskId: String(taskId), title, dealIds: dealIds.map(String), files, fileForClient, results };
 }
 
 app.post('/api/acts/task-done', async (req, res) => {
