@@ -5294,38 +5294,68 @@ async function actsResolveTaskFiles(task) {
 
   const files = [];
   const seenFile = new Set();
+  const addFile = (file) => {
+    if (!file) return;
+    const name = actsCleanText(file.name || '');
+    const id = String(file.id || '');
+    const url = String(file.url || '');
+    const key = `${id}:${name}:${url}`;
+    if (seenFile.has(key)) return;
+    seenFile.add(key);
+    files.push({ ...file, id, name: name || (id ? `файл ${id}` : 'файл'), url });
+  };
+
+  // 1) Классическое вложение непосредственно к задаче (UF_TASK_WEBDAV_FILES).
   for (const id of [...ids].slice(0, 20)) {
-    // В задачах Bitrix файлы часто приходят как webdav/attached object: n123456.
-    // Поэтому сначала пробуем disk.attachedObject.get, затем disk.file.get.
     try {
       const attached = await bitrixRestCall('disk.attachedObject.get', { id });
       const obj = attached && (attached.object || attached.OBJECT || attached);
       const fileId = obj && (obj.ID || obj.id || obj.OBJECT_ID || obj.objectId);
       const name = actsCleanText(obj && (obj.NAME || obj.name || obj.TITLE || obj.title));
       const url = obj && (obj.DOWNLOAD_URL || obj.downloadUrl || obj.URL || obj.url || obj.DETAIL_URL || obj.detailUrl);
-      const key = `${fileId || id}:${name}`;
-      if (!seenFile.has(key)) {
-        seenFile.add(key);
-        files.push({ id: String(fileId || id), attachedId: String(id), name: name || `файл ${id}`, url: url || '' });
-      }
+      addFile({ id: String(fileId || id), attachedId: String(id), name: name || `файл ${id}`, url: url || '', source: 'task-webdav' });
       continue;
     } catch (_) {}
     try {
       const f = await bitrixRestCall('disk.file.get', { id });
       const name = actsCleanText(f && (f.NAME || f.name || f.TITLE || f.title));
       const url = f && (f.DOWNLOAD_URL || f.downloadUrl || f.URL || f.url || f.DETAIL_URL || f.detailUrl);
-      const key = `${id}:${name}`;
-      if (!seenFile.has(key)) {
-        seenFile.add(key);
-        files.push({ id: String(id), attachedId: '', name: name || `файл ${id}`, url: url || '' });
-      }
+      addFile({ id: String(id), attachedId: '', name: name || `файл ${id}`, url: url || '', source: 'task-disk' });
     } catch (_) {}
   }
 
-  // Если API не раскрыл файлы, хотя имена в задаче видны — вернём хотя бы названия.
+  // 2) Новая карточка Bitrix24: комментарии/результат задачи находятся в чате задачи.
+  // UF_TASK_WEBDAV_FILES в таком случае может быть пустым, хотя сотрудник визуально прикрепил акт.
+  // tasks.task.get должен вернуть CHAT_ID, после чего im.dialog.messages.get отдаёт result.files[].urlDownload.
+  const chatId = String(actsTaskField(task, ['chatId','CHAT_ID','chat_id']) || '').trim();
+  if (chatId) {
+    try {
+      const dialog = await bitrixRestCall('im.dialog.messages.get', { DIALOG_ID: `chat${chatId}`, LIMIT: 50 });
+      const chatFiles = dialog && (dialog.files || dialog.FILES);
+      if (Array.isArray(chatFiles)) {
+        for (const f of chatFiles) {
+          const id = String(f && (f.id || f.ID || f.diskId || f.DISK_ID) || '');
+          const name = actsCleanText(f && (f.name || f.NAME || f.title || f.TITLE));
+          const url = f && (f.urlDownload || f.URL_DOWNLOAD || f.downloadUrl || f.DOWNLOAD_URL || f.url || f.URL);
+          const date = f && (f.date || f.DATE || f.createTime || f.CREATE_TIME || '');
+          addFile({ id, attachedId: '', name: name || (id ? `файл ${id}` : 'файл из чата'), url: url || '', date: date || '', source: 'task-chat' });
+        }
+        console.log(`[acts-files] task=${actsTaskField(task, ['id','ID']) || '?'}: chatId=${chatId}; chat files=${chatFiles.length}`);
+      } else {
+        console.log(`[acts-files] task=${actsTaskField(task, ['id','ID']) || '?'}: chatId=${chatId}; chat files=0`);
+      }
+    } catch (e) {
+      // Если у вебхука нет scope im, задача всё равно продолжит обрабатываться через старые вложения.
+      console.warn(`[acts-files] task=${actsTaskField(task, ['id','ID']) || '?'}: не смог прочитать чат ${chatId}: ${e.message}`);
+    }
+  } else {
+    console.log(`[acts-files] task=${actsTaskField(task, ['id','ID']) || '?'}: CHAT_ID не получен`);
+  }
+
+  // Если API не раскрыл файлы, хотя имена в задаче видны — вернём хотя бы названия для диагностики.
   for (const name of names) {
     const clean = actsCleanText(name);
-    if (clean && !files.some((f) => f.name === clean)) files.push({ id: '', attachedId: '', name: clean, url: '' });
+    if (clean && !files.some((f) => f.name === clean)) addFile({ id: '', attachedId: '', name: clean, url: '', source: 'task-name-only' });
   }
   return files;
 }
@@ -5334,8 +5364,18 @@ async function actsResolveTaskFiles(task) {
 function actsPickBestFileForClient(files) {
   const usable = (files || []).filter((f) => f && f.url);
   if (!usable.length) return null;
-  const actLike = usable.find((f) => /акт|act/i.test(String(f.name || '')));
-  return actLike || usable[0];
+
+  // В чате задачи могут быть старые документы. Сначала берём АКТ, затем PDF/DOC,
+  // и внутри группы предпочитаем самый свежий файл.
+  const ts = (f) => {
+    const n = Date.parse(String(f && f.date || ''));
+    return Number.isFinite(n) ? n : 0;
+  };
+  const newest = (arr) => [...arr].sort((a, b) => ts(b) - ts(a))[0] || null;
+  const actLike = usable.filter((f) => /акт|act/i.test(String(f.name || '')));
+  if (actLike.length) return newest(actLike);
+  const docs = usable.filter((f) => /\.(pdf|docx?)$/i.test(String(f.name || '')));
+  return newest(docs.length ? docs : usable);
 }
 
 function actsBuildClientMessage(deal, task, file) {
@@ -5476,7 +5516,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
     taskId,
     select: [
       'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
-      'RESPONSIBLE_ID', 'CREATED_DATE', 'CHANGED_DATE',
+      'RESPONSIBLE_ID', 'CREATED_DATE', 'CHANGED_DATE', 'CHAT_ID',
       'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES'
     ],
   });
@@ -5498,7 +5538,8 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   const fileForClient = actsPickBestFileForClient(files);
   const crmBindingForLog = actsTaskField(task, ['ufCrmTask','UF_CRM_TASK','UF_CRM_TASKS','crm','CRM']);
   const webdavForLog = actsTaskField(task, ['ufTaskWebdavFiles','UF_TASK_WEBDAV_FILES']);
-  console.log(`[acts] task=${taskId}: CRM=${JSON.stringify(crmBindingForLog || [])}; dealIds=${JSON.stringify(dealIds)}; webdav=${JSON.stringify(webdavForLog || [])}; files=${files.map(f => f.name || f.id).join(', ') || 'нет'}`);
+  const chatIdForLog = actsTaskField(task, ['chatId','CHAT_ID','chat_id']);
+  console.log(`[acts] task=${taskId}: CRM=${JSON.stringify(crmBindingForLog || [])}; dealIds=${JSON.stringify(dealIds)}; webdav=${JSON.stringify(webdavForLog || [])}; chatId=${chatIdForLog || 'нет'}; files=${files.map(f => `${f.name || f.id}[${f.source || '?'}]${f.url ? ':url' : ':no-url'}`).join(', ') || 'нет'}`);
   const title = actsTaskField(task, ['title','TITLE']) || '';
   const doneMarker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
   const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
@@ -5618,7 +5659,7 @@ async function runActsDonePollingCycle() {
       return;
     }
 
-    // v62: не фильтруем STAGE_ID на стороне Bitrix. На некоторых порталах/состояниях Kanban
+    // v63: не фильтруем STAGE_ID на стороне Bitrix. На некоторых порталах/состояниях Kanban
     // серверный фильтр по стадии возвращал 0, хотя карточка визуально уже была в нужной колонке.
     // Забираем задачи проекта и сравниваем реальный STAGE_ID локально.
     const projectTasks = await bitrixRestList('tasks.task.list', {
