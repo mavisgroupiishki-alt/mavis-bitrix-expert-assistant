@@ -5618,11 +5618,17 @@ async function runActsDonePollingCycle() {
       return;
     }
 
-    const tasks = await bitrixRestList('tasks.task.list', {
-      filter: { GROUP_ID: config.actsProjectId, STAGE_ID: doneStageId },
+    // v62: не фильтруем STAGE_ID на стороне Bitrix. На некоторых порталах/состояниях Kanban
+    // серверный фильтр по стадии возвращал 0, хотя карточка визуально уже была в нужной колонке.
+    // Забираем задачи проекта и сравниваем реальный STAGE_ID локально.
+    const projectTasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId },
       order: { CHANGED_DATE: 'DESC' },
-      select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','UF_CRM_TASK','CHANGED_DATE'],
-    }, 100);
+      select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CHANGED_DATE'],
+    }, 200);
+
+    const stageOf = (task) => String(actsTaskField(task, ['stageId','STAGE_ID','stage_id']) ?? '');
+    const tasks = projectTasks.filter((task) => stageOf(task) === String(doneStageId));
 
     const candidates = tasks.filter((task) => {
       const title = String(actsTaskField(task, ['title','TITLE']) || '');
@@ -5632,7 +5638,17 @@ async function runActsDonePollingCycle() {
       return allDealsMode ? true : actsTaskMatchesPilotDeal(task, targetDealId);
     });
 
-    console.log(`[acts-poll] Стадия ${doneStageId}: найдено ${tasks.length} задач, к обработке ${candidates.length}${allDealsMode ? '' : ` для тестовой сделки ${targetDealId}`}.`);
+    console.log(`[acts-poll] Проект #${config.actsProjectId}: всего получено ${projectTasks.length} задач; на стадии ${doneStageId} — ${tasks.length}; к обработке ${candidates.length}${allDealsMode ? '' : ` для тестовой сделки ${targetDealId}`}.`);
+    if (!tasks.length) {
+      const preview = projectTasks.slice(0, 12).map((task) => ({
+        id: actsTaskField(task, ['id','ID']),
+        stage: stageOf(task),
+        status: actsTaskField(task, ['status','STATUS','realStatus','REAL_STATUS']),
+        crm: actsTaskField(task, ['ufCrmTask','UF_CRM_TASK','uf_crm_task']),
+        title: String(actsTaskField(task, ['title','TITLE']) || '').slice(0, 90),
+      }));
+      console.log(`[acts-poll] Последние задачи проекта (для диагностики стадии): ${JSON.stringify(preview)}`);
+    }
     const now = Date.now();
     for (const task of candidates) {
       const taskId = String(actsTaskField(task, ['id','ID']) || '');
