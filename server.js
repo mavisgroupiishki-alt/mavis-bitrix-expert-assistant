@@ -166,6 +166,10 @@ const config = {
   actsSendChannel: process.env.ACTS_SEND_CHANNEL || '',
   actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
   actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
+  // v60: резервный polling стадии «Сделано/Сделаны», чтобы отправка акта не зависела
+  // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
+  actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
+  actsDonePollIntervalSeconds: Number(process.env.ACTS_DONE_POLL_INTERVAL_SECONDS || 60),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -205,7 +209,15 @@ async function bitrixRestList(method, params = {}, limit = 200) {
   let start = 0;
   for (;;) {
     const page = await bitrixRestCall(method, { ...params, start });
-    const items = Array.isArray(page) ? page : (page && page.items) || [];
+    // CRM-методы обычно возвращают массив, а tasks.task.list возвращает { tasks: [...] }.
+    // v60: поддерживаем оба формата, иначе задачи проекта выглядели как пустой список.
+    const items = Array.isArray(page)
+      ? page
+      : (page && Array.isArray(page.items))
+        ? page.items
+        : (page && Array.isArray(page.tasks))
+          ? page.tasks
+          : [];
     // Дедупликация по полю ID — Bitrix иногда возвращает одни и те же записи
     // при пагинации (особенно при малом числе результатов).
     let newItems = 0;
@@ -216,9 +228,8 @@ async function bitrixRestList(method, params = {}, limit = 200) {
       out.push(item);
       newItems++;
     }
-    // Останавливаемся если: пришёл не массив, пришло 0 новых элементов,
-    // или меньше 50 (стандартный размер страницы Bitrix) — значит это последняя страница.
-    if (!Array.isArray(page) || newItems === 0 || items.length < 50 || out.length >= limit) break;
+    // В Bitrix tasks.task.list и CRM-списках размер страницы — 50.
+    if (newItems === 0 || items.length < 50 || out.length >= limit) break;
     start += items.length;
   }
   return out.slice(0, limit);
@@ -5172,6 +5183,8 @@ app.get('/api/acts/robot-closed', async (req, res) => {
 
 // v56: акт обработан в проекте "Акты счета" — задача перешла на стадию "Сделано".
 const ACTS_TASK_DONE_MARKER = '[MAVIS_ACTS_TASK_DONE]';
+const ACTS_TASK_SENT_MARKER = '[MAVIS_ACTS_SENT]';
+const ACTS_TASK_SEND_FAILED_MARKER = '[MAVIS_ACTS_SEND_FAILED]';
 
 function actsReqTaskId(req) {
   const src = Object.assign({}, req.query || {}, req.body || {});
@@ -5474,7 +5487,9 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
   const files = await actsResolveTaskFiles(task);
   const fileForClient = actsPickBestFileForClient(files);
   const title = actsTaskField(task, ['title','TITLE']) || '';
-  const marker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
+  const doneMarker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
+  const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
+  const failedMarker = `${ACTS_TASK_SEND_FAILED_MARKER} task=${taskId}`;
 
   if (!dealIds.length) {
     return { ok: false, skipped: true, taskId: String(taskId), title, files, message: 'Не нашёл ID сделки производства в задаче. Проверь, что задача создана ИИгорем или в описании есть ссылка/ID сделки.' };
@@ -5482,9 +5497,9 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
 
   const results = [];
   for (const dealId of dealIds) {
-    const already = await fgTimelineHasMarker(dealId, marker, 50);
-    if (already) {
-      results.push({ dealId: String(dealId), duplicate: true, message: 'Эта задача уже была обработана ранее, повторно клиенту не отправляю.' });
+    const alreadySent = await fgTimelineHasMarker(dealId, sentMarker, 50);
+    if (alreadySent) {
+      results.push({ dealId: String(dealId), duplicate: true, message: 'Этот акт уже был успешно отправлен ранее, повторно клиенту не отправляю.' });
       continue;
     }
 
@@ -5514,7 +5529,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
       fields: {
         ENTITY_ID: dealId,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${marker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
+        COMMENT: `${sendResult && sendResult.ok ? sentMarker : failedMarker}\n${doneMarker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
       },
     });
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
@@ -5526,8 +5541,10 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
 app.post('/api/acts/task-done', async (req, res) => {
   try {
     const taskId = actsReqTaskId(req);
+    console.log(`[acts-task-done] POST вызван${taskId ? `, task=${taskId}` : ', но task_id не найден'}.`);
     if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
     const result = await actsHandleTaskDone(taskId, 'task-done-post');
+    console.log(`[acts-task-done] task=${taskId}: ${JSON.stringify({ ok: result.ok, event: result.event, dealIds: result.dealIds, results: result.results && result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) })}`);
     res.status(result.ok ? 200 : 422).json(result);
   } catch (e) {
     console.error('[acts-task-done]', e.message || e);
@@ -5538,14 +5555,90 @@ app.post('/api/acts/task-done', async (req, res) => {
 app.get('/api/acts/task-done', async (req, res) => {
   try {
     const taskId = actsReqTaskId(req);
+    console.log(`[acts-task-done] GET вызван${taskId ? `, task=${taskId}` : ', но task_id не найден'}.`);
     if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
     const result = await actsHandleTaskDone(taskId, 'task-done-get');
+    console.log(`[acts-task-done] task=${taskId}: ${JSON.stringify({ ok: result.ok, event: result.event, dealIds: result.dealIds, results: result.results && result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) })}`);
     res.status(result.ok ? 200 : 422).json(result);
   } catch (e) {
     console.error('[acts-task-done-get]', e.message || e);
     res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
+
+// v60: резервный серверный контроль стадии «Сделано/Сделаны» в проекте «Акты счета».
+// Он нужен, потому что робот Bitrix может не вызвать URL, а пользователь ожидает отправку
+// именно по факту перемещения задачи в нужную Kanban-стадию.
+let actsResolvedDoneStageId = '';
+const actsPollRecentAttempts = new Map();
+
+async function actsResolveDoneStageId() {
+  if (config.actsDoneStageId) return String(config.actsDoneStageId);
+  if (actsResolvedDoneStageId) return actsResolvedDoneStageId;
+  const raw = await bitrixRestCall('task.stages.get', { entityId: config.actsProjectId });
+  const stages = raw && typeof raw === 'object' ? Object.values(raw) : [];
+  const done = stages.find((st) => /^сделан/i.test(actsCleanText(st && (st.TITLE || st.title))))
+    || stages.find((st) => /готов/i.test(actsCleanText(st && (st.TITLE || st.title))));
+  if (!done) {
+    console.warn(`[acts-poll] Не нашёл стадию «Сделано/Сделаны» в проекте #${config.actsProjectId}. Доступные стадии: ${stages.map(st => `${st.ID || st.id}:${st.TITLE || st.title}`).join(', ')}`);
+    return '';
+  }
+  actsResolvedDoneStageId = String(done.ID || done.id);
+  console.log(`[acts-poll] Автоопределил стадию «${done.TITLE || done.title}» → ${actsResolvedDoneStageId}.`);
+  return actsResolvedDoneStageId;
+}
+
+function actsTaskMatchesPilotDeal(task, targetDealId) {
+  if (!targetDealId) return false;
+  return actsExtractDealIdsFromTask(task).map(String).includes(String(targetDealId));
+}
+
+async function runActsDonePollingCycle() {
+  if (!config.bitrixWebhookUrl || !config.actsTasksEnabled || !config.actsSendToClientEnabled || !config.actsDonePollEnabled) return;
+  try {
+    const doneStageId = await actsResolveDoneStageId();
+    if (!doneStageId) return;
+    const targetDealId = String(config.executorTestDealId || config.liveChatTestDealId || '').trim();
+    const allDealsMode = Boolean(config.executorAllDeals);
+    if (!targetDealId && !allDealsMode) {
+      console.warn('[acts-poll] Нет EXECUTOR_TEST_DEAL_ID/LIVE_CHAT_TEST_DEAL_ID и EXECUTOR_ALL_DEALS=false — polling пропущен для защиты от массовой отправки.');
+      return;
+    }
+
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId, STAGE_ID: doneStageId },
+      order: { CHANGED_DATE: 'DESC' },
+      select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','UF_CRM_TASK','CHANGED_DATE'],
+    }, 100);
+
+    const candidates = tasks.filter((task) => {
+      const title = String(actsTaskField(task, ['title','TITLE']) || '');
+      const description = String(actsTaskField(task, ['description','DESCRIPTION']) || '');
+      const isActTask = title.includes(ACTS_ORIGINAL_MARKER) || description.includes(ACTS_ORIGINAL_MARKER) || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title);
+      if (!isActTask) return false;
+      return allDealsMode ? true : actsTaskMatchesPilotDeal(task, targetDealId);
+    });
+
+    console.log(`[acts-poll] Стадия ${doneStageId}: найдено ${tasks.length} задач, к обработке ${candidates.length}${allDealsMode ? '' : ` для тестовой сделки ${targetDealId}`}.`);
+    const now = Date.now();
+    for (const task of candidates) {
+      const taskId = String(actsTaskField(task, ['id','ID']) || '');
+      if (!taskId) continue;
+      const lastAttempt = actsPollRecentAttempts.get(taskId) || 0;
+      if (now - lastAttempt < 10 * 60 * 1000) continue;
+      actsPollRecentAttempts.set(taskId, now);
+      try {
+        const result = await actsHandleTaskDone(taskId, 'task-done-poll');
+        const compact = result && result.results ? result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) : [];
+        console.log(`[acts-poll] task=${taskId}: ${JSON.stringify({ ok: result && result.ok, deals: compact })}`);
+      } catch (e) {
+        console.error(`[acts-poll] task=${taskId}: ${e.message || e}`);
+      }
+    }
+  } catch (e) {
+    console.error('[acts-poll] Ошибка цикла:', e.message || e);
+  }
+}
 
 app.post('/api/foreman/robot-linked', async (req, res) => {
   try {
@@ -5633,17 +5726,25 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v60 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, testDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsProject=${config.actsProjectId}.`);
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
     console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
-    // Первый запуск через 2 минуты после старта (дать серверу прогреться).
-    setTimeout(() => {
-      runAutopilotPollingCycle();
-      setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
-    }, 2 * 60 * 1000);
+    // v60: первый цикл сразу после старта, а не через 2 минуты.
+    setTimeout(() => runAutopilotPollingCycle(), 2000);
+    setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
+  }
+
+  if (config.bitrixWebhookUrl && config.actsTasksEnabled && config.actsSendToClientEnabled && config.actsDonePollEnabled) {
+    const actsPollMs = Math.max(30, config.actsDonePollIntervalSeconds || 60) * 1000;
+    console.log(`[acts-poll] Резервный контроль «Акты счета» включён, интервал ${actsPollMs / 1000} сек.`);
+    setTimeout(() => runActsDonePollingCycle(), 4000);
+    setInterval(runActsDonePollingCycle, actsPollMs);
+  } else {
+    console.log('[acts-poll] Резервный контроль актов выключен.');
   }
 
   if (config.foremanAutomationEnabled && config.bitrixWebhookUrl) {
