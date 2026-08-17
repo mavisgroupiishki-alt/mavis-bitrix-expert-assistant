@@ -5095,6 +5095,223 @@ app.get('/api/acts/robot-closed', async (req, res) => {
   }
 });
 
+
+// v56: акт обработан в проекте "Акты счета" — задача перешла на стадию "Сделано".
+const ACTS_TASK_DONE_MARKER = '[MAVIS_ACTS_TASK_DONE]';
+
+function actsReqTaskId(req) {
+  const src = Object.assign({}, req.query || {}, req.body || {});
+  const keys = ['task_id', 'taskId', 'TASK_ID', 'id', 'ID', 'entityId', 'ENTITY_ID'];
+  for (const k of keys) {
+    const v = src[k];
+    if (v !== undefined && v !== null && String(v).trim()) {
+      const m = String(v).match(/\d+/);
+      if (m) return m[0];
+    }
+  }
+  const raw = JSON.stringify(src);
+  const m = raw.match(/tasks\/task\/view\/(\d+)/i) || raw.match(/"(?:task_id|taskId|TASK_ID|ID)"\s*:\s*"?(\d+)/i);
+  return m ? m[1] : '';
+}
+
+function actsTaskField(task, names) {
+  if (!task) return undefined;
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(task, name)) return task[name];
+  }
+  const lowerMap = {};
+  for (const k of Object.keys(task)) lowerMap[k.toLowerCase()] = k;
+  for (const name of names) {
+    const real = lowerMap[String(name).toLowerCase()];
+    if (real) return task[real];
+  }
+  return undefined;
+}
+
+function actsExtractDealIdsFromTask(task) {
+  const ids = new Set();
+  const addFromText = (value) => {
+    const text = String(value || '');
+    if (!text) return;
+    for (const m of text.matchAll(/\bD_(\d+)\b/gi)) ids.add(m[1]);
+    for (const m of text.matchAll(/deal=(\d+)/gi)) ids.add(m[1]);
+    for (const m of text.matchAll(/deal\/details\/(\d+)/gi)) ids.add(m[1]);
+    for (const m of text.matchAll(/ID сделки производства:\s*(\d+)/gi)) ids.add(m[1]);
+  };
+  const crm = actsTaskField(task, ['ufCrmTask','UF_CRM_TASK','UF_CRM_TASKS','crm','CRM']);
+  const walk = (v) => {
+    if (v === null || v === undefined) return;
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (typeof v === 'object') return Object.values(v).forEach(walk);
+    addFromText(v);
+  };
+  walk(crm);
+  addFromText(actsTaskField(task, ['description','DESCRIPTION']));
+  addFromText(actsTaskField(task, ['title','TITLE']));
+  return [...ids];
+}
+
+function actsTaskUrl(taskId) {
+  return `https://mavisgroup.bitrix24.by/workgroups/group/${config.actsProjectId}/tasks/task/view/${taskId}/`;
+}
+
+function actsCollectRawFileRefs(task) {
+  const refs = [];
+  const seen = new Set();
+  const add = (value, path = '') => {
+    if (value === null || value === undefined || value === false) return;
+    const key = `${path}:${JSON.stringify(value).slice(0, 200)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    refs.push({ value, path });
+  };
+  const walk = (v, path = '') => {
+    if (v === null || v === undefined) return;
+    if (Array.isArray(v)) return v.forEach((x, i) => walk(x, `${path}[${i}]`));
+    if (typeof v === 'object') {
+      for (const [k, val] of Object.entries(v)) {
+        const p = path ? `${path}.${k}` : k;
+        if (/file|files|webdav|attached|attachment|disk/i.test(k)) add(val, p);
+        walk(val, p);
+      }
+      return;
+    }
+  };
+  walk(task);
+  return refs;
+}
+
+async function actsResolveTaskFiles(task) {
+  const rawFields = [
+    actsTaskField(task, ['ufTaskWebdavFiles','UF_TASK_WEBDAV_FILES','files','FILES','attachments','ATTACHMENTS']),
+    ...actsCollectRawFileRefs(task).map((x) => x.value),
+  ];
+  const ids = new Set();
+  const names = new Set();
+  const walk = (v) => {
+    if (v === null || v === undefined || v === false) return;
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (typeof v === 'object') {
+      const name = v.NAME || v.name || v.TITLE || v.title || v.fileName || v.filename;
+      if (name) names.add(String(name));
+      ['ID','id','OBJECT_ID','objectId','attachedObjectId','ATTACHED_OBJECT_ID','fileId','FILE_ID'].forEach((k) => walk(v[k]));
+      return;
+    }
+    const text = String(v || '').trim();
+    if (!text) return;
+    const n = text.match(/^n?(\d{2,})$/i);
+    if (n) ids.add(n[1]);
+    if (/\.(pdf|docx?|xlsx?|jpg|jpeg|png)$/i.test(text) || /акт/i.test(text)) names.add(text);
+  };
+  rawFields.forEach(walk);
+
+  const files = [];
+  const seenFile = new Set();
+  for (const id of [...ids].slice(0, 20)) {
+    // В задачах Bitrix файлы часто приходят как webdav/attached object: n123456.
+    // Поэтому сначала пробуем disk.attachedObject.get, затем disk.file.get.
+    try {
+      const attached = await bitrixRestCall('disk.attachedObject.get', { id });
+      const obj = attached && (attached.object || attached.OBJECT || attached);
+      const fileId = obj && (obj.ID || obj.id || obj.OBJECT_ID || obj.objectId);
+      const name = actsCleanText(obj && (obj.NAME || obj.name || obj.TITLE || obj.title));
+      const url = obj && (obj.DOWNLOAD_URL || obj.downloadUrl || obj.URL || obj.url || obj.DETAIL_URL || obj.detailUrl);
+      const key = `${fileId || id}:${name}`;
+      if (!seenFile.has(key)) {
+        seenFile.add(key);
+        files.push({ id: String(fileId || id), attachedId: String(id), name: name || `файл ${id}`, url: url || '' });
+      }
+      continue;
+    } catch (_) {}
+    try {
+      const f = await bitrixRestCall('disk.file.get', { id });
+      const name = actsCleanText(f && (f.NAME || f.name || f.TITLE || f.title));
+      const url = f && (f.DOWNLOAD_URL || f.downloadUrl || f.URL || f.url || f.DETAIL_URL || f.detailUrl);
+      const key = `${id}:${name}`;
+      if (!seenFile.has(key)) {
+        seenFile.add(key);
+        files.push({ id: String(id), attachedId: '', name: name || `файл ${id}`, url: url || '' });
+      }
+    } catch (_) {}
+  }
+
+  // Если API не раскрыл файлы, хотя имена в задаче видны — вернём хотя бы названия.
+  for (const name of names) {
+    const clean = actsCleanText(name);
+    if (clean && !files.some((f) => f.name === clean)) files.push({ id: '', attachedId: '', name: clean, url: '' });
+  }
+  return files;
+}
+
+async function actsHandleTaskDone(taskId, source = 'task-done-robot') {
+  if (!config.actsTasksEnabled) return { ok: false, skipped: true, message: 'ACTS_TASKS_ENABLED=false' };
+  if (!config.actsProjectId) throw new Error('ACTS_PROJECT_ID не задан');
+
+  const raw = await bitrixRestCall('tasks.task.get', { taskId });
+  const task = raw && (raw.task || raw.TASK || raw);
+  if (!task) throw new Error(`Задача ${taskId} не найдена`);
+
+  const groupId = actsTaskField(task, ['groupId','GROUP_ID','group_id']);
+  if (String(groupId) !== String(config.actsProjectId)) {
+    return { ok: false, skipped: true, taskId: String(taskId), groupId: String(groupId || ''), message: `Задача не из проекта Акты счета #${config.actsProjectId}` };
+  }
+
+  const dealIds = actsExtractDealIdsFromTask(task);
+  const files = await actsResolveTaskFiles(task);
+  const title = actsTaskField(task, ['title','TITLE']) || '';
+  const marker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
+
+  if (!dealIds.length) {
+    return { ok: false, skipped: true, taskId: String(taskId), title, files, message: 'Не нашёл ID сделки производства в задаче. Проверь, что задача создана ИИгорем или в описании есть ссылка/ID сделки.' };
+  }
+
+  const comments = [];
+  for (const dealId of dealIds) {
+    const already = await fgTimelineHasMarker(dealId, marker, 50);
+    if (already) {
+      comments.push({ dealId: String(dealId), duplicate: true });
+      continue;
+    }
+    const fileLines = files.length
+      ? files.map((f) => `— ${f.name || f.id}${f.url ? `\n  ${f.url}` : ''}`).join('\n')
+      : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: dealId,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `${marker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\nДальше можно забирать акт из этой задачи и раскладывать/прикреплять по регламенту.`,
+      },
+    });
+    comments.push({ dealId: String(dealId), commentAdded: true });
+  }
+
+  return { ok: true, event: 'acts_task_done_processed', source, taskId: String(taskId), title, dealIds: dealIds.map(String), files, comments };
+}
+
+app.post('/api/acts/task-done', async (req, res) => {
+  try {
+    const taskId = actsReqTaskId(req);
+    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+    const result = await actsHandleTaskDone(taskId, 'task-done-post');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[acts-task-done]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+app.get('/api/acts/task-done', async (req, res) => {
+  try {
+    const taskId = actsReqTaskId(req);
+    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+    const result = await actsHandleTaskDone(taskId, 'task-done-get');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[acts-task-done-get]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 app.post('/api/foreman/robot-linked', async (req, res) => {
   try {
     if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
