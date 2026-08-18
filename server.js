@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 const helmet = require('helmet');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
@@ -175,6 +176,9 @@ const config = {
   actsTestDealId: process.env.ACTS_TEST_DEAL_ID || '38072',
   actsAllDeals: String(process.env.ACTS_ALL_DEALS || 'false').toLowerCase() === 'true',
   actsRetrySeconds: Number(process.env.ACTS_RETRY_SECONDS || 120),
+  // v67: Wazzup принимает файл только по публичному contentUri. Поэтому реальный бинарный файл
+  // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
+  actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -724,7 +728,7 @@ app.get('/api/wazzup/channels', async (_req, res) => {
 // Вынесено в отдельную функцию, чтобы её мог использовать и маршрут /api/wazzup/send (ручная
 // отправка через автопилот), и обработчик вебхука живого бота (автоответ клиенту) — одна и та же
 // проверенная логика (минимальный payload для Telegram, повтор при 500).
-async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId, ignoreStrictPreferredChannel = false }) {
+async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId, ignoreStrictPreferredChannel = false, crmMessageId = '' }) {
   const apiKey = process.env.WAZZUP_API_KEY || '';
   const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
   if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
@@ -756,7 +760,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     channelId: configured.channelId,
     chatType: configured.chatType,
     text: cleanText,
-    crmMessageId: `mavis-executor-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
+    crmMessageId: crmMessageId || `mavis-executor-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
     clearUnanswered: false,
   };
 
@@ -776,7 +780,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     payload.chatId = recipientId;
   }
 
-  const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text };
+  const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text, crmMessageId: payload.crmMessageId, clearUnanswered: false };
   if (payload.chatId) minimalPayload.chatId = payload.chatId;
   if (payload.phone) minimalPayload.phone = payload.phone;
   if (payload.username) minimalPayload.username = payload.username;
@@ -820,7 +824,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
 }
 
 
-async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, username, dealId, fileName }) {
+async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, username, dealId, fileName, crmMessageId = '' }) {
   const apiKey = process.env.WAZZUP_API_KEY || '';
   const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
   if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
@@ -839,7 +843,7 @@ async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, u
     channelId: configured.channelId,
     chatType: configured.chatType,
     contentUri: url,
-    crmMessageId: `mavis-acts-file-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
+    crmMessageId: crmMessageId || `mavis-acts-file-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
     clearUnanswered: false,
   };
 
@@ -5569,18 +5573,44 @@ function actsPickBestFileForClient(files) {
   return newest(docs.length ? docs : usable);
 }
 
+function actsMinskGreeting(date = new Date()) {
+  // Приветствие всегда определяется по времени Минска, независимо от TZ сервера Render.
+  // Правило: до 12:00 — утро (рабочий диапазон пользователя 09–11),
+  // 12:00–16:59 — день, с 17:00 — вечер.
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Minsk',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value || 0);
+  if (hour >= 17) return 'Добрый вечер!';
+  if (hour >= 12) return 'Добрый день!';
+  return 'Доброе утро!';
+}
+
 function actsBuildClientMessage(deal, task, file) {
   const service = detectServiceFromDeal(deal) || 'закрытой услуге';
   const company = actsCleanText(deal.COMPANY_TITLE || deal.COMPANY_NAME || deal.TITLE || '');
+  const greeting = actsMinskGreeting();
   const custom = String(config.actsClientMessage || '').trim();
   if (custom) {
-    return custom
+    let rendered = custom
+      .replace(/\{greeting\}/g, greeting)
       .replace(/\{company\}/g, company || 'вашей компании')
       .replace(/\{service\}/g, service)
       .replace(/\{deal_id\}/g, String(deal.ID || ''))
       .replace(/\{file\}/g, String(file && file.name || 'акт'));
+
+    // Даже старый кастомный шаблон с фиксированным приветствием автоматически
+    // переводим на актуальное приветствие по минскому времени.
+    if (/^(?:Доброе утро|Добрый день|Добрый вечер)!?/i.test(rendered)) {
+      rendered = rendered.replace(/^(?:Доброе утро|Добрый день|Добрый вечер)!?/i, greeting);
+    } else if (!custom.includes('{greeting}')) {
+      rendered = `${greeting}\n\n${rendered}`;
+    }
+    return rendered;
   }
-  return `Добрый день!\n\nНаправляем акт по услуге «${service}».\nПожалуйста, проверьте, подпишите и верните оригинал акта в MAVIS GROUP.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
+  return `${greeting}\n\nНаправляем акт по услуге «${service}».\nПожалуйста, проверьте и подпишите акт. В течение 2 рабочих дней пришлите, пожалуйста, скан подписанного акта ответным сообщением.\n\nОригинал акта в 2 экземплярах направим вам почтой.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
 }
 
 function maskEmailForLog(email) {
@@ -5601,6 +5631,153 @@ function actsBuildEmailStorageElementIds(file) {
   if (/^\d+$/.test(attachedId)) ids.push(`n${attachedId}`);
   return ids;
 }
+
+
+// v67: короткоживущий прокси реального бинарного файла для Wazzup.
+// Нельзя передавать Wazzup Bitrix urlDownload напрямую: URL часто заканчивается на .php,
+// и мессенджер может получить/назвать вложение как PHP вместо исходного .docx/.pdf.
+// Wazzup API принимает только contentUri, поэтому сервер сам скачивает бинарные байты Bitrix,
+// проверяет, что это не HTML/PHP-страница, и отдаёт их Wazzup по URL с исходным именем и MIME.
+const ACTS_FILE_CACHE_TTL_MS = 15 * 60 * 1000;
+const actsFileProxyCache = new Map();
+
+function actsSafeFileName(name) {
+  const clean = String(name || 'act-file').replace(/[\\/\0\r\n]/g, '_').trim();
+  return clean || 'act-file';
+}
+
+function actsMimeByFileName(name, upstreamType = '') {
+  const ext = path.extname(String(name || '')).toLowerCase();
+  const byExt = {
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc': 'application/msword',
+    '.pdf': 'application/pdf',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xls': 'application/vnd.ms-excel',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.rtf': 'application/rtf',
+    '.txt': 'text/plain; charset=utf-8',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+  };
+  return byExt[ext] || (String(upstreamType || '').split(';')[0].trim() || 'application/octet-stream');
+}
+
+function actsBitrixOrigin() {
+  try { return new URL(config.bitrixWebhookUrl).origin; } catch (_) { return 'https://mavisgroup.bitrix24.by'; }
+}
+
+function actsAbsoluteBitrixFileUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value) return '';
+  try { return new URL(value).toString(); } catch (_) {}
+  try { return new URL(value, `${actsBitrixOrigin()}/`).toString(); } catch (_) { return value; }
+}
+
+async function actsFetchBinaryFromUrl(sourceUrl, fileName) {
+  const origin = actsBitrixOrigin();
+  const response = await fetch(sourceUrl, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      // Bitrix рекомендует browser-like User-Agent/Accept/Referer при скачивании DOWNLOAD_URL.
+      'User-Agent': 'Mozilla/5.0 (compatible; MAVIS-Expert-Assistant/1.0; +https://mavisgroup.by)',
+      'Accept': 'application/octet-stream,application/pdf,application/zip,*/*',
+      'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.7',
+      'Referer': `${origin}/`,
+    },
+  });
+
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('пустой ответ');
+  if (buffer.length > 10 * 1024 * 1024) throw new Error('файл больше 10 МБ');
+
+  // Защита от страницы авторизации/скрипта вместо бинарного документа.
+  const head = buffer.subarray(0, Math.min(buffer.length, 512)).toString('utf8').trim().toLowerCase();
+  if (head.startsWith('<?php') || head.startsWith('<!doctype html') || head.startsWith('<html') || head.includes('<body')) {
+    throw new Error('вместо файла получена HTML/PHP-страница');
+  }
+
+  return {
+    buffer,
+    contentType: actsMimeByFileName(fileName, response.headers.get('content-type') || ''),
+    upstreamType: response.headers.get('content-type') || 'unknown',
+  };
+}
+
+async function actsDownloadRealFile(file) {
+  let fileName = actsSafeFileName(file && file.name);
+  const attempts = [];
+
+  // 1) Сначала URL из task chat / attached object.
+  const directUrl = actsAbsoluteBitrixFileUrl(file && file.url);
+  if (directUrl) attempts.push({ label: 'task-url', url: directUrl });
+
+  // 2) Если в чате есть реальный Disk file ID, просим у Bitrix официальный DOWNLOAD_URL.
+  const diskId = String(file && file.id || '').trim();
+  if (/^\d+$/.test(diskId)) {
+    try {
+      const diskFile = await bitrixRestCall('disk.file.get', { id: Number(diskId) });
+      const diskUrl = actsAbsoluteBitrixFileUrl(diskFile && (diskFile.DOWNLOAD_URL || diskFile.downloadUrl));
+      if (diskUrl && !attempts.some((x) => x.url === diskUrl)) attempts.push({ label: 'disk.file.get', url: diskUrl });
+      const diskName = actsSafeFileName(diskFile && (diskFile.NAME || diskFile.name) || fileName);
+      if ((!file || !file.name) && diskName) fileName = diskName;
+    } catch (e) {
+      console.warn(`[acts-file-download] disk.file.get id=${diskId} не сработал: ${e.message || e}`);
+    }
+  }
+
+  if (!attempts.length) throw new Error(`У файла «${fileName}» нет URL для скачивания из Bitrix.`);
+
+  let lastError = '';
+  for (const attempt of attempts) {
+    try {
+      const result = await actsFetchBinaryFromUrl(attempt.url, fileName);
+      console.log(`[acts-file-download] ${fileName}: ${result.buffer.length} bytes; type=${result.contentType}; source=${attempt.label}; upstream=${result.upstreamType}`);
+      return { buffer: result.buffer, fileName, contentType: result.contentType };
+    } catch (e) {
+      lastError = `${attempt.label}: ${e.message || e}`;
+      console.warn(`[acts-file-download] ${fileName}: ${lastError}`);
+    }
+  }
+
+  throw new Error(`Не удалось скачать реальный файл «${fileName}» из Bitrix (${lastError}). Клиенту ничего не отправлено.`);
+}
+
+function actsCleanupFileProxyCache() {
+  const now = Date.now();
+  for (const [token, item] of actsFileProxyCache.entries()) {
+    if (!item || item.expiresAt <= now) actsFileProxyCache.delete(token);
+  }
+}
+
+async function actsPrepareWazzupFile(file) {
+  actsCleanupFileProxyCache();
+  const downloaded = await actsDownloadRealFile(file);
+  const token = crypto.randomBytes(24).toString('hex');
+  actsFileProxyCache.set(token, { ...downloaded, expiresAt: Date.now() + ACTS_FILE_CACHE_TTL_MS });
+  const publicUrl = `${config.actsPublicBaseUrl}/api/acts/file/${token}/${encodeURIComponent(downloaded.fileName)}`;
+  console.log(`[acts-file-proxy] Готов реальный файл для Wazzup: ${downloaded.fileName}; ${downloaded.buffer.length} bytes; TTL=15m.`);
+  return { url: publicUrl, ...downloaded };
+}
+
+// Публичный короткоживущий endpoint нужен именно Wazzup: их API сам скачивает contentUri.
+// Токен криптографически случайный, ссылка живёт 15 минут, Cache-Control запрещает кеширование.
+app.get('/api/acts/file/:token/:filename', (req, res) => {
+  actsCleanupFileProxyCache();
+  const item = actsFileProxyCache.get(String(req.params.token || ''));
+  if (!item || item.expiresAt <= Date.now()) return res.status(404).send('File expired or not found');
+
+  res.setHeader('Content-Type', item.contentType || 'application/octet-stream');
+  res.setHeader('Content-Length', String(item.buffer.length));
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(item.fileName)}`);
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  return res.status(200).send(item.buffer);
+});
 
 async function sendActEmailThroughBitrix(deal, toEmail, text, file) {
   const dealId = deal.ID;
@@ -5701,6 +5878,7 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
         dealId: deal.ID,
         // Канал уже разрешён по enum/тексту выше; sync-проверка внутри Wazzup не умеет enum ID.
         ignoreStrictPreferredChannel: true,
+        crmMessageId: taskId ? `mavis-acts-text-${preferredChannel}-${deal.ID}-${taskId}` : '',
       });
       if (taskId) {
         await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${textMarker}
@@ -5709,12 +5887,16 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     }
 
     if (!fileAlreadySent) {
+      // v67: сначала реально скачиваем байты из Bitrix и только потом даём Wazzup
+      // короткую публичную ссылку с исходным именем/расширением.
+      const preparedFile = await actsPrepareWazzupFile(file);
       fileResult = await sendWazzupFileInternal({
         channelKey: preferredChannel,
-        contentUri: file.url,
+        contentUri: preparedFile.url,
         phone,
         dealId: deal.ID,
-        fileName: file.name,
+        fileName: preparedFile.fileName,
+        crmMessageId: taskId ? `mavis-acts-file-${preferredChannel}-${deal.ID}-${taskId}` : '',
       });
       if (taskId) {
         await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${fileMarker}

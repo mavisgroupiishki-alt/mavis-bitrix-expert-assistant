@@ -1,6 +1,6 @@
 {
   "name": "mavis-bitrix-expert-assistant",
-  "version": "0.18.13-v66",
+  "version": "0.18.15-v68",
   "description": "MAVIS GROUP Bitrix24 expert assistant server app",
   "main": "server.js",
   "scripts": {
