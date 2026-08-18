@@ -5588,18 +5588,49 @@ function actsMinskGreeting(date = new Date()) {
   return 'Доброе утро!';
 }
 
+function actsExtractActNumber(task) {
+  const title = actsCleanText(actsTaskField(task, ['title', 'TITLE']) || '');
+  if (!title) return '';
+
+  // Предпочитаем явную запись: «АКТ №4», «Акт выполненных работ № 4», «АКТ N4».
+  let m = title.match(/(?:^|\s)акт(?:\s+выполненных\s+работ)?\s*(?:№|n\.?|no\.?)\s*(\d+)(?=\s|$|[.,;:()\-])/iu);
+  if (m) return m[1];
+
+  // В проекте также встречается формат «АКТ 1 1000р Компания ...» без знака №.
+  // Берём только полностью цифровой токен сразу после слова АКТ, поэтому «АКТ 3Д КЛИМАТ»
+  // номером 3 ошибочно не станет.
+  m = title.match(/(?:^|\s)акт\s+(\d+)(?=\s|$|[.,;:()\-])/iu);
+  return m ? m[1] : '';
+}
+
+function actsActLabel(task) {
+  const number = actsExtractActNumber(task);
+  return number ? `акт выполненных работ №${number}` : 'акт выполненных работ';
+}
+
 function actsBuildClientMessage(deal, task, file) {
-  const service = detectServiceFromDeal(deal) || 'закрытой услуге';
   const company = actsCleanText(deal.COMPANY_TITLE || deal.COMPANY_NAME || deal.TITLE || '');
   const greeting = actsMinskGreeting();
+  const actNumber = actsExtractActNumber(task);
+  const actLabel = actsActLabel(task);
   const custom = String(config.actsClientMessage || '').trim();
   if (custom) {
     let rendered = custom
       .replace(/\{greeting\}/g, greeting)
       .replace(/\{company\}/g, company || 'вашей компании')
-      .replace(/\{service\}/g, service)
+      .replace(/\{act_number\}/g, actNumber)
+      .replace(/\{act_label\}/g, actLabel)
       .replace(/\{deal_id\}/g, String(deal.ID || ''))
       .replace(/\{file\}/g, String(file && file.name || 'акт'));
+
+    // Совместимость со старым стандартным шаблоном: если он был сохранён в ACTS_CLIENT_MESSAGE,
+    // убираем из него название услуги и заменяем строку на новый формат акта.
+    rendered = rendered
+      .replace(/Направляем\s+акт\s+по\s+услуге\s+[«"“][^»"”]+[»"”]\.?/giu, `Направляем ${actLabel}.`)
+      .replace(/Направляем\s+акт\s+по\s+услуге\s*:\s*[^\n.]+\.?/giu, `Направляем ${actLabel}.`);
+
+    // Старый плейсхолдер {service} больше не раскрываем названием услуги в актовом сообщении.
+    rendered = rendered.replace(/\{service\}/g, actLabel);
 
     // Даже старый кастомный шаблон с фиксированным приветствием автоматически
     // переводим на актуальное приветствие по минскому времени.
@@ -5610,7 +5641,7 @@ function actsBuildClientMessage(deal, task, file) {
     }
     return rendered;
   }
-  return `${greeting}\n\nНаправляем акт по услуге «${service}».\nПожалуйста, проверьте и подпишите акт. В течение 2 рабочих дней пришлите, пожалуйста, скан подписанного акта ответным сообщением.\n\nОригинал акта в 2 экземплярах направим вам почтой.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
+  return `${greeting}\n\nНаправляем ${actLabel}.\nПожалуйста, проверьте и подпишите акт. В течение 2 рабочих дней пришлите, пожалуйста, скан подписанного акта ответным сообщением.\n\nОригинал акта в 2 экземплярах направим вам почтой.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
 }
 
 function maskEmailForLog(email) {
@@ -6353,7 +6384,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v66 is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v69 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}.`);
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
