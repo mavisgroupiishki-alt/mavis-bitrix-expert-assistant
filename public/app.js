@@ -2370,7 +2370,7 @@ function summarizeDealFields(id, deal) {
     `Дата начала оказания услуг: ${getStartDate(deal) || ''}`,
     `Ответственный: ${userName(deal.ASSIGNED_BY_ID)}`,
     `Создал сделку: ${userName(deal.CREATED_BY_ID)}`,
-    `Предпочитаемый способ связи (поле сделки): ${messengerLabel(preferredChannelKey(deal))}`,
+    `Предпочитаемый канал связи (поле сделки): ${messengerLabel(preferredChannelKey(deal))}`,
     `Ссылка на сделку отдела продаж: ${getSalesLink(deal) || ''}`,
     `Компания адрес: ${company.ADDRESS || ''} ${company.ADDRESS_CITY || ''} ${company.ADDRESS_REGION || ''} ${company.ADDRESS_PROVINCE || ''}`,
     `Компания email: ${extractMultiField(company.EMAIL)}`,
@@ -2401,7 +2401,7 @@ function directEvidence(item, deal, contexts) {
   if (item.key === 'channel') {
     const ch = preferredChannelKey(deal);
     if (ch && ch !== 'manual') {
-      return { status: 'found', source: 'поле “Предпочитаемый способ связи” сделки', snippet: messengerLabel(ch) };
+      return { status: 'found', source: 'поле “Предпочитаемый канал связи” сделки', snippet: messengerLabel(ch) };
     }
   }
   if (item.key === 'email') {
@@ -5789,7 +5789,7 @@ async function runExecutorAutopilot() {
           sentInfo += `Сообщение клиенту отправлено через ${messengerLabel(channel)}.`;
           if (sendResult._diagnosticNote) sentInfo += ` [Диагностика: ${sendResult._diagnosticNote}]`;
         } catch (sendError) {
-          sentInfo += `Сообщение клиенту подготовлено, но ${messengerLabel(channel)} не отправил его: ${sendError.message || String(sendError)}. Запасные каналы не используем, потому что работаем строго по полю «Предпочитаемый способ связи».`;
+          sentInfo += `Сообщение клиенту подготовлено, но ${messengerLabel(channel)} не отправил его: ${sendError.message || String(sendError)}. Запасные каналы не используем, потому что работаем строго по полю «Предпочитаемый канал связи».`;
         }
       } else {
         sentInfo += 'Сообщение клиенту подготовлено, но не отправлено: не найден телефон или Wazzup не настроен.';
