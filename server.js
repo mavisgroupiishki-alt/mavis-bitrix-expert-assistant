@@ -190,6 +190,12 @@ const config = {
   actsPushRecoveryDays: Number(process.env.ACTS_PUSH_RECOVERY_DAYS || 30),
   // Не обрабатываем исторические задачи «Сделано» до запуска боевого режима актов.
   actsProductionStartIso: process.env.ACTS_PRODUCTION_START_ISO || '2026-08-18T14:56:00+03:00',
+  // v71: входящие подписанные сканы актов из Wazzup (Viber/Telegram) и почты.
+  // Включено независимо от LIVE_CHAT_ENABLED: документы клиента должны обрабатываться даже если живой чат-бот выключен.
+  actsIncomingEnabled: String(process.env.ACTS_INCOMING_ENABLED || 'true').toLowerCase() !== 'false',
+  actsIncomingWazzupEnabled: String(process.env.ACTS_INCOMING_WAZZUP_ENABLED || 'true').toLowerCase() !== 'false',
+  actsIncomingEmailEnabled: String(process.env.ACTS_INCOMING_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
+  actsIncomingLeaderId: process.env.ACTS_INCOMING_LEADER_ID || process.env.TANYA_USER_ID || '2182',
   // v67: Wazzup принимает файл только по публичному contentUri. Поэтому реальный бинарный файл
   // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
   actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
@@ -1165,12 +1171,26 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       }
     }
 
+    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+
+    // v71: входящие документы/изображения обрабатываем независимо от LIVE_CHAT_ENABLED.
+    // Wazzup ждёт 200 максимум 30 секунд, поэтому тяжёлую работу (скачивание, ИИ, Bitrix Disk)
+    // запускаем асинхронно и не держим webhook-ответ.
+    if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
+      for (const msg of messages) {
+        if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
+        if (!msg.contentUri || !['image','document'].includes(String(msg.type || '').toLowerCase())) continue;
+        setImmediate(() => actsProcessIncomingWazzupMessage(msg).catch((e) =>
+          console.error(`[acts-incoming] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)
+        ));
+      }
+    }
+
     if (!config.liveChatEnabled) {
       res.status(200).json({ ok: true });
       return;
     }
 
-    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
     for (const msg of messages) {
       try {
         // Только входящие текстовые сообщения от клиента (не эхо исходящих, не статусы).
@@ -1665,6 +1685,27 @@ async function processIncomingEmails() {
           const attachments = (parsed.attachments || []).filter((a) => a.size > 0);
 
           console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}`);
+
+          // v71: сначала отдельно проверяем — не вернулся ли подписанный акт по активному контролю.
+          // Общую почтовую обработку ниже НЕ прерываем: она по-прежнему сохранит письмо в папку компании.
+          if (config.actsIncomingEnabled && config.actsIncomingEmailEnabled && attachments.length) {
+            try {
+              await actsProcessIncomingAttachments({
+                source: 'email',
+                commType: 'EMAIL',
+                commValue: senderEmail,
+                messageText: `${subject}\n${parsed.text || ''}`.slice(0, 2000),
+                attachments: attachments.map((a) => ({
+                  fileName: a.filename || 'attachment',
+                  contentType: a.contentType || '',
+                  buffer: a.content,
+                })),
+                skipCompanyFolder: true,
+              });
+            } catch (actErr) {
+              console.warn(`[acts-incoming] email ${maskEmailForLog(senderEmail)}: ${actErr.message || actErr}`);
+            }
+          }
 
           // ✅ ФИЛЬТР СПАМА
           if (isSpamSender(senderEmail)) {
@@ -6019,7 +6060,271 @@ async function runActsPushCycle() {
     actsPushCycleRunning = false;
   }
 }
-// ======================= /v70: АВТОПУШИ ПО АКТУ =========================
+// ========================= v71: ВХОДЯЩИЕ СКАНЫ АКТОВ =========================
+const ACTS_EXPERT_FOLDERS = [
+  { surname: 'кананович', first: 'иоланта', folder: 'Кананович Иоланта' },
+  { surname: 'горбатова', first: 'елизавета', folder: 'Горбатова Елизавета' },
+  { surname: 'николаева', first: 'екатерина', folder: 'Николаева Екатерина' },
+  { surname: 'баженова', first: 'мария', folder: 'Баженова Мария' },
+  { surname: 'панькова', first: 'ольга', folder: 'Панькова Ольга' },
+];
+
+const ACTS_RU_MONTHS = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+
+function actsMonthFolderFromDeal(deal) {
+  // Папка акта относится к месяцу закрытия производственной сделки. Это важно для
+  // последующей месячной сверки: августовская сделка остаётся в «Акты_август», даже если скан пришёл в сентябре.
+  let d = deal && deal.CLOSEDATE ? new Date(deal.CLOSEDATE) : null;
+  if (!d || Number.isNaN(d.getTime())) d = new Date();
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit' }).formatToParts(d);
+  const month = Number(parts.find((p) => p.type === 'month')?.value || (d.getMonth()+1));
+  return `Акты_${ACTS_RU_MONTHS[Math.max(0, Math.min(11, month - 1))]}`;
+}
+
+function actsResolveExpertFolderName(user) {
+  const full = `${user && (user.LAST_NAME || user.lastName) || ''} ${user && (user.NAME || user.name) || ''}`.toLowerCase().replace(/ё/g,'е');
+  const hit = ACTS_EXPERT_FOLDERS.find((x) => full.includes(x.surname.replace(/ё/g,'е')) || (full.includes(x.first) && full.includes(x.surname)));
+  return hit ? hit.folder : '';
+}
+
+async function actsGetOrCreateChildFolder(parentId, name) {
+  const children = await bitrixRestList('disk.folder.getchildren', { id: parentId }, 1000);
+  let folder = children.find((c) => String(c.TYPE || c.type).toLowerCase() === 'folder' && actsCleanText(c.NAME || c.name) === name);
+  if (!folder) folder = await bitrixRestCall('disk.folder.addsubfolder', { id: parentId, data: { NAME: name } });
+  return String(folder && (folder.ID || folder.id) || '');
+}
+
+async function actsGetExpertActFolder(deal) {
+  const userRows = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+  const user = Array.isArray(userRows) ? userRows[0] : userRows;
+  const expertFolder = actsResolveExpertFolderName(user);
+  if (!expertFolder) {
+    const expertHuman = `${user && user.LAST_NAME || ''} ${user && user.NAME || ''}`.trim() || `ID ${deal.ASSIGNED_BY_ID || '?'}`;
+    throw new Error(`Ответственный эксперт «${expertHuman}» не сопоставлен с папками актов.`);
+  }
+  const rootId = await getCommonDriveRootId();
+  const monthFolderName = actsMonthFolderFromDeal(deal);
+  const monthFolderId = await actsGetOrCreateChildFolder(rootId, monthFolderName);
+  const expertFolderId = await actsGetOrCreateChildFolder(monthFolderId, expertFolder);
+  return { expertFolderId, expertFolder, monthFolderName, user };
+}
+
+function actsIncomingFileNameFromUrl(urlRaw, fallback = '') {
+  try {
+    const u = new URL(String(urlRaw || ''));
+    const q = u.searchParams.get('filename') || u.searchParams.get('fileName') || '';
+    if (q) return decodeURIComponent(q);
+    const last = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+    if (last && /\.[a-z0-9]{2,6}$/i.test(last)) return last;
+  } catch (_) {}
+  return fallback || '';
+}
+
+async function actsDownloadIncomingUrl(urlRaw, fallbackName = 'scan') {
+  const response = await fetch(String(urlRaw || ''), { redirect: 'follow', headers: { Accept: '*/*', 'User-Agent': 'MAVIS-Acts-Incoming/1.0' } });
+  if (!response.ok) throw new Error(`не удалось скачать входящий файл: HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('входящий файл пустой');
+  const cd = response.headers.get('content-disposition') || '';
+  let fileName = '';
+  const utf = cd.match(/filename\*=UTF-8''([^;]+)/i);
+  const plain = cd.match(/filename="?([^";]+)"?/i);
+  if (utf) { try { fileName = decodeURIComponent(utf[1]); } catch (_) { fileName = utf[1]; } }
+  if (!fileName && plain) fileName = plain[1];
+  if (!fileName) fileName = actsIncomingFileNameFromUrl(response.url || urlRaw, fallbackName);
+  fileName = actsSafeFileName(fileName || fallbackName || 'scan');
+  return { buffer, fileName, contentType: response.headers.get('content-type') || '' };
+}
+
+function actsArrayIds(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === 'object') return Object.values(value).flatMap(actsArrayIds).map(String);
+  return [String(value)];
+}
+
+async function actsFindWaitingStatesByComm(commType, commValue) {
+  if (!actsPushStates.size) {
+    // После рестарта состояния восстанавливаются из Bitrix; если входящий файл пришёл в первые секунды,
+    // попробуем восстановить их прямо сейчас, чтобы не потерять скан.
+    await actsRecoverPushStatesFromBitrix().catch(() => {});
+  }
+  if (!actsPushStates.size) return [];
+  const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
+  const value = type === 'PHONE' ? normalizePhoneDigits(commValue) : String(commValue || '').trim().toLowerCase();
+  if (!value) return [];
+  let dup = {};
+  try {
+    dup = await bitrixRestCall('crm.duplicate.findbycomm', { type, values: [value] });
+  } catch (e) {
+    console.warn(`[acts-incoming] duplicate.findbycomm ${type}: ${e.message || e}`);
+  }
+  const contactIds = new Set(actsArrayIds(dup && (dup.CONTACT || dup.contact)).map(String));
+  const companyIds = new Set(actsArrayIds(dup && (dup.COMPANY || dup.company)).map(String));
+
+  // Иногда PHONE в duplicate.findbycomm чувствителен к формату. Для телефона делаем дополнительный
+  // безопасный fallback по последним 9 цифрам непосредственно в контакте/компании активной сделки.
+  const phoneTail = type === 'PHONE' ? value.slice(-9) : '';
+  const matches = [];
+  for (const state of actsPushStates.values()) {
+    try {
+      const deal = await bitrixRestCall('crm.deal.get', { id: state.dealId });
+      if (!deal) continue;
+      let matched = (deal.CONTACT_ID && contactIds.has(String(deal.CONTACT_ID))) || (deal.COMPANY_ID && companyIds.has(String(deal.COMPANY_ID)));
+      if (!matched && type === 'PHONE' && phoneTail) {
+        const entities = [];
+        if (deal.CONTACT_ID) entities.push(['crm.contact.get', deal.CONTACT_ID]);
+        if (deal.COMPANY_ID) entities.push(['crm.company.get', deal.COMPANY_ID]);
+        for (const [method,id] of entities) {
+          try {
+            const ent = await bitrixRestCall(method, { id });
+            const phones = Array.isArray(ent && ent.PHONE) ? ent.PHONE : [];
+            if (phones.some((p) => normalizePhoneDigits(p && p.VALUE).slice(-9) === phoneTail)) { matched = true; break; }
+          } catch (_) {}
+        }
+      }
+      if (!matched && type === 'EMAIL') {
+        const entities = [];
+        if (deal.CONTACT_ID) entities.push(['crm.contact.get', deal.CONTACT_ID]);
+        if (deal.COMPANY_ID) entities.push(['crm.company.get', deal.COMPANY_ID]);
+        for (const [method,id] of entities) {
+          try {
+            const ent = await bitrixRestCall(method, { id });
+            const emails = Array.isArray(ent && ent.EMAIL) ? ent.EMAIL : [];
+            if (emails.some((x) => String(x && x.VALUE || '').trim().toLowerCase() === value)) { matched = true; break; }
+          } catch (_) {}
+        }
+      }
+      if (matched) matches.push({ state, deal });
+    } catch (_) {}
+  }
+  return matches.sort((a,b) => Number(b.state.sentAtMs || 0) - Number(a.state.sentAtMs || 0));
+}
+
+async function actsAiCheckSignedAct(buffer, fileName, contentType, messageText = '') {
+  const nameSignal = /акт|act|скан|scan|подпис/i.test(`${fileName} ${messageText}`);
+  const ext = String(fileName || '').split('.').pop().toLowerCase();
+  const isImage = ['jpg','jpeg','png','webp'].includes(ext) || /^image\//i.test(contentType || '');
+  if (!isImage) {
+    // Для PDF/документа сам файл в текущем AI-router надёжно не передаём. Сигналом служат
+    // контекст активного акта + имя/текст сообщения. Если имя нейтральное, не рискуем останавливать пуши.
+    return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: nameSignal ? 'имя/текст указывает на акт' : 'не удалось визуально проверить не-изображение' };
+  }
+  try {
+    const ai = resolveAiProvider();
+    if (!ai.apiKey) return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: 'AI key не задан' };
+    const dataUrl = `data:${contentType || (ext === 'png' ? 'image/png' : 'image/jpeg')};base64,${buffer.toString('base64')}`;
+    const response = await fetch(`${ai.baseUrl}/chat/completions`, {
+      method: 'POST', headers: { ...ai.authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: config.aiModel, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'user', content: [
+        { type: 'text', text: 'Определи, является ли изображение подписанным/заполненным актом выполненных работ или сканом акта. Подпись, печать или заполненная сторона акта — сильный признак. Ответ только JSON: {"isSignedAct":true|false,"confidence":"high|medium|low","company":"название компании если видно или null","actNumber":"номер акта если видно или null","reason":"коротко"}.' },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ]}] }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data && data.error && data.error.message || `HTTP ${response.status}`);
+    const text = data?.choices?.[0]?.message?.content || '{}';
+    const obj = JSON.parse((text.match(/\{[\s\S]*\}/) || ['{}'])[0]);
+    return { isSignedAct: !!obj.isSignedAct, confidence: obj.confidence || 'low', company: obj.company || null, actNumber: obj.actNumber || null, reason: obj.reason || '' };
+  } catch (e) {
+    return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: `AI не сработал: ${e.message || e}` };
+  }
+}
+
+async function actsNotifyExpertScanReceived(deal, taskId, source, fileName, storage) {
+  const expertId = String(deal && deal.ASSIGNED_BY_ID || '');
+  if (!expertId) return;
+  const companyName = deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID) : null;
+  const label = companyName || deal.TITLE || `сделка ${deal.ID}`;
+  const message = `ИИгорь: подписанный скан акта по «${label}» получен через ${source}. Сохранил: ${storage.monthFolderName} → ${storage.expertFolder} → ${fileName}. Автопуши клиенту остановлены.`;
+  try {
+    await bitrixRestCall('im.notify.personal.add', { USER_ID: Number(expertId), MESSAGE: message, MESSAGE_OUT: message });
+  } catch (e) {
+    console.warn(`[acts-incoming] deal=${deal.ID}: уведомление эксперту не отправлено: ${e.message || e}`);
+    // fallback: комментарий всё равно останется в таймлайне через actsMarkScanReceived.
+  }
+}
+
+async function actsSaveIncomingScanForState({ state, deal, source, fileName, buffer, contentType, skipCompanyFolder = false }) {
+  const taskRaw = await bitrixRestCall('tasks.task.get', { taskId: Number(state.taskId), select: ['ID','TITLE','UF_CRM_TASK'] });
+  const task = taskRaw && (taskRaw.task || taskRaw.TASK || taskRaw);
+  const storage = await actsGetExpertActFolder(deal);
+  const savedExpert = await uploadFileToDiskFolder(storage.expertFolderId, fileName, buffer);
+  if (!savedExpert) throw new Error('не удалось сохранить скан в папку эксперта');
+
+  if (!skipCompanyFolder) {
+    try {
+      const companyName = deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID) : (deal.TITLE || `Сделка ${deal.ID}`);
+      const companyFolderId = await getOrCreateCompanyFolder(companyName || `Сделка ${deal.ID}`);
+      await uploadFileToDiskFolder(companyFolderId, fileName, buffer);
+    } catch (e) {
+      console.warn(`[acts-incoming] deal=${deal.ID}: в папку компании не продублировал: ${e.message || e}`);
+    }
+  }
+
+  await actsMarkScanReceived(state, `${source}; сохранено ${storage.monthFolderName}/${storage.expertFolder}`, fileName);
+  await actsNotifyExpertScanReceived(deal, state.taskId, source, fileName, storage);
+  console.log(`[acts-incoming] ✅ task=${state.taskId}, deal=${deal.ID}: ${fileName} → ${storage.monthFolderName}/${storage.expertFolder}; пуши остановлены.`);
+  return { ok: true, taskId: state.taskId, dealId: deal.ID, fileName, storage };
+}
+
+async function actsProcessIncomingAttachments({ source, commType, commValue, messageText = '', attachments = [], skipCompanyFolder = false }) {
+  if (!config.actsIncomingEnabled || !attachments.length) return { ok: true, processed: 0 };
+  const waiting = await actsFindWaitingStatesByComm(commType, commValue);
+  if (!waiting.length) {
+    console.log(`[acts-incoming] ${source}: активный ожидаемый акт по ${commType} не найден — вложение не трогаю.`);
+    return { ok: true, processed: 0, reason: 'no-active-act' };
+  }
+  if (waiting.length > 1) console.warn(`[acts-incoming] ${source}: найдено ${waiting.length} ожидаемых актов у одного клиента; начинаю с самого свежего.`);
+  const target = waiting[0];
+  for (const att of attachments) {
+    const fileName = actsSafeFileName(att.fileName || 'scan');
+    const buffer = Buffer.isBuffer(att.buffer) ? att.buffer : Buffer.from(att.buffer || '');
+    if (!buffer.length) continue;
+    const check = await actsAiCheckSignedAct(buffer, fileName, att.contentType || '', messageText);
+    console.log(`[acts-incoming] ${source}: ${fileName}; signed=${check.isSignedAct}; confidence=${check.confidence}; reason=${check.reason || ''}`);
+    if (!check.isSignedAct) continue;
+    return actsSaveIncomingScanForState({ state: target.state, deal: target.deal, source, fileName, buffer, contentType: att.contentType || '', skipCompanyFolder });
+  }
+  return { ok: true, processed: 0, reason: 'no-signed-act-detected' };
+}
+
+async function actsLogWazzupIncomingWebhookStatus() {
+  const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
+  if (!apiKey || !config.actsIncomingEnabled || !config.actsIncomingWazzupEnabled) return;
+  try {
+    const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/webhooks`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(compactWazzupError(data, `HTTP ${response.status}`));
+    const actual = String(data.webhooksUri || data.webhookUri || data.uri || '').replace(/\/+$/, '');
+    const expected = `${config.actsPublicBaseUrl}/api/wazzup/webhook`.replace(/\/+$/, '');
+    const subscribed = !!(data.subscriptions && data.subscriptions.messagesAndStatuses);
+    if (actual === expected && subscribed) {
+      console.log(`[acts-incoming] Wazzup webhook OK: ${expected}; messagesAndStatuses=true.`);
+    } else {
+      console.warn(`[acts-incoming] ⚠️ Wazzup webhook не готов для входящих актов: сейчас=${actual || 'не задан'}, messagesAndStatuses=${subscribed}; ожидаю=${expected}.`);
+    }
+  } catch (e) {
+    console.warn(`[acts-incoming] Не смог проверить Wazzup webhook: ${e.message || e}`);
+  }
+}
+
+async function actsProcessIncomingWazzupMessage(msg) {
+  const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+  const channel = String(msg.chatType || findChannelKeyByChannelId(msg.channelId) || 'messenger').toLowerCase();
+  const fallbackExt = String(msg.type || '').toLowerCase() === 'image' ? '.jpg' : '.pdf';
+  const fromUrl = actsIncomingFileNameFromUrl(msg.contentUri, '');
+  const fallback = fromUrl || `Акт_скан_${phone ? phone.slice(-4) : 'клиент'}_${Date.now()}${fallbackExt}`;
+  const downloaded = await actsDownloadIncomingUrl(msg.contentUri, fallback);
+  console.log(`[acts-incoming] Wazzup ${channel}: inbound ${downloaded.fileName}, phone=***${phone.slice(-4)}, message=${msg.messageId || '?'}`);
+  return actsProcessIncomingAttachments({
+    source: channel === 'viber' ? 'Viber' : channel === 'telegram' ? 'Telegram' : 'Wazzup',
+    commType: 'PHONE', commValue: phone, messageText: msg.text || '',
+    attachments: [downloaded], skipCompanyFolder: false,
+  });
+}
+// ======================= /v71: ВХОДЯЩИЕ СКАНЫ АКТОВ =========================
 
 function maskEmailForLog(email) {
   const e = String(email || '').trim();
@@ -6767,8 +7072,12 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v70 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v71 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
+
+  if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
+    setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
+  }
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
     console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
