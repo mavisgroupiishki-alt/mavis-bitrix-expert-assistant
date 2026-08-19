@@ -6251,32 +6251,64 @@ async function actsFindWaitingStatesByComm(commType, commValue) {
 }
 
 async function actsAiCheckSignedAct(buffer, fileName, contentType, messageText = '') {
-  const nameSignal = /акт|act|скан|scan|подпис/i.test(`${fileName} ${messageText}`);
   const ext = String(fileName || '').split('.').pop().toLowerCase();
   const isImage = ['jpg','jpeg','png','webp'].includes(ext) || /^image\//i.test(contentType || '');
-  if (!isImage) {
-    // Для PDF/документа сам файл в текущем AI-router надёжно не передаём. Сигналом служат
-    // контекст активного акта + имя/текст сообщения. Если имя нейтральное, не рискуем останавливать пуши.
-    return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: nameSignal ? 'имя/текст указывает на акт' : 'не удалось визуально проверить не-изображение' };
-  }
+  const isPdf = ext === 'pdf' || /^application\/pdf/i.test(contentType || '') || (buffer && buffer.subarray(0, 4).toString() === '%PDF');
+  const ai = resolveAiProvider();
+  if (!ai.apiKey) return { isSignedAct: false, confidence: 'low', reason: 'AI key не задан — документ не принимаю автоматически' };
+
+  const prompt = [
+    'Определи, является ли присланный клиентом файл именно ПОДПИСАННЫМ актом выполненных работ / актом оказанных услуг.',
+    'Важно отличать акт от счета, договора, счета-фактуры, накладной, коммерческого предложения и любых других документов.',
+    'Если это акт, но он не подписан клиентом, isSignedAct=false.',
+    'Признаки возврата подписанного акта: видимая подпись, рукописное заполнение поля подписи, печать/штамп рядом с реквизитами стороны либо электронная подпись/отметка подписания.',
+    'Само слово «акт» или имя файла недостаточно. Для счета или любого другого документа всегда isSignedAct=false.',
+    messageText ? `Текст сообщения клиента: ${String(messageText).slice(0, 1000)}` : '',
+    'Ответ только JSON: {"isSignedAct":true|false,"confidence":"high|medium|low","documentType":"акт|счет|договор|накладная|другое","company":"название компании если видно или null","actNumber":"номер акта если видно или null","signatureEvidence":"что именно указывает на подпись или null","reason":"коротко"}.',
+  ].filter(Boolean).join(' ');
+
   try {
-    const ai = resolveAiProvider();
-    if (!ai.apiKey) return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: 'AI key не задан' };
-    const dataUrl = `data:${contentType || (ext === 'png' ? 'image/png' : 'image/jpeg')};base64,${buffer.toString('base64')}`;
+    let content;
+    if (isImage) {
+      const dataUrl = `data:${contentType || (ext === 'png' ? 'image/png' : 'image/jpeg')};base64,${buffer.toString('base64')}`;
+      content = [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ];
+    } else if (isPdf) {
+      // v73: PDF передаём модели целиком как file input. Это позволяет анализировать как текст PDF,
+      // так и изображения страниц (включая скан подписи), вместо эвристики по имени файла.
+      const dataUrl = `data:application/pdf;base64,${buffer.toString('base64')}`;
+      content = [
+        { type: 'file', file: { filename: fileName || 'document.pdf', file_data: dataUrl } },
+        { type: 'text', text: prompt },
+      ];
+    } else {
+      return { isSignedAct: false, confidence: 'low', reason: `формат .${ext || '?'} пока не поддерживает надёжную проверку подписи` };
+    }
+
     const response = await fetch(`${ai.baseUrl}/chat/completions`, {
       method: 'POST', headers: { ...ai.authHeader, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: config.aiModel, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'user', content: [
-        { type: 'text', text: 'Определи, является ли изображение подписанным/заполненным актом выполненных работ или сканом акта. Подпись, печать или заполненная сторона акта — сильный признак. Ответ только JSON: {"isSignedAct":true|false,"confidence":"high|medium|low","company":"название компании если видно или null","actNumber":"номер акта если видно или null","reason":"коротко"}.' },
-        { type: 'image_url', image_url: { url: dataUrl } },
-      ]}] }),
+      body: JSON.stringify({ model: config.aiModel, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'user', content }] }),
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data && data.error && data.error.message || `HTTP ${response.status}`);
+    if (!response.ok) throw new Error(data && data.error && (data.error.message || data.error_description) || `HTTP ${response.status}`);
     const text = data?.choices?.[0]?.message?.content || '{}';
     const obj = JSON.parse((text.match(/\{[\s\S]*\}/) || ['{}'])[0]);
-    return { isSignedAct: !!obj.isSignedAct, confidence: obj.confidence || 'low', company: obj.company || null, actNumber: obj.actNumber || null, reason: obj.reason || '' };
+    const confidence = String(obj.confidence || 'low').toLowerCase();
+    const isSignedAct = !!obj.isSignedAct && confidence !== 'low';
+    return {
+      isSignedAct,
+      confidence,
+      documentType: obj.documentType || null,
+      company: obj.company || null,
+      actNumber: obj.actNumber || null,
+      signatureEvidence: obj.signatureEvidence || null,
+      reason: obj.reason || (isSignedAct ? 'подписанный акт подтверждён ИИ' : 'подписанный акт не подтверждён'),
+    };
   } catch (e) {
-    return { isSignedAct: nameSignal, confidence: nameSignal ? 'medium' : 'low', reason: `AI не сработал: ${e.message || e}` };
+    // Fail closed: при сбое ИИ НЕ останавливаем пуши и НЕ раскладываем неизвестный документ.
+    return { isSignedAct: false, confidence: 'low', reason: `AI-проверка файла не сработала: ${e.message || e}` };
   }
 }
 
@@ -7121,7 +7153,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v72 is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v73 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
