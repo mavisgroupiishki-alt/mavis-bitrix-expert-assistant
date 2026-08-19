@@ -7238,13 +7238,54 @@ function actsReconBuildText(monthInfo, groups) {
   return lines.join('\n').trim();
 }
 
+async function actsReconMapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(concurrency || 6, items.length || 1)) }, async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function actsReconTasksForDeal(dealId) {
+  return bitrixRestList('tasks.task.list', {
+    filter: { GROUP_ID: config.actsProjectId, UF_CRM_TASK: `D_${dealId}` },
+    select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
+    order: { ID: 'DESC' },
+  }, 100);
+}
+
+async function actsReconFallbackTasksByTitle(companyName, service) {
+  const titleNeedle = actsCleanText(companyName || '').trim();
+  if (!titleNeedle || titleNeedle.length < 3) return [];
+  let tasks = await bitrixRestList('tasks.task.list', {
+    filter: { GROUP_ID: config.actsProjectId, '%TITLE': titleNeedle },
+    select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
+    order: { ID: 'DESC' },
+  }, 100);
+  const serviceKey = actsReconServiceKeyword(service);
+  if (serviceKey && tasks.length > 1) {
+    const narrowed = tasks.filter((task) => actsReconNorm(actsReconTaskTitle(task)).includes(serviceKey));
+    if (narrowed.length) tasks = narrowed;
+  }
+  return tasks;
+}
+
 async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
+  const startedAt = Date.now();
   const monthInfo = actsReconMonthRange(monthRaw);
   const productionCategoryId = Number(config.productionCategoryId || 28);
   const serviceField = config.serviceFieldCode || 'UF_CRM_1765113071';
+  console.log(`[acts-recon] START month=${monthInfo.key}: определяю стадию Архив...`);
   const archiveStageId = await actsResolveArchiveStageId();
   if (!archiveStageId) throw new Error(`В проекте #${config.actsProjectId} не найдена стадия «Архив».`);
 
+  console.log(`[acts-recon] month=${monthInfo.key}: загружаю успешно закрытые сделки Производства...`);
   const deals = await bitrixRestList('crm.deal.list', {
     filter: {
       CATEGORY_ID: productionCategoryId,
@@ -7255,46 +7296,39 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
     select: ['ID','TITLE','CATEGORY_ID','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CLOSEDATE','ASSIGNED_BY_ID','COMPANY_ID', serviceField],
     order: { CLOSEDATE: 'ASC', ID: 'ASC' },
   }, 5000);
-
-  const tasks = await bitrixRestList('tasks.task.list', {
-    filter: { GROUP_ID: config.actsProjectId },
-    select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
-    order: { ID: 'DESC' },
-  }, 5000);
-
-  const taskByDeal = new Map();
-  for (const task of tasks) {
-    for (const dealId of actsExtractDealIdsFromTask(task)) {
-      const key = String(dealId);
-      if (!taskByDeal.has(key)) taskByDeal.set(key, []);
-      taskByDeal.get(key).push(task);
-    }
-  }
+  console.log(`[acts-recon] month=${monthInfo.key}: найдено успешно закрытых сделок=${deals.length}. Ищу задачи актов точечно по CRM-привязке.`);
 
   const companyCache = new Map();
   const userCache = new Map();
-  const rows = [];
-  for (const deal of deals) {
+  let done = 0;
+  const rows = await actsReconMapWithConcurrency(deals, 6, async (deal) => {
     const dealId = String(deal.ID || '');
-    const companyName = await actsReconCompanyName(deal, companyCache);
-    const service = await actsReconResolveService(deal, serviceField);
-    const expert = await actsReconUserInfo(deal.ASSIGNED_BY_ID, userCache);
+    const [companyName, service, expert] = await Promise.all([
+      actsReconCompanyName(deal, companyCache),
+      actsReconResolveService(deal, serviceField),
+      actsReconUserInfo(deal.ASSIGNED_BY_ID, userCache),
+    ]);
     const info = { deal, companyName, service, expert };
-    const exact = taskByDeal.get(dealId) || [];
-    let candidates = exact;
-    let matchType = exact.length ? 'crm-link' : 'none';
+
+    let candidates = await actsReconTasksForDeal(dealId);
+    let matchType = candidates.length ? 'crm-link' : 'none';
     if (!candidates.length) {
-      candidates = actsReconFallbackCandidates(info, tasks);
+      candidates = await actsReconFallbackTasksByTitle(companyName, service);
       if (candidates.length === 1) matchType = 'title-fallback';
       else if (candidates.length > 1) matchType = 'ambiguous-title';
     }
 
-    // Exact CRM link wins. For title fallback we only trust a unique match.
     const trustedTasks = matchType === 'crm-link' ? candidates : (matchType === 'title-fallback' ? candidates.slice(0,1) : []);
     const archived = trustedTasks.filter((t) => actsReconTaskStage(t) === String(archiveStageId));
     const hasOriginal = archived.length > 0;
     const bestTask = archived[0] || trustedTasks[0] || null;
-    rows.push({
+
+    done++;
+    if (done === 1 || done % 10 === 0 || done === deals.length) {
+      console.log(`[acts-recon] month=${monthInfo.key}: обработано ${done}/${deals.length} сделок.`);
+    }
+
+    return {
       dealId,
       dealTitle: actsCleanText(deal.TITLE),
       closeDate: deal.CLOSEDATE || '',
@@ -7317,8 +7351,8 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
             : bestTask
               ? `задача ${actsReconTaskId(bestTask)} найдена, но её стадия ${actsReconTaskStage(bestTask)} != Архив ${archiveStageId}`
               : 'оригинал не подтверждён',
-    });
-  }
+    };
+  });
 
   const byExpert = new Map();
   for (const row of rows) {
@@ -7330,12 +7364,15 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
     .sort((a,b) => a.expert.label.localeCompare(b.expert.label, 'ru'))
     .map((g) => ({ ...g, have: g.have.sort((a,b) => a.label.localeCompare(b.label, 'ru')), missing: g.missing.sort((a,b) => a.label.localeCompare(b.label, 'ru')) }));
   const text = actsReconBuildText(monthInfo, groups);
+  const durationMs = Date.now() - startedAt;
+  console.log(`[acts-recon] DONE month=${monthInfo.key}: ${rows.length} сделок за ${(durationMs/1000).toFixed(1)} сек.`);
   return {
     ok: true,
     month: monthInfo.key,
     productionCategoryId,
     actsProjectId: config.actsProjectId,
     archiveStageId,
+    durationMs,
     dealsCount: rows.length,
     originalsCount: rows.filter((x) => x.hasOriginal).length,
     missingCount: rows.filter((x) => !x.hasOriginal).length,
@@ -7469,7 +7506,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v74 is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v75 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
