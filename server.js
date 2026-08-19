@@ -199,6 +199,11 @@ const config = {
   // v67: Wazzup принимает файл только по публичному contentUri. Поэтому реальный бинарный файл
   // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
   actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
+
+  // v74: ежемесячная сверка оригиналов актов. Пока только ручной тест;
+  // автоматический запуск добавим после проверки отчёта на реальных данных.
+  actsReconToken: process.env.ACTS_RECON_TOKEN || '',
+  actsReconLeaderId: process.env.ACTS_RECON_LEADER_ID || process.env.TANYA_USER_ID || '2182',
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -7067,6 +7072,317 @@ async function runActsDonePollingCycle() {
   }
 }
 
+
+// v74: ручная месячная сверка оригиналов актов.
+// Логика: успешные сделки Производства за месяц -> задача в проекте Акты счета -> стадия Архив.
+const ACTS_RECON_MONTHS_RU = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+const ACTS_RECON_EXPERT_ALIASES = [
+  { re: /горбатова/i, label: 'Лиза' },
+  { re: /панькова/i, label: 'Оля' },
+  { re: /кананович/i, label: 'Иоланта' },
+  { re: /николаева/i, label: 'Катя' },
+  { re: /баженова/i, label: 'Мария' },
+];
+
+function actsReconParseMonth(raw) {
+  const m = String(raw || '').trim().match(/^(20\d{2})-(0[1-9]|1[0-2])$/);
+  if (!m) throw new Error('month должен быть в формате YYYY-MM, например 2026-08');
+  return { year: Number(m[1]), month: Number(m[2]), key: `${m[1]}-${m[2]}` };
+}
+
+function actsReconMonthRange(raw) {
+  const { year, month, key } = actsReconParseMonth(raw);
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const pad = (n) => String(n).padStart(2, '0');
+  // Минск в 2026 году UTC+3 без сезонного перевода времени.
+  const startIso = `${year}-${pad(month)}-01T00:00:00+03:00`;
+  const nextIso = `${nextYear}-${pad(nextMonth)}-01T00:00:00+03:00`;
+  const endMs = Date.parse(nextIso) - 1000;
+  const end = new Date(endMs);
+  const endIso = `${end.getUTCFullYear()}-${pad(end.getUTCMonth()+1)}-${pad(end.getUTCDate())}T${pad(end.getUTCHours()+3)}:${pad(end.getUTCMinutes())}:${pad(end.getUTCSeconds())}+03:00`;
+  return { year, month, key, startIso, endIso };
+}
+
+function actsReconNorm(value) {
+  return String(value || '')
+    .toLowerCase().replace(/ё/g, 'е')
+    .replace(/[«»"'`]/g, ' ')
+    .replace(/\b(ооо|одо|оао|зао|ип|чуп|уп|сп|общество с ограниченной ответственностью)\b/gi, ' ')
+    .replace(/[^a-zа-я0-9]+/gi, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function actsReconServiceKeyword(raw) {
+  const s = actsReconNorm(raw);
+  if (/\bспк\b|свидетельств.*техн|техн.*компет/.test(s)) return 'спк';
+  if (/аттест/.test(s)) return 'аттест';
+  if (/\bисо\b|\biso\b/.test(s)) return 'исо';
+  if (/\bсуот\b/.test(s)) return 'суот';
+  if (/\bмчс\b/.test(s)) return 'мчс';
+  if (/\bмвд\b/.test(s)) return 'мвд';
+  if (/сертиф/.test(s)) return 'сертиф';
+  return '';
+}
+
+function actsReconTaskStage(task) {
+  return String(actsTaskField(task, ['stageId','STAGE_ID','stage_id']) || '');
+}
+
+function actsReconTaskId(task) {
+  return String(actsTaskField(task, ['id','ID']) || '');
+}
+
+function actsReconTaskTitle(task) {
+  return actsCleanText(actsTaskField(task, ['title','TITLE']) || '');
+}
+
+async function actsReconUserInfo(userId, cache) {
+  const key = String(userId || '');
+  if (!key) return { id: '', full: 'Без ответственного', label: 'Без ответственного' };
+  if (cache.has(key)) return cache.get(key);
+  let user = null;
+  try {
+    const rows = await bitrixRestCall('user.get', { ID: key });
+    user = Array.isArray(rows) ? rows[0] : rows;
+  } catch (_) {}
+  const full = actsCleanText(`${user && user.LAST_NAME || ''} ${user && user.NAME || ''}`) || `ID ${key}`;
+  const hit = ACTS_RECON_EXPERT_ALIASES.find((x) => x.re.test(full));
+  const label = hit ? hit.label : (actsCleanText(user && user.NAME) || full);
+  const out = { id: key, full, label };
+  cache.set(key, out);
+  return out;
+}
+
+async function actsReconCompanyName(deal, cache) {
+  const id = String(deal && deal.COMPANY_ID || '');
+  if (!id) return actsCleanText(deal && deal.TITLE) || `Сделка ${deal && deal.ID || '?'}`;
+  if (cache.has(id)) return cache.get(id);
+  let name = '';
+  try { name = await fgGetCompanyName(id); } catch (_) {}
+  name = actsCleanText(name || deal.TITLE || `Компания ${id}`);
+  cache.set(id, name);
+  return name;
+}
+
+function actsReconFallbackCandidates(info, tasks) {
+  const companyNorm = actsReconNorm(info.companyName);
+  const dealNorm = actsReconNorm(info.deal.TITLE);
+  const serviceKey = actsReconServiceKeyword(info.service);
+  let candidates = tasks.filter((task) => {
+    const t = actsReconNorm(actsReconTaskTitle(task));
+    if (!t) return false;
+    const byCompany = companyNorm.length >= 4 && t.includes(companyNorm);
+    const byDeal = dealNorm.length >= 6 && (t.includes(dealNorm) || dealNorm.includes(t.replace(/^акт\s+/, '')));
+    return byCompany || byDeal;
+  });
+  if (serviceKey && candidates.length > 1) {
+    const byService = candidates.filter((task) => actsReconNorm(actsReconTaskTitle(task)).includes(serviceKey));
+    if (byService.length) candidates = byService;
+  }
+  return candidates;
+}
+
+const actsReconServiceEnumCache = new Map();
+async function actsReconResolveService(deal, serviceField) {
+  const raw = deal && deal[serviceField];
+  if (raw === null || raw === undefined || raw === '') return actsCleanText(detectServiceFromDeal(deal) || '');
+  const direct = Array.isArray(raw) ? raw.map(String).join(', ') : String(raw);
+  const ids = (Array.isArray(raw) ? raw : [raw]).map((x) => String(x)).filter((x) => /^\d+$/.test(x));
+  if (!ids.length) return actsCleanText(direct);
+  try {
+    let map = actsReconServiceEnumCache.get(serviceField);
+    if (!map) {
+      map = new Map();
+      const fields = await bitrixRestList('crm.deal.userfield.list', { filter: { FIELD_NAME: serviceField } }, 20);
+      const field = fields.find((f) => String(f.FIELD_NAME || f.fieldName || '') === serviceField) || fields[0];
+      const list = field && (field.LIST || field.list);
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const id = String(item.ID || item.id || '');
+          const value = actsCleanText(item.VALUE || item.value || '');
+          if (id && value) map.set(id, value);
+        }
+      }
+      actsReconServiceEnumCache.set(serviceField, map);
+    }
+    const labels = ids.map((id) => map.get(id)).filter(Boolean);
+    if (labels.length) return labels.join(', ');
+    const titleFallback = fgProductionService(deal);
+    return actsCleanText(titleFallback && !/^\d+(?:,\s*\d+)*$/.test(titleFallback) ? titleFallback : direct);
+  } catch (_) {
+    return actsCleanText(direct);
+  }
+}
+
+function actsReconDisplayDeal(info) {
+  const service = getShortServiceName(info.service || '');
+  return service && service !== 'услуги' ? `${info.companyName} — ${service}` : info.companyName;
+}
+
+function actsReconBuildText(monthInfo, groups) {
+  const titleMonth = ACTS_RECON_MONTHS_RU[monthInfo.month - 1];
+  const lines = [`Сверка оригиналов актов за ${titleMonth} ${monthInfo.year}`, ''];
+  let idx = 1;
+  for (const g of groups) {
+    lines.push(`${idx}) ${g.expert.label}`);
+    lines.push('Акты есть в оригинале:');
+    if (g.have.length) g.have.forEach((x) => lines.push(`- ${x.label}`));
+    else lines.push('- нет');
+    lines.push('Актов нет в оригинале:');
+    if (g.missing.length) g.missing.forEach((x) => lines.push(`- ${x.label}`));
+    else lines.push('- нет');
+    lines.push('');
+    idx++;
+  }
+  return lines.join('\n').trim();
+}
+
+async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
+  const monthInfo = actsReconMonthRange(monthRaw);
+  const productionCategoryId = Number(config.productionCategoryId || 28);
+  const serviceField = config.serviceFieldCode || 'UF_CRM_1765113071';
+  const archiveStageId = await actsResolveArchiveStageId();
+  if (!archiveStageId) throw new Error(`В проекте #${config.actsProjectId} не найдена стадия «Архив».`);
+
+  const deals = await bitrixRestList('crm.deal.list', {
+    filter: {
+      CATEGORY_ID: productionCategoryId,
+      STAGE_SEMANTIC_ID: 'S',
+      '>=CLOSEDATE': monthInfo.startIso,
+      '<=CLOSEDATE': monthInfo.endIso,
+    },
+    select: ['ID','TITLE','CATEGORY_ID','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','CLOSEDATE','ASSIGNED_BY_ID','COMPANY_ID', serviceField],
+    order: { CLOSEDATE: 'ASC', ID: 'ASC' },
+  }, 5000);
+
+  const tasks = await bitrixRestList('tasks.task.list', {
+    filter: { GROUP_ID: config.actsProjectId },
+    select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
+    order: { ID: 'DESC' },
+  }, 5000);
+
+  const taskByDeal = new Map();
+  for (const task of tasks) {
+    for (const dealId of actsExtractDealIdsFromTask(task)) {
+      const key = String(dealId);
+      if (!taskByDeal.has(key)) taskByDeal.set(key, []);
+      taskByDeal.get(key).push(task);
+    }
+  }
+
+  const companyCache = new Map();
+  const userCache = new Map();
+  const rows = [];
+  for (const deal of deals) {
+    const dealId = String(deal.ID || '');
+    const companyName = await actsReconCompanyName(deal, companyCache);
+    const service = await actsReconResolveService(deal, serviceField);
+    const expert = await actsReconUserInfo(deal.ASSIGNED_BY_ID, userCache);
+    const info = { deal, companyName, service, expert };
+    const exact = taskByDeal.get(dealId) || [];
+    let candidates = exact;
+    let matchType = exact.length ? 'crm-link' : 'none';
+    if (!candidates.length) {
+      candidates = actsReconFallbackCandidates(info, tasks);
+      if (candidates.length === 1) matchType = 'title-fallback';
+      else if (candidates.length > 1) matchType = 'ambiguous-title';
+    }
+
+    // Exact CRM link wins. For title fallback we only trust a unique match.
+    const trustedTasks = matchType === 'crm-link' ? candidates : (matchType === 'title-fallback' ? candidates.slice(0,1) : []);
+    const archived = trustedTasks.filter((t) => actsReconTaskStage(t) === String(archiveStageId));
+    const hasOriginal = archived.length > 0;
+    const bestTask = archived[0] || trustedTasks[0] || null;
+    rows.push({
+      dealId,
+      dealTitle: actsCleanText(deal.TITLE),
+      closeDate: deal.CLOSEDATE || '',
+      expert,
+      companyName,
+      service,
+      label: actsReconDisplayDeal(info),
+      hasOriginal,
+      matchType,
+      taskId: bestTask ? actsReconTaskId(bestTask) : '',
+      taskTitle: bestTask ? actsReconTaskTitle(bestTask) : '',
+      taskStageId: bestTask ? actsReconTaskStage(bestTask) : '',
+      matchingTaskIds: candidates.map(actsReconTaskId).filter(Boolean),
+      reason: hasOriginal
+        ? `задача ${actsReconTaskId(archived[0])} в стадии Архив ${archiveStageId}`
+        : matchType === 'none'
+          ? 'задача на акт не найдена'
+          : matchType === 'ambiguous-title'
+            ? `по названию найдено несколько задач (${candidates.map(actsReconTaskId).join(', ')}) — автоматически не засчитываю`
+            : bestTask
+              ? `задача ${actsReconTaskId(bestTask)} найдена, но её стадия ${actsReconTaskStage(bestTask)} != Архив ${archiveStageId}`
+              : 'оригинал не подтверждён',
+    });
+  }
+
+  const byExpert = new Map();
+  for (const row of rows) {
+    const key = row.expert.id || 'none';
+    if (!byExpert.has(key)) byExpert.set(key, { expert: row.expert, have: [], missing: [] });
+    byExpert.get(key)[row.hasOriginal ? 'have' : 'missing'].push(row);
+  }
+  const groups = [...byExpert.values()]
+    .sort((a,b) => a.expert.label.localeCompare(b.expert.label, 'ru'))
+    .map((g) => ({ ...g, have: g.have.sort((a,b) => a.label.localeCompare(b.label, 'ru')), missing: g.missing.sort((a,b) => a.label.localeCompare(b.label, 'ru')) }));
+  const text = actsReconBuildText(monthInfo, groups);
+  return {
+    ok: true,
+    month: monthInfo.key,
+    productionCategoryId,
+    actsProjectId: config.actsProjectId,
+    archiveStageId,
+    dealsCount: rows.length,
+    originalsCount: rows.filter((x) => x.hasOriginal).length,
+    missingCount: rows.filter((x) => !x.hasOriginal).length,
+    ambiguousCount: rows.filter((x) => x.matchType === 'ambiguous-title').length,
+    groups,
+    rows,
+    text,
+  };
+}
+
+function actsReconRequestAuthorized(req) {
+  const expected = String(config.actsReconToken || '');
+  if (!expected) return false;
+  const supplied = String((req.query && req.query.token) || (req.body && req.body.token) || '').trim();
+  if (!supplied || supplied.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+}
+
+async function actsReconSendToLeader(report) {
+  const leaderId = String(config.actsReconLeaderId || '2182');
+  const messageId = await bitrixRestCall('im.message.add', { DIALOG_ID: leaderId, MESSAGE: report.text });
+  return { leaderId, messageId };
+}
+
+async function actsReconEndpoint(req, res) {
+  try {
+    if (!config.actsReconToken) {
+      return res.status(503).json({ ok: false, error: 'В Render не задан ACTS_RECON_TOKEN. Добавь секретную строку и повтори запрос.' });
+    }
+    if (!actsReconRequestAuthorized(req)) return res.status(403).json({ ok: false, error: 'Неверный ACTS_RECON_TOKEN.' });
+    const rawMonth = String((req.query && req.query.month) || (req.body && req.body.month) || '').trim();
+    const sendRaw = String((req.query && req.query.send) || (req.body && req.body.send) || '0').toLowerCase();
+    const send = ['1','true','yes','y'].includes(sendRaw);
+    const report = await actsBuildMonthlyOriginalsReconciliation(rawMonth);
+    let sent = null;
+    if (send) sent = await actsReconSendToLeader(report);
+    console.log(`[acts-recon] month=${report.month}: успешно закрыто=${report.dealsCount}, оригиналы=${report.originalsCount}, нет=${report.missingCount}, неоднозначных=${report.ambiguousCount}, send=${send}.`);
+    return res.json({ ...report, sent });
+  } catch (e) {
+    console.error('[acts-recon]', e.message || e);
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+app.get('/api/acts/reconcile', actsReconEndpoint);
+app.post('/api/acts/reconcile', actsReconEndpoint);
+
 app.post('/api/foreman/robot-linked', async (req, res) => {
   try {
     if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
@@ -7153,8 +7469,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v73 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v74 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
