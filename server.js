@@ -171,11 +171,25 @@ const config = {
   // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
   actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
   actsDonePollIntervalSeconds: Number(process.env.ACTS_DONE_POLL_INTERVAL_SECONDS || 60),
-  // v65: отдельный безопасный пилот для актов. Не наследуем массовый режим основного автопилота.
-  // Для текущего теста Бобик = сделка 38072. Чтобы включить массовую отправку актов, нужно ЯВНО ACTS_ALL_DEALS=true.
+  // v70: автоотправка актов переведена в боевой режим по всей воронке.
+  // При необходимости аварийно ограничить отправку одной сделкой — задай ACTS_ALL_DEALS=false.
   actsTestDealId: process.env.ACTS_TEST_DEAL_ID || '38072',
-  actsAllDeals: String(process.env.ACTS_ALL_DEALS || 'false').toLowerCase() === 'true',
+  actsAllDeals: String(process.env.ACTS_ALL_DEALS || 'true').toLowerCase() !== 'false',
   actsRetrySeconds: Number(process.env.ACTS_RETRY_SECONDS || 120),
+  // v70: автопуши по подписанному скану. Первый/следующий пуш — через 2 календарных дня
+  // после последнего сообщения; если расчётная дата приходится на Сб/Вс, она пропускается
+  // и следующая попытка остаётся ещё через 2 календарных дня.
+  actsPushEnabled: String(process.env.ACTS_PUSH_ENABLED || 'true').toLowerCase() !== 'false',
+  actsPushIntervalMinutes: Number(process.env.ACTS_PUSH_INTERVAL_MINUTES || 60),
+  actsPushEveryDays: Number(process.env.ACTS_PUSH_EVERY_DAYS || 2),
+  actsCallAfterDays: Number(process.env.ACTS_CALL_AFTER_DAYS || 7),
+  // Только для короткого теста. Если >0, минуты временно заменяют 2 дня / 7 дней.
+  // После теста ОБЯЗАТЕЛЬНО удалить эти переменные из Render.
+  actsPushTestMinutes: Number(process.env.ACTS_PUSH_TEST_MINUTES || 0),
+  actsCallTestMinutes: Number(process.env.ACTS_CALL_TEST_MINUTES || 0),
+  actsPushRecoveryDays: Number(process.env.ACTS_PUSH_RECOVERY_DAYS || 30),
+  // Не обрабатываем исторические задачи «Сделано» до запуска боевого режима актов.
+  actsProductionStartIso: process.env.ACTS_PRODUCTION_START_ISO || '2026-08-18T14:56:00+03:00',
   // v67: Wazzup принимает файл только по публичному contentUri. Поэтому реальный бинарный файл
   // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
   actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
@@ -191,7 +205,7 @@ async function bitrixRestCall(method, params = {}) {
   if (String(method || '').toLowerCase() === 'tasks.task.add' && !config.serverTasksEnabled) {
     const title = params && params.fields ? String(params.fields.TITLE || '') : '';
     const isForemanTask = /^ИИгорь:/i.test(title) && config.foremanTasksEnabled;
-    const isActsTask = (title.includes('[MAVIS_ACTS_ORIGINAL]') || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title)) && config.actsTasksEnabled;
+    const isActsTask = (title.includes('[MAVIS_ACTS_ORIGINAL]') || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title) || /^ПОЗВОНИТЬ ПО АКТУ/i.test(title)) && config.actsTasksEnabled;
     if (!isForemanTask && !isActsTask) {
       console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
       return { task: { id: null, blocked: true } };
@@ -5644,6 +5658,369 @@ function actsBuildClientMessage(deal, task, file) {
   return `${greeting}\n\nНаправляем ${actLabel}.\nПожалуйста, проверьте и подпишите акт. В течение 2 рабочих дней пришлите, пожалуйста, скан подписанного акта ответным сообщением.\n\nОригинал акта в 2 экземплярах направим вам почтой.\n\nЕсли по акту будут вопросы — напишите, пожалуйста, в ответном сообщении.`;
 }
 
+
+// ========================= v70: АВТОПУШИ ПО АКТУ =========================
+const ACTS_PUSH_SENT_MARKER = '[MAVIS_ACTS_PUSH_SENT]';
+const ACTS_SCAN_RECEIVED_MARKER = '[MAVIS_ACTS_SCAN_RECEIVED]';
+const ACTS_CALL_TASK_MARKER = '[MAVIS_ACTS_CALL_TASK_CREATED]';
+const ACTS_PUSH_STATE_MARKER = '[MAVIS_ACTS_PUSH_STATE]';
+const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
+let actsPushCycleRunning = false;
+
+function actsNormalizeChannelKey(value) {
+  const x = actsCleanText(value).toLowerCase();
+  if (x.includes('viber') || x.includes('вайбер')) return 'viber';
+  if (x.includes('telegram') || x.includes('телеграм') || x === 'tg') return 'telegram';
+  if (x.includes('email') || x.includes('e-mail') || x.includes('почт')) return 'email';
+  return '';
+}
+
+function actsMinskCalendarParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', weekday: 'short',
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value || '';
+  return {
+    y: Number(get('year')), m: Number(get('month')), d: Number(get('day')),
+    hour: Number(get('hour')), minute: Number(get('minute')), second: Number(get('second')),
+    weekday: get('weekday'),
+    ymd: `${get('year')}-${get('month')}-${get('day')}`,
+  };
+}
+
+function actsIsMinskWeekend(date = new Date()) {
+  const wd = actsMinskCalendarParts(date).weekday.toLowerCase();
+  return wd.startsWith('sat') || wd.startsWith('sun');
+}
+
+function actsNextPushDueFrom(lastSentAtMs) {
+  const testMinutes = Number(config.actsPushTestMinutes || 0);
+  const stepMs = testMinutes > 0
+    ? Math.max(1, testMinutes) * 60 * 1000
+    : Math.max(1, Number(config.actsPushEveryDays || 2)) * 24 * 60 * 60 * 1000;
+  let due = Number(lastSentAtMs || 0) + stepMs;
+  // Не пишем клиенту в субботу/воскресенье. Пропускаем такой слот полностью,
+  // следующий слот остаётся ещё через 2 календарных дня.
+  for (let i = 0; i < 4 && actsIsMinskWeekend(new Date(due)); i++) due += stepMs;
+  return due;
+}
+
+function actsParseTimelineCreated(comment) {
+  return actsParseDateMs(comment && (comment.CREATED || comment.DATE_CREATE || comment.created || comment.dateCreate));
+}
+
+function actsExtractChannelFromSentComment(commentText) {
+  const text = String(commentText || '');
+  const explicit = text.match(/channel=(email|telegram|viber)/i);
+  if (explicit) return explicit[1].toLowerCase();
+  const human = text.match(/отправлено\s+через\s+(Email|Telegram|Viber|Вайбер|Телеграм)/i);
+  return human ? actsNormalizeChannelKey(human[1]) : '';
+}
+
+async function actsLoadTimelineComments(dealId, limit = 100) {
+  return bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+    order: { CREATED: 'DESC' },
+    select: ['ID','CREATED','COMMENT','FILES'],
+  }, limit);
+}
+
+function actsTimelineFiles(comment) {
+  const raw = comment && (comment.FILES || comment.files);
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'object') return Object.values(raw);
+  return [];
+}
+
+async function actsMarkScanReceived(state, source, fileName = '') {
+  const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${state.taskId}`;
+  if (!(await fgTimelineHasMarker(state.dealId, marker, 100))) {
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: state.dealId,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `${marker}\nПодписанный акт считаю полученным: ${source}${fileName ? ` — ${fileName}` : ''}. Автопуши по этому акту остановлены.`,
+      },
+    });
+  }
+  actsPushStates.delete(String(state.taskId));
+  console.log(`[acts-push] task=${state.taskId}: скан/оригинал найден (${source}${fileName ? `, ${fileName}` : ''}) — пуши остановлены.`);
+  return true;
+}
+
+async function actsResolveArchiveStageId() {
+  if (actsResolveArchiveStageId.cache) return actsResolveArchiveStageId.cache;
+  try {
+    const raw = await bitrixRestCall('task.stages.get', { entityId: config.actsProjectId });
+    const stages = raw && typeof raw === 'object' ? Object.values(raw) : [];
+    const found = stages.find((st) => /архив/i.test(actsCleanText(st && (st.TITLE || st.title))));
+    actsResolveArchiveStageId.cache = found ? String(found.ID || found.id) : '';
+  } catch (e) {
+    console.warn(`[acts-push] Не смог определить стадию «Архив»: ${e.message || e}`);
+    actsResolveArchiveStageId.cache = '';
+  }
+  return actsResolveArchiveStageId.cache;
+}
+actsResolveArchiveStageId.cache = '';
+
+async function actsCheckScanReceived(state, task = null, dealComments = null) {
+  const scanMarker = `${ACTS_SCAN_RECEIVED_MARKER} task=${state.taskId}`;
+  const comments = dealComments || await actsLoadTimelineComments(state.dealId, 100);
+  if (comments.some((c) => String(c.COMMENT || '').includes(scanMarker))) return true;
+
+  // Если задача уже в «Архиве», бумажный оригинал вернулся — пушить точно больше не нужно.
+  try {
+    if (!task) {
+      const raw = await bitrixRestCall('tasks.task.get', {
+        taskId: Number(state.taskId),
+        select: ['ID','TITLE','STAGE_ID','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES'],
+      });
+      task = raw && (raw.task || raw.TASK || raw);
+    }
+    const archiveStageId = await actsResolveArchiveStageId();
+    const stage = String(actsTaskField(task, ['stageId','STAGE_ID','stage_id']) || '');
+    if (archiveStageId && stage === archiveStageId) {
+      await actsMarkScanReceived(state, 'задача находится в «Архиве»');
+      return true;
+    }
+
+    // В task chat исходный акт был прикреплён ДО отправки. Любой новый документ/изображение,
+    // появившийся после отправки, считаем вернувшимся сканом (эксперт прикрепил ответ клиента в Bitrix).
+    const resolved = await actsResolveTaskFiles(task);
+    const originalName = actsCleanText(state.originalFileName || '').toLowerCase();
+    const candidates = (resolved.files || []).filter((f) => {
+      const fileMs = actsParseDateMs(f && f.date);
+      if (!fileMs || fileMs <= Number(state.sentAtMs || 0) + 30 * 1000) return false;
+      const name = actsCleanText(f && f.name || '');
+      if (!name) return false;
+      if (originalName && name.toLowerCase() === originalName && String(f.source || '') !== 'task-chat') return false;
+      return /\.(pdf|docx?|jpg|jpeg|png|heic|tiff?|bmp)$/i.test(name) || /акт|скан|подпис/i.test(name);
+    });
+    if (candidates.length) {
+      const newest = [...candidates].sort((a,b) => actsParseDateMs(b.date) - actsParseDateMs(a.date))[0];
+      await actsMarkScanReceived(state, 'новый файл в задаче после отправки акта', newest.name || 'файл');
+      return true;
+    }
+  } catch (e) {
+    console.warn(`[acts-push] task=${state.taskId}: не смог проверить файлы задачи: ${e.message || e}`);
+  }
+
+  // Если эксперт прикрепил скан прямо в таймлайн сделки — тоже останавливаем пуши.
+  for (const c of comments) {
+    const createdMs = actsParseTimelineCreated(c);
+    if (!createdMs || createdMs <= Number(state.sentAtMs || 0) + 30 * 1000) continue;
+    const files = actsTimelineFiles(c);
+    if (!files.length) continue;
+    const f = files[0] || {};
+    await actsMarkScanReceived(state, 'файл в таймлайне сделки после отправки акта', actsCleanText(f.name || f.NAME || 'файл'));
+    return true;
+  }
+  return false;
+}
+
+function actsPushMessage() {
+  return `${actsMinskGreeting()}\n\nРанее направляли вам акт выполненных работ сообщением выше, но пока не получили подписанный скан. Наша бухгалтерия очень просит вернуть подписанный акт. Будем вам очень признательны, если сможете направить его ответным сообщением.`;
+}
+
+async function actsSendReminderEmail(deal, email, text, taskId, sequence) {
+  const responsibleId = Number(deal.ASSIGNED_BY_ID || deal.assignedById || 1);
+  let staff = null;
+  try {
+    const u = await bitrixRestCall('user.get', { ID: responsibleId });
+    staff = Array.isArray(u) ? u[0] : u;
+  } catch (_) {}
+  const senderName = (staff && `${staff.NAME || ''} ${staff.LAST_NAME || ''}`.trim()) || config.emailSenderName || 'Mavis Group';
+  const entityId = Number(deal.CONTACT_ID || deal.COMPANY_ID || 0);
+  const fields = {
+    OWNER_TYPE_ID: 2,
+    OWNER_ID: Number(deal.ID),
+    RESPONSIBLE_ID: responsibleId,
+    TYPE_ID: 4,
+    DIRECTION: 2,
+    SUBJECT: 'Напоминание: подписанный акт выполненных работ',
+    DESCRIPTION: text,
+    DESCRIPTION_TYPE: 1,
+    COMPLETED: 'Y',
+    START_TIME: new Date().toISOString(),
+    END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    COMMUNICATIONS: [{ VALUE: email, ENTITY_ID: entityId, ENTITY_TYPE_ID: deal.CONTACT_ID ? 3 : 4, TYPE: 'EMAIL' }],
+  };
+  if (staff && staff.EMAIL) fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${staff.EMAIL}>` };
+  return bitrixRestCall('crm.activity.add', { fields });
+}
+
+async function actsSendPush(state, deal, sequence) {
+  const channel = actsNormalizeChannelKey(state.channel) || await detectPreferredChannelResolved(deal);
+  if (!channel) return { ok: false, error: 'Не удалось определить канал первоначальной отправки акта.' };
+  const text = actsPushMessage();
+  if (channel === 'email') {
+    const email = await getContactEmail(deal);
+    if (!email) return { ok: false, error: 'Для Email-пуша не найден email контакта/компании.' };
+    await actsSendReminderEmail(deal, email, text, state.taskId, sequence);
+    return { ok: true, channel: 'Email', contact: maskEmailForLog(email) };
+  }
+  const phone = await getContactPhone(deal);
+  if (!phone) return { ok: false, error: `Для ${preferredChannelLabel(channel)}-пуша не найден телефон.` };
+  const ch = getConfiguredWazzupChannel(channel);
+  if (!ch || !ch.channelId || ch.key !== channel) return { ok: false, error: `${preferredChannelLabel(channel)} не настроен в Wazzup.` };
+  const sent = await sendWazzupMessageInternal({
+    channelKey: channel,
+    text,
+    phone,
+    dealId: deal.ID,
+    ignoreStrictPreferredChannel: true,
+    crmMessageId: `mavis-acts-push-${channel}-${deal.ID}-${state.taskId}-${sequence}`,
+  });
+  return { ok: true, channel: preferredChannelLabel(channel), contact: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'), raw: sent };
+}
+
+function actsNextWorkingDeadlineIso(now = new Date()) {
+  // Срок задачи эксперту — ближайший рабочий день (Пн–Пт) 17:00 по Минску.
+  // Если задача создаётся в рабочий день до 17:00 — срок сегодня; иначе следующий рабочий день.
+  const p = actsMinskCalendarParts(now);
+  let base = new Date(Date.UTC(p.y, p.m - 1, p.d, 14, 0, 0)); // 17:00 Minsk = 14:00 UTC
+  if (now.getTime() > base.getTime()) base = new Date(base.getTime() + 24 * 60 * 60 * 1000);
+  while (actsIsMinskWeekend(base)) base = new Date(base.getTime() + 24 * 60 * 60 * 1000);
+  return base.toISOString();
+}
+
+async function actsCreateCallTaskIfNeeded(state, deal, comments) {
+  const threshold = Number(state.sentAtMs || 0) + (Number(config.actsCallTestMinutes || 0) > 0
+    ? Math.max(1, Number(config.actsCallTestMinutes)) * 60 * 1000
+    : Math.max(1, Number(config.actsCallAfterDays || 7)) * 24 * 60 * 60 * 1000);
+  if (Date.now() < threshold) return false;
+  const marker = `${ACTS_CALL_TASK_MARKER} task=${state.taskId}`;
+  if ((comments || []).some((c) => String(c.COMMENT || '').includes(marker))) return false;
+  const responsibleId = Number(deal.ASSIGNED_BY_ID || deal.assignedById || 0);
+  if (!responsibleId) {
+    console.warn(`[acts-push] task=${state.taskId}: 7 дней прошло, но у сделки ${state.dealId} нет ASSIGNED_BY_ID — задачу на звонок не создал.`);
+    return false;
+  }
+  const company = actsCleanText(deal.COMPANY_TITLE || deal.COMPANY_NAME || deal.TITLE || `сделка ${state.dealId}`);
+  const title = `Позвонить по акту: ${company}`;
+  const description = `Подписанный скан акта не получен в течение ${config.actsCallAfterDays || 7} календарных дней после отправки клиенту.\n\nПозвоните клиенту по акту и попросите вернуть подписанный скан.\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${state.dealId}/\nЗадача по акту: ${actsTaskUrl(state.taskId)}`;
+  const added = await bitrixRestCall('tasks.task.add', { fields: {
+    TITLE: title,
+    DESCRIPTION: description,
+    RESPONSIBLE_ID: responsibleId,
+    DEADLINE: actsNextWorkingDeadlineIso(),
+    UF_CRM_TASK: [`D_${state.dealId}`],
+  }});
+  const createdTaskId = added && (added.task && (added.task.id || added.task.ID) || added.id || added.ID || '');
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: state.dealId,
+    ENTITY_TYPE: 'deal',
+    COMMENT: `${marker}\n7 дней без подписанного скана. Эксперту поставлена задача «${title}»${createdTaskId ? ` (#${createdTaskId})` : ''}.`,
+  }});
+  console.log(`[acts-push] task=${state.taskId}: прошло 7 дней — задача на звонок создана эксперту ${responsibleId}${createdTaskId ? `, task=${createdTaskId}` : ''}.`);
+  return true;
+}
+
+async function actsRegisterPushState({ taskId, dealId, channel, sentAtMs = Date.now(), originalFileName = '' }) {
+  if (!config.actsPushEnabled || !taskId || !dealId) return;
+  actsPushStates.set(String(taskId), {
+    taskId: String(taskId), dealId: String(dealId), channel: actsNormalizeChannelKey(channel),
+    sentAtMs: Number(sentAtMs || Date.now()), lastMessageAtMs: Number(sentAtMs || Date.now()),
+    pushCount: 0, originalFileName: actsCleanText(originalFileName || ''),
+  });
+  console.log(`[acts-push] Зарегистрирован контроль task=${taskId}, deal=${dealId}, channel=${actsNormalizeChannelKey(channel) || channel}, следующий пуш после ${new Date(actsNextPushDueFrom(sentAtMs)).toISOString()}.`);
+}
+
+async function actsRecoverPushStatesFromBitrix() {
+  if (!config.actsPushEnabled || !config.bitrixWebhookUrl) return;
+  const since = new Date(Date.now() - Math.max(7, Number(config.actsPushRecoveryDays || 30)) * 24 * 60 * 60 * 1000).toISOString();
+  let tasks = [];
+  try {
+    tasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId, '>=CHANGED_DATE': since },
+      order: { CHANGED_DATE: 'DESC' },
+      select: ['ID','TITLE','STAGE_ID','CHAT_ID','UF_CRM_TASK','CHANGED_DATE'],
+    }, 1000);
+  } catch (e) {
+    console.warn(`[acts-push] Не смог восстановить состояния после старта: ${e.message || e}`);
+    return;
+  }
+  const actTasks = tasks.filter((t) => /^АКТ/i.test(actsCleanText(actsTaskField(t, ['title','TITLE']) || '')) || String(actsTaskField(t, ['description','DESCRIPTION']) || '').includes(ACTS_ORIGINAL_MARKER));
+  let restored = 0;
+  for (const task of actTasks) {
+    const taskId = String(actsTaskField(task, ['id','ID']) || '');
+    const dealIds = actsExtractDealIdsFromTask(task);
+    if (!taskId || !dealIds.length) continue;
+    for (const dealId of dealIds.slice(0,1)) {
+      try {
+        const comments = await actsLoadTimelineComments(dealId, 100);
+        const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
+        const sentComment = comments.find((c) => String(c.COMMENT || '').includes(sentMarker));
+        if (!sentComment) continue;
+        if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_SCAN_RECEIVED_MARKER} task=${taskId}`))) continue;
+        const sentAtMs = actsParseTimelineCreated(sentComment);
+        if (!sentAtMs) continue;
+        const pushComments = comments.filter((c) => String(c.COMMENT || '').includes(`${ACTS_PUSH_SENT_MARKER} task=${taskId}`));
+        const lastPush = [...pushComments].sort((a,b) => actsParseTimelineCreated(b)-actsParseTimelineCreated(a))[0];
+        const lastMessageAtMs = lastPush ? actsParseTimelineCreated(lastPush) : sentAtMs;
+        const channel = actsExtractChannelFromSentComment(sentComment.COMMENT) || await detectPreferredChannelResolved(await bitrixRestCall('crm.deal.get', { id: dealId }));
+        const originalMatch = String(sentComment.COMMENT || '').match(/Файл:\s*([^\n]+)/i);
+        actsPushStates.set(taskId, { taskId, dealId: String(dealId), channel, sentAtMs, lastMessageAtMs, pushCount: pushComments.length, originalFileName: originalMatch ? actsCleanText(originalMatch[1]) : '' });
+        restored++;
+      } catch (e) {
+        console.warn(`[acts-push] task=${taskId}: восстановление состояния пропущено: ${e.message || e}`);
+      }
+    }
+  }
+  console.log(`[acts-push] После старта восстановлено ${restored} активных контролей из Bitrix (окно ${config.actsPushRecoveryDays || 30} дней).`);
+}
+
+async function runActsPushCycle() {
+  if (!config.actsPushEnabled || !config.bitrixWebhookUrl || actsPushCycleRunning) return;
+  actsPushCycleRunning = true;
+  try {
+    if (!actsPushStates.size) return;
+    const now = Date.now();
+    for (const state of [...actsPushStates.values()]) {
+      try {
+        const comments = await actsLoadTimelineComments(state.dealId, 100);
+        const deal = await bitrixRestCall('crm.deal.get', { id: state.dealId });
+        if (!deal) continue;
+        if (await actsCheckScanReceived(state, null, comments)) continue;
+
+        await actsCreateCallTaskIfNeeded(state, deal, comments);
+
+        const dueAt = actsNextPushDueFrom(state.lastMessageAtMs || state.sentAtMs);
+        if (now < dueAt) continue;
+        if (actsIsMinskWeekend(new Date(now))) {
+          console.log(`[acts-push] task=${state.taskId}: пуш уже по сроку, но сегодня выходной по Минску — клиенту не пишу.`);
+          continue;
+        }
+
+        const sequence = Number(state.pushCount || 0) + 1;
+        const result = await actsSendPush(state, deal, sequence);
+        if (!result.ok) {
+          console.warn(`[acts-push] task=${state.taskId}: пуш #${sequence} не отправлен: ${result.error || result.message || 'ошибка'}`);
+          continue;
+        }
+        const marker = `${ACTS_PUSH_SENT_MARKER} task=${state.taskId} n=${sequence} channel=${actsNormalizeChannelKey(state.channel) || actsNormalizeChannelKey(result.channel)}`;
+        await bitrixRestCall('crm.timeline.comment.add', { fields: {
+          ENTITY_ID: state.dealId,
+          ENTITY_TYPE: 'deal',
+          COMMENT: `${marker}\nАвтопуш #${sequence} по подписанному скану отправлен клиенту через ${result.channel}.`,
+        }});
+        state.lastMessageAtMs = Date.now();
+        state.pushCount = sequence;
+        if (!state.channel) state.channel = actsNormalizeChannelKey(result.channel);
+        actsPushStates.set(String(state.taskId), state);
+        console.log(`[acts-push] task=${state.taskId}: пуш #${sequence} отправлен через ${result.channel}; следующий после ${new Date(actsNextPushDueFrom(state.lastMessageAtMs)).toISOString()}.`);
+      } catch (e) {
+        console.error(`[acts-push] task=${state.taskId}: ошибка цикла: ${e.message || e}`);
+      }
+    }
+  } finally {
+    actsPushCycleRunning = false;
+  }
+}
+// ======================= /v70: АВТОПУШИ ПО АКТУ =========================
+
 function maskEmailForLog(email) {
   const e = String(email || '').trim();
   const parts = e.split('@');
@@ -6063,13 +6440,19 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       ? `✅ Клиенту отправлено через ${sendResult.channel || 'предпочитаемый канал'}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.phone || sendResult.email || 'скрыт'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
       : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый канал связи», телефон/email основного контакта, настройки Wazzup Telegram/Viber и прямую ссылку на файл в задаче.`;
 
+    const pushStateLine = sendResult && sendResult.ok
+      ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} sentAt=${new Date().toISOString()}`
+      : '';
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
         ENTITY_ID: dealId,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${sendResult && sendResult.ok ? sentMarker : failedMarker}\n${doneMarker}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
+        COMMENT: `${sendResult && sendResult.ok ? sentMarker : failedMarker}\n${doneMarker}${pushStateLine}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
       },
     });
+    if (sendResult && sendResult.ok) {
+      await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '' });
+    }
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
   }
 
@@ -6186,7 +6569,8 @@ async function runActsDonePollingCycle() {
 
     // v64: ищем только недавно изменённые задачи проекта, поэтому новая задача не может
     // потеряться из-за общего лимита первых 200 карточек. CHANGED_DATE поддерживает >= фильтр.
-    const scanSinceMs = Math.max(0, actsPollLastScanAt - ACTS_HISTORY_GRACE_MS);
+    const productionStartMs = actsParseDateMs(config.actsProductionStartIso) || 0;
+    const scanSinceMs = Math.max(productionStartMs, 0, actsPollLastScanAt - ACTS_HISTORY_GRACE_MS);
     const scanSinceIso = new Date(scanSinceMs).toISOString();
     const projectTasks = await bitrixRestList('tasks.task.list', {
       filter: { GROUP_ID: config.actsProjectId, '>=CHANGED_DATE': scanSinceIso },
@@ -6206,12 +6590,11 @@ async function runActsDonePollingCycle() {
       console.warn(`[acts-poll] Не смог отдельно получить текущую стадию ${doneStageId}: ${e.message || e}`);
     }
 
-    const mergedById = new Map();
-    for (const task of [...projectTasks, ...currentDoneTasks]) {
-      const id = String(actsTaskField(task, ['id','ID']) || '');
-      if (id) mergedById.set(id, task);
-    }
-    const mergedTasks = [...mergedById.values()];
+    // v70: currentDoneTasks используем только для диагностики. В кандидаты НЕ подмешиваем
+    // старые задачи, давно лежащие в «Сделано», иначе при включении ACTS_ALL_DEALS можно
+    // случайно разослать исторические акты. К отправке идут только недавно изменённые задачи
+    // (или отдельные retries ниже).
+    const mergedTasks = projectTasks;
 
     const stageOf = (task) => String(actsTaskField(task, ['stageId','STAGE_ID','stage_id']) ?? '');
     const recentIds = new Set(projectTasks.map((t) => String(actsTaskField(t, ['id','ID']) || '')));
@@ -6384,8 +6767,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v69 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v70 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
     console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
@@ -6403,6 +6786,21 @@ app.listen(PORT, () => {
     setInterval(runActsDonePollingCycle, actsPollMs);
   } else {
     console.log('[acts-poll] Резервный контроль актов выключен.');
+  }
+
+  if (config.bitrixWebhookUrl && config.actsPushEnabled) {
+    const pushMs = Math.max(15, Number(config.actsPushIntervalMinutes || 60)) * 60 * 1000;
+    const timingInfo = Number(config.actsPushTestMinutes || 0) > 0 || Number(config.actsCallTestMinutes || 0) > 0
+      ? `ТЕСТ: push=${config.actsPushTestMinutes || 0} мин, call=${config.actsCallTestMinutes || 0} мин`
+      : `push=${config.actsPushEveryDays || 2} календарных дня, call=${config.actsCallAfterDays || 7} дней`;
+    console.log(`[acts-push] Контроль сканов/автопуши включены: ${timingInfo}; клиенту не пишем Сб/Вс. Проверка раз в ${pushMs / 60000} мин.`);
+    setTimeout(async () => {
+      await actsRecoverPushStatesFromBitrix();
+      await runActsPushCycle();
+      setInterval(() => runActsPushCycle().catch((e) => console.error('[acts-push] interval:', e.message || e)), pushMs);
+    }, 7000);
+  } else {
+    console.log('[acts-push] Автопуши по актам выключены.');
   }
 
   if (config.foremanAutomationEnabled && config.bitrixWebhookUrl) {
