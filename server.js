@@ -1153,31 +1153,80 @@ async function createEscalationTask(dealId, expertId, reason, clientText) {
   });
 }
 
+function wazzupWebhookContentHostAllowed(contentUri) {
+  if (!contentUri) return false;
+  try {
+    const host = new URL(String(contentUri)).hostname.toLowerCase();
+    return host === 'wazzup24.com' || host.endsWith('.wazzup24.com');
+  } catch (_) {
+    return false;
+  }
+}
+
+function wazzupWebhookKnownChannel(msg) {
+  if (!msg || !msg.channelId) return false;
+  return !!findChannelKeyByChannelId(msg.channelId);
+}
+
+function wazzupWebhookSafeInboundFile(msg) {
+  if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') return false;
+  const type = String(msg.type || '').toLowerCase();
+  if (!['image', 'document'].includes(type)) return false;
+  if (!msg.contentUri || !wazzupWebhookContentHostAllowed(msg.contentUri)) return false;
+  return wazzupWebhookKnownChannel(msg);
+}
+
+function wazzupWebhookMessageLogSummary(msg) {
+  if (!msg) return { empty: true };
+  const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+  return {
+    id: msg.messageId || '',
+    status: msg.status || '',
+    type: msg.type || '',
+    chatType: msg.chatType || '',
+    channelKnown: wazzupWebhookKnownChannel(msg),
+    echo: !!msg.isEcho,
+    hasContent: !!msg.contentUri,
+    contentHostOk: !!(msg.contentUri && wazzupWebhookContentHostAllowed(msg.contentUri)),
+    phone: phone ? `***${phone.slice(-4)}` : '',
+  };
+}
+
 app.post('/api/wazzup/webhook', async (req, res) => {
   // Wazzup при регистрации вебхука шлёт тестовый POST {test: true} и ждёт 200 немедленно.
   if (req.body && req.body.test) {
+    console.log('[wazzup-webhook] test POST получен → 200 OK.');
     res.status(200).json({ ok: true });
     return;
   }
-  // Всегда отвечаем 200 быстро (Wazzup ждёт 200 в течение 30с), а основную работу делаем
-  // не блокируя ответ надолго — но для простоты и надёжности логики на пилоте обрабатываем
-  // синхронно и просто не делаем тяжёлых лишних шагов.
   try {
-    if (config.wazzupCrmKey) {
-      const auth = req.headers.authorization || '';
-      if (auth !== `Bearer ${config.wazzupCrmKey}`) {
-        res.status(200).json({ ok: true }); // отвечаем 200, но дальше не обрабатываем чужой запрос
+    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+    const auth = String(req.headers.authorization || '');
+    const authRequired = !!config.wazzupCrmKey;
+    const authMatches = !authRequired || auth === `Bearer ${config.wazzupCrmKey}`;
+    console.log(`[wazzup-webhook] POST получен: messages=${messages.length}; auth=${auth ? 'present' : 'none'}; authMatches=${authMatches}; summaries=${JSON.stringify(messages.slice(0, 5).map(wazzupWebhookMessageLogSummary))}`);
+
+    if (!authMatches) {
+      // Некоторые Wazzup-подключения не присылают crmKey в webhook, даже если старый WAZZUP_CRM_KEY
+      // остался в Render. Не теряем настоящий входящий файл молча: разрешаем ТОЛЬКО строго
+      // проверенный inbound-файл с нашего известного channelId и contentUri на домене Wazzup.
+      const safe = messages.filter(wazzupWebhookSafeInboundFile);
+      if (!safe.length) {
+        console.warn('[wazzup-webhook] Authorization не совпал; безопасных входящих файлов нашего канала нет → webhook проигнорирован.');
+        res.status(200).json({ ok: true });
         return;
       }
+      console.warn(`[wazzup-webhook] Authorization не совпал, но найдено безопасных inbound-файлов нашего Wazzup-канала: ${safe.length}. Обрабатываю только их.`);
+      req.body = { ...req.body, messages: safe };
     }
 
-    const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+    const acceptedMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
 
     // v71: входящие документы/изображения обрабатываем независимо от LIVE_CHAT_ENABLED.
     // Wazzup ждёт 200 максимум 30 секунд, поэтому тяжёлую работу (скачивание, ИИ, Bitrix Disk)
     // запускаем асинхронно и не держим webhook-ответ.
     if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
-      for (const msg of messages) {
+      for (const msg of acceptedMessages) {
         if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
         if (!msg.contentUri || !['image','document'].includes(String(msg.type || '').toLowerCase())) continue;
         setImmediate(() => actsProcessIncomingWazzupMessage(msg).catch((e) =>
@@ -1191,7 +1240,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       return;
     }
 
-    for (const msg of messages) {
+    for (const msg of acceptedMessages) {
       try {
         // Только входящие текстовые сообщения от клиента (не эхо исходящих, не статусы).
         if (msg.isEcho || msg.status !== 'inbound') continue;
@@ -7072,7 +7121,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v71 is running on port ${PORT}`);
+  console.log(`MAVIS Bitrix Expert Assistant v72 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
