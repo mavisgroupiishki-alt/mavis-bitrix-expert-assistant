@@ -112,6 +112,10 @@ const config = {
   liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotEnabled: String(process.env.AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotCategoryId: Number(process.env.AUTOPILOT_CATEGORY_ID || 28),
+  // v79: anti-spam / resilient first-call processing.
+  autopilotPollIntervalMinutes: Number(process.env.AUTOPILOT_POLL_INTERVAL_MINUTES || 10),
+  autopilotTimelineDiagnostics: String(process.env.AUTOPILOT_TIMELINE_DIAGNOSTICS || 'false').toLowerCase() === 'true',
+  autopilotTranscribeRetries: Math.max(1, Number(process.env.AUTOPILOT_TRANSCRIBE_RETRIES || 2)),
   // v77: блок 1 CJM — контроль стадии «На распределении».
   // Явный ID надёжнее названия; fallback соответствует текущей воронке Производства.
   unassignedStageId: process.env.UNASSIGNED_STAGE_ID || 'C28:UC_01240N',
@@ -143,6 +147,9 @@ const config = {
   // Тогда ИИгорь не заменяет старого прораба, а добавляет нового в массив значений.
   foremanProductionSpecialistFieldMultiple: String(process.env.FOREMAN_PRODUCTION_SPECIALIST_FIELD_MULTIPLE || 'false').toLowerCase() === 'true',
   foremanAutomationEnabled: String(process.env.FOREMAN_AUTOMATION_ENABLED || 'false').toLowerCase() === 'true',
+  // v79: old Render flags are not enough for mass actions anymore.
+  foremanAllowGlobalScan: String(process.env.FOREMAN_ALLOW_GLOBAL_SCAN || 'false').toLowerCase() === 'true',
+  foremanAllowPropagation: String(process.env.FOREMAN_ALLOW_PROPAGATION || 'false').toLowerCase() === 'true',
   foremanPollIntervalMinutes: Number(process.env.FOREMAN_POLL_INTERVAL_MINUTES || 60),
   foremanLookbackDays: Number(process.env.FOREMAN_LOOKBACK_DAYS || 45),
   foremanCreateSuggestionTasks: String(process.env.FOREMAN_CREATE_SUGGESTION_TASKS || 'true').toLowerCase() !== 'false',
@@ -2714,7 +2721,10 @@ async function checkUnassignedDeals() {
 
 const AUTOPILOT_MARKER = '[MAVIS_AUTOPILOT_DONE]';
 const AUTOPILOT_ERROR_MARKER = '[MAVIS_AUTOPILOT_ERROR]';
-const AUTOPILOT_POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 минут
+const AUTOPILOT_SEND_PENDING_MARKER = '[MAVIS_AUTOPILOT_SEND_PENDING]';
+const AUTOPILOT_CALL_REJECTED_MARKER = '[MAVIS_AUTOPILOT_CALL_REJECTED]';
+const AUTOPILOT_POLL_INTERVAL_MS = Math.max(1, Number(config.autopilotPollIntervalMinutes || 10)) * 60 * 1000;
+let autopilotCycleRunning = false;
 
 // Дата запуска сервера — сделки созданные раньше этой даты не трогаем.
 // Это гарантирует, что текущие 14 сделок на стадии "Эксперт назначен"
@@ -2789,6 +2799,101 @@ async function dealAlreadyProcessed(dealId) {
   } catch (_) {
     return false; // если не удалось прочитать таймлайн — не блокируем, попробуем обработать
   }
+}
+
+async function autopilotTimelineHasMarker(dealId, marker, limit = 80) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+      select: ['ID', 'COMMENT'],
+    }, limit);
+    return comments.some((c) => String(c.COMMENT || '').includes(marker));
+  } catch (_) { return false; }
+}
+
+async function addAutopilotCommentOnce(dealId, marker, body) {
+  if (await autopilotTimelineHasMarker(dealId, marker, 100)) return false;
+  await bitrixRestCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${marker}\n${body}` },
+  });
+  return true;
+}
+
+function normalizeTranscriptQuality(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function transcriptLooksLikePlaceholder(text) {
+  const t = normalizeTranscriptQuality(text).toLowerCase().replace(/ё/g, 'е');
+  if (!t || t.length < 30) return true;
+  if (/^(продолжение следует|спасибо за просмотр|субтитры|конец записи)[.!…\s-]*$/i.test(t)) return true;
+  if (/продолжение следует/i.test(t) && t.length < 120) return true;
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length >= 6 && new Set(words).size <= 2) return true;
+  return false;
+}
+
+function embeddedTranscriptCandidates(activity) {
+  const out = []; const seen = new Set();
+  const push = (v, path) => {
+    if (typeof v !== 'string') return;
+    const text = normalizeTranscriptQuality(v.replace(/<[^>]+>/g, ' '));
+    if (text.length < 30 || /https?:\/\//i.test(text)) return;
+    const key = text.slice(0, 500); if (seen.has(key)) return;
+    seen.add(key); out.push({ text, path });
+  };
+  const walk = (value, path = '') => {
+    if (!value || typeof value !== 'object') return;
+    for (const [k, v] of Object.entries(value)) {
+      const next = path ? `${path}.${k}` : k;
+      if (typeof v === 'string' && /(transcript|speech|recogn|description|comment|text)/i.test(k)) push(v, next);
+      else if (v && typeof v === 'object') walk(v, next);
+    }
+  };
+  walk(activity || {}); return out;
+}
+
+async function resolveAllAudioUrlsForActivity(activity, primaryUrl = '') {
+  const urls = []; const seen = new Set();
+  const add = (u) => { u = String(u || '').trim(); if (!u || seen.has(u)) return; seen.add(u); urls.push(u); };
+  add(primaryUrl);
+  const files = Array.isArray(activity && activity.FILES) ? activity.FILES : [];
+  for (const f of files) {
+    add(f && (f.DOWNLOAD_URL || f.downloadUrl || f.VIEW_URL || f.url));
+    const fileId = f && (f.ID || f.id || f.FILE_ID || f.fileId);
+    if (fileId) {
+      try { const file = await bitrixRestCall('disk.file.get', { id: fileId }); add(file && (file.DOWNLOAD_URL || file.downloadUrl || file.VIEW_URL || file.url)); } catch (_) {}
+    }
+  }
+  for (const c of serverCollectActivityAudioCandidates(activity || {})) {
+    try { add(await serverResolveCandidateDownloadUrl(c)); } catch (_) {}
+  }
+  return urls;
+}
+
+async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
+  for (const c of embeddedTranscriptCandidates(callRecord && callRecord.activity)) {
+    if (!transcriptLooksLikePlaceholder(c.text)) {
+      console.log(`${logPrefix} Использую встроенный текст звонка из ${c.path}, ${c.text.length} символов.`);
+      return { text: c.text, source: `activity:${c.path}`, ready: true };
+    }
+  }
+  const urls = await resolveAllAudioUrlsForActivity(callRecord && callRecord.activity, callRecord && callRecord.url);
+  let lastText = ''; let lastError = null;
+  const retries = Math.max(1, Number(config.autopilotTranscribeRetries || 2));
+  for (const url of urls) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const text = await transcribeAudioUrl(url, callRecord && callRecord.fileName);
+        lastText = text;
+        if (!transcriptLooksLikePlaceholder(text)) return { text, source: `audio:${attempt}`, ready: true };
+        console.warn(`${logPrefix} STT вернул служебную/пустую расшифровку (попытка ${attempt}/${retries}): "${normalizeTranscriptQuality(text).slice(0, 120)}"`);
+      } catch (e) { lastError = e; console.warn(`${logPrefix} STT попытка ${attempt}/${retries} не удалась: ${e.message || e}`); }
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 1200));
+    }
+  }
+  return { text: lastText, source: '', ready: false, error: lastError };
 }
 
 async function transcribeAudioUrl(audioUrl, fileName) {
@@ -3795,11 +3900,13 @@ async function runServerAutopilotForDeal(deal, stageId) {
       return;
     }
 
-    // 2. Расшифровываем.
+    // 2. Расшифровываем. v79: placeholder/empty STT is NOT a deal error.
     console.log(`${logPrefix} Расшифровываю звонок: ${callRecord.subject || callRecord.url}`);
-    const transcript = await transcribeAudioUrl(callRecord.url, callRecord.fileName);
-    if (!transcript || transcript.length < 30) {
-      throw new Error(`Расшифровка слишком короткая или пустая: "${transcript.slice(0, 100)}"`);
+    const transcription = await transcribeCallBestEffort(callRecord, logPrefix);
+    const transcript = String(transcription.text || '').trim();
+    if (!transcription.ready || transcriptLooksLikePlaceholder(transcript)) {
+      console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю позже БЕЗ комментариев в CRM.`);
+      return;
     }
     if (looksLikeCallbackOnlyTranscript(transcript)) {
       autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
@@ -3926,13 +4033,11 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
       const reason = String(aiResult.call_reason || 'ИИ не подтвердил содержательный первый звонок').trim();
       console.log(`${logPrefix} Звонок ${callRecord.activityId} не подходит для запуска хода работы: ${reason}`);
       try {
-        await bitrixRestCall('crm.timeline.comment.add', {
-          fields: {
-            ENTITY_ID: dealId,
-            ENTITY_TYPE: 'deal',
-            COMMENT: `[MAVIS_AUTOPILOT_CALL_REJECTED] activity=${callRecord.activityId}\nИгорь не запускал ход работы: ${reason}`,
-          },
-        });
+        await addAutopilotCommentOnce(
+          dealId,
+          `${AUTOPILOT_CALL_REJECTED_MARKER} activity=${callRecord.activityId}`,
+          `Игорь не запускал ход работы: ${reason}`
+        );
       } catch (_) {}
       return;
     }
@@ -4037,13 +4142,11 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
         } catch (_) {}
       }
       try {
-        await bitrixRestCall('crm.timeline.comment.add', {
-          fields: {
-            ENTITY_ID: dealId,
-            ENTITY_TYPE: 'deal',
-            COMMENT: `[MAVIS_AUTOPILOT_SEND_PENDING]\n${sendStatus}\n\n${dealComment}${clientMessageWithEmail ? `\n\nПодготовлено клиенту:\n${clientMessageWithEmail}` : ''}`,
-          },
-        });
+        await addAutopilotCommentOnce(
+          dealId,
+          AUTOPILOT_SEND_PENDING_MARKER,
+          `${sendStatus}\n\n${dealComment}${clientMessageWithEmail ? `\n\nПодготовлено клиенту:\n${clientMessageWithEmail}` : ''}`
+        );
       } catch (_) {}
       console.warn(`${logPrefix} ${sendStatus}`);
       return;
@@ -4164,12 +4267,17 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
     }
   } catch (err) {
     console.error(`${logPrefix} Ошибка: ${err.message}`);
-    try {
-      await bitrixRestCall('crm.timeline.comment.add', {
-        fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${AUTOPILOT_ERROR_MARKER}\nАвтопилот Игорь столкнулся с ошибкой: ${err.message}` },
-      });
-    } catch (_) {}
-    // v77: не помечаем как обработанную — после временной ошибки повторим в следующем цикле.
+    if (config.autopilotTimelineDiagnostics) {
+      try {
+        const fingerprint = String(err && err.message || 'unknown').toLowerCase().replace(/[^a-zа-я0-9]+/gi, '-').slice(0, 60);
+        await addAutopilotCommentOnce(
+          dealId,
+          `${AUTOPILOT_ERROR_MARKER} code=${fingerprint}`,
+          `Автопилот Игорь столкнулся с ошибкой: ${err.message}`
+        );
+      } catch (_) {}
+    }
+    // v79: retry later, but never spam CRM.
   }
 }
 
@@ -5028,6 +5136,10 @@ async function runStageMonitoring() {
 
 
 async function runAutopilotPollingCycle() {
+  if (autopilotCycleRunning) {
+    console.log('[autopilot] Предыдущий polling ещё выполняется — новый цикл пропускаю (anti-overlap).');
+    return;
+  }
   if (!config.bitrixWebhookUrl) {
     console.log('[autopilot] BITRIX_WEBHOOK_URL не задан — фоновый автопилот не запускается.');
     return;
@@ -5036,6 +5148,7 @@ async function runAutopilotPollingCycle() {
     return; // AUTOPILOT_ENABLED=false — выключен
   }
 
+  autopilotCycleRunning = true;
   try {
     const stageIds = await getAutopilotStageIds();
     if (!stageIds.length) {
@@ -5114,6 +5227,8 @@ async function runAutopilotPollingCycle() {
     await checkUnassignedDeals();
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
+  } finally {
+    autopilotCycleRunning = false;
   }
 }
 
@@ -5666,7 +5781,12 @@ async function fgHandleForemanLinked(dealId, source = 'robot') {
   const companyName = await fgGetCompanyName(deal.COMPANY_ID);
   const expertName = await fgGetUserLabel(deal.ASSIGNED_BY_ID);
   const service = fgProductionService(deal);
-  const siblingDeals = config.foremanPropagateToCompanyDeals ? await fgFindActiveCompanyDeals(deal.COMPANY_ID, cfg, deal.ID) : [];
+  const siblingDeals = (config.foremanPropagateToCompanyDeals && config.foremanAllowPropagation)
+    ? await fgFindActiveCompanyDeals(deal.COMPANY_ID, cfg, deal.ID)
+    : [];
+  if (config.foremanPropagateToCompanyDeals && !config.foremanAllowPropagation) {
+    summary.skipped.push('Массовое распространение прораба по соседним сделкам отключено защитой v79.');
+  }
 
   for (const foremanId of foremanIds) {
     let foreman = null;
@@ -8838,7 +8958,7 @@ app.listen(PORT, () => {
   }
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
-    console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
+    console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Timeline diagnostics=${config.autopilotTimelineDiagnostics ? 'ON' : 'OFF'}; anti-spam v79=ON. Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
     setTimeout(() => recoverPendingDocsChecks().catch((e) => console.warn(`[docsReminder] recovery: ${e.message || e}`)), 1500);
     // v60: первый цикл сразу после старта, а не через 2 минуты.
     setTimeout(() => runAutopilotPollingCycle(), 2000);
@@ -8871,15 +8991,15 @@ app.listen(PORT, () => {
     console.log('[acts-push] Автопуши по актам выключены.');
   }
 
-  if (config.foremanAutomationEnabled && config.bitrixWebhookUrl) {
+  if (config.foremanAutomationEnabled && config.foremanAllowGlobalScan && config.bitrixWebhookUrl) {
     const intervalMs = Math.max(15, config.foremanPollIntervalMinutes || 60) * 60 * 1000;
-    console.log(`[foreman-auto] ИИгорь включён: поле специалиста ${config.foremanProductionSpecialistField}, интервал ${intervalMs / 60000} мин.`);
+    console.log(`[foreman-auto] Глобальный обход ЯВНО включён: поле специалиста ${config.foremanProductionSpecialistField}, интервал ${intervalMs / 60000} мин.`);
     setTimeout(() => {
       runForemanAutomationCycle('startup').catch((e) => console.error('[foreman-auto] startup:', e.message || e));
       setInterval(() => runForemanAutomationCycle('interval').catch((e) => console.error('[foreman-auto] interval:', e.message || e)), intervalMs);
     }, 4 * 60 * 1000);
   } else {
-    console.log('[foreman-auto] ИИгорь выключен. Для включения задай FOREMAN_AUTOMATION_ENABLED=true и BITRIX_WEBHOOK_URL.');
+    console.log('[foreman-auto] Глобальный обход прорабов выключен защитой v79. Для включения нужны FOREMAN_AUTOMATION_ENABLED=true + FOREMAN_ALLOW_GLOBAL_SCAN=true.');
   }
 
   if (process.env.MAIL_IMAP_USER && process.env.MAIL_IMAP_PASSWORD && config.bitrixWebhookUrl) {
