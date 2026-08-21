@@ -112,6 +112,15 @@ const config = {
   liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotEnabled: String(process.env.AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotCategoryId: Number(process.env.AUTOPILOT_CATEGORY_ID || 28),
+  // v77: блок 1 CJM — контроль стадии «На распределении».
+  // Явный ID надёжнее названия; fallback соответствует текущей воронке Производства.
+  unassignedStageId: process.env.UNASSIGNED_STAGE_ID || 'C28:UC_01240N',
+  // Только для короткого теста блока 1. Например UNASSIGNED_TEST_MINUTES=2.
+  // В бою удалить переменную: вернётся правило 4 рабочих часа по Минску.
+  unassignedTestMinutes: Number(process.env.UNASSIGNED_TEST_MINUTES || 0),
+  // Опционально: точный список экспертов, между которыми ИИгорь сравнивает текущую загрузку
+  // при рекомендации распределения новой сделки. Пример: 2052,1960,2192,2198
+  distributionExpertIds: parseIdList(process.env.DISTRIBUTION_EXPERT_IDS),
 
   // v45: ИИгорь — диагностика воронки прорабов.
   foremanCategoryId: Number(process.env.FOREMAN_CATEGORY_ID || 32),
@@ -200,10 +209,14 @@ const config = {
   // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
   actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
 
-  // v74: ежемесячная сверка оригиналов актов. Пока только ручной тест;
-  // автоматический запуск добавим после проверки отчёта на реальных данных.
+  // v76: ежемесячная сверка оригиналов актов.
+  // Месяц определяется ТОЛЬКО по CLOSEDATE успешной сделки Производства.
+  // Автоотчёт уходит Тане в последний рабочий день месяца (Пн–Пт) после 18:00 по Минску.
   actsReconToken: process.env.ACTS_RECON_TOKEN || '',
   actsReconLeaderId: process.env.ACTS_RECON_LEADER_ID || process.env.TANYA_USER_ID || '2182',
+  actsReconAutoEnabled: String(process.env.ACTS_RECON_AUTO_ENABLED || 'true').toLowerCase() !== 'false',
+  actsReconCheckMinutes: Number(process.env.ACTS_RECON_CHECK_MINUTES || 30),
+  actsReconSendHourMinsk: Number(process.env.ACTS_RECON_SEND_HOUR_MINSK || 18),
 };
 
 // Прямой вызов Bitrix REST через входящий вебхук — нужен, потому что вебхук Wazzup может прийти,
@@ -217,11 +230,18 @@ async function bitrixRestCall(method, params = {}) {
     const title = params && params.fields ? String(params.fields.TITLE || '') : '';
     const isForemanTask = /^ИИгорь:/i.test(title) && config.foremanTasksEnabled;
     const isActsTask = (title.includes('[MAVIS_ACTS_ORIGINAL]') || /^СОБРАТЬ АКТ/i.test(title) || /^АКТ/i.test(title) || /^ПОЗВОНИТЬ ПО АКТУ/i.test(title)) && config.actsTasksEnabled;
-    if (!isForemanTask && !isActsTask) {
+    // v77: эти задачи являются частью утверждённого CJM ИИ-ассистента и должны
+    // создаваться независимо от общего SERVER_TASKS_ENABLED, иначе блоки 1–3 молча не работают.
+    const isCoreAssistantTask = /^Распредели сделку:/i.test(title)
+      || /позвони клиенту.*4\+.*час/i.test(title)
+      || /я отправил ход работы клиенту/i.test(title)
+      || /не смог отправить ход работы клиенту/i.test(title);
+    if (!isForemanTask && !isActsTask && !isCoreAssistantTask) {
       console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
       return { task: { id: null, blocked: true } };
     }
-    console.log(`[tasks] allowed as ${isActsTask ? 'acts' : 'foreman'} task: ${title || 'без названия'}`);
+    const kind = isActsTask ? 'acts' : (isForemanTask ? 'foreman' : 'core-assistant');
+    console.log(`[tasks] allowed as ${kind} task: ${title || 'без названия'}`);
   }
   if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
   const response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
@@ -498,7 +518,7 @@ function productAiGuidance(productRaw, scenarioRaw = '') {
       '2. 1-2 предложения что уже понятно/есть (специалисты, СИ, что в порядке)',
       '3. Блок "**От вас:**" — нумерованный список конкретных действий с датами. Каждый пункт: "До [дата] — [что сделать]". Выходные учитывай.',
       '4. Блок "**С нашей стороны:**" — нумерованный список что делаем мы пошагово (проверяем специалистов, сверяем СИ, готовим документы, заказываем счета, подаём заявку и т.д.)',
-      '5. Строка: "**Все документы присылайте на почту: mavis.group@mail.ru**" (жирный шрифт, без точки в конце)',
+      '5. Строка: "**Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru**" (жирный шрифт, без точки в конце)',
       '6. Последняя строка: "Мы всегда на связи — дополнительно свяжемся с вами [дата через 2 рабочих дня], чтобы зафиксировать всё по документам."',
       '',
       'После сообщения клиенту — отдельным блоком добавь перечень документов из context.document_list.docs (текстом, нумерованный список с заголовком "Перечень документов для [услуга]:"). Если услуга СПК — добавь под перечнем раздел "Средства измерений:" со списком нужных СИ.',
@@ -2074,19 +2094,46 @@ const TANYA_USER_ID = 2182; // Татьяна Куровская
 const NPS_GROUP_ID = 114;   // Группа задач "Сбор NPS"
 const UNASSIGNED_NOTIFIED = new Map(); // dealId → lastNotifiedAt (Date)
 
+const MINSK_PARTS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Europe/Minsk',
+  weekday: 'short',
+  hour: '2-digit',
+  hour12: false,
+});
+
+function minskWeekdayHour(date = new Date()) {
+  const parts = MINSK_PARTS_FORMATTER.formatToParts(date);
+  const weekday = (parts.find((p) => p.type === 'weekday') || {}).value || '';
+  const hour = Number((parts.find((p) => p.type === 'hour') || {}).value || 0);
+  const dayMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 0 };
+  return { day: dayMap[weekday], hour };
+}
+
 function isWorkingHour(date = new Date()) {
-  const day = date.getDay(); // 0=вс, 6=сб
-  const hour = date.getHours();
+  // v77: Render обычно работает в UTC, поэтому рабочие часы считаем явно по Минску.
+  const { day, hour } = minskWeekdayHour(date);
   return day >= 1 && day <= 5 && hour >= 9 && hour < 18;
 }
 
+function toMinskLocalIso(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Minsk',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(date);
+  const get = (type) => (parts.find((p) => p.type === type) || {}).value || '00';
+  return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}+03:00`;
+}
+
 function workingHoursBetween(from, to) {
-  // Считаем рабочие часы (9-18, пн-пт) между двумя датами.
+  // Считаем рабочие часы 09:00–18:00 Пн–Пт именно по Europe/Minsk.
   let count = 0;
   const cur = new Date(from);
-  while (cur < to) {
+  const end = new Date(to);
+  if (Number.isNaN(cur.getTime()) || Number.isNaN(end.getTime()) || cur >= end) return 0;
+  while (cur < end) {
     if (isWorkingHour(cur)) count++;
-    cur.setHours(cur.getHours() + 1);
+    cur.setTime(cur.getTime() + 60 * 60 * 1000);
   }
   return count;
 }
@@ -2132,7 +2179,7 @@ async function generateDocListDocx(deal) {
     }
     children.push(
       new Paragraph({ children: [new TextRun({ text: '', size: 22 })], spacing: { before: 300 } }),
-      new Paragraph({ children: [new TextRun({ text: 'Все документы присылайте на почту: mavis.group@mail.ru', bold: true, size: 22, font: 'Arial', color: '1a5276' })] }),
+      new Paragraph({ children: [new TextRun({ text: 'Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru', bold: true, size: 22, font: 'Arial', color: '1a5276' })] }),
     );
     const doc = new Document({ sections: [{ children }], styles: { default: { document: { run: { font: 'Arial', size: 22 } } } } });
     return await Packer.toBuffer(doc);
@@ -2255,20 +2302,168 @@ async function isNewClient(companyId, companyName) {
   } catch (_) { return true; }
 }
 
-async function getPreviousExpert(companyId) {
-  // Ищем последнего ответственного по завершённым сделкам этой компании.
+const distributionUserCache = new Map();
+
+async function getDistributionUserName(userId) {
+  const key = String(userId || '').trim();
+  if (!key) return '';
+  if (distributionUserCache.has(key)) return distributionUserCache.get(key);
+  try {
+    const u = await bitrixRestCall('user.get', { ID: key });
+    const user = Array.isArray(u) ? u[0] : u;
+    const full = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : '';
+    distributionUserCache.set(key, full);
+    return full;
+  } catch (_) {
+    return '';
+  }
+}
+
+async function getPreviousExpert(companyId, currentDealId) {
+  // v77: предыдущий эксперт = ответственный по последней УСПЕШНО закрытой
+  // производственной сделке компании, а не просто по последней изменённой сделке CRM.
   if (!companyId) return null;
   try {
     const deals = await bitrixRestList('crm.deal.list', {
-      filter: { COMPANY_ID: companyId },
-      select: ['ID', 'ASSIGNED_BY_ID', 'DATE_MODIFY'],
-      order: { DATE_MODIFY: 'DESC' },
-    }, 3);
-    if (!deals.length) return null;
-    const u = await bitrixRestCall('user.get', { ID: deals[0].ASSIGNED_BY_ID });
-    const user = Array.isArray(u) ? u[0] : u;
-    return user ? `${user.NAME || ''}`.trim() : null;
-  } catch (_) { return null; }
+      filter: {
+        COMPANY_ID: companyId,
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        STAGE_SEMANTIC_ID: 'S',
+      },
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CLOSEDATE', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      order: { CLOSEDATE: 'DESC' },
+    }, 10);
+    const prev = deals.find((d) => String(d.ID) !== String(currentDealId || ''));
+    if (!prev || !prev.ASSIGNED_BY_ID) return null;
+    const expertName = await getDistributionUserName(prev.ASSIGNED_BY_ID);
+    return {
+      dealId: prev.ID,
+      title: prev.TITLE || '',
+      service: detectServiceFromDeal(prev),
+      closeDate: prev.CLOSEDATE || '',
+      expertId: String(prev.ASSIGNED_BY_ID),
+      expertName,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getActiveProductionDealsForCompany(companyId, currentDealId) {
+  if (!companyId) return [];
+  try {
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        COMPANY_ID: companyId,
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        CLOSED: 'N',
+      },
+      select: ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'MOVED_TIME', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      order: { MOVED_TIME: 'DESC' },
+    }, 30);
+    const out = [];
+    for (const d of deals) {
+      if (String(d.ID) === String(currentDealId || '')) continue;
+      if (!d.ASSIGNED_BY_ID) continue;
+      const expertName = await getDistributionUserName(d.ASSIGNED_BY_ID);
+      out.push({
+        dealId: d.ID,
+        title: d.TITLE || '',
+        service: detectServiceFromDeal(d),
+        stageId: d.STAGE_ID || '',
+        expertId: String(d.ASSIGNED_BY_ID),
+        expertName,
+      });
+    }
+    return out;
+  } catch (e) {
+    console.warn(`[unassigned] Не удалось получить активные сделки компании ${companyId}: ${e.message}`);
+    return [];
+  }
+}
+
+async function getDistributionTeamLoad() {
+  // Считаем текущую загрузку по незакрытым сделкам Производства.
+  // Если DISTRIBUTION_EXPERT_IDS задан — сравниваем только этих экспертов.
+  // Иначе берём всех ответственных, у которых сейчас есть активные сделки в Производстве.
+  try {
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        CLOSED: 'N',
+      },
+      select: ['ID', 'ASSIGNED_BY_ID', 'STAGE_ID'],
+      order: { ID: 'DESC' },
+    }, 1000);
+
+    const configured = new Set((config.distributionExpertIds || []).map(String));
+    const counts = new Map();
+    for (const d of deals) {
+      const id = String(d.ASSIGNED_BY_ID || '').trim();
+      if (!id || id === String(TANYA_USER_ID)) continue;
+      if (configured.size && !configured.has(id)) continue;
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+
+    // Если список задан явно, показываем также экспертов с нулевой загрузкой.
+    if (configured.size) {
+      for (const id of configured) if (!counts.has(id)) counts.set(id, 0);
+    }
+
+    const rows = [];
+    for (const [expertId, activeCount] of counts.entries()) {
+      const expertName = await getDistributionUserName(expertId);
+      rows.push({ expertId, expertName: expertName || `ID ${expertId}`, activeCount });
+    }
+    rows.sort((a, b) => a.activeCount - b.activeCount || a.expertName.localeCompare(b.expertName, 'ru'));
+    return rows;
+  } catch (e) {
+    console.warn(`[unassigned] Не удалось посчитать загрузку экспертов: ${e.message}`);
+    return [];
+  }
+}
+
+function leastLoadedRecommendation(teamLoad) {
+  const rows = Array.isArray(teamLoad) ? teamLoad : [];
+  if (!rows.length) return null;
+  const min = rows[0].activeCount;
+  const leaders = rows.filter((x) => x.activeCount === min);
+  if (leaders.length === 1) {
+    return `Рекомендация: передать ${leaders[0].expertName} — сейчас у него/неё минимальная загрузка (${min} активных сделок).`;
+  }
+  return `Рекомендация: минимальная загрузка сейчас у ${leaders.map((x) => x.expertName).join(', ')} — по ${min} активных сделок. Можно распределить между ними.`;
+}
+
+function formatRoutingRecommendation({ isNew, activeDeals, previous, nps, teamLoad }) {
+  const activeExperts = new Map();
+  for (const d of activeDeals || []) {
+    const key = String(d.expertId || '');
+    if (!key) continue;
+    if (!activeExperts.has(key)) activeExperts.set(key, { name: d.expertName || `ID ${key}`, deals: [] });
+    activeExperts.get(key).deals.push(d);
+  }
+
+  if (activeExperts.size === 1) {
+    const only = [...activeExperts.values()][0];
+    const services = only.deals.map((d) => d.service || d.title || `сделка ${d.dealId}`).filter(Boolean).join(', ');
+    return `Рекомендация: передать ${only.name}. У этого эксперта уже есть активная работа с компанией${services ? `: ${services}` : ''}.`;
+  }
+  if (activeExperts.size > 1) {
+    const names = [...activeExperts.values()].map((x) => x.name).join(', ');
+    return `Рекомендация: распределить вручную — у компании одновременно есть активные сделки у нескольких экспертов (${names}).`;
+  }
+
+  const lowNps = nps && nps.score !== null && nps.score <= 6;
+  if (previous && previous.expertName) {
+    if (lowNps) {
+      return `Рекомендация: не возвращать автоматически прежнему эксперту. Ранее компанию вёл ${previous.expertName}, но NPS низкий (${nps.score}/10) — решение лучше принять вручную.`;
+    }
+    return `Рекомендация: передать ${previous.expertName} — это последний эксперт, успешно работавший с компанией.`;
+  }
+
+  const loadRecommendation = leastLoadedRecommendation(teamLoad);
+  if (isNew) return loadRecommendation || 'Рекомендация: новый клиент, истории работы нет — распределить по текущей загрузке команды.';
+  return loadRecommendation || 'Рекомендация: история клиента найдена не полностью — распределить вручную.';
 }
 
 async function notifyTanyaAboutUnassignedDeal(deal) {
@@ -2276,119 +2471,197 @@ async function notifyTanyaAboutUnassignedDeal(deal) {
   const companyId = deal.COMPANY_ID;
   const companyName = deal.TITLE || `Сделка ${dealId}`;
 
-  // Определяем новый клиент или нет.
   const isNew = await isNewClient(companyId, companyName);
-  let msgBody = '';
+  const activeDeals = await getActiveProductionDealsForCompany(companyId, dealId);
+  const previous = await getPreviousExpert(companyId, dealId);
+  const nps = isNew ? null : await findNpsForCompany(companyName, companyId);
+  const teamLoad = await getDistributionTeamLoad();
+  const recommendation = formatRoutingRecommendation({ isNew, activeDeals, previous, nps, teamLoad });
 
-  if (isNew) {
-    msgBody = `Таня, распредели новую сделку! Это новый клиент 🆕\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
-  } else {
-    // Ищем NPS и предыдущего эксперта.
-    const nps = await findNpsForCompany(companyName, companyId);
-    const prevExpert = await getPreviousExpert(companyId);
-    const expertLine = prevExpert ? `, с ним работал${prevExpert.endsWith('а') ? 'а' : ''} ${prevExpert}` : '';
+  const lines = [
+    'Таня, распредели новую сделку!',
+    '',
+    `Клиент: ${isNew ? 'новый 🆕' : 'действующий'}`,
+    `Компания: ${companyName}`,
+  ];
 
-    if (!nps) {
-      msgBody = `Таня, распредели новую сделку! Клиент не новый${expertLine}, NPS не найден.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
-    } else if (nps.score !== null && nps.score <= 6) {
-      const reasonLine = nps.reason && nps.reason !== 'причина не указана' ? ` — ${nps.reason}` : '';
-      msgBody = `Таня, распредели новую сделку! Клиент не новый — НО у него низкий NPS ${nps.score} баллов${reasonLine}${expertLine}.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
-    } else {
-      const scoreText = nps.score !== null ? ` ${nps.score} баллов` : '';
-      msgBody = `Таня, распредели новую сделку! Клиент не новый, его NPS${scoreText}${expertLine}.\n\nСделка: ${companyName} (ID ${dealId})\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+  if (activeDeals.length) {
+    lines.push('', 'Сейчас в работе у компании:');
+    for (const d of activeDeals.slice(0, 5)) {
+      lines.push(`— ${d.service || d.title || `сделка ${d.dealId}`} — ${d.expertName || `эксперт ID ${d.expertId}`}`);
     }
   }
 
-  // Создаём задачу Тане.
-  const deadline = new Date();
-  deadline.setHours(deadline.getHours() + 2);
+  if (previous) {
+    lines.push('', `Последняя успешная работа: ${previous.service || previous.title || `сделка ${previous.dealId}`} — ${previous.expertName || `эксперт ID ${previous.expertId}`}${previous.closeDate ? `, закрыта ${String(previous.closeDate).slice(0, 10)}` : ''}.`);
+  }
+
+  if (nps) {
+    if (nps.score !== null) {
+      lines.push(`NPS: ${nps.score}/10${nps.reason && nps.reason !== 'причина не указана' ? ` — ${nps.reason}` : ''}.`);
+    } else {
+      lines.push('NPS: запись найдена, числовая оценка не распознана.');
+    }
+  } else if (!isNew) {
+    lines.push('NPS: не найден.');
+  }
+
+  if (teamLoad.length) {
+    lines.push('', 'Текущая загрузка экспертов:');
+    for (const row of teamLoad.slice(0, 10)) {
+      lines.push(`— ${row.expertName}: ${row.activeCount} активных сделок`);
+    }
+  }
+
+  lines.push('', recommendation, '', `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`);
+  const msgBody = lines.join('\n');
+
+  // Задача Тане — часть CJM блока 1. В v77 она разрешена даже при SERVER_TASKS_ENABLED=false.
+  const deadline = new Date(Date.now() + 2 * 60 * 60 * 1000);
   try {
     await bitrixRestCall('tasks.task.add', {
       fields: {
         TITLE: `Распредели сделку: ${companyName}`,
         DESCRIPTION: msgBody,
         RESPONSIBLE_ID: TANYA_USER_ID,
-        DEADLINE: deadline.toISOString().slice(0, 19) + '+03:00',
+        DEADLINE: toMinskLocalIso(deadline),
         UF_CRM_TASK: [`D_${dealId}`],
-        PRIORITY: 2, // высокий
+        PRIORITY: 2,
       },
     });
   } catch (e) {
     console.warn(`[unassigned] Не удалось создать задачу Тане: ${e.message}`);
   }
 
-  // Отправляем уведомление в Битрикс (сообщение во внутреннем чате).
+  let notified = false;
   try {
     await bitrixRestCall('im.notify.system.add', {
       USER_ID: TANYA_USER_ID,
       MESSAGE: msgBody,
     });
-  } catch (e) {
-    // Пробуем альтернативный метод — личное сообщение через im.message.add.
+    notified = true;
+  } catch (_) {
     try {
       await bitrixRestCall('im.message.add', {
         DIALOG_ID: TANYA_USER_ID,
         MESSAGE: msgBody,
       });
+      notified = true;
     } catch (e2) {
       console.warn(`[unassigned] Не удалось отправить уведомление Тане: ${e2.message}`);
     }
   }
 
-  console.log(`[unassigned] Таня уведомлена о сделке ${dealId} (${companyName})`);
+  // Постоянный антидубль переживает рестарт Render.
+  try {
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: dealId,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `[MAVIS_UNASSIGNED_NOTIFY] at=${new Date().toISOString()}\n${recommendation}`,
+      },
+    });
+  } catch (_) {}
+
+  console.log(`[unassigned] ${notified ? 'Таня уведомлена' : 'уведомление не доставлено'} о сделке ${dealId} (${companyName}). ${recommendation}`);
+}
+
+async function getLastUnassignedNotificationAt(dealId) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID', 'COMMENT', 'CREATED'],
+      order: { ID: 'DESC' },
+    }, 30);
+    for (const c of comments) {
+      const text = String(c.COMMENT || '');
+      if (!text.includes('[MAVIS_UNASSIGNED_NOTIFY]')) continue;
+      const m = text.match(/at=([^\s]+)/);
+      const d = new Date(m ? m[1] : c.CREATED || '');
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+  } catch (_) {}
+  return null;
 }
 
 async function checkUnassignedDeals() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
 
   try {
-    // Находим стадию "Не распределённые" в воронке 28.
     const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
-    const newStage = (Array.isArray(stages) ? stages : []).find((s) =>
-      /не распредел/i.test(s.NAME || '') || s.STATUS_ID === 'C28:NEW'
-    );
-    if (!newStage) return;
+    const allStages = Array.isArray(stages) ? stages : [];
+
+    // v77: сначала берём явно заданный ID, затем ищем именно «На/Не распределении».
+    // C28:NEW больше НИКОГДА не используется как fallback — это «Эксперт назначен».
+    let unassignedStage = allStages.find((s) => String(s.STATUS_ID) === String(config.unassignedStageId || ''));
+    // Даже если старый ID существует, не доверяем ему, если название уже не про распределение.
+    if (unassignedStage && !/(?:^|\s)(?:на|не)\s+распредел/i.test(String(unassignedStage.NAME || ''))) {
+      console.warn(`[unassigned] UNASSIGNED_STAGE_ID=${config.unassignedStageId} сейчас называется «${unassignedStage.NAME}» — это не стадия распределения, ищу по названию.`);
+      unassignedStage = null;
+    }
+    if (!unassignedStage) {
+      unassignedStage = allStages.find((s) => /(?:^|\s)(?:на|не)\s+распредел/i.test(String(s.NAME || '')));
+    }
+    if (!unassignedStage) {
+      console.warn(`[unassigned] Не нашёл стадию «На распределении». Проверь UNASSIGNED_STAGE_ID. Известные стадии: ${allStages.map((s) => `${s.NAME}=${s.STATUS_ID}`).join('; ')}`);
+      return;
+    }
+    if (checkUnassignedDeals._lastStageLog !== String(unassignedStage.STATUS_ID)) {
+      console.log(`[unassigned] Контролирую стадию «${unassignedStage.NAME}» → ${unassignedStage.STATUS_ID}.`);
+      checkUnassignedDeals._lastStageLog = String(unassignedStage.STATUS_ID);
+    }
 
     const deals = await bitrixRestList('crm.deal.list', {
-      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: newStage.STATUS_ID },
-      select: ['ID', 'TITLE', 'COMPANY_ID', 'DATE_CREATE', 'MOVED_TIME'],
-      order: { DATE_CREATE: 'ASC' },
-    }, 50);
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: unassignedStage.STATUS_ID },
+      select: ['ID', 'TITLE', 'COMPANY_ID', 'DATE_CREATE', 'MOVED_TIME', 'STAGE_ID'],
+      order: { MOVED_TIME: 'ASC' },
+    }, 100);
 
     const now = new Date();
+    const testMinutes = Math.max(0, Number(config.unassignedTestMinutes || 0));
     for (const deal of deals) {
       if (await isDealAiDisabledAsync(deal)) {
-        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю без задач/комментариев/сообщений.`);
+        console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю распределение.`);
         continue;
       }
 
-      const createdAt = new Date(deal.DATE_CREATE || deal.MOVED_TIME);
-      const workedHours = workingHoursBetween(createdAt, now);
+      // Отсчёт только от входа на стадию, а не от создания сделки в продажах.
+      const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
+      if (Number.isNaN(movedAt.getTime())) continue;
 
-      if (workedHours < 4) continue; // ещё не пора
-
-      const lastNotified = UNASSIGNED_NOTIFIED.get(String(deal.ID));
-      if (lastNotified) {
-        const hoursSinceNotify = workingHoursBetween(lastNotified, now);
-        if (hoursSinceNotify < 4) continue;
+      let due = false;
+      let elapsedLabel = '';
+      if (testMinutes > 0) {
+        const elapsedMinutes = (now.getTime() - movedAt.getTime()) / 60000;
+        due = elapsedMinutes >= testMinutes;
+        elapsedLabel = `${elapsedMinutes.toFixed(1)} мин`;
       } else {
-        // Map пуст (рестарт сервера) — проверяем задачи в Bitrix.
-        const hasRecent = await hasRecentUnassignedTask(deal.ID);
-        if (hasRecent) {
-          UNASSIGNED_NOTIFIED.set(String(deal.ID), now); // восстанавливаем в Map
-          continue;
-        }
+        const workedHours = workingHoursBetween(movedAt, now);
+        due = workedHours >= 4;
+        elapsedLabel = `${workedHours} раб. ч`;
+      }
+      if (!due) continue;
+
+      // В бою клиентскую/внутреннюю коммуникацию делаем только в рабочее время Минска.
+      // В коротком тесте разрешаем срабатывание сразу.
+      if (!testMinutes && !isWorkingHour(now)) continue;
+
+      const memoryLast = UNASSIGNED_NOTIFIED.get(String(deal.ID));
+      const persistedLast = memoryLast || await getLastUnassignedNotificationAt(deal.ID);
+      if (persistedLast) {
+        const repeatDue = testMinutes > 0
+          ? ((now.getTime() - persistedLast.getTime()) / 60000 >= testMinutes)
+          : (workingHoursBetween(persistedLast, now) >= 4);
+        if (!repeatDue) continue;
       }
 
-      // Проверяем что сейчас рабочее время прежде чем слать уведомление.
-      if (!isWorkingHour(now)) continue;
-
+      console.log(`[unassigned] Сделка ${deal.ID} «${deal.TITLE}» ждёт распределения ${elapsedLabel} — готовлю уведомление и рекомендацию.`);
       await notifyTanyaAboutUnassignedDeal(deal);
       UNASSIGNED_NOTIFIED.set(String(deal.ID), now);
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 1500));
     }
   } catch (e) {
-    console.error('[unassigned] Ошибка проверки нераспределённых сделок:', e.message);
+    console.error('[unassigned] Ошибка проверки стадии «На распределении»:', e.message);
   }
 }
 
@@ -2404,6 +2677,8 @@ const AUTOPILOT_START_DATE = new Date();
 // Кэш обработанных сделок (dealId → true), чтобы не перечитывать
 // таймлайн каждые 10 минут для уже обработанных сделок.
 const autopilotProcessed = new Set();
+// v77: короткие/служебные звонки, уже проверенные в текущем процессе Render.
+const autopilotRejectedCallIds = new Set(); // `${dealId}:${activityId}`
 
 async function getAutopilotStageIds() {
   if (getAutopilotStageIds._cached) return getAutopilotStageIds._cached;
@@ -2460,7 +2735,8 @@ async function dealAlreadyProcessed(dealId) {
       select: ['ID', 'COMMENT'],
       order: { ID: 'DESC' },
     }, 30);
-    const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER) || String(c.COMMENT || '').includes(AUTOPILOT_ERROR_MARKER));
+    // v77: только успешный DONE блокирует повторную обработку; ERROR не должен навсегда выключать сделку.
+    const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER));
     if (done) autopilotProcessed.add(String(dealId));
     return done;
   } catch (_) {
@@ -2568,6 +2844,48 @@ function activityActorIds(act) {
   return [...new Set(ids)];
 }
 
+function activityCallDurationSeconds(act) {
+  const candidates = [
+    act && act.DURATION,
+    act && act.CALL_DURATION,
+    act && act.SETTINGS && (act.SETTINGS.DURATION || act.SETTINGS.CALL_DURATION),
+    act && act.PROVIDER_PARAMS && (act.PROVIDER_PARAMS.DURATION || act.PROVIDER_PARAMS.CALL_DURATION),
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const text = String([act && act.SUBJECT, act && act.DESCRIPTION].filter(Boolean).join(' '));
+  let m = text.match(/(?:длительн(?:ость)?|duration)\D{0,10}(\d{1,2}):(\d{2})(?::(\d{2}))?/i);
+  if (m) {
+    if (m[3] !== undefined) return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+    return Number(m[1]) * 60 + Number(m[2]);
+  }
+  m = text.match(/(?:длительн(?:ость)?|duration)\D{0,10}(\d+)\s*(?:сек|sec)/i);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function looksLikeCallbackOnlyTranscript(text) {
+  const t = String(text || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+  if (!t) return true;
+  const callbackPhrases = [
+    /перезвон(ите|ю|им|ить)/,
+    /не могу говорить/,
+    /неудобно говорить/,
+    /давайте позже/,
+    /позвоните позже/,
+    /я занят/,
+    /я занята/,
+    /сейчас неудобно/,
+    /ошиблись номером/,
+    /не тот номер/,
+  ];
+  const phraseHit = callbackPhrases.some((re) => re.test(t));
+  // Если разговор короткий по содержанию и состоит в основном из просьбы перезвонить — не запускаем ход работы.
+  return phraseHit && t.length < 450;
+}
+
 function activityPassesExpertGate(act, deal, opts = {}) {
   const assignedId = String(opts.assignedById || (deal && deal.ASSIGNED_BY_ID) || '').trim();
   const minDateRaw = opts.minDate || (deal && deal.MOVED_TIME) || '';
@@ -2581,7 +2899,11 @@ function activityPassesExpertGate(act, deal, opts = {}) {
     const actorIds = activityActorIds(act);
     if (actorIds.length && !actorIds.includes(assignedId)) return { ok: false, reason: `звонок не ответственного эксперта: actors=${actorIds.join(',')}, assigned=${assignedId}` };
   }
-  return { ok: true, reason: 'ok' };
+  const durationSec = activityCallDurationSeconds(act);
+  if (durationSec !== null && durationSec < 60) {
+    return { ok: false, reason: `звонок короче 60 секунд (${durationSec} сек)` };
+  }
+  return { ok: true, reason: 'ok', durationSec };
 }
 
 async function findCallForDeal(dealId, opts = {}) {
@@ -2603,6 +2925,10 @@ async function findCallForDeal(dealId, opts = {}) {
   });
 
   for (const act of callActs) {
+    if (autopilotRejectedCallIds.has(`${dealId}:${act.ID}`)) {
+      console.log(`[findCall deal=${dealId} act=${act.ID}] skip: звонок ранее признан не первым содержательным касанием`);
+      continue;
+    }
     const gate = activityPassesExpertGate(act, deal, opts);
     if (!gate.ok) {
       console.log(`[findCall deal=${dealId} act=${act.ID}] skip: ${gate.reason}`);
@@ -2618,10 +2944,10 @@ async function findCallForDeal(dealId, opts = {}) {
         const file = await bitrixRestCall('disk.file.get', { id: fileId });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl || file.VIEW_URL);
         console.log(`${logAct} disk.file.get id=${fileId} → url=${url ? 'OK' : 'пусто'}`);
-        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act };
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
       } catch (e) { console.log(`${logAct} disk.file.get id=${fileId} → ошибка: ${e.message}`); }
       const directUrl = f && (f.DOWNLOAD_URL || f.downloadUrl || f.VIEW_URL || f.url);
-      if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3`, activity: act };
+      if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
     }
 
     const raw = JSON.stringify(act);
@@ -2632,7 +2958,7 @@ async function findCallForDeal(dealId, opts = {}) {
         const file = await bitrixRestCall('disk.file.get', { id: fileIdMatch[1] });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl);
         console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → url=${url ? 'OK' : 'пусто'}`);
-        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act };
+        if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
       } catch (e) { console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → ошибка: ${e.message}`); }
     }
 
@@ -2640,7 +2966,7 @@ async function findCallForDeal(dealId, opts = {}) {
     console.log(`${logAct} candidates=${candidates.length}`);
     for (const c of candidates) {
       const url = await serverResolveCandidateDownloadUrl(c);
-      if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3`, activity: act };
+      if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
     }
   }
 
@@ -2779,9 +3105,10 @@ function getDocumentListForService(serviceText) {
 
 // ✅ НОВАЯ ФУНКЦИЯ: Очистка Markdown для мессенджеров
 function stripClientGreeting(text) {
+  const greeting = (typeof actsMinskGreeting === 'function' ? actsMinskGreeting() : 'Добрый день!');
   return String(text || '')
-    .replace(/^\s*(?:[А-ЯЁA-Z][а-яёa-z]+|Клиент|Анна|Надежда|Нина|Ольга|Мария|Елена|Кристина)\s*,?\s*(?:добрый день|здравствуйте)[!.,—-]*\s*/i, 'Добрый день! ')
-    .replace(/^\s*(добрый день|здравствуйте)[!.,—-]*/i, 'Добрый день!')
+    .replace(/^\s*(?:[А-ЯЁA-Z][а-яёa-z]+|Клиент|Анна|Надежда|Нина|Ольга|Мария|Елена|Кристина)\s*,?\s*(?:доброе утро|добрый день|добрый вечер|здравствуйте)[!.,—-]*\s*/i, `${greeting} `)
+    .replace(/^\s*(доброе утро|добрый день|добрый вечер|здравствуйте)[!.,—-]*/i, greeting)
     .trim();
 }
 
@@ -2793,6 +3120,35 @@ function cleanMarkdownForMessenger(text) {
     .replace(/\[(.+?)\]\((.+?)\)/g, '$1') // [ссылка](url) → ссылка
     .replace(/^#{1,6}\s+/gm, '')          // # Заголовок → Заголовок
     .trim();
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Шаблоны хода работы для каждой услуги (из регламентов)
+function removeForbiddenClientPhrases(text) {
+  return String(text || '')
+    // Клиенту не отправляем размытые формулировки вместо конкретного перечня.
+    .replace(/^\s*[-•]?\s*иные документы из обязательного перечня[^\n]*\n?/gim, '')
+    .replace(/^\s*[-•]?\s*остальные необходимые документы[^\n]*\n?/gim, '')
+    .replace(/^\s*[-•]?\s*прочие необходимые документы[^\n]*\n?/gim, '')
+    // Старые версии разрешали «ответным сообщением» — теперь документы просим только на почту.
+    .replace(/\n*\s*Документы\s+(?:можете|можно|пожалуйста,?\s*)?(?:направить|отправить|прислать)[^\n]*(?:ответным сообщением|сюда)[^\n]*/gim, '')
+    .trim();
+}
+
+function buildClientDocumentSection(docList) {
+  const docs = Array.isArray(docList && docList.docs) ? docList.docs.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  if (!docs.length) return '';
+  const title = String((docList && docList.title) || '').trim();
+  const lines = [title ? `Что необходимо предоставить (${title}):` : 'Что необходимо предоставить:'];
+  docs.forEach((doc, i) => lines.push(`${i + 1}. ${doc}`));
+  lines.push('', 'Если какой-то документ уже направляли ранее, повторно присылать его не нужно.');
+  return lines.join('\n');
+}
+
+function finalizeClientWorkMessage(aiMessage, docList) {
+  const base = removeForbiddenClientPhrases(cleanMarkdownForMessenger(stripClientGreeting(aiMessage)));
+  const docsSection = buildClientDocumentSection(docList);
+  const emailNote = 'Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru';
+  return [base, docsSection, emailNote].filter(Boolean).join('\n\n').trim();
 }
 
 // ✅ НОВАЯ ФУНКЦИЯ: Шаблоны хода работы для каждой услуги (из регламентов)
@@ -2822,24 +3178,25 @@ function getClientMessageTemplate(service) {
   }
   
   if (/атт|аттестац/.test(s) && !/специалист/.test(s)) {
-    return `[Имя], фиксирую порядок работы по аттестации организации.
+    return `[Имя], фиксирую дальнейший ход работы по аттестации организации.
 
 Что у нас есть сейчас:
 - виды работ: [перечень из КП];
 - специалисты: [ФИО / должности / кто закрывает какие виды работ];
 - кого подбираем: [если требуется];
-- крайний срок аттестации: [дата].
+- по каждому специалисту: [что уже получено / что нужно сделать / чего не хватает].
 
-От вас:
-1. До [дата] - прислать недостающие документы специалистов
-2. До [дата] - подготовить акты выполненных работ за 5 лет
-3. Оплатить счета и пошлины
+Что необходимо сделать с вашей стороны до [дата]:
+- [конкретные действия по каждому специалисту и организации из звонка; без общих фраз «остальные/иные документы»].
 
-От нас:
-1. Проверяем документы специалистов
-2. Готовим аттестационное дело
-3. Подаем в Белстройцентр
-4. Контролируем замечания и статус`;
+Что делаем мы:
+1. Проверяем организацию и специалистов по требованиям аттестации
+2. Проверяем образование, стаж, должности и аттестаты специалистов
+3. Определяем, что нужно перевести/совместить/дооформить, если это требуется
+4. После получения полного комплекта готовим аттестационное дело и документы для подачи
+5. Контролируем замечания и статус в Белстройцентре
+
+Срок предоставления документов: до [дата].`;
   }
   
   if (/исо|iso|суот|45001/.test(s)) {
@@ -3249,7 +3606,7 @@ function getDiminutiveName(fullName) {
   return diminutives[name] || `${name}` ; // если не нашли — просто имя
 }
 
-async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage, otherDealIds = []) {
+async function createExpertFollowUpTask(dealId, expertId, expertName, clientMessage, docMessage, otherDealIds = [], reportComment = '') {
   // ✅ ИСПРАВЛЕНО: Создаём задачу только если прошло 4+ часа с последней
   const taskCheckPattern = `отправил ход работы`;
   const shouldCreate = await shouldCreateTaskAgain(dealId, taskCheckPattern, 4);  // 4 часа
@@ -3262,7 +3619,7 @@ async function createExpertFollowUpTask(dealId, expertId, expertName, clientMess
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   tomorrow.setHours(18, 0, 0, 0);
-  const deadline = tomorrow.toISOString().slice(0, 19) + '+03:00';
+  const deadline = toMinskLocalIso(tomorrow);
 
   const petName = getDiminutiveName(expertName);
   const taskTitle = `${petName}, я отправил ход работы клиенту 📋`;
@@ -3270,15 +3627,22 @@ async function createExpertFollowUpTask(dealId, expertId, expertName, clientMess
     ? `\n\nПо этой компании сразу несколько сделок (${[dealId, ...otherDealIds].join(', ')}) — клиенту отправлено одно общее сообщение по всем услугам, но в каждой сделке свой комментарий и своя задача.`
     : '';
   // ✅ ИСПРАВЛЕНО: Упоминаем ТОЛЬКО эксперта, убираем менеджера
-  const taskDesc = `${petName}, я отправил ход работы клиенту со всеми перечнями и прописал всё в комментарии к сделке 😊
+  const reportBlock = String(reportComment || '').trim()
+    ? `
+
+Мой отчёт по звонку и ходу работы:
+${String(reportComment).trim()}`
+    : '';
+  const taskDesc = `${petName}, я отправил клиенту ход работы и перечень документов и записал всё в сделку.
 
 Что сделал:
-— Отправил первое сообщение клиенту с кратким ходом работы
-— Отправил второй список с перечнем документов${docMessage ? ' ✅' : ''}
-— Написал краткую выжимку в комментарий к сделке
-— Перевёл сделку на стадию «Сбор информации»${siblingsLine}
+— проанализировал первый содержательный звонок;
+— сформировал и отправил клиенту ход работы;
+— зафиксировал недостающие документы и сроки;
+— перевёл сделку на «Сбор информации».
+${siblingsLine}${reportBlock}
 
-Твой следующий шаг — дождаться ответа/документов от клиента и проверить что всё приложено по перечню 🙌`;
+Твой следующий шаг — проверить мой отчёт и дождаться документов клиента.`;
 
   await bitrixRestCall('tasks.task.add', {
     fields: {
@@ -3390,6 +3754,12 @@ async function runServerAutopilotForDeal(deal, stageId) {
     if (!transcript || transcript.length < 30) {
       throw new Error(`Расшифровка слишком короткая или пустая: "${transcript.slice(0, 100)}"`);
     }
+    if (looksLikeCallbackOnlyTranscript(transcript)) {
+      autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
+      console.log(`${logPrefix} Звонок ${callRecord.activityId} похож на короткое служебное касание/просьбу перезвонить — ход работы не запускаю.`);
+      return;
+    }
+    console.log(`${logPrefix} Первый звонок-кандидат: activity=${callRecord.activityId}, duration=${callRecord.durationSec ?? 'не определена'} сек, transcript=${transcript.length} символов.`);
 
     // 3. Ищем сделки-компаньоны (другие услуги той же компании на той же стадии).
     const siblings = stageId ? await findSiblingDeals(deal, stageId) : [];
@@ -3408,12 +3778,23 @@ async function runServerAutopilotForDeal(deal, stageId) {
       context.multiple_deals_note = `По этой компании одновременно в работе ${siblings.length + 1} услуги. Сформируй один общий ход работы и одно общее сообщение клиенту, упомянув все услуги. Не пиши отдельные сообщения для каждой услуги.`;
     }
 
+    const nowForPrompt = new Date();
+    const minskTodayIso = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(nowForPrompt);
+    const defaultDeadlineDate = new Date(nowForPrompt.getTime() + 2 * 24 * 60 * 60 * 1000);
+    const defaultDocDeadline = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: 'Europe/Minsk', day: 'numeric', month: 'long'
+    }).format(defaultDeadlineDate).replace(/\s*г\.?$/i, '');
+
     const systemPrompt = [
       'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP.',
-      'Твоя задача — ЗАПОЛНИТЬ шаблон хода работы для услуги на основе звонка и карточки сделки.',
-      'Шаблон уже задан в контексте (template). Ты просто ЗАПОЛНЯЕШЬ [ФИО], [дата], [что нужно] из информации звонка.',
-      'client_message: это заполненный шаблон (с конкретными ФИО, датами, документами). НЕ переписывай шаблон, просто заполни поля.',
-      'comment: краткая выжимка для эксперта (3-5 строк) — ключевые факты из звонка и договорённости.',
+      'Твоя задача — проверить, был ли это полноценный первый рабочий звонок, и только затем заполнить шаблон хода работы.',
+      'call_qualified=false, если это только просьба перезвонить, автоответчик, ошибочный номер, разговор без обсуждения услуги/документов/следующих шагов.',
+      'Если длительность звонка известна и меньше 60 секунд — call_qualified=false.',
+      'Шаблон уже задан в контексте. client_message — готовый ход работы для клиента с конкретными данными, без плейсхолдеров.',
+      'comment — ПОЛНЫЙ отчёт эксперту: что выяснили, специалисты/роли, что уже есть, чего не хватает, сроки, риски и следующий шаг. Не ограничивайся 3-5 строками.',
+      'Если эксперт не назвал срок предоставления документов, используй ровно стандартный срок +2 календарных дня, который передан в prompt.',
       'Верни только валидный JSON без markdown.',
     ].join('\n');
     
@@ -3427,7 +3808,7 @@ ${template}
 ИНФОРМАЦИЯ ИЗ ЗВОНКА И СДЕЛКИ:
 ${JSON.stringify(context, null, 2).slice(0, 20000)}
 
-СЕГОДНЯ: ${new Date().toISOString().slice(0, 10)}
+СЕГОДНЯ ПО МИНСКУ: ${minskTodayIso}\nСТАНДАРТНЫЙ ДЕДЛАЙН ЕСЛИ ЭКСПЕРТ ЕГО НЕ НАЗВАЛ: ${defaultDocDeadline}
 
 ИНСТРУКЦИИ ПО ЗАПОЛНЕНИЮ:
 
@@ -3436,19 +3817,18 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
    - Если имени нет — убери обращение, оставь просто текст
 
 2. ДАТЫ (КРИТИЧНО!):
-   - Замени [дата] на конкретные даты из звонка
-   - Если в звонке назван срок (например "завтра", "в понедельник") — переведи в формат ДАТА
-   - Если срок в звонке не назван — добавь +2-3 дня от СЕГОДНЯ
-   - ВСЕГДА используй формат: "21 июля" или "22.07.2026" (2026 год, не 2024!)
-   - Примеры: "до 23 июля", "до 24 июля", "к 25 июля"
+   - Если эксперт назвал конкретный срок — используй именно его
+   - Если эксперт сказал "завтра", "в понедельник" и т.п. — переведи в конкретную дату
+   - Если эксперт НЕ назвал срок документов — используй РОВНО стандартный дедлайн: ${defaultDocDeadline}
+   - Не ставь диапазон 2-3 дня и не придумывай другой срок
+   - Используй понятный формат: "до 23 августа" или "до 23.08.2026"
 
 3. ДОКУМЕНТЫ И ДЕЙСТВИЯ:
-   - Замени [что нужно] / [документы] на КОНКРЕТНЫЕ из звонка:
-     * "копию аттестата"
-     * "скан трудовой"
-     * "фото 3х4"
-     * "приказ о назначении"
-   - НЕ оставляй [что нужно] - это ошибка!
+   - Пиши только КОНКРЕТНЫЕ действия и документы по фактической ситуации клиента.
+   - По каждому специалисту, если он обсуждался, укажи: что уже есть / что нужно сделать / какой документ нужен.
+   - НЕ пиши фразы «иные документы из обязательного перечня», «остальные необходимые документы», «прочие документы».
+   - Полный стандартный перечень документов система добавит в сообщение автоматически после твоего текста — не заменяй его общей фразой.
+   - НЕ оставляй [что нужно] или другие плейсхолдеры — это ошибка!
 
 4. ДАННЫЕ ИЗ СДЕЛКИ:
    - Замени [услуга] на: "${context.service}"
@@ -3460,10 +3840,20 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
    - Все ФИО и названия конкретные
    - Текст читается как готовое сообщение клиенту (можно копировать в Telegram/Viber)
 
-6. comment: 3-5 строк выжимки главных фактов из звонка + согласованные сроки
+6. КВАЛИФИКАЦИЯ ЗВОНКА:
+   - Известная длительность: ${callRecord.durationSec ?? 'не определена'} сек
+   - call_qualified=true только если это содержательный первый разговор по услуге, а не просьба перезвонить
+   - call_reason — коротко объясни решение
+
+7. comment: полный рабочий отчёт эксперту. Обязательно перечисли:
+   - что договорились с клиентом;
+   - специалисты/должности и кто кого закрывает, если обсуждалось;
+   - какие документы уже есть и каких не хватает;
+   - дедлайны;
+   - следующий шаг и риск, если есть.
 
 ВЕРНИ ТОЛЬКО JSON (без markdown, без \`\`\`):
-{"client_message":"готовое сообщение БЕЗ плейсхолдеров","comment":"выжимка"}`;
+{"call_qualified":true,"call_reason":"содержательный разговор","deadline_mentioned":true,"client_message":"готовое сообщение БЕЗ плейсхолдеров","comment":"полный отчёт эксперту"}`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -3476,24 +3866,46 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
       if (match) try { aiResult = JSON.parse(match[0]); } catch (_2) { aiResult = {}; }
     }
 
+    const callQualifiedRaw = aiResult.call_qualified;
+    const callQualified = callQualifiedRaw === true
+      || String(callQualifiedRaw || '').toLowerCase() === 'true'
+      || (callQualifiedRaw === undefined && callRecord.durationSec !== null && Number(callRecord.durationSec) >= 60 && !looksLikeCallbackOnlyTranscript(transcript));
+    if (!callQualified) {
+      autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
+      const reason = String(aiResult.call_reason || 'ИИ не подтвердил содержательный первый звонок').trim();
+      console.log(`${logPrefix} Звонок ${callRecord.activityId} не подходит для запуска хода работы: ${reason}`);
+      try {
+        await bitrixRestCall('crm.timeline.comment.add', {
+          fields: {
+            ENTITY_ID: dealId,
+            ENTITY_TYPE: 'deal',
+            COMMENT: `[MAVIS_AUTOPILOT_CALL_REJECTED] activity=${callRecord.activityId}\nИгорь не запускал ход работы: ${reason}`,
+          },
+        });
+      } catch (_) {}
+      return;
+    }
+
     const clientMessage = String(aiResult.client_message || '').trim();
-    // ✅ ИСПРАВЛЕНО: Очищаем Markdown перед отправкой
-    const clientMessageCleaned = cleanMarkdownForMessenger(stripClientGreeting(clientMessage));
-    const EMAIL_REMINDER = '\n\nВсе документы отправляйте нам на почту: mavis.group@mail.ru';
-    const clientMessageWithEmail = clientMessageCleaned ? clientMessageCleaned + EMAIL_REMINDER : '';
+    // v77: клиент ВСЕГДА получает конкретный стандартный перечень по продукту.
+    // Размытые «иные/остальные документы» удаляем, а документы просим присылать только на почту MAVIS.
+    const clientMessageWithEmail = clientMessage
+      ? finalizeClientWorkMessage(clientMessage, context.document_list)
+      : '';
     const documentMessage = ''; // объединено в client_message
     const dealComment = String(aiResult.comment || 'Автопилот выполнен').trim();
     const siblingNote = formatSiblingServicesNote(siblings);
 
-    // 5. Отправляем сообщение клиенту: предпочитаемый → Viber → Telegram → Email.
+    // 5. Отправляем ОДНО сообщение клиенту по предпочтительному каналу.
+    // v77: при нескольких сделках одной компании клиент не должен получать один и тот же текст несколько раз.
     let sent = false;
     let sentChannel = '';
     if (clientMessageWithEmail) {
       const phone = await getContactPhone(deal);
       const email = await getContactEmail(deal);
-      const preferredChannel = detectPreferredChannel(deal);
+      const preferredChannel = await detectPreferredChannelResolved(deal);
       if (!preferredChannel) {
-        console.warn(`${logPrefix} Сообщение подготовлено, но не отправлено: поле предпочитаемого способа связи не распознано.`);
+        console.warn(`${logPrefix} Сообщение подготовлено, но не отправлено: поле «Предпочитаемый канал связи» не распознано.`);
       } else if (preferredChannel === 'email') {
         if (email) {
           try {
@@ -3524,27 +3936,7 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
       } else {
         console.warn(`${logPrefix} ${preferredChannel} выбран, но телефон клиента не найден.`);
       }
-
-      // ✅ ИСПРАВЛЕНО: Дублируем сообщение для КАЖДОЙ сопутствующей сделки
-      if (sent && clientMessageWithEmail && phone && siblings.length > 0) {
-        console.log(`${logPrefix} Отправляю дублирующие сообщения для ${siblings.length} сопутствующих сделок...`);
-        for (const sibling of siblings) {
-          try {
-            const siblingAlreadyDone = await dealAlreadyProcessed(sibling.ID);
-            if (siblingAlreadyDone) continue;
-            
-            await sendWazzupMessageInternal({ 
-              channelKey: sentChannel, 
-              text: clientMessageWithEmail, 
-              phone, 
-              dealId: sibling.ID  
-            });
-            console.log(`${logPrefix} sibling=${sibling.ID} Сообщение отправлено через ${sentChannel}`);
-          } catch (siblingErr) {
-            console.warn(`${logPrefix} sibling=${sibling.ID} Ошибка: ${siblingErr.message}`);
-          }
-        }
-      }
+    }
 
       // Отправляем docx файл перечня документов вторым сообщением.
       if (sent && sentChannel !== 'email') {
@@ -3565,36 +3957,49 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
           console.warn(`${logPrefix} Не удалось отправить docx перечня: ${docxErr.message}`);
         }
       }
-    }
 
     // 6. Комментарий в текущую сделку.
     const channelLabel = { telegram: 'Telegram', viber: 'Viber', email: 'Email', default: 'мессенджер' };
     const sendStatus = clientMessageWithEmail
       ? (sent
         ? `✅ Сообщение клиенту отправлено через ${channelLabel[sentChannel] || sentChannel}.`
-        : `⚠️ Сообщение подготовлено, но не удалось отправить. Эксперту: отправь вручную.`)
-      : `ℹ️ Сообщение клиенту не сформировано.`;
+        : `⚠️ Сообщение подготовлено, но не удалось отправить. Сделку не двигаю, попробую повторно.`)
+      : `⚠️ ИИ не сформировал готовое сообщение клиенту. Сделку не двигаю.`;
 
-    // Если не смогли отправить — задача эксперту.
-    if (clientMessageWithEmail && !sent) {
+    // v77: «Эксперт назначен» → «Сбор информации» только после фактической успешной отправки.
+    // Ошибка канала/контакта не должна считаться выполненным автопилотом.
+    if (!clientMessageWithEmail || !sent) {
+      if (clientMessageWithEmail) {
+        try {
+          const shouldCreate = await shouldCreateTaskAgain(dealId, 'не смог отправить ход работы клиенту', 4);
+          if (shouldCreate) {
+            await bitrixRestCall('tasks.task.add', {
+              fields: {
+                TITLE: `Игорь не смог отправить ход работы клиенту — ${deal.TITLE}`,
+                DESCRIPTION: `Игорь подготовил ход работы, но не смог отправить его по выбранному каналу. Сделка оставлена на текущей стадии.\n\nТекст клиенту:\n${clientMessageWithEmail}\n\nОтчёт:\n${dealComment}`,
+                RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || config.executorExpertId,
+                UF_CRM_TASK: [`D_${dealId}`],
+                PRIORITY: 1,
+              },
+            });
+          }
+        } catch (_) {}
+      }
       try {
-        await bitrixRestCall('tasks.task.add', {
+        await bitrixRestCall('crm.timeline.comment.add', {
           fields: {
-            TITLE: `Игорь не смог отправить ход работы клиенту — ${deal.TITLE}`,
-            DESCRIPTION: `Игорь подготовил сообщение, но не смог отправить.\n\nТекст:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`,
-            RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || config.executorExpertId,
-            UF_CRM_TASK: [`D_${dealId}`],
-            PRIORITY: 1,
+            ENTITY_ID: dealId,
+            ENTITY_TYPE: 'deal',
+            COMMENT: `[MAVIS_AUTOPILOT_SEND_PENDING]\n${sendStatus}\n\n${dealComment}${clientMessageWithEmail ? `\n\nПодготовлено клиенту:\n${clientMessageWithEmail}` : ''}`,
           },
         });
       } catch (_) {}
+      console.warn(`${logPrefix} ${sendStatus}`);
+      return;
     }
 
-    // Сообщение клиенту тоже пишем в комментарий.
-    const clientMsgForComment = clientMessageWithEmail
-      ? `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`
-      : '';
-    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n${dealComment}${clientMsgForComment}`;
+    const clientMsgForComment = `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`;
+    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n📋 Ход работы / отчёт эксперту:\n${dealComment}${clientMsgForComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
@@ -3622,7 +4027,7 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
         const expertUsers = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
         const expertUser = Array.isArray(expertUsers) ? expertUsers[0] : expertUsers;
         mainExpertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
-        await createExpertFollowUpTask(dealId, deal.ASSIGNED_BY_ID, mainExpertName, clientMessage, documentMessage, []);
+        await createExpertFollowUpTask(dealId, deal.ASSIGNED_BY_ID, mainExpertName, clientMessage, documentMessage, [], dealComment);
         console.log(`${logPrefix} Задача эксперту создана (${mainExpertName}).`);
       } catch (taskErr) {
         console.warn(`${logPrefix} Задача эксперту не создалась: ${taskErr.message}`);
@@ -3664,7 +4069,7 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
             } catch (_) { siblingExpertName = ''; }
           }
           try {
-            await createExpertFollowUpTask(sibling.ID, sibling.ASSIGNED_BY_ID, siblingExpertName, clientMessage, documentMessage, otherIds);
+            await createExpertFollowUpTask(sibling.ID, sibling.ASSIGNED_BY_ID, siblingExpertName, clientMessage, documentMessage, otherIds, dealComment);
           } catch (_) {}
         }
       } catch (_) {}
@@ -3704,7 +4109,7 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
         fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${AUTOPILOT_ERROR_MARKER}\nАвтопилот Игорь столкнулся с ошибкой: ${err.message}` },
       });
     } catch (_) {}
-    autopilotProcessed.add(String(dealId));
+    // v77: не помечаем как обработанную — после временной ошибки повторим в следующем цикле.
   }
 }
 
@@ -4239,7 +4644,7 @@ async function checkExpertFirstCallReminder() {
           TITLE: `${petName}, позвони клиенту — сделка ждёт 4+ часа без первого касания`,
           DESCRIPTION: `${petName}, сделка "${deal.TITLE}" уже 4+ рабочих часа на стадии "Эксперт назначен", но первого звонка ещё не было.\n\nПозвони клиенту сегодня — первое касание критично для впечатления.`,
           RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          DEADLINE: deadline.toISOString().slice(0, 19) + '+03:00',
+          DEADLINE: toMinskLocalIso(deadline),
           UF_CRM_TASK: [`D_${deal.ID}`],
           PRIORITY: 2,
         },
@@ -7216,8 +7621,14 @@ async function actsReconResolveService(deal, serviceField) {
 }
 
 function actsReconDisplayDeal(info) {
-  const service = getShortServiceName(info.service || '');
-  return service && service !== 'услуги' ? `${info.companyName} — ${service}` : info.companyName;
+  // v76: в отчёте оставляем реальное название услуги из сделки.
+  // Никаких общих «аттестации» вместо «Аттестация ГенПодр / СМР / ИНЖ ИЗЫСКАНИЯ».
+  const service = actsCleanText(info.service || '');
+  return service ? `${info.companyName} — ${service}` : info.companyName;
+}
+
+function actsReconReportLabel(row) {
+  return actsCleanText(row && (row.reportLabel || row.label) || '');
 }
 
 function actsReconBuildText(monthInfo, groups) {
@@ -7227,10 +7638,13 @@ function actsReconBuildText(monthInfo, groups) {
   for (const g of groups) {
     lines.push(`${idx}) ${g.expert.label}`);
     lines.push('Акты есть в оригинале:');
-    if (g.have.length) g.have.forEach((x) => lines.push(`- ${x.label}`));
+    if (g.have.length) g.have.forEach((x) => lines.push(`- ${actsReconReportLabel(x)}`));
     else lines.push('- нет');
     lines.push('Актов нет в оригинале:');
-    if (g.missing.length) g.missing.forEach((x) => lines.push(`- ${x.label}`));
+    if (g.missing.length) g.missing.forEach((x) => lines.push(`- ${actsReconReportLabel(x)}`));
+    else lines.push('- нет');
+    lines.push('Нужно проверить вручную:');
+    if (g.review.length) g.review.forEach((x) => lines.push(`- ${actsReconReportLabel(x)}`));
     else lines.push('- нет');
     lines.push('');
     idx++;
@@ -7252,6 +7666,12 @@ async function actsReconMapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
+function actsReconIsActTask(task) {
+  const title = actsCleanText(actsReconTaskTitle(task));
+  // В проекте есть договоры и счета. Для сверки оригиналов учитываем только задачи АКТ.
+  return /^акт(?:\s|№|#|$)/i.test(title);
+}
+
 async function actsReconTasksForDeal(dealId) {
   return bitrixRestList('tasks.task.list', {
     filter: { GROUP_ID: config.actsProjectId, UF_CRM_TASK: `D_${dealId}` },
@@ -7268,6 +7688,8 @@ async function actsReconFallbackTasksByTitle(companyName, service) {
     select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','UF_CRM_TASK','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
     order: { ID: 'DESC' },
   }, 100);
+  // Договоры / счета / счёт-заказы из того же проекта не являются актами.
+  tasks = tasks.filter(actsReconIsActTask);
   const serviceKey = actsReconServiceKeyword(service);
   if (serviceKey && tasks.length > 1) {
     const narrowed = tasks.filter((task) => actsReconNorm(actsReconTaskTitle(task)).includes(serviceKey));
@@ -7310,7 +7732,10 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
     ]);
     const info = { deal, companyName, service, expert };
 
-    let candidates = await actsReconTasksForDeal(dealId);
+    // Правило v76: D_ID — абсолютный приоритет. Если есть АКТ, прямо связанный с D_ID сделки,
+    // название компании вообще не участвует в выборе. По названию ищем только при отсутствии CRM-связи.
+    const linkedTasks = await actsReconTasksForDeal(dealId);
+    let candidates = linkedTasks.filter(actsReconIsActTask);
     let matchType = candidates.length ? 'crm-link' : 'none';
     if (!candidates.length) {
       candidates = await actsReconFallbackTasksByTitle(companyName, service);
@@ -7337,6 +7762,7 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
       service,
       label: actsReconDisplayDeal(info),
       hasOriginal,
+      status: hasOriginal ? 'have' : (matchType === 'ambiguous-title' ? 'review' : 'missing'),
       matchType,
       taskId: bestTask ? actsReconTaskId(bestTask) : '',
       taskTitle: bestTask ? actsReconTaskTitle(bestTask) : '',
@@ -7357,12 +7783,23 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
   const byExpert = new Map();
   for (const row of rows) {
     const key = row.expert.id || 'none';
-    if (!byExpert.has(key)) byExpert.set(key, { expert: row.expert, have: [], missing: [] });
-    byExpert.get(key)[row.hasOriginal ? 'have' : 'missing'].push(row);
+    if (!byExpert.has(key)) byExpert.set(key, { expert: row.expert, have: [], missing: [], review: [] });
+    byExpert.get(key)[row.status || (row.hasOriginal ? 'have' : 'missing')].push(row);
   }
+
   const groups = [...byExpert.values()]
     .sort((a,b) => a.expert.label.localeCompare(b.expert.label, 'ru'))
-    .map((g) => ({ ...g, have: g.have.sort((a,b) => a.label.localeCompare(b.label, 'ru')), missing: g.missing.sort((a,b) => a.label.localeCompare(b.label, 'ru')) }));
+    .map((g) => {
+      const all = [...g.have, ...g.missing, ...g.review];
+      const counts = new Map();
+      for (const row of all) counts.set(row.label, (counts.get(row.label) || 0) + 1);
+      for (const row of all) {
+        row.reportLabel = counts.get(row.label) > 1 ? `${row.label} (сделка ${row.dealId})` : row.label;
+      }
+      const sorter = (a,b) => actsReconReportLabel(a).localeCompare(actsReconReportLabel(b), 'ru');
+      return { ...g, have: g.have.sort(sorter), missing: g.missing.sort(sorter), review: g.review.sort(sorter) };
+    });
+
   const text = actsReconBuildText(monthInfo, groups);
   const durationMs = Date.now() - startedAt;
   console.log(`[acts-recon] DONE month=${monthInfo.key}: ${rows.length} сделок за ${(durationMs/1000).toFixed(1)} сек.`);
@@ -7374,14 +7811,15 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
     archiveStageId,
     durationMs,
     dealsCount: rows.length,
-    originalsCount: rows.filter((x) => x.hasOriginal).length,
-    missingCount: rows.filter((x) => !x.hasOriginal).length,
-    ambiguousCount: rows.filter((x) => x.matchType === 'ambiguous-title').length,
+    originalsCount: rows.filter((x) => x.status === 'have').length,
+    missingCount: rows.filter((x) => x.status === 'missing').length,
+    ambiguousCount: rows.filter((x) => x.status === 'review').length,
     groups,
     rows,
     text,
   };
 }
+
 
 function actsReconRequestAuthorized(req) {
   const expected = String(config.actsReconToken || '');
@@ -7391,10 +7829,88 @@ function actsReconRequestAuthorized(req) {
   return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
 }
 
-async function actsReconSendToLeader(report) {
+function actsReconReportTitleForMonth(monthRaw) {
+  const info = actsReconParseMonth(monthRaw);
+  return `Сверка оригиналов актов за ${ACTS_RECON_MONTHS_RU[info.month - 1]} ${info.year}`;
+}
+
+async function actsReconLeaderAlreadyHasReport(monthRaw) {
   const leaderId = String(config.actsReconLeaderId || '2182');
+  const needle = actsReconReportTitleForMonth(monthRaw);
+  try {
+    // Надёжная дедупликация: получаем ID личного чата и ищем сообщение по тексту во всей истории,
+    // а не только среди последних 50 сообщений.
+    const dialogInfo = await bitrixRestCall('im.dialog.get', { DIALOG_ID: leaderId });
+    const chatId = Number(dialogInfo && (dialogInfo.id || dialogInfo.ID || dialogInfo.chat_id || dialogInfo.CHAT_ID) || 0);
+    if (chatId > 0) {
+      const found = await bitrixRestCall('im.dialog.messages.search', { CHAT_ID: chatId, SEARCH_MESSAGE: needle, ORDER: { ID: 'DESC' }, LIMIT: 20 });
+      const messages = found && (found.messages || found.MESSAGES);
+      if (Array.isArray(messages)) {
+        return messages.some((m) => String(m && (m.text || m.TEXT || m.message || m.MESSAGE) || '').includes(needle));
+      }
+    }
+    // Резерв: если search недоступен, проверяем последние сообщения обычным методом.
+    const dialog = await bitrixRestCall('im.dialog.messages.get', { DIALOG_ID: leaderId, LIMIT: 50 });
+    const messages = dialog && (dialog.messages || dialog.MESSAGES);
+    return Array.isArray(messages) && messages.some((m) => String(m && (m.text || m.TEXT || m.message || m.MESSAGE) || '').includes(needle));
+  } catch (e) {
+    console.warn(`[acts-recon] Не удалось проверить дубль отчёта в чате Тани: ${e.message || e}`);
+    // Если проверка дубля недоступна, безопаснее НЕ слать автоматически повторно.
+    return null;
+  }
+}
+
+async function actsReconSendToLeader(report, { allowWhenDedupeUnknown = true } = {}) {
+  const leaderId = String(config.actsReconLeaderId || '2182');
+  const already = await actsReconLeaderAlreadyHasReport(report.month);
+  if (already === true) return { leaderId, skipped: true, reason: 'report-already-sent' };
+  if (already === null && !allowWhenDedupeUnknown) return { leaderId, skipped: true, reason: 'dedupe-check-failed' };
   const messageId = await bitrixRestCall('im.message.add', { DIALOG_ID: leaderId, MESSAGE: report.text });
-  return { leaderId, messageId };
+  return { leaderId, messageId, skipped: false };
+}
+
+function actsReconLastWeekdayDay(year, month) {
+  let day = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  while (day > 0) {
+    const wd = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+    if (wd !== 0 && wd !== 6) return day;
+    day--;
+  }
+  return 1;
+}
+
+function actsReconIsAutoSendMoment(now = new Date()) {
+  const p = actsMinskCalendarParts(now);
+  const lastWeekday = actsReconLastWeekdayDay(p.y, p.m);
+  return p.d === lastWeekday && p.hour >= Math.max(0, Math.min(23, Number(config.actsReconSendHourMinsk || 18)));
+}
+
+let actsReconAutoRunning = false;
+async function runActsReconAutoCycle() {
+  if (actsReconAutoRunning || !config.actsReconAutoEnabled || !config.bitrixWebhookUrl) return;
+  if (!actsReconIsAutoSendMoment(new Date())) return;
+  actsReconAutoRunning = true;
+  try {
+    const p = actsMinskCalendarParts(new Date());
+    const monthKey = `${p.y}-${String(p.m).padStart(2, '0')}`;
+    const already = await actsReconLeaderAlreadyHasReport(monthKey);
+    if (already === true) {
+      console.log(`[acts-recon-auto] ${monthKey}: отчёт уже есть в чате Тани — повтор не отправляю.`);
+      return;
+    }
+    if (already === null) {
+      console.warn(`[acts-recon-auto] ${monthKey}: не удалось проверить дубль — автоматическую отправку пропускаю ради безопасности.`);
+      return;
+    }
+    console.log(`[acts-recon-auto] ${monthKey}: последний рабочий день месяца, формирую отчёт...`);
+    const report = await actsBuildMonthlyOriginalsReconciliation(monthKey);
+    const sent = await actsReconSendToLeader(report, { allowWhenDedupeUnknown: false });
+    console.log(`[acts-recon-auto] ${monthKey}: ${sent && sent.skipped ? `пропущено (${sent.reason})` : `отправлено Тане, messageId=${sent && sent.messageId}`}.`);
+  } catch (e) {
+    console.error('[acts-recon-auto]', e.message || e);
+  } finally {
+    actsReconAutoRunning = false;
+  }
 }
 
 async function actsReconEndpoint(req, res) {
@@ -7506,11 +8022,20 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v75 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v76 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'auto'}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
+  }
+
+  if (config.bitrixWebhookUrl && config.actsReconAutoEnabled) {
+    const reconCheckMs = Math.max(15, Number(config.actsReconCheckMinutes || 30)) * 60 * 1000;
+    console.log(`[acts-recon-auto] Включено: последний Пн–Пт месяца после ${String(config.actsReconSendHourMinsk || 18).padStart(2,'0')}:00 по Минску; проверка раз в ${reconCheckMs / 60000} мин; получатель Таня ID ${config.actsReconLeaderId}.`);
+    setTimeout(() => runActsReconAutoCycle(), 12000);
+    setInterval(() => runActsReconAutoCycle(), reconCheckMs);
+  } else {
+    console.log('[acts-recon-auto] Автоматическая месячная сверка выключена.');
   }
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
