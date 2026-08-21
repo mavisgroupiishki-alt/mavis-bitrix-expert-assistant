@@ -205,6 +205,18 @@ const config = {
   actsIncomingWazzupEnabled: String(process.env.ACTS_INCOMING_WAZZUP_ENABLED || 'true').toLowerCase() !== 'false',
   actsIncomingEmailEnabled: String(process.env.ACTS_INCOMING_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
   actsIncomingLeaderId: process.env.ACTS_INCOMING_LEADER_ID || process.env.TANYA_USER_ID || '2182',
+
+  // v78: CJM блоки 3–4 — контроль первого касания/дедлайна документов
+  // и автоматический сбор входящих документов по Аттестации + СПК.
+  firstCallTestMinutes: Number(process.env.FIRST_CALL_TEST_MINUTES || 0),
+  docsReminderTestMinutes: Number(process.env.DOCS_REMINDER_TEST_MINUTES || 0),
+  clientDocsIncomingEnabled: String(process.env.CLIENT_DOCS_INCOMING_ENABLED || 'true').toLowerCase() !== 'false',
+  clientDocsWazzupEnabled: String(process.env.CLIENT_DOCS_WAZZUP_ENABLED || 'true').toLowerCase() !== 'false',
+  clientDocsEmailEnabled: String(process.env.CLIENT_DOCS_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
+  clientDocsAllDeals: String(process.env.CLIENT_DOCS_ALL_DEALS || 'false').toLowerCase() === 'true',
+  clientDocsTestDealId: process.env.CLIENT_DOCS_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || process.env.LIVE_CHAT_TEST_DEAL_ID || '',
+  clientDocsLeaderId: process.env.CLIENT_DOCS_LEADER_ID || process.env.TANYA_USER_ID || '2182',
+
   // v67: Wazzup принимает файл только по публичному contentUri. Поэтому реальный бинарный файл
   // сначала скачиваем с Bitrix и на короткое время отдаём через наш Render без редиректов.
   actsPublicBaseUrl: String(process.env.ACTS_PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://mavis-bitrix-expert-assistant.onrender.com').replace(/\/+$/, ''),
@@ -1260,6 +1272,17 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       }
     }
 
+    // v78: тот же входящий файл используем для сбора документов по Аттестации/СПК.
+    if (config.clientDocsIncomingEnabled && config.clientDocsWazzupEnabled) {
+      for (const msg of acceptedMessages) {
+        if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
+        if (!msg.contentUri || !['image','document'].includes(String(msg.type || '').toLowerCase())) continue;
+        setImmediate(() => clientDocsProcessIncomingWazzupMessage(msg).catch((e) =>
+          console.error(`[client-docs] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)
+        ));
+      }
+    }
+
     if (!config.liveChatEnabled) {
       res.status(200).json({ ok: true });
       return;
@@ -1792,6 +1815,30 @@ async function processIncomingEmails() {
           if (!attachments.length) {
             await client.messageFlagsAdd(uid, ['\\Seen']);
             continue;
+          }
+
+          // v78: единый сбор документов Аттестации/СПК.
+          if (config.clientDocsIncomingEnabled && config.clientDocsEmailEnabled) {
+            try {
+              const clientDocsResult = await clientDocsProcessIncomingAttachments({
+                source: 'Email',
+                commType: 'EMAIL',
+                commValue: senderEmail,
+                messageText: `${subject}\n${parsed.text || ''}`.slice(0, 3000),
+                attachments: attachments.map((a) => ({
+                  fileName: a.filename || 'attachment',
+                  contentType: a.contentType || '',
+                  buffer: a.content,
+                })),
+              });
+              if (clientDocsResult && Number(clientDocsResult.processed || 0) > 0) {
+                await client.messageFlagsAdd(uid, ['\\Seen']);
+                console.log(`[client-docs] Email ${maskEmailForLog(senderEmail)} обработан новой логикой; старую ветку пропускаю.`);
+                continue;
+              }
+            } catch (docErr) {
+              console.warn(`[client-docs] email ${maskEmailForLog(senderEmail)}: ${docErr.message || docErr}`);
+            }
           }
 
           // ✅ 1. ПЕРВЫЙ СПОСОБ: Ищем email в CRM
@@ -3853,7 +3900,11 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
    - следующий шаг и риск, если есть.
 
 ВЕРНИ ТОЛЬКО JSON (без markdown, без \`\`\`):
-{"call_qualified":true,"call_reason":"содержательный разговор","deadline_mentioned":true,"client_message":"готовое сообщение БЕЗ плейсхолдеров","comment":"полный отчёт эксперту"}`;
+{"call_qualified":true,"call_reason":"содержательный разговор","deadline_mentioned":true,"documents_due_date":"2026-08-23","client_message":"готовое сообщение БЕЗ плейсхолдеров","comment":"полный отчёт эксперту"}
+
+documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM-DD.
+Если эксперт назвал срок — переведи его в конкретную дату.
+Если срок не назван — укажи стандартный дедлайн +2 календарных дня, который дан выше.`;
 
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
@@ -4077,16 +4128,25 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
 
     console.log(`${logPrefix} Готово.${hasMultipleDeals ? ` Сопутствующие (комментарий+стадия+задача): ${siblings.map((s) => s.ID).join(', ')}.` : ''}`)
 
-    // Регистрируем сделку для контроля документов (Этап 5).
-    // Только если сообщение реально отправлено клиенту.
+    // v78 / блок 3: регистрируем сделку для контроля документов.
     if (sent) {
       const companyName = await getCompanyName(deal.COMPANY_ID) || deal.TITLE;
-      pendingDocsCheck.set(String(dealId), {
-        sentAt: new Date(),
+      const sentAt = new Date();
+      const dueAt = resolveDocumentsDueAt(aiResult.documents_due_date, sentAt);
+      const serviceResolved = await resolveDealServiceName(deal);
+      const preferredForTrack = await detectPreferredChannelResolved(deal);
+      const trackInfo = {
+        sentAt,
+        dueAt,
         companyName,
-        service: detectServiceFromDeal(deal),
-      });
-      console.log(`${logPrefix} Сделка добавлена в контроль документов (через 2 раб. дня).`);
+        service: serviceResolved || detectServiceFromDeal(deal),
+        preferredChannel: preferredForTrack || '',
+      };
+      pendingDocsCheck.set(String(dealId), trackInfo);
+      await persistDocsWaitStart(dealId, trackInfo).catch((e) =>
+        console.warn(`${logPrefix} Не записал маркер ожидания документов: ${e.message || e}`)
+      );
+      console.log(`${logPrefix} Сделка добавлена в контроль документов: due=${toMinskLocalIso(dueAt)}, channel=${trackInfo.preferredChannel || 'не распознан'}.`);
     }
 
     // ЭТАП 4: Уточнение ЛК Белстройцентра — только для сделок с аттестацией.
@@ -4304,6 +4364,7 @@ async function checkPendingAttStage4Tasks() {
 // ============================================================================
 
 const DOCS_REMINDER_MARKER = '[MAVIS_DOCS_REMINDER_DONE]';
+const DOCS_REMINDER_ERROR_MARKER = '[MAVIS_DOCS_REMINDER_ERROR]';
 const DOCS_SPECIALIST_TASK_MARKER = '[MAVIS_SPECIALIST_CHECK_DONE]';
 
 // Трекинг сделок ожидающих проверки документов.
@@ -4426,11 +4487,11 @@ async function runDocsReminderForDeal(dealId, trackInfo) {
 
     const siblings = await findSiblingDeals(deal, deal.STAGE_ID);
 
-    // Сначала смотрим на Диске — может документы уже пришли по почте.
+    // v78: входящие Email/Viber/Telegram отмечаются устойчивым маркером в таймлайне.
     const companyName = trackInfo.companyName || deal.TITLE;
-    const docsArrived = await checkFolderForNewFiles(companyName, trackInfo.sentAt);
+    const docsArrived = await hasClientDocsReceivedAfter(dealId, trackInfo.sentAt);
     if (docsArrived) {
-      console.log(`${logPrefix} Документы уже пришли на почту — напоминание не нужно.`);
+      console.log(`${logPrefix} После старта ожидания уже пришли документы — первый пуш не нужен.`);
       pendingDocsCheck.delete(String(dealId));
       return;
     }
@@ -4446,72 +4507,36 @@ async function runDocsReminderForDeal(dealId, trackInfo) {
     const expertName = expertUser ? `${expertUser.NAME || ''} ${expertUser.LAST_NAME || ''}`.trim() : '';
     const petName = getDiminutiveName(expertName);
 
-    if (analysis.action === 'send_reminder' && analysis.client_message) {
-      // Отправляем напоминание клиенту.
-      const phone = await getContactPhone(deal);
-      const preferredChannel = detectPreferredChannel(deal);
-      const channels = [];
-      if (preferredChannel !== 'email') {
-        channels.push(preferredChannel);
-        if (preferredChannel !== 'viber') channels.push('viber');
-        if (preferredChannel !== 'telegram') channels.push('telegram');
-      }
-      let sent = false;
-      if (phone) {
-        for (const ch of channels) {
-          const chCfg = getConfiguredWazzupChannel(ch);
-          if (!chCfg || !chCfg.channelId) continue;
-          try {
-            await sendWazzupMessageInternal({ channelKey: ch, text: analysis.client_message, phone, dealId });
-            sent = true;
-            console.log(`${logPrefix} Напоминание отправлено клиенту через ${ch}.`);
-            break;
-          } catch (_) {}
-        }
-      }
+    if (analysis.action === 'send_reminder') {
+      // v78: строго выбранный клиентом канал, без fallback на другой мессенджер.
+      const serviceResolved = await resolveDealServiceName(deal);
+      const reminderText = finalizeDocsReminderMessage(
+        analysis.client_message,
+        getDocumentListForService(serviceResolved || detectServiceFromDeal(deal))
+      );
+      const sentResult = await sendClientTextByPreferredChannel(deal, reminderText, `Напоминание по документам: ${deal.TITLE}`);
+      const sent = !!sentResult.ok;
+      if (sent) console.log(`${logPrefix} Напоминание отправлено через ${sentResult.channel}.`);
+      else console.warn(`${logPrefix} Напоминание не отправлено: ${sentResult.error || 'неизвестная ошибка'}.`);
 
-      // Задача эксперту.
-      if (analysis.expert_task_title) {
-        const tomorrow = new Date();
-        tomorrow.setDate(tomorrow.getDate() + 2);
-        tomorrow.setHours(18, 0, 0, 0);
-        await bitrixRestCall('tasks.task.add', {
-          fields: {
-            TITLE: analysis.expert_task_title,
-            DESCRIPTION: analysis.expert_task_body || `${petName}, клиент не прислал документы. Отправил напоминание${sent ? '' : ' (не удалось отправить — проверь канал связи)'}. Если не ответит — стоит позвонить.`,
-            RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-            DEADLINE: tomorrow.toISOString().slice(0, 19) + '+03:00',
-            UF_CRM_TASK: [`D_${dealId}`],
-            PRIORITY: 1,
-          },
-        });
-      }
-
+      // Эскалация эксперту/руководителю относится к следующему блоку CJM.
       await bitrixRestCall('crm.timeline.comment.add', {
         fields: {
           ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-          COMMENT: `${DOCS_REMINDER_MARKER}\nИгорь: ${sent ? 'отправил напоминание клиенту про документы' : 'не удалось отправить напоминание клиенту'} (${analysis.situation})`,
+          COMMENT: `${sent ? DOCS_REMINDER_MARKER : DOCS_REMINDER_ERROR_MARKER}\nat=${new Date().toISOString()}\ndue=${new Date(trackInfo.dueAt || Date.now()).toISOString()}\nИгорь: ${sent ? 'отправил первое напоминание клиенту про документы' : `не удалось отправить первое напоминание клиенту: ${sentResult.error || 'ошибка канала'}`} (${analysis.situation})`,
         },
       });
+      // Если канал временно не сработал — оставляем сделку в pending и повторим в следующем цикле.
+      if (!sent) return;
 
-    } else if (analysis.action === 'send_specialist_task' && analysis.expert_task_title) {
-      // Задача эксперту уточнить нашли ли специалистов.
-      const in3days = addWorkingDays(new Date(), 3);
-      in3days.setHours(18, 0, 0, 0);
-      await bitrixRestCall('tasks.task.add', {
-        fields: {
-          TITLE: analysis.expert_task_title || `${petName}, уточни нашли ли специалистов — ${deal.TITLE}`,
-          DESCRIPTION: analysis.expert_task_body || `${petName}, клиент искал специалистов. Прошло 2 рабочих дня — уточни есть ли прогресс и можно ли запрашивать документы 🙌`,
-          RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-          DEADLINE: in3days.toISOString().slice(0, 19) + '+03:00',
-          UF_CRM_TASK: [`D_${dealId}`],
-          PRIORITY: 1,
-        },
-      });
+    } else if (analysis.action === 'send_specialist_task') {
+      // Если ИИ видит, что вопрос не в документах, а в отсутствии специалистов,
+      // в блоке 3 не создаём параллельную задачу: этим занимается отдельный блок «Подбор».
       await bitrixRestCall('crm.timeline.comment.add', {
         fields: {
-          ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-          COMMENT: `${DOCS_SPECIALIST_TASK_MARKER}\nИгорь: поставил задачу эксперту уточнить статус поиска специалистов (${analysis.situation})`,
+          ENTITY_ID: dealId,
+          ENTITY_TYPE: 'deal',
+          COMMENT: `${DOCS_REMINDER_MARKER}\nat=${new Date().toISOString()}\nИгорь: первый пуш по документам не отправлял — по контексту сначала нужно закрыть вопрос со специалистами. Контроль подбора идёт отдельным сценарием.`,
         },
       });
 
@@ -4519,12 +4544,18 @@ async function runDocsReminderForDeal(dealId, trackInfo) {
       await bitrixRestCall('crm.timeline.comment.add', {
         fields: {
           ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-          COMMENT: `Игорь: ${analysis.comment}`,
+          COMMENT: `${DOCS_REMINDER_MARKER}\nat=${new Date().toISOString()}\nИгорь: первый пуш не отправлял после анализа контекста. ${analysis.comment}`,
         },
       });
 
     } else {
       console.log(`${logPrefix} Действие не требуется: ${analysis.reason}`);
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+          COMMENT: `${DOCS_REMINDER_MARKER}\nat=${new Date().toISOString()}\nИгорь: первый контроль дедлайна выполнен, клиентский пуш не требуется. Причина: ${analysis.reason || 'по контексту сделки'}.`,
+        },
+      }).catch(() => {});
     }
 
     // Удаляем из трекинга — проверка выполнена.
@@ -4552,8 +4583,13 @@ async function checkPendingDocsReminders() {
       if (alreadyDone) { pendingDocsCheck.delete(dealId); continue; }
     } catch (_) {}
 
-    if (isWorkingDaysPassed(trackInfo.sentAt, 2)) {
-      await runDocsReminderForDeal(dealId, trackInfo);
+    const now = new Date();
+    const testMinutes = Math.max(0, Number(config.docsReminderTestMinutes || 0));
+    const dueAt = testMinutes > 0
+      ? new Date(new Date(trackInfo.sentAt).getTime() + testMinutes * 60000)
+      : new Date(trackInfo.dueAt || resolveDocumentsDueAt('', trackInfo.sentAt));
+    if (now >= dueAt && (testMinutes > 0 || isWorkingHour(now))) {
+      await runDocsReminderForDeal(dealId, { ...trackInfo, dueAt });
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
@@ -4619,19 +4655,21 @@ async function checkExpertFirstCallReminder() {
       }
 
       const movedAt = new Date(deal.MOVED_TIME || deal.DATE_CREATE);
-      if (workingHoursBetween(movedAt, now) < 4) continue;
+      const testMinutes = Math.max(0, Number(config.firstCallTestMinutes || 0));
+      const due = testMinutes > 0
+        ? ((now.getTime() - movedAt.getTime()) / 60000 >= testMinutes)
+        : (workingHoursBetween(movedAt, now) >= 4);
+      if (!due) continue;
       const marker = '[MAVIS_FIRST_CALL_REMINDER]';
       const already = await isStageEventProcessed(deal.ID, 'first_call', marker);
       if (already) continue;
-      if (!isWorkingHour(now)) continue;
-      // Проверяем был ли уже звонок в сделке.
-      const acts = await bitrixRestList('crm.activity.list', {
-        filter: { OWNER_ID: deal.ID, OWNER_TYPE_ID: 2 },
-        select: ['ID', 'TYPE_ID', 'PROVIDER_ID'],
-        order: { ID: 'DESC' },
-      }, 10);
-      const hasCall = acts.some((a) => String(a.TYPE_ID) === '2' || /voximplant|call|телеф/i.test(String(a.PROVIDER_ID || '')));
-      if (hasCall) { stageEventProcessed.set(stageEventKey(deal.ID, 'first_call'), true); continue; }
+      if (!testMinutes && !isWorkingHour(now)) continue;
+
+      const hasCall = await hasQualifiedFirstContact(deal);
+      if (hasCall) {
+        stageEventProcessed.set(stageEventKey(deal.ID, 'first_call'), true);
+        continue;
+      }
       // Ставим задачу эксперту.
       const u = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
       const user = Array.isArray(u) ? u[0] : u;
@@ -4641,8 +4679,8 @@ async function checkExpertFirstCallReminder() {
       deadline.setHours(18, 0, 0, 0);
       await bitrixRestCall('tasks.task.add', {
         fields: {
-          TITLE: `${petName}, позвони клиенту — сделка ждёт 4+ часа без первого касания`,
-          DESCRIPTION: `${petName}, сделка "${deal.TITLE}" уже 4+ рабочих часа на стадии "Эксперт назначен", но первого звонка ещё не было.\n\nПозвони клиенту сегодня — первое касание критично для впечатления.`,
+          TITLE: `${petName}, позвони клиенту — нет первого содержательного касания`,
+          DESCRIPTION: `${petName}, по сделке "${deal.TITLE}" ещё нет первого содержательного звонка после назначения эксперта${testMinutes ? ` (тестовый порог ${testMinutes} мин)` : ' за 4+ рабочих часа'}.\n\nКороткий звонок/просьба перезвонить не закрывает контроль. Нужен полноценный разговор по услуге и следующим шагам.`,
           RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
           DEADLINE: toMinskLocalIso(deadline),
           UF_CRM_TASK: [`D_${deal.ID}`],
@@ -6817,6 +6855,767 @@ async function actsProcessIncomingWazzupMessage(msg) {
 }
 // ======================= /v71: ВХОДЯЩИЕ СКАНЫ АКТОВ =========================
 
+
+// ============================================================================
+// v78: CJM БЛОКИ 3–4 — ДЕДЛАЙН ДОКУМЕНТОВ + ВХОДЯЩИЕ ДОКУМЕНТЫ АТТЕСТАЦИИ/СПК
+// ============================================================================
+
+const DOCS_WAIT_START_MARKER = '[MAVIS_DOCS_WAIT_START]';
+const CLIENT_DOCS_RECEIVED_MARKER = '[MAVIS_CLIENT_DOCS_RECEIVED]';
+const CLIENT_DOCS_STATE_MARKER = '[MAVIS_CLIENT_DOCS_STATE]';
+let clientDocsExtraEmailFieldCache = undefined; // undefined = ещё не искали, '' = не найдено
+
+function clientDocsNormalizeText(value) {
+  return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+function clientDocsTargetService(service) {
+  const s = clientDocsNormalizeText(service);
+  return /аттест/.test(s) || /(?:^|\s)спк(?:\s|$)|свидетельств.*техн|техн.*компетент/.test(s);
+}
+
+async function resolveDealServiceName(deal) {
+  if (!deal) return '';
+  const serviceField = config.serviceFieldCode || process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071';
+  try {
+    const resolved = await actsReconResolveService(deal, serviceField);
+    if (resolved) return String(resolved).trim();
+  } catch (_) {}
+  return detectServiceFromDeal(deal);
+}
+
+function resolveDocumentsDueAt(rawDate, sentAt = new Date()) {
+  const raw = String(rawDate || '').trim();
+  let datePart = '';
+  const m = raw.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (m) datePart = m[1];
+
+  if (!datePart) {
+    const baseParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(new Date(sentAt));
+    const get = (t) => (baseParts.find((x) => x.type === t) || {}).value;
+    const baseUtcNoon = new Date(Date.UTC(Number(get('year')), Number(get('month')) - 1, Number(get('day')), 12, 0, 0));
+    baseUtcNoon.setUTCDate(baseUtcNoon.getUTCDate() + 2);
+    datePart = `${baseUtcNoon.getUTCFullYear()}-${String(baseUtcNoon.getUTCMonth()+1).padStart(2,'0')}-${String(baseUtcNoon.getUTCDate()).padStart(2,'0')}`;
+  }
+
+  // Срок формулируется как «до <дата> включительно», поэтому пуш не раньше конца рабочего дня.
+  const due = new Date(`${datePart}T18:00:00+03:00`);
+  if (!Number.isNaN(due.getTime())) return due;
+  return new Date(new Date(sentAt).getTime() + 2 * 24 * 60 * 60 * 1000);
+}
+
+async function persistDocsWaitStart(dealId, info) {
+  const payload = {
+    sentAt: new Date(info.sentAt || Date.now()).toISOString(),
+    dueAt: new Date(info.dueAt || Date.now()).toISOString(),
+    companyName: String(info.companyName || ''),
+    service: String(info.service || ''),
+    preferredChannel: String(info.preferredChannel || ''),
+  };
+  await bitrixRestCall('crm.timeline.comment.add', {
+    fields: {
+      ENTITY_ID: dealId,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `${DOCS_WAIT_START_MARKER}\n${JSON.stringify(payload)}`,
+    },
+  });
+}
+
+function clientDocsParseMarkerJson(text, markerText) {
+  const str = String(text || '');
+  const idx = str.indexOf(markerText);
+  if (idx < 0) return null;
+  const tail = str.slice(idx + markerText.length);
+  // Маркерный payload всегда пишем одной JSON-строкой. Берём первый JSON после маркера,
+  // чтобы следующий JSON-маркер в том же комментарии не склеился с первым.
+  const line = tail.split(/\r?\n/).map((x) => x.trim()).find((x) => x.startsWith('{') && x.endsWith('}'));
+  if (!line) return null;
+  try { return JSON.parse(line); } catch (_) { return null; }
+}
+
+async function hasClientDocsReceivedAfter(dealId, afterDate) {
+  const afterTs = new Date(afterDate || 0).getTime();
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID','COMMENT','DATE_CREATE','CREATED'],
+      order: { ID: 'DESC' },
+    }, 80);
+    for (const c of comments) {
+      const text = String(c.COMMENT || '');
+      if (!text.includes(CLIENT_DOCS_RECEIVED_MARKER)) continue;
+      const payload = clientDocsParseMarkerJson(text, CLIENT_DOCS_RECEIVED_MARKER);
+      const ts = new Date((payload && payload.at) || c.DATE_CREATE || c.CREATED || 0).getTime();
+      if (Number.isFinite(ts) && ts >= afterTs) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+async function recoverPendingDocsChecks() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
+  const prepStageId = getPreparationStageId();
+  if (!prepStageId) return;
+
+  let deals = [];
+  try {
+    deals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: prepStageId },
+      select: ['ID','TITLE','COMPANY_ID','CONTACT_ID','ASSIGNED_BY_ID','STAGE_ID',
+        config.serviceFieldCode || process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      order: { ID: 'DESC' },
+    }, 150);
+  } catch (e) {
+    console.warn(`[docsReminder] Не смог восстановить сделки: ${e.message || e}`);
+    return;
+  }
+
+  let recovered = 0;
+  for (const deal of deals) {
+    try {
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+        select: ['ID','COMMENT','DATE_CREATE'],
+        order: { ID: 'DESC' },
+      }, 80);
+
+      let wait = null;
+      let reminderAfter = false;
+      let receivedAfter = false;
+      for (const c of comments) {
+        const text = String(c.COMMENT || '');
+        if (!wait && text.includes(DOCS_WAIT_START_MARKER)) {
+          wait = clientDocsParseMarkerJson(text, DOCS_WAIT_START_MARKER);
+          if (wait) continue;
+        }
+      }
+      if (!wait || !wait.sentAt) continue;
+      const startTs = new Date(wait.sentAt).getTime();
+
+      for (const c of comments) {
+        const text = String(c.COMMENT || '');
+        let cTs = new Date(c.DATE_CREATE || c.CREATED || 0).getTime();
+        if (text.includes(CLIENT_DOCS_RECEIVED_MARKER)) {
+          const payload = clientDocsParseMarkerJson(text, CLIENT_DOCS_RECEIVED_MARKER);
+          if (payload && payload.at) cTs = new Date(payload.at).getTime();
+        }
+        if (text.includes(DOCS_REMINDER_MARKER)) {
+          const m = text.match(/\bat=([^\s]+)/);
+          if (m) cTs = new Date(m[1]).getTime();
+        }
+        if (!Number.isFinite(cTs) || cTs < startTs) continue;
+        if (text.includes(DOCS_REMINDER_MARKER)) reminderAfter = true;
+        if (text.includes(CLIENT_DOCS_RECEIVED_MARKER)) receivedAfter = true;
+      }
+      if (reminderAfter || receivedAfter) continue;
+
+      pendingDocsCheck.set(String(deal.ID), {
+        sentAt: new Date(wait.sentAt),
+        dueAt: new Date(wait.dueAt || resolveDocumentsDueAt('', wait.sentAt)),
+        companyName: wait.companyName || deal.TITLE,
+        service: wait.service || await resolveDealServiceName(deal),
+        preferredChannel: wait.preferredChannel || '',
+      });
+      recovered++;
+    } catch (_) {}
+  }
+  console.log(`[docsReminder] Восстановлено ожиданий документов после рестарта: ${recovered}.`);
+}
+
+async function hasQualifiedFirstContact(deal) {
+  try {
+    const acts = await bitrixRestList('crm.activity.list', {
+      filter: { OWNER_ID: deal.ID, OWNER_TYPE_ID: 2 },
+      select: ['*','FILES'],
+      order: { ID: 'DESC' },
+    }, 40);
+    for (const a of acts) {
+      const typeId = String(a.TYPE_ID || '');
+      const provider = String(a.PROVIDER_ID || '').toLowerCase();
+      const text = String([a.SUBJECT,a.DESCRIPTION,a.PROVIDER_TYPE_ID].join(' ')).toLowerCase();
+      const isCall = typeId === '2' || /call|voximplant|asterisk|zruchna|telephony|звон|телеф/.test(`${provider} ${text}`);
+      if (!isCall) continue;
+      const gate = activityPassesExpertGate(a, deal, {
+        assignedById: deal.ASSIGNED_BY_ID,
+        minDate: deal.MOVED_TIME,
+      });
+      if (!gate.ok) continue;
+      return true;
+    }
+  } catch (e) {
+    console.warn(`[firstCall] deal=${deal.ID}: не смог проверить звонки: ${e.message || e}`);
+  }
+  return false;
+}
+
+function clientDocsRequiredDocs(docList) {
+  const docs = Array.isArray(docList && docList.docs) ? docList.docs : [];
+  return docs.filter((x) => !/все копии заверяются|копия верна|подпись.*расшифровка.*печать/i.test(String(x || '')));
+}
+
+function finalizeDocsReminderMessage(_baseText, docList) {
+  const docs = clientDocsRequiredDocs(docList);
+  const lines = docs.map((d, i) => `${i + 1}. ${String(d).trim()}`);
+  return [
+    actsMinskGreeting(),
+    '',
+    `Напоминаем по документам для услуги «${docList && docList.title ? docList.title : 'вашей услуги'}». Пока не получили необходимый комплект.`,
+    '',
+    'Пожалуйста, направьте:',
+    ...lines,
+    '',
+    'Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru',
+  ].join('\n').trim();
+}
+
+async function sendEmailTextThroughBitrix(deal, toEmail, subject, text) {
+  await bitrixRestCall('crm.activity.add', {
+    fields: {
+      TYPE_ID: 4,
+      SUBJECT: subject || `Документы по сделке: ${deal.TITLE}`,
+      DESCRIPTION: text,
+      DESCRIPTION_TYPE: 1,
+      DIRECTION: 2,
+      OWNER_TYPE_ID: 2,
+      OWNER_ID: deal.ID,
+      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || 1,
+      COMPLETED: 'Y',
+      COMMUNICATIONS: [{
+        VALUE: toEmail,
+        ENTITY_ID: Number(deal.CONTACT_ID || 0),
+        ENTITY_TYPE_ID: 3,
+        TYPE: 'EMAIL',
+      }],
+    },
+  });
+}
+
+async function sendClientTextByPreferredChannel(deal, text, subject = '') {
+  const preferred = await detectPreferredChannelResolved(deal);
+  if (!preferred) return { ok: false, error: 'не заполнен/не распознан предпочитаемый канал связи' };
+
+  if (preferred === 'email') {
+    const email = await getContactEmail(deal);
+    if (!email) return { ok: false, channel: 'email', error: 'у клиента не найден email' };
+    await sendEmailTextThroughBitrix(deal, email, subject || `Документы: ${deal.TITLE}`, text);
+    return { ok: true, channel: 'email' };
+  }
+
+  if (!['viber','telegram'].includes(preferred)) {
+    return { ok: false, channel: preferred, error: `канал ${preferred} не поддерживается` };
+  }
+  const phone = await getContactPhone(deal);
+  if (!phone) return { ok: false, channel: preferred, error: 'не найден телефон клиента' };
+  const cfg = getConfiguredWazzupChannel(preferred);
+  if (!cfg || !cfg.channelId) return { ok: false, channel: preferred, error: `Wazzup ${preferred} не настроен` };
+  await sendWazzupMessageInternal({ channelKey: preferred, text, phone, dealId: deal.ID });
+  return { ok: true, channel: preferred };
+}
+
+async function clientDocsFindExtraEmailField() {
+  if (clientDocsExtraEmailFieldCache !== undefined) return clientDocsExtraEmailFieldCache;
+  try {
+    const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
+    const f = fields.find((x) => {
+      const label = [
+        x.EDIT_FORM_LABEL, x.LIST_COLUMN_LABEL, x.LIST_FILTER_LABEL,
+        x.USER_TYPE_ID, x.FIELD_NAME
+      ].filter(Boolean).join(' ');
+      return /доп.*(?:email|e-mail|почт)|(?:email|e-mail|почт).*доп/i.test(label);
+    });
+    clientDocsExtraEmailFieldCache = f ? String(f.FIELD_NAME || '') : '';
+    if (clientDocsExtraEmailFieldCache) {
+      console.log(`[client-docs] Поле дополнительной почты найдено: ${clientDocsExtraEmailFieldCache}.`);
+    }
+  } catch (e) {
+    clientDocsExtraEmailFieldCache = '';
+    console.warn(`[client-docs] Не смог найти поле дополнительной почты: ${e.message || e}`);
+  }
+  return clientDocsExtraEmailFieldCache;
+}
+
+async function clientDocsCommMatchesDeal(deal, commType, commValue) {
+  const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
+  const target = type === 'PHONE'
+    ? normalizePhoneDigits(commValue)
+    : String(commValue || '').trim().toLowerCase();
+  if (!target || !deal) return false;
+
+  const entities = [];
+  if (deal.CONTACT_ID) entities.push(['crm.contact.get', deal.CONTACT_ID]);
+  if (deal.COMPANY_ID) entities.push(['crm.company.get', deal.COMPANY_ID]);
+  for (const [method,id] of entities) {
+    try {
+      const ent = await bitrixRestCall(method, { id });
+      if (type === 'PHONE') {
+        const tail = target.slice(-9);
+        const values = Array.isArray(ent && ent.PHONE) ? ent.PHONE : [];
+        if (values.some((x) => normalizePhoneDigits(x && x.VALUE).slice(-9) === tail)) return true;
+      } else {
+        const values = Array.isArray(ent && ent.EMAIL) ? ent.EMAIL : [];
+        if (values.some((x) => String(x && x.VALUE || '').trim().toLowerCase() === target)) return true;
+      }
+    } catch (_) {}
+  }
+
+  if (type === 'EMAIL') {
+    const extraField = await clientDocsFindExtraEmailField();
+    if (extraField && String(deal[extraField] || '').trim().toLowerCase() === target) return true;
+  }
+  return false;
+}
+
+async function clientDocsFindDealsByComm(commType, commValue) {
+  const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
+  const value = type === 'PHONE'
+    ? normalizePhoneDigits(commValue)
+    : String(commValue || '').trim().toLowerCase();
+  if (!value) return { deals: [], reason: 'empty-comm' };
+
+  // В пилоте не трогаем другие сделки.
+  const testId = String(config.clientDocsTestDealId || '').trim();
+  if (!config.clientDocsAllDeals && !testId) {
+    return { deals: [], reason: 'pilot-no-test-deal' };
+  }
+
+  let dup = {};
+  try {
+    dup = await bitrixRestCall('crm.duplicate.findbycomm', { type, values: [value] });
+  } catch (_) {}
+
+  const contactIds = [...new Set(actsArrayIds(dup && (dup.CONTACT || dup.contact)).map(String))];
+  const companyIds = [...new Set(actsArrayIds(dup && (dup.COMPANY || dup.company)).map(String))];
+  const serviceField = config.serviceFieldCode || process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071';
+  const dealSelect = ['ID','TITLE','CATEGORY_ID','STAGE_ID','STAGE_SEMANTIC_ID','CLOSED','ASSIGNED_BY_ID','CONTACT_ID','COMPANY_ID','MOVED_TIME','DATE_MODIFY',serviceField];
+
+  const all = [];
+  async function addDeals(filter) {
+    try {
+      const rows = await bitrixRestList('crm.deal.list', {
+        filter: { CATEGORY_ID: config.autopilotCategoryId || 28, ...filter },
+        select: dealSelect,
+        order: { DATE_MODIFY: 'DESC' },
+      }, 80);
+      all.push(...rows);
+    } catch (_) {}
+  }
+
+  for (const id of contactIds.slice(0, 10)) await addDeals({ CONTACT_ID: id });
+  for (const id of companyIds.slice(0, 10)) await addDeals({ COMPANY_ID: id });
+
+  // SPK CJM: эксперт может заполнить «доп.email», откуда тоже должны забираться документы.
+  if (type === 'EMAIL') {
+    const extraEmailField = await clientDocsFindExtraEmailField();
+    if (extraEmailField) await addDeals({ [extraEmailField]: value });
+  }
+
+  // Если duplicate.findbycomm не сработал, в тесте можно проверить конкретную сделку,
+  // но ТОЛЬКО если телефон/email действительно принадлежит её контакту/компании.
+  if (!all.length && testId) {
+    try {
+      const d = await bitrixRestCall('crm.deal.get', { id: testId });
+      if (d && await clientDocsCommMatchesDeal(d, type, value)) all.push(d);
+    } catch (_) {}
+  }
+
+  const seen = new Set();
+  const unique = [];
+  for (const d of all) {
+    if (!d || seen.has(String(d.ID))) continue;
+    seen.add(String(d.ID));
+    if (String(d.CLOSED || '').toUpperCase() === 'Y' || ['S','F'].includes(String(d.STAGE_SEMANTIC_ID || '').toUpperCase())) continue;
+    if (!config.clientDocsAllDeals && testId && String(d.ID) !== testId) continue;
+    const service = await resolveDealServiceName(d);
+    if (!clientDocsTargetService(service)) continue;
+    d.__clientDocsService = service;
+    unique.push(d);
+  }
+
+  if (!unique.length) return { deals: [], reason: 'no-target-active-deal' };
+
+  // Защита от телефона/email, который привязан к нескольким разным компаниям.
+  if (config.clientDocsAllDeals) {
+    const companies = new Set(unique.map((d) => String(d.COMPANY_ID || `contact:${d.CONTACT_ID || '?'}`)));
+    if (companies.size > 1) {
+      console.warn(`[client-docs] ${type} совпал сразу с ${companies.size} компаниями — авторазбор не выполняю.`);
+      return { deals: [], reason: 'ambiguous-multiple-companies' };
+    }
+  }
+
+  const prep = getPreparationStageId();
+  const priority = (d) => String(d.STAGE_ID) === String(prep) ? 0
+    : String(d.STAGE_ID) === String(STAGE_IDS.expertAssigned) ? 1
+    : 2;
+  unique.sort((a,b) => priority(a) - priority(b) || new Date(b.DATE_MODIFY || b.MOVED_TIME || 0) - new Date(a.DATE_MODIFY || a.MOVED_TIME || 0));
+  return { deals: unique, reason: 'ok' };
+}
+
+function clientDocsClassifyByName(fileName) {
+  const s = clientDocsNormalizeText(fileName);
+  const rules = [
+    [/диплом/, 'диплом'],
+    [/трудов/, 'трудовая книжка'],
+    [/аттестат/, 'аттестат специалиста'],
+    [/паспорт/, 'паспорт'],
+    [/устав/, 'устав'],
+    [/свидетел.*регист|регистрац.*свидетел/, 'свидетельство о регистрации'],
+    [/аренд.*помещ|помещ.*аренд|купл.*продаж.*помещ/, 'документ на помещение'],
+    [/приказ/, 'приказ о назначении'],
+    [/контракт|трудов.*договор/, 'контракт/трудовой договор'],
+    [/стройдок.*счет|счет.*стройдок/, 'счёт Стройдокумент'],
+    [/стройдок.*плат|плат.*стройдок/, 'платёжка Стройдокумент'],
+    [/тех.*карт.*счет|счет.*тех.*карт/, 'счёт технологические карты'],
+    [/тех.*карт.*плат|плат.*тех.*карт/, 'платёжка технологические карты'],
+    [/тех.*карт/, 'технологическая карта'],
+    [/поверк/, 'поверка средства измерений'],
+    [/тех.*паспорт|паспорт.*си/, 'техпаспорт средства измерений'],
+    [/накладн/, 'накладная'],
+    [/книг.*провер/, 'книга учёта проверок'],
+    [/заявлен|заявк/, 'заявление/заявка'],
+  ];
+  for (const [re,label] of rules) if (re.test(s)) return label;
+  return 'другое';
+}
+
+// Старый почтовый код тоже вызывает classifyFileByName — v78 закрывает этот старый undefined helper.
+function classifyFileByName(fileName) {
+  return clientDocsClassifyByName(fileName);
+}
+
+async function clientDocsAnalyzeAttachment(buffer, fileName, contentType, messageText = '') {
+  const ext = String(fileName || '').split('.').pop().toLowerCase();
+  const isImage = ['jpg','jpeg','png','webp'].includes(ext) || /^image\//i.test(contentType || '');
+  const isPdf = ext === 'pdf' || /^application\/pdf/i.test(contentType || '') || (buffer && buffer.subarray(0,4).toString() === '%PDF');
+
+  if (!isImage && !isPdf) {
+    return {
+      documentType: clientDocsClassifyByName(fileName),
+      person: null, organization: null, instrument: null,
+      readable: null, confidence: 'low', fileName,
+      notes: 'тип определён только по имени файла',
+    };
+  }
+
+  const ai = resolveAiProvider();
+  if (!ai.apiKey) {
+    return {
+      documentType: clientDocsClassifyByName(fileName),
+      person: null, organization: null, instrument: null,
+      readable: null, confidence: 'low', fileName,
+      notes: 'AI key не задан',
+    };
+  }
+
+  const prompt = [
+    'Ты разбираешь входящие документы клиента MAVIS GROUP для услуг Аттестация организации и СПК.',
+    'Определи тип документа максимально конкретно.',
+    'Возможные типы: диплом, трудовая книжка, аттестат специалиста, паспорт, свидетельство о регистрации, устав, документ на помещение, приказ о назначении, контракт/трудовой договор, счёт Стройдокумент, платёжка Стройдокумент, счёт технологические карты, платёжка технологические карты, технологическая карта, поверка средства измерений, техпаспорт средства измерений, накладная средства измерений, договор аренды средства измерений, книга учёта проверок, заявление/заявка, другое.',
+    'Если документ относится к человеку — извлеки ФИО. Если к средству измерений — название/тип прибора. Если видна организация — название.',
+    'Не придумывай данные, которых не видно.',
+    messageText ? `Текст сообщения клиента: ${String(messageText).slice(0,1200)}` : '',
+    'Ответ ТОЛЬКО JSON: {"documentType":"...","person":"ФИО или null","organization":"название или null","instrument":"название СИ или null","readable":true|false,"confidence":"high|medium|low","notes":"коротко или null"}',
+  ].filter(Boolean).join(' ');
+
+  try {
+    let content;
+    if (isImage) {
+      const mime = contentType || (ext === 'png' ? 'image/png' : 'image/jpeg');
+      content = [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` } },
+      ];
+    } else {
+      content = [
+        { type: 'file', file: { filename: fileName || 'document.pdf', file_data: `data:application/pdf;base64,${buffer.toString('base64')}` } },
+        { type: 'text', text: prompt },
+      ];
+    }
+
+    const response = await fetch(`${ai.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { ...ai.authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.aiModel,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content }],
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error?.message || `HTTP ${response.status}`);
+    const text = data?.choices?.[0]?.message?.content || '{}';
+    const obj = JSON.parse((text.match(/\{[\s\S]*\}/) || ['{}'])[0]);
+    return {
+      documentType: String(obj.documentType || clientDocsClassifyByName(fileName)),
+      person: obj.person || null,
+      organization: obj.organization || null,
+      instrument: obj.instrument || null,
+      readable: obj.readable === false ? false : obj.readable === true ? true : null,
+      confidence: String(obj.confidence || 'low').toLowerCase(),
+      fileName,
+      notes: obj.notes || null,
+    };
+  } catch (e) {
+    return {
+      documentType: clientDocsClassifyByName(fileName),
+      person: null, organization: null, instrument: null,
+      readable: null, confidence: 'low', fileName,
+      notes: `AI-анализ не сработал: ${e.message || e}`,
+    };
+  }
+}
+
+async function clientDocsLoadState(dealId) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID','COMMENT','DATE_CREATE'],
+      order: { ID: 'DESC' },
+    }, 80);
+    for (const c of comments) {
+      if (!String(c.COMMENT || '').includes(CLIENT_DOCS_STATE_MARKER)) continue;
+      const obj = clientDocsParseMarkerJson(c.COMMENT, CLIENT_DOCS_STATE_MARKER);
+      if (obj) return obj;
+    }
+  } catch (_) {}
+  return { docs: [] };
+}
+
+function clientDocsMergeDocs(oldDocs, newDocs) {
+  const result = [];
+  const seen = new Set();
+  for (const d of [...(Array.isArray(oldDocs) ? oldDocs : []), ...(Array.isArray(newDocs) ? newDocs : [])]) {
+    if (!d) continue;
+    const key = [
+      clientDocsNormalizeText(d.documentType),
+      clientDocsNormalizeText(d.person),
+      clientDocsNormalizeText(d.instrument),
+      clientDocsNormalizeText(d.fileName),
+    ].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(d);
+  }
+  return result.slice(-120);
+}
+
+async function clientDocsCheckCompleteness(deal, service, docs) {
+  const docList = getDocumentListForService(service);
+  const required = clientDocsRequiredDocs(docList);
+  const system = 'Ты ИИ-ассистент MAVIS GROUP. Проверяешь комплектность документов по Аттестации/СПК. Отвечай только JSON. Ничего не выдумывай.';
+  const user = `Услуга: ${service}
+Обязательный перечень:
+${JSON.stringify(required, null, 2)}
+
+Ранее и сейчас распознанные документы:
+${JSON.stringify(docs, null, 2)}
+
+Правила:
+- Если не можешь подтвердить документ по данным — считай, что его ещё не хватает.
+- Для документов по специалистам учитывай ФИО: диплом/трудовая/аттестат одного человека не закрывает другого.
+- Для СПК средства измерений и поверки оценивай отдельно.
+- Не называй комплект полным при низкой уверенности в критичном документе.
+
+Ответ JSON:
+{
+  "complete": true/false,
+  "confidence": "high"|"medium"|"low",
+  "received": ["конкретно что подтверждено"],
+  "missing": ["КОНКРЕТНО чего не хватает"],
+  "actions_per_person": ["ФИО — что уже есть / что ещё нужно"],
+  "warnings": ["нечитаемо / неясно / требует ручной проверки"]
+}`;
+  try {
+    const raw = await callAiChatCompletion({
+      model: config.aiModel,
+      temperature: 0.1,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    });
+    let obj = {};
+    try { obj = JSON.parse(raw); } catch (_) {
+      const m = String(raw || '').match(/\{[\s\S]*\}/);
+      if (m) obj = JSON.parse(m[0]);
+    }
+    const confidence = String(obj.confidence || 'low').toLowerCase();
+    return {
+      complete: !!obj.complete && confidence !== 'low',
+      confidence,
+      received: Array.isArray(obj.received) ? obj.received.map(String) : [],
+      missing: Array.isArray(obj.missing) ? obj.missing.map(String) : required,
+      actions_per_person: Array.isArray(obj.actions_per_person) ? obj.actions_per_person.map(String) : [],
+      warnings: Array.isArray(obj.warnings) ? obj.warnings.map(String) : [],
+      docList,
+    };
+  } catch (e) {
+    console.warn(`[client-docs] deal=${deal.ID}: комплектность не определена: ${e.message || e}`);
+    return null;
+  }
+}
+
+function clientDocsBuildClientUpdate(results) {
+  const greeting = actsMinskGreeting();
+  const lines = [greeting, '', 'Документы получили, спасибо. Зафиксировали их в работе.'];
+
+  for (const r of results) {
+    lines.push('', `По услуге «${r.service}»:`);
+    if (r.completeness && r.completeness.received.length) {
+      lines.push('Получено и распознано:');
+      r.completeness.received.slice(0, 12).forEach((x) => lines.push(`• ${x}`));
+    }
+    if (r.completeness && r.completeness.complete) {
+      lines.push('Предварительно комплект собран. Передали эксперту на контроль.');
+    } else if (r.completeness && r.completeness.missing.length) {
+      lines.push('Ещё необходимо предоставить:');
+      r.completeness.missing.slice(0, 20).forEach((x) => lines.push(`• ${x}`));
+    } else {
+      lines.push('Эксперт дополнительно проверит комплект и сообщит, если потребуется что-то дослать.');
+    }
+  }
+
+  lines.push('', 'Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru');
+  return lines.join('\n').trim();
+}
+
+async function clientDocsNotifyExpert(deal, source, analyzedDocs, completeness) {
+  const expertId = String(deal.ASSIGNED_BY_ID || '');
+  if (!expertId) return;
+  const files = analyzedDocs.map((d) => `${d.fileName}: ${d.documentType}${d.person ? ` (${d.person})` : ''}`).join('; ');
+  const missing = completeness && completeness.missing && completeness.missing.length
+    ? completeness.missing.slice(0, 8).join('; ')
+    : 'по автоматической проверке критичного недостающего не выявлено';
+  const msg = `ИИгорь: по сделке «${deal.TITLE}» пришли документы через ${source}. Сохранил в папку компании. Распознано: ${files}. Не хватает: ${missing}.`;
+  try {
+    await bitrixRestCall('im.notify.personal.add', {
+      USER_ID: Number(expertId),
+      MESSAGE: msg,
+      MESSAGE_OUT: msg,
+    });
+  } catch (_) {}
+}
+
+async function clientDocsProcessIncomingAttachments({ source, commType, commValue, messageText = '', attachments = [] }) {
+  if (!config.clientDocsIncomingEnabled || !attachments.length) return { ok: true, processed: 0 };
+  const match = await clientDocsFindDealsByComm(commType, commValue);
+  if (!match.deals.length) {
+    console.log(`[client-docs] ${source}: подходящая активная Аттестация/СПК не найдена (${match.reason}).`);
+    return { ok: true, processed: 0, reason: match.reason };
+  }
+
+  const deals = match.deals;
+  const primary = deals[0];
+  const companyName = primary.COMPANY_ID ? await getCompanyName(primary.COMPANY_ID) : (primary.TITLE || `Сделка ${primary.ID}`);
+  const folderId = await getOrCreateCompanyFolder(companyName || `Сделка ${primary.ID}`);
+
+  const analyzedDocs = [];
+  const savedNames = [];
+  for (const att of attachments) {
+    const fileName = actsSafeFileName(att.fileName || `document_${Date.now()}`);
+    const buffer = Buffer.isBuffer(att.buffer) ? att.buffer : Buffer.from(att.buffer || '');
+    if (!buffer.length) continue;
+    try {
+      await uploadFileToDiskFolder(folderId, fileName, buffer);
+      savedNames.push(fileName);
+    } catch (e) {
+      console.warn(`[client-docs] ${source}: не сохранил ${fileName}: ${e.message || e}`);
+    }
+    const analysis = await clientDocsAnalyzeAttachment(buffer, fileName, att.contentType || '', messageText);
+    analyzedDocs.push(analysis);
+    console.log(`[client-docs] ${source}: ${fileName} → ${analysis.documentType}, person=${analysis.person || '-'}, confidence=${analysis.confidence}`);
+  }
+
+  if (!savedNames.length && !analyzedDocs.length) return { ok: true, processed: 0, reason: 'empty-files' };
+
+  const resultPerDeal = [];
+  const nowIso = new Date().toISOString();
+
+  for (const deal of deals) {
+    try {
+      const service = deal.__clientDocsService || await resolveDealServiceName(deal);
+      const oldState = await clientDocsLoadState(deal.ID);
+      const mergedDocs = clientDocsMergeDocs(oldState.docs, analyzedDocs);
+      const completeness = await clientDocsCheckCompleteness(deal, service, mergedDocs);
+
+      const statePayload = {
+        at: nowIso,
+        source,
+        companyName,
+        service,
+        docs: mergedDocs,
+        complete: completeness ? completeness.complete : false,
+        missing: completeness ? completeness.missing : [],
+      };
+      const receivedPayload = {
+        at: nowIso,
+        source,
+        files: savedNames,
+      };
+
+      const receivedText = analyzedDocs.map((d) =>
+        `— ${d.fileName}: ${d.documentType}${d.person ? ` — ${d.person}` : ''}${d.instrument ? ` — ${d.instrument}` : ''}`
+      ).join('\n');
+      const missingText = completeness && completeness.missing.length
+        ? completeness.missing.map((x) => `— ${x}`).join('\n')
+        : '— предварительно не выявлено';
+      const actionsText = completeness && completeness.actions_per_person.length
+        ? `\n\nПо специалистам:\n${completeness.actions_per_person.map((x) => `— ${x}`).join('\n')}`
+        : '';
+      const warningsText = completeness && completeness.warnings.length
+        ? `\n\nНужно проверить вручную:\n${completeness.warnings.map((x) => `— ${x}`).join('\n')}`
+        : '';
+
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: deal.ID,
+          ENTITY_TYPE: 'deal',
+          COMMENT: `${CLIENT_DOCS_RECEIVED_MARKER}\n${JSON.stringify(receivedPayload)}\n\n📨 ИИгорь получил документы через ${source} и сохранил их в папку компании.\n${receivedText}\n\nНе хватает:\n${missingText}${actionsText}${warningsText}\n\n${CLIENT_DOCS_STATE_MARKER}\n${JSON.stringify(statePayload)}`,
+        },
+      });
+
+      pendingDocsCheck.delete(String(deal.ID)); // первый пуш уже не нужен: клиент что-то прислал
+      await clientDocsNotifyExpert(deal, source, analyzedDocs, completeness);
+      resultPerDeal.push({ deal, service, completeness });
+    } catch (e) {
+      console.warn(`[client-docs] deal=${deal.ID}: ${e.message || e}`);
+    }
+  }
+
+  if (resultPerDeal.length) {
+    const updateText = clientDocsBuildClientUpdate(resultPerDeal);
+    const send = await sendClientTextByPreferredChannel(primary, updateText, `Получены документы: ${primary.TITLE}`).catch((e) => ({ ok:false, error:e.message || String(e) }));
+    await bitrixRestCall('crm.timeline.comment.add', {
+      fields: {
+        ENTITY_ID: primary.ID,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `[MAVIS_CLIENT_DOCS_REPLY]\nИИгорь: ${send.ok ? `отправил клиенту обновлённый статус через ${send.channel}` : `не смог отправить клиенту обновлённый статус: ${send.error || 'ошибка'}`}.`,
+      },
+    }).catch(() => {});
+  }
+
+  return { ok: true, processed: savedNames.length || analyzedDocs.length, deals: resultPerDeal.map((x) => x.deal.ID) };
+}
+
+async function clientDocsProcessIncomingWazzupMessage(msg) {
+  const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+  if (!phone) return { ok: true, processed: 0, reason: 'no-phone' };
+  const channel = String(msg.chatType || findChannelKeyByChannelId(msg.channelId) || 'Wazzup');
+  const fallbackExt = String(msg.type || '').toLowerCase() === 'image' ? '.jpg' : '.pdf';
+  const fromUrl = actsIncomingFileNameFromUrl(msg.contentUri, '');
+  const fallback = fromUrl || `Документ_${phone.slice(-4)}_${Date.now()}${fallbackExt}`;
+  const downloaded = await actsDownloadIncomingUrl(msg.contentUri, fallback);
+  console.log(`[client-docs] Wazzup ${channel}: inbound ${downloaded.fileName}, phone=***${phone.slice(-4)}`);
+  return clientDocsProcessIncomingAttachments({
+    source: /^viber$/i.test(channel) ? 'Viber' : /^telegram$/i.test(channel) ? 'Telegram' : 'Wazzup',
+    commType: 'PHONE',
+    commValue: phone,
+    messageText: msg.text || '',
+    attachments: [downloaded],
+  });
+}
+
+// ======================= /v78: CJM БЛОКИ 3–4 ================================
+
 function maskEmailForLog(email) {
   const e = String(email || '').trim();
   const parts = e.split('@');
@@ -8022,8 +8821,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v76 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'auto'}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v78 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'auto'}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
@@ -8040,6 +8839,7 @@ app.listen(PORT, () => {
 
   if (config.bitrixWebhookUrl && config.autopilotEnabled) {
     console.log(`[autopilot] Фоновый автопилот включён (интервал ${AUTOPILOT_POLL_INTERVAL_MS / 60000} мин). Старт с ${AUTOPILOT_START_DATE.toISOString()}.`);
+    setTimeout(() => recoverPendingDocsChecks().catch((e) => console.warn(`[docsReminder] recovery: ${e.message || e}`)), 1500);
     // v60: первый цикл сразу после старта, а не через 2 минуты.
     setTimeout(() => runAutopilotPollingCycle(), 2000);
     setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
