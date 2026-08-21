@@ -83,7 +83,9 @@ const config = {
   // v43: тестовый режим ассистента-исполнителя на одной сделке.
   executorMode: String(process.env.EXECUTOR_MODE || 'false').toLowerCase() === 'true',
   executorTestDealId: process.env.EXECUTOR_TEST_DEAL_ID || '',
-  executorAllDeals: String(process.env.EXECUTOR_ALL_DEALS || 'false').toLowerCase() === 'true',
+  // v80: автопилот работает по всем подходящим сделкам Производства.
+  // Ограничение одной тестовой сделкой полностью снято. EXECUTOR_TEST_DEAL_ID больше не ограничивает polling.
+  executorAllDeals: true,
   executorExpertId: process.env.EXECUTOR_EXPERT_ID || '',
   executorLeaderId: process.env.EXECUTOR_LEADER_ID || process.env.EXECUTOR_EXPERT_ID || '',
   executorProduct: process.env.EXECUTOR_PRODUCT || 'attestation',
@@ -220,7 +222,8 @@ const config = {
   clientDocsIncomingEnabled: String(process.env.CLIENT_DOCS_INCOMING_ENABLED || 'true').toLowerCase() !== 'false',
   clientDocsWazzupEnabled: String(process.env.CLIENT_DOCS_WAZZUP_ENABLED || 'true').toLowerCase() !== 'false',
   clientDocsEmailEnabled: String(process.env.CLIENT_DOCS_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
-  clientDocsAllDeals: String(process.env.CLIENT_DOCS_ALL_DEALS || 'false').toLowerCase() === 'true',
+  // v80: входящие документы Аттестации/СПК обрабатываем по всем активным подходящим сделкам.
+  clientDocsAllDeals: true,
   clientDocsTestDealId: process.env.CLIENT_DOCS_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || process.env.LIVE_CHAT_TEST_DEAL_ID || '',
   clientDocsLeaderId: process.env.CLIENT_DOCS_LEADER_ID || process.env.TANYA_USER_ID || '2182',
 
@@ -5156,22 +5159,10 @@ async function runAutopilotPollingCycle() {
       return;
     }
 
-    // v59: для пилота не фильтруем сделку по MOVED_TIME/дате создания.
-    // ИИгорь должен подхватить тестовую сделку, даже если она была создана или переведена
-    // на текущую стадию больше 24 часов назад. При этом не допускаем массовую обработку
-    // старых сделок: если задан тестовый ID, ищем только его. Массовый режим разрешается
-    // только явно через EXECUTOR_ALL_DEALS=true.
-    const targetTestDealId = String(config.executorTestDealId || config.liveChatTestDealId || '').trim();
-    const testOnlyMode = Boolean(targetTestDealId && !config.executorAllDeals);
-
-    if (testOnlyMode) {
-      console.log(`[autopilot] Тестовый режим: ищу сделку ID ${targetTestDealId} по текущей стадии без ограничения 24 часа.`);
-    } else if (config.executorAllDeals) {
-      console.log('[autopilot] EXECUTOR_ALL_DEALS=true: ищу все сделки на целевых стадиях без ограничения по времени.');
-    } else {
-      console.warn('[autopilot] Не задан EXECUTOR_TEST_DEAL_ID/LIVE_CHAT_TEST_DEAL_ID и EXECUTOR_ALL_DEALS=false — цикл пропущен для защиты от массовой обработки.');
-      return;
-    }
+    // v80: работаем по ВСЕМ подходящим сделкам Производства.
+    // EXECUTOR_TEST_DEAL_ID / LIVE_CHAT_TEST_DEAL_ID больше не ограничивают фоновый автопилот.
+    // Единственный общий аварийный выключатель — AUTOPILOT_ENABLED=false.
+    console.log('[autopilot] v80: массовый режим — ищу все сделки на целевых стадиях без ограничения одной тестовой сделкой.');
 
     // Собираем сделки по каждой стадии отдельно (Bitrix не поддерживает массив в STAGE_ID фильтре).
     const allDeals = [];
@@ -5181,7 +5172,6 @@ async function runAutopilotPollingCycle() {
         CATEGORY_ID: config.autopilotCategoryId || 28,
         STAGE_ID: stageId,
       };
-      if (testOnlyMode) filter.ID = targetTestDealId;
 
       const deals = await bitrixRestList('crm.deal.list', {
         filter,
@@ -5198,7 +5188,7 @@ async function runAutopilotPollingCycle() {
       }
     }
 
-    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}]${testOnlyMode ? ` для тестовой сделки ID ${targetTestDealId}` : ''}.`);
+    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] по всей воронке Производства.`);
 
     for (const deal of allDeals) {
       if (autopilotProcessed.has(String(deal.ID))) continue;
