@@ -206,6 +206,10 @@ const config = {
   actsPushTestMinutes: Number(process.env.ACTS_PUSH_TEST_MINUTES || 0),
   actsCallTestMinutes: Number(process.env.ACTS_CALL_TEST_MINUTES || 0),
   actsPushRecoveryDays: Number(process.env.ACTS_PUSH_RECOVERY_DAYS || 30),
+  // v81: если клиент прислал PDF/изображение, но ИИ не смог уверенно классифицировать файл,
+  // не шлём напоминание сразу: даём окну ручной/повторной проверки.
+  actsIncomingUncertainHoldHours: Number(process.env.ACTS_INCOMING_UNCERTAIN_HOLD_HOURS || 24),
+  actsPushStateRefreshMinutes: Number(process.env.ACTS_PUSH_STATE_REFRESH_MINUTES || 10),
   // Не обрабатываем исторические задачи «Сделано» до запуска боевого режима актов.
   actsProductionStartIso: process.env.ACTS_PRODUCTION_START_ISO || '2026-08-18T14:56:00+03:00',
   // v71: входящие подписанные сканы актов из Wazzup (Viber/Telegram) и почты.
@@ -6312,6 +6316,7 @@ const ACTS_PUSH_SENT_MARKER = '[MAVIS_ACTS_PUSH_SENT]';
 const ACTS_SCAN_RECEIVED_MARKER = '[MAVIS_ACTS_SCAN_RECEIVED]';
 const ACTS_CALL_TASK_MARKER = '[MAVIS_ACTS_CALL_TASK_CREATED]';
 const ACTS_PUSH_STATE_MARKER = '[MAVIS_ACTS_PUSH_STATE]';
+const ACTS_FILE_PENDING_MARKER = '[MAVIS_ACTS_FILE_PENDING]';
 const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
 let actsPushCycleRunning = false;
 
@@ -6366,7 +6371,7 @@ function actsExtractChannelFromSentComment(commentText) {
   return human ? actsNormalizeChannelKey(human[1]) : '';
 }
 
-async function actsLoadTimelineComments(dealId, limit = 100) {
+async function actsLoadTimelineComments(dealId, limit = 300) {
   return bitrixRestList('crm.timeline.comment.list', {
     filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
     order: { CREATED: 'DESC' },
@@ -6380,6 +6385,42 @@ function actsTimelineFiles(comment) {
   if (Array.isArray(raw)) return raw;
   if (typeof raw === 'object') return Object.values(raw);
   return [];
+}
+
+function actsCommentIsAfterSend(comment, sentAtMs, toleranceMs = 60 * 1000) {
+  const createdMs = actsParseTimelineCreated(comment);
+  if (!createdMs) return false;
+  return createdMs >= Number(sentAtMs || 0) - Math.max(0, Number(toleranceMs || 0));
+}
+
+function actsFindLatestMarkerAfterSend(comments, marker, sentAtMs) {
+  return (comments || [])
+    .filter((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, sentAtMs))
+    .sort((a,b) => actsParseTimelineCreated(b) - actsParseTimelineCreated(a))[0] || null;
+}
+
+function actsTrustedScanMarker(comment, sentAtMs) {
+  if (!comment || !actsCommentIsAfterSend(comment, sentAtMs)) return false;
+  const text = String(comment.COMMENT || '');
+  if (!text.includes(ACTS_SCAN_RECEIVED_MARKER)) return false;
+  // v82: старые ложные маркеры могли создаваться просто из-за любого нового файла в задаче/таймлайне.
+  // Доверяем только входящему акту, который был сохранён обработчиком, либо бумажному оригиналу в Архиве.
+  return /сохранено/i.test(text) || /архив/i.test(text);
+}
+
+async function actsMarkFilePending(state, source, fileName = '') {
+  const marker = `${ACTS_FILE_PENDING_MARKER} task=${state.taskId}`;
+  const comments = await actsLoadTimelineComments(state.dealId, 300).catch(() => []);
+  const recent = actsFindLatestMarkerAfterSend(comments, marker, state.sentAtMs);
+  const holdMs = Math.max(1, Number(config.actsIncomingUncertainHoldHours || 24)) * 60 * 60 * 1000;
+  if (recent) {
+    const t = actsParseTimelineCreated(recent);
+    if (t && Date.now() - t < holdMs) return;
+  }
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: state.dealId, ENTITY_TYPE: 'deal',
+    COMMENT: `${marker}\nПосле отправки акта появился новый файл${fileName ? ` «${fileName}»` : ''} (${source}). Пока не считаю его подписанным актом автоматически; автопуш временно приостановлен на ${config.actsIncomingUncertainHoldHours || 24} ч.`
+  }}).catch(() => {});
 }
 
 async function actsMarkScanReceived(state, source, fileName = '') {
@@ -6416,7 +6457,9 @@ actsResolveArchiveStageId.cache = '';
 async function actsCheckScanReceived(state, task = null, dealComments = null) {
   const scanMarker = `${ACTS_SCAN_RECEIVED_MARKER} task=${state.taskId}`;
   const comments = dealComments || await actsLoadTimelineComments(state.dealId, 100);
-  if (comments.some((c) => String(c.COMMENT || '').includes(scanMarker))) return true;
+  // v81: старые тестовые маркеры по той же задаче не должны навсегда глушить новый цикл.
+  // Учитываем только маркер, появившийся после текущей отправки акта.
+  if (comments.some((c) => String(c.COMMENT || '').includes(scanMarker) && actsTrustedScanMarker(c, state.sentAtMs))) return true;
 
   // Если задача уже в «Архиве», бумажный оригинал вернулся — пушить точно больше не нужно.
   try {
@@ -6434,8 +6477,8 @@ async function actsCheckScanReceived(state, task = null, dealComments = null) {
       return true;
     }
 
-    // В task chat исходный акт был прикреплён ДО отправки. Любой новый документ/изображение,
-    // появившийся после отправки, считаем вернувшимся сканом (эксперт прикрепил ответ клиента в Bitrix).
+    // v82: любой новый файл в задаче больше НЕ означает автоматически «подписанный акт».
+    // Это мог быть исходный файл, договор, счёт или техническая копия — из-за этого часть клиентов ошибочно выпадала из пушей.
     const resolved = await actsResolveTaskFiles(task);
     const originalName = actsCleanText(state.originalFileName || '').toLowerCase();
     const candidates = (resolved.files || []).filter((f) => {
@@ -6443,27 +6486,26 @@ async function actsCheckScanReceived(state, task = null, dealComments = null) {
       if (!fileMs || fileMs <= Number(state.sentAtMs || 0) + 30 * 1000) return false;
       const name = actsCleanText(f && f.name || '');
       if (!name) return false;
-      if (originalName && name.toLowerCase() === originalName && String(f.source || '') !== 'task-chat') return false;
+      if (originalName && name.toLowerCase() === originalName) return false;
       return /\.(pdf|docx?|jpg|jpeg|png|heic|tiff?|bmp)$/i.test(name) || /акт|скан|подпис/i.test(name);
     });
     if (candidates.length) {
       const newest = [...candidates].sort((a,b) => actsParseDateMs(b.date) - actsParseDateMs(a.date))[0];
-      await actsMarkScanReceived(state, 'новый файл в задаче после отправки акта', newest.name || 'файл');
-      return true;
+      await actsMarkFilePending(state, 'файл в задаче после отправки', newest.name || 'файл');
     }
   } catch (e) {
     console.warn(`[acts-push] task=${state.taskId}: не смог проверить файлы задачи: ${e.message || e}`);
   }
 
-  // Если эксперт прикрепил скан прямо в таймлайн сделки — тоже останавливаем пуши.
+  // Файл в таймлайне сделки тоже не считаем подписанным актом без проверки.
   for (const c of comments) {
     const createdMs = actsParseTimelineCreated(c);
     if (!createdMs || createdMs <= Number(state.sentAtMs || 0) + 30 * 1000) continue;
     const files = actsTimelineFiles(c);
     if (!files.length) continue;
     const f = files[0] || {};
-    await actsMarkScanReceived(state, 'файл в таймлайне сделки после отправки акта', actsCleanText(f.name || f.NAME || 'файл'));
-    return true;
+    await actsMarkFilePending(state, 'файл в таймлайне сделки', actsCleanText(f.name || f.NAME || 'файл'));
+    break;
   }
   return false;
 }
@@ -6576,16 +6618,29 @@ async function actsRegisterPushState({ taskId, dealId, channel, sentAtMs = Date.
   console.log(`[acts-push] Зарегистрирован контроль task=${taskId}, deal=${dealId}, channel=${actsNormalizeChannelKey(channel) || channel}, следующий пуш после ${new Date(actsNextPushDueFrom(sentAtMs)).toISOString()}.`);
 }
 
-async function actsRecoverPushStatesFromBitrix() {
+async function actsRecoverPushStatesFromBitrix(options = {}) {
   if (!config.actsPushEnabled || !config.bitrixWebhookUrl) return;
   const since = new Date(Date.now() - Math.max(7, Number(config.actsPushRecoveryDays || 30)) * 24 * 60 * 60 * 1000).toISOString();
   let tasks = [];
   try {
-    tasks = await bitrixRestList('tasks.task.list', {
-      filter: { GROUP_ID: config.actsProjectId, '>=CHANGED_DATE': since },
-      order: { CHANGED_DATE: 'DESC' },
-      select: ['ID','TITLE','STAGE_ID','CHAT_ID','UF_CRM_TASK','CHANGED_DATE'],
-    }, 1000);
+    const [changed, created] = await Promise.all([
+      bitrixRestList('tasks.task.list', {
+        filter: { GROUP_ID: config.actsProjectId, '>=CHANGED_DATE': since },
+        order: { CHANGED_DATE: 'DESC' },
+        select: ['ID','TITLE','DESCRIPTION','STAGE_ID','CHAT_ID','UF_CRM_TASK','CHANGED_DATE','CREATED_DATE'],
+      }, 2000),
+      bitrixRestList('tasks.task.list', {
+        filter: { GROUP_ID: config.actsProjectId, '>=CREATED_DATE': since },
+        order: { CREATED_DATE: 'DESC' },
+        select: ['ID','TITLE','DESCRIPTION','STAGE_ID','CHAT_ID','UF_CRM_TASK','CHANGED_DATE','CREATED_DATE'],
+      }, 2000),
+    ]);
+    const byId = new Map();
+    for (const t of [...(changed || []), ...(created || [])]) {
+      const id = String(actsTaskField(t, ['id','ID']) || '');
+      if (id) byId.set(id, t);
+    }
+    tasks = [...byId.values()];
   } catch (e) {
     console.warn(`[acts-push] Не смог восстановить состояния после старта: ${e.message || e}`);
     return;
@@ -6598,14 +6653,15 @@ async function actsRecoverPushStatesFromBitrix() {
     if (!taskId || !dealIds.length) continue;
     for (const dealId of dealIds.slice(0,1)) {
       try {
-        const comments = await actsLoadTimelineComments(dealId, 100);
+        const comments = await actsLoadTimelineComments(dealId, 300);
         const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
         const sentComment = comments.find((c) => String(c.COMMENT || '').includes(sentMarker));
         if (!sentComment) continue;
-        if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_SCAN_RECEIVED_MARKER} task=${taskId}`))) continue;
         const sentAtMs = actsParseTimelineCreated(sentComment);
         if (!sentAtMs) continue;
-        const pushComments = comments.filter((c) => String(c.COMMENT || '').includes(`${ACTS_PUSH_SENT_MARKER} task=${taskId}`));
+        // v81: игнорируем старые scan/push маркеры, оставшиеся от предыдущих тестов этой же задачи.
+        if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_SCAN_RECEIVED_MARKER} task=${taskId}`) && actsTrustedScanMarker(c, sentAtMs))) continue;
+        const pushComments = comments.filter((c) => String(c.COMMENT || '').includes(`${ACTS_PUSH_SENT_MARKER} task=${taskId}`) && actsCommentIsAfterSend(c, sentAtMs));
         const lastPush = [...pushComments].sort((a,b) => actsParseTimelineCreated(b)-actsParseTimelineCreated(a))[0];
         const lastMessageAtMs = lastPush ? actsParseTimelineCreated(lastPush) : sentAtMs;
         const channel = actsExtractChannelFromSentComment(sentComment.COMMENT) || await detectPreferredChannelResolved(await bitrixRestCall('crm.deal.get', { id: dealId }));
@@ -6617,21 +6673,48 @@ async function actsRecoverPushStatesFromBitrix() {
       }
     }
   }
-  console.log(`[acts-push] После старта восстановлено ${restored} активных контролей из Bitrix (окно ${config.actsPushRecoveryDays || 30} дней).`);
+  if (!options.silent) console.log(`[acts-push] Восстановлено ${restored} активных контролей из ${actTasks.length} задач на акт (просмотрено ${tasks.length} задач проекта, окно ${config.actsPushRecoveryDays || 30} дней).`);
+  return restored;
+}
+
+let actsLastStateRefreshAtMs = 0;
+
+async function actsHasRecentUncertainIncoming(state, comments) {
+  const holdMs = Math.max(1, Number(config.actsIncomingUncertainHoldHours || 24)) * 60 * 60 * 1000;
+  const marker = `${ACTS_FILE_PENDING_MARKER} task=${state.taskId}`;
+  const latest = actsFindLatestMarkerAfterSend(comments, marker, state.sentAtMs);
+  if (!latest) return false;
+  const createdMs = actsParseTimelineCreated(latest);
+  return !!createdMs && Date.now() - createdMs < holdMs;
 }
 
 async function runActsPushCycle() {
   if (!config.actsPushEnabled || !config.bitrixWebhookUrl || actsPushCycleRunning) return;
   actsPushCycleRunning = true;
   try {
-    if (!actsPushStates.size) return;
+    // v82: перед КАЖДОЙ проверкой заново сверяемся с Bitrix, чтобы ни один отправленный акт
+    // не зависел только от памяти Render и не выпадал после деплоя/рестарта.
+    actsLastStateRefreshAtMs = Date.now();
+    try { await actsRecoverPushStatesFromBitrix({ silent: true }); } catch (e) { console.warn(`[acts-push] refresh states: ${e.message || e}`); }
+    if (!actsPushStates.size) {
+      console.log('[acts-push] Активных контролей не найдено.');
+      return;
+    }
     const now = Date.now();
-    for (const state of [...actsPushStates.values()]) {
+    const allStates = [...actsPushStates.values()];
+    const dueCount = allStates.filter((st) => now >= actsNextPushDueFrom(st.lastMessageAtMs || st.sentAtMs)).length;
+    console.log(`[acts-push] Цикл: активных=${allStates.length}, по сроку=${dueCount}.`);
+    for (const state of allStates) {
       try {
         const comments = await actsLoadTimelineComments(state.dealId, 100);
         const deal = await bitrixRestCall('crm.deal.get', { id: state.dealId });
         if (!deal) continue;
         if (await actsCheckScanReceived(state, null, comments)) continue;
+        // v81: если клиент уже прислал файл, но ИИ временно не уверен, не отправляем нелепое напоминание.
+        if (await actsHasRecentUncertainIncoming(state, comments)) {
+          console.log(`[acts-push] task=${state.taskId}: есть свежий входящий файл на проверке — пуш временно приостановлен.`);
+          continue;
+        }
 
         await actsCreateCallTaskIfNeeded(state, deal, comments);
 
@@ -6922,7 +7005,22 @@ async function actsProcessIncomingAttachments({ source, commType, commValue, mes
     if (!buffer.length) continue;
     const check = await actsAiCheckSignedAct(buffer, fileName, att.contentType || '', messageText);
     console.log(`[acts-incoming] ${source}: ${fileName}; signed=${check.isSignedAct}; confidence=${check.confidence}; reason=${check.reason || ''}`);
-    if (!check.isSignedAct) continue;
+    if (!check.isSignedAct) {
+      const uncertain = String(check.confidence || 'low').toLowerCase() === 'low' || /не сработал|не удалось|ошиб|не поддерж/i.test(String(check.reason || ''));
+      if (uncertain) {
+        const marker = `${ACTS_FILE_PENDING_MARKER} task=${target.state.taskId}`;
+        const comments = await actsLoadTimelineComments(target.state.dealId, 100).catch(() => []);
+        const already = actsFindLatestMarkerAfterSend(comments, marker, target.state.sentAtMs);
+        if (!already) {
+          await bitrixRestCall('crm.timeline.comment.add', { fields: {
+            ENTITY_ID: target.state.dealId, ENTITY_TYPE: 'deal',
+            COMMENT: `${marker}\nКлиент прислал файл «${fileName}», но ИИ не смог уверенно определить, подписанный ли это акт. Автопуш временно приостановлен на ${config.actsIncomingUncertainHoldHours || 24} ч, чтобы не напоминать клиенту ошибочно.`
+          }}).catch(() => {});
+        }
+        console.warn(`[acts-incoming] task=${target.state.taskId}: файл ${fileName} не классифицирован уверенно — пуши поставлены на паузу.`);
+      }
+      continue;
+    }
     return actsSaveIncomingScanForState({ state: target.state, deal: target.deal, source, fileName, buffer, contentType: att.contentType || '', skipCompanyFolder });
   }
   return { ok: true, processed: 0, reason: 'no-signed-act-detected' };
