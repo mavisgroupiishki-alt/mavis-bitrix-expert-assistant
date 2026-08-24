@@ -139,6 +139,13 @@ const config = {
   selectionLeaderDays: Number(process.env.SELECTION_LEADER_DAYS || 14),
   collectionTestMinutes: Number(process.env.COLLECTION_TEST_MINUTES || 0),
   selectionTestMinutes: Number(process.env.SELECTION_TEST_MINUTES || 0),
+  // v86: временный ускоренный тестовый контур только для ООО «Бобик» (deal 38072).
+  // Позволяет прогнать CJM 1–6 с минимумом ручных действий, не ускоряя реальные сделки.
+  cjmTestMode: String(process.env.CJM_TEST_MODE || 'true').toLowerCase() !== 'false',
+  cjmTestDealId: String(process.env.CJM_TEST_DEAL_ID || '38072'),
+  // v87: только в тестовом CJM-контуре Бобика разрешаем сформировать Ход работы без звонка.
+  // Боевые сделки по-прежнему требуют содержательный звонок >=60 сек.
+  cjmTestAllowNoCall: String(process.env.CJM_TEST_ALLOW_NO_CALL || 'true').toLowerCase() !== 'false',
 
   // v45: ИИгорь — диагностика воронки прорабов.
   foremanCategoryId: Number(process.env.FOREMAN_CATEGORY_ID || 32),
@@ -2167,6 +2174,11 @@ const TANYA_USER_ID = 2182; // Татьяна Куровская
 const NPS_GROUP_ID = 114;   // Группа задач "Сбор NPS"
 const UNASSIGNED_NOTIFIED = new Map(); // dealId → lastNotifiedAt (Date)
 
+function isCjmTestDeal(dealId) {
+  return Boolean(config.cjmTestMode) && String(dealId || '') === String(config.cjmTestDealId || '');
+}
+
+
 const MINSK_PARTS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
   timeZone: 'Europe/Minsk',
   weekday: 'short',
@@ -2761,8 +2773,9 @@ async function checkUnassignedDeals() {
     }, 100);
 
     const now = new Date();
-    const testMinutes = Math.max(0, Number(config.unassignedTestMinutes || 0));
+    const globalTestMinutes = Math.max(0, Number(config.unassignedTestMinutes || 0));
     for (const deal of deals) {
+      const testMinutes = isCjmTestDeal(deal.ID) ? 2 : globalTestMinutes;
       if (await isDealAiDisabledAsync(deal)) {
         console.log(`[AI] Сделка ${deal.ID} помечена "ИИ=Нет" — пропускаю распределение.`);
         continue;
@@ -2812,6 +2825,7 @@ const AUTOPILOT_MARKER = '[MAVIS_AUTOPILOT_DONE]';
 const AUTOPILOT_ERROR_MARKER = '[MAVIS_AUTOPILOT_ERROR]';
 const AUTOPILOT_SEND_PENDING_MARKER = '[MAVIS_AUTOPILOT_SEND_PENDING]';
 const AUTOPILOT_CALL_REJECTED_MARKER = '[MAVIS_AUTOPILOT_CALL_REJECTED]';
+const AUTOPILOT_CALL_DONE_MARKER = '[MAVIS_AUTOPILOT_CALL_DONE]';
 const AUTOPILOT_POLL_INTERVAL_MS = Math.max(1, Number(config.autopilotPollIntervalMinutes || 10)) * 60 * 1000;
 let autopilotCycleRunning = false;
 
@@ -2874,6 +2888,9 @@ function getPreparationStageId() {
 
 async function dealAlreadyProcessed(dealId) {
   if (autopilotProcessed.has(String(dealId))) return true;
+  // v86: для тестового Бобика старые DONE-маркеры прошлых прогонов не блокируют новый тестовый цикл.
+  // Повтор того же звонка блокируется отдельным marker activity=... внутри runServerAutopilotForDeal.
+  if (isCjmTestDeal(dealId)) return false;
   // Проверяем таймлайн сделки на наличие маркера выполненного автопилота.
   try {
     const comments = await bitrixRestList('crm.timeline.comment.list', {
@@ -4127,26 +4144,55 @@ async function runServerAutopilotForDeal(deal, stageId) {
     }
 
     // 2. Ищем запись звонка.
-    const callRecord = await findCallForDeal(dealId, { deal, assignedById: deal.ASSIGNED_BY_ID, minDate: deal.MOVED_TIME });
+    // v87: для тестового Бобика можно прогнать CJM без звонка вообще. Это ТОЛЬКО тестовый fallback.
+    // Все остальные сделки по-прежнему требуют содержательный звонок >=60 сек.
+    const testDeal = isCjmTestDeal(dealId);
+    let callRecord = await findCallForDeal(dealId, {
+      deal,
+      assignedById: testDeal ? '' : deal.ASSIGNED_BY_ID,
+      minDate: testDeal ? '' : deal.MOVED_TIME,
+    });
+    let noCallTestMode = false;
+    if (!callRecord && testDeal && config.cjmTestAllowNoCall) {
+      const stageStamp = String(deal.MOVED_TIME || deal.STAGE_ID || 'stage')
+        .replace(/[^0-9A-Za-zА-Яа-я_-]+/g, '_')
+        .slice(0, 80);
+      callRecord = {
+        activityId: `NO_CALL_${stageStamp || 'TEST'}`,
+        durationSec: null,
+        subject: 'CJM тест без звонка',
+        url: '',
+      };
+      noCallTestMode = true;
+      console.log(`${logPrefix} v87 TEST: звонка нет — для Бобика формирую стартовый Ход работы только из данных сделки и стандартного перечня документов.`);
+    }
     if (!callRecord) {
       console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
       return;
     }
+    if (testDeal && await autopilotTimelineHasMarker(dealId, `${AUTOPILOT_CALL_DONE_MARKER} activity=${callRecord.activityId}`, 500)) {
+      console.log(`${logPrefix} Тестовый цикл activity=${callRecord.activityId} уже успешно использован — повторно не отправляю.`);
+      autopilotProcessed.add(String(dealId));
+      return;
+    }
 
-    // 2. Расшифровываем. v79: placeholder/empty STT is NOT a deal error.
-    console.log(`${logPrefix} Расшифровываю звонок: ${callRecord.subject || callRecord.url}`);
-    const transcription = await transcribeCallBestEffort(callRecord, logPrefix);
-    const transcript = String(transcription.text || '').trim();
-    if (!transcription.ready || transcriptLooksLikePlaceholder(transcript)) {
-      console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю позже БЕЗ комментариев в CRM.`);
-      return;
+    // 2. Расшифровываем, если звонок есть. В no-call тесте ничего не выдумываем из несуществующего разговора.
+    let transcript = '';
+    if (!noCallTestMode) {
+      console.log(`${logPrefix} Расшифровываю звонок: ${callRecord.subject || callRecord.url}`);
+      const transcription = await transcribeCallBestEffort(callRecord, logPrefix);
+      transcript = String(transcription.text || '').trim();
+      if (!transcription.ready || transcriptLooksLikePlaceholder(transcript)) {
+        console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю позже БЕЗ комментариев в CRM.`);
+        return;
+      }
+      if (looksLikeCallbackOnlyTranscript(transcript)) {
+        autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
+        console.log(`${logPrefix} Звонок ${callRecord.activityId} похож на короткое служебное касание/просьбу перезвонить — ход работы не запускаю.`);
+        return;
+      }
+      console.log(`${logPrefix} Первый звонок-кандидат: activity=${callRecord.activityId}, duration=${callRecord.durationSec ?? 'не определена'} сек, transcript=${transcript.length} символов.`);
     }
-    if (looksLikeCallbackOnlyTranscript(transcript)) {
-      autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
-      console.log(`${logPrefix} Звонок ${callRecord.activityId} похож на короткое служебное касание/просьбу перезвонить — ход работы не запускаю.`);
-      return;
-    }
-    console.log(`${logPrefix} Первый звонок-кандидат: activity=${callRecord.activityId}, duration=${callRecord.durationSec ?? 'не определена'} сек, transcript=${transcript.length} символов.`);
 
     // 3. Ищем сделки-компаньоны (другие услуги той же компании на той же стадии).
     const siblings = stageId ? await findSiblingDeals(deal, stageId) : [];
@@ -4176,18 +4222,26 @@ async function runServerAutopilotForDeal(deal, stageId) {
 
     const systemPrompt = [
       'Ты ИИ-ассистент Игорь, помощник эксперта производства MAVIS GROUP.',
-      'Твоя задача — проверить, был ли это полноценный первый рабочий звонок, и только затем заполнить шаблон хода работы.',
-      'call_qualified=false, если это только просьба перезвонить, автоответчик, ошибочный номер, разговор без обсуждения услуги/документов/следующих шагов.',
-      'Если длительность звонка известна и меньше 60 секунд — call_qualified=false.',
+      noCallTestMode
+        ? 'Это тестовый сценарий БЕЗ звонка. Сформируй стартовый ход работы только из полей сделки, комментариев и стандартного перечня документов. НЕ придумывай договорённости, ФИО, сроки или факты, которых нет в данных.'
+        : 'Твоя задача — проверить, был ли это полноценный первый рабочий звонок, и только затем заполнить шаблон хода работы.',
+      noCallTestMode
+        ? 'В клиентском сообщении не пиши «по итогам разговора», «как договорились», «вы говорили» и другие ссылки на несуществующий звонок. Начинай нейтрально: «Фиксируем дальнейший ход работы...».'
+        : 'call_qualified=false, если это только просьба перезвонить, автоответчик, ошибочный номер, разговор без обсуждения услуги/документов/следующих шагов.',
+      noCallTestMode
+        ? 'Для этого теста call_qualified=true. В comment явно отметь: «Тестовый Ход работы сформирован без звонка, только по данным сделки». '
+        : 'Если длительность звонка известна и меньше 60 секунд — call_qualified=false.',
       'Шаблон уже задан в контексте. client_message — готовый ход работы для клиента с конкретными данными, без плейсхолдеров.',
-      'comment — ПОЛНЫЙ отчёт эксперту: что выяснили, специалисты/роли, что уже есть, чего не хватает, сроки, риски и следующий шаг. Не ограничивайся 3-5 строками.',
-      'Если эксперт не назвал срок предоставления документов, используй ровно стандартный срок +2 календарных дня, который передан в prompt.',
+      'comment — ПОЛНЫЙ отчёт эксперту: что известно, специалисты/роли, что уже есть, чего не хватает, сроки, риски и следующий шаг. Не ограничивайся 3-5 строками.',
+      noCallTestMode
+        ? 'Так как срока из звонка нет, используй ровно стандартный срок +2 календарных дня, который передан в prompt.'
+        : 'Если эксперт не назвал срок предоставления документов, используй ровно стандартный срок +2 календарных дня, который передан в prompt.',
       'Верни только валидный JSON без markdown.',
     ].join('\n');
     
     const template = getClientMessageTemplate(detectServiceFromDeal(deal));
     
-    const userPrompt = `Ты получил звонок от клиента ${context.contact.name || 'клиента'}. Заполни шаблон хода работы.
+    const userPrompt = `${noCallTestMode ? `Звонка с клиентом нет. Это тестовый прогон сделки ${deal.TITLE}. Сформируй стартовый Ход работы по данным сделки.` : `Ты получил звонок от клиента ${context.contact.name || 'клиента'}. Заполни шаблон хода работы.`}
 
 ШАБЛОН (заполни все плейсхолдеры):
 ${template}
@@ -4227,13 +4281,14 @@ ${JSON.stringify(context, null, 2).slice(0, 20000)}
    - Все ФИО и названия конкретные
    - Текст читается как готовое сообщение клиенту (можно копировать в Telegram/Viber)
 
-6. КВАЛИФИКАЦИЯ ЗВОНКА:
+6. КВАЛИФИКАЦИЯ:
+   - Режим: ${noCallTestMode ? 'ТЕСТ БЕЗ ЗВОНКА' : 'звонок'}
    - Известная длительность: ${callRecord.durationSec ?? 'не определена'} сек
-   - call_qualified=true только если это содержательный первый разговор по услуге, а не просьба перезвонить
+   - ${noCallTestMode ? 'Для теста поставь call_qualified=true и call_reason="тест без звонка"' : 'call_qualified=true только если это содержательный первый разговор по услуге, а не просьба перезвонить'}
    - call_reason — коротко объясни решение
 
 7. comment: полный рабочий отчёт эксперту. Обязательно перечисли:
-   - что договорились с клиентом;
+   - ${noCallTestMode ? 'что известно из сделки; НЕ пиши, что с клиентом о чём-то договорились' : 'что договорились с клиентом'};
    - специалисты/должности и кто кого закрывает, если обсуждалось;
    - какие документы уже есть и каких не хватает;
    - дедлайны;
@@ -4258,7 +4313,7 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
     }
 
     const callQualifiedRaw = aiResult.call_qualified;
-    const callQualified = callQualifiedRaw === true
+    const callQualified = noCallTestMode || callQualifiedRaw === true
       || String(callQualifiedRaw || '').toLowerCase() === 'true'
       || (callQualifiedRaw === undefined && callRecord.durationSec !== null && Number(callRecord.durationSec) >= 60 && !looksLikeCallbackOnlyTranscript(transcript));
     if (!callQualified) {
@@ -4386,7 +4441,8 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
     }
 
     const clientMsgForComment = `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`;
-    const commentText = `${AUTOPILOT_MARKER}${siblingNote}\n\n${sendStatus}\n\n📋 Ход работы / отчёт эксперту:\n${dealComment}${clientMsgForComment}`;
+    const callDoneSuffix = testDeal ? `\n${AUTOPILOT_CALL_DONE_MARKER} activity=${callRecord.activityId}` : '';
+    const commentText = `${AUTOPILOT_MARKER}${callDoneSuffix}${siblingNote}\n\n${sendStatus}\n\n📋 Ход работы / отчёт эксперту:\n${dealComment}${clientMsgForComment}`;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
@@ -4925,7 +4981,7 @@ async function checkPendingDocsReminders() {
     } catch (_) {}
 
     const now = new Date();
-    const testMinutes = Math.max(0, Number(config.docsReminderTestMinutes || 0));
+    const testMinutes = isCjmTestDeal(dealId) ? 2 : Math.max(0, Number(config.docsReminderTestMinutes || 0));
     const dueAt = testMinutes > 0
       ? new Date(new Date(trackInfo.sentAt).getTime() + testMinutes * 60000)
       : new Date(trackInfo.dueAt || resolveDocumentsDueAt('', trackInfo.sentAt));
@@ -5192,11 +5248,12 @@ async function checkCollectionCjmBlock5() {
       const waitingBase = lastDocsAt && lastDocsAt > movedAt ? lastDocsAt : movedAt;
       const stageDays = elapsedDaysExact(movedAt, now);
       const waitDays = elapsedDaysExact(waitingBase, now);
-      const testMin = Math.max(0, Number(config.collectionTestMinutes || 0));
+      const testDeal = isCjmTestDeal(deal.ID);
+      const testMin = testDeal ? 5 : Math.max(0, Number(config.collectionTestMinutes || 0));
       const waitMinutes = (now - waitingBase) / 60000;
       const stageMinutes = (now - movedAt) / 60000;
       const reminderDue = testMin > 0 ? waitMinutes >= testMin : waitDays >= Number(config.collectionReminderDays || 3);
-      const leaderDue = testMin > 0 ? stageMinutes >= testMin * 2 : stageDays >= Number(config.collectionLeaderDays || 7);
+      const leaderDue = testMin > 0 ? stageMinutes >= (testDeal ? 8 : testMin * 2) : stageDays >= Number(config.collectionLeaderDays || 7);
 
       if (reminderDue && !(await timelineHasHumanSignature(deal.ID, COLLECTION_3D_TEXT))) {
         if (selection.need && ['mavis','client','contractor'].includes(selection.mode)) {
@@ -5379,12 +5436,13 @@ async function checkSelectionCjmBlock6() {
       const movedAt = new Date(deal.MOVED_TIME || 0);
       if (Number.isNaN(movedAt.getTime())) continue;
       const elapsedDays = elapsedDaysExact(movedAt, now);
-      const testMin = Math.max(0, Number(config.selectionTestMinutes || 0));
+      const testDeal = isCjmTestDeal(deal.ID);
+      const testMin = testDeal ? 2 : Math.max(0, Number(config.selectionTestMinutes || 0));
       const elapsedMinutes = (now - movedAt) / 60000;
       const everyDays = Math.max(1, Number(config.selectionExpertEveryDays || 7));
       const cycle = testMin > 0 ? Math.floor(elapsedMinutes / testMin) : Math.floor(elapsedDays / everyDays);
       const dueExpert = testMin > 0 ? elapsedMinutes >= testMin : elapsedDays >= everyDays;
-      const dueLeader = testMin > 0 ? elapsedMinutes >= testMin * 2 : elapsedDays >= Number(config.selectionLeaderDays || 14);
+      const dueLeader = testMin > 0 ? elapsedMinutes >= (testDeal ? 4 : testMin * 2) : elapsedDays >= Number(config.selectionLeaderDays || 14);
       const humanCycle = Math.max(1, cycle);
       const signature = `ИИгорь — контроль подбора: период ${humanCycle}.`;
 
@@ -9694,8 +9752,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v85 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v86 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
