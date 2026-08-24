@@ -742,10 +742,16 @@ function getConfiguredWazzupChannel(channelKey) {
       chatType: process.env.WAZZUP_CHAT_TYPE || 'whatsapp',
     },
   };
-  if (key && channels[key] && channels[key].channelId) return channels[key];
+  // v90: если вызывающий код явно попросил конкретный канал, НИКОГДА не подменяем его другим.
+  // Раньше при channelKey='viber' и проблеме с Viber-конфигом функция могла вернуть Telegram,
+  // что ломало строгий режим и потенциально могло отправить не туда.
+  if (key && Object.prototype.hasOwnProperty.call(channels, key)) {
+    return channels[key].channelId ? channels[key] : null;
+  }
+  // Без явного канала допускается только общий/default выбор для служебных сценариев.
+  if (channels.default.channelId) return channels.default;
   if (channels.telegram.channelId) return channels.telegram;
   if (channels.viber.channelId) return channels.viber;
-  if (channels.default.channelId) return channels.default;
   return null;
 }
 
@@ -830,7 +836,11 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     const deal = await loadFreshDeal(dealId);
     if (isDealAiDisabled(deal)) throw new Error('Поле ИИ=Нет — отправка клиенту заблокирована.');
     if (config.strictPreferredChannel && !ignoreStrictPreferredChannel) {
-      const preferred = detectPreferredChannel(deal);
+      // v90: пользовательское поле канала в Bitrix — enum. Сырой detectPreferredChannel()
+      // видит только текст и на enum-ID возвращает null. Из-за этого внешний код уже правильно
+      // распознавал Viber через detectPreferredChannelResolved(), но sendWazzupMessageInternal
+      // тут же повторно блокировал ту же отправку как «канал не распознан».
+      const preferred = await detectPreferredChannelResolved(deal);
       if (!preferred || preferred === 'email') {
         throw new Error(`Строгий режим канала: в сделке не выбран Telegram/Viber для Wazzup (выбрано: ${preferred || 'не распознано'}).`);
       }
