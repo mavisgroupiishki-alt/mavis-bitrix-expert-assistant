@@ -127,6 +127,18 @@ const config = {
   // Опционально: точный список экспертов, между которыми ИИгорь сравнивает текущую загрузку
   // при рекомендации распределения новой сделки. Пример: 2052,1960,2192,2198
   distributionExpertIds: parseIdList(process.env.DISTRIBUTION_EXPERT_IDS),
+  // v85: если явный список не задан, кандидатов на распределение определяем только
+  // по отделу Производства. Опорные эксперты нужны лишь чтобы автоматически найти ID отдела.
+  distributionExpertSeedIds: parseIdList(process.env.DISTRIBUTION_EXPERT_SEED_IDS || '2052,1960,2192,2198'),
+  // v85: CJM блоки 5–6 запускаются отдельно от старого STAGE_MONITORING_ENABLED.
+  collectionControlEnabled: String(process.env.COLLECTION_CONTROL_ENABLED || 'true').toLowerCase() !== 'false',
+  selectionControlEnabled: String(process.env.SELECTION_CONTROL_ENABLED || 'true').toLowerCase() !== 'false',
+  collectionReminderDays: Number(process.env.COLLECTION_REMINDER_DAYS || 3),
+  collectionLeaderDays: Number(process.env.COLLECTION_LEADER_DAYS || 7),
+  selectionExpertEveryDays: Number(process.env.SELECTION_EXPERT_EVERY_DAYS || 7),
+  selectionLeaderDays: Number(process.env.SELECTION_LEADER_DAYS || 14),
+  collectionTestMinutes: Number(process.env.COLLECTION_TEST_MINUTES || 0),
+  selectionTestMinutes: Number(process.env.SELECTION_TEST_MINUTES || 0),
 
   // v45: ИИгорь — диагностика воронки прорабов.
   foremanCategoryId: Number(process.env.FOREMAN_CATEGORY_ID || 32),
@@ -2380,6 +2392,54 @@ async function getDistributionUserName(userId) {
   }
 }
 
+
+const distributionUserProfileCache = new Map();
+let distributionExpertDepartmentCache = null;
+
+async function getDistributionUserProfile(userId) {
+  const key = String(userId || '').trim();
+  if (!key) return null;
+  if (distributionUserProfileCache.has(key)) return distributionUserProfileCache.get(key);
+  try {
+    const raw = await bitrixRestCall('user.get', { ID: key });
+    const user = Array.isArray(raw) ? raw[0] : raw;
+    distributionUserProfileCache.set(key, user || null);
+    return user || null;
+  } catch (_) {
+    distributionUserProfileCache.set(key, null);
+    return null;
+  }
+}
+
+function userDepartmentIds(user) {
+  const raw = user && (user.UF_DEPARTMENT || user.ufDepartment);
+  return (Array.isArray(raw) ? raw : [raw]).map((x) => String(x || '').trim()).filter(Boolean);
+}
+
+async function getProductionExpertDepartmentIds() {
+  if (distributionExpertDepartmentCache) return distributionExpertDepartmentCache;
+  const ids = new Set();
+  for (const expertId of (config.distributionExpertSeedIds || [])) {
+    const user = await getDistributionUserProfile(expertId);
+    for (const dep of userDepartmentIds(user)) ids.add(dep);
+  }
+  distributionExpertDepartmentCache = ids;
+  console.log(`[unassigned] Отдел(ы) экспертов Производства: ${[...ids].join(',') || 'не определены'}.`);
+  return ids;
+}
+
+async function isProductionDistributionExpert(userId) {
+  const id = String(userId || '').trim();
+  if (!id || id === String(TANYA_USER_ID)) return false;
+  const explicit = new Set((config.distributionExpertIds || []).map(String));
+  if (explicit.size) return explicit.has(id);
+  if ((config.distributionExpertSeedIds || []).map(String).includes(id)) return true;
+  const expertDeps = await getProductionExpertDepartmentIds();
+  if (!expertDeps.size) return false;
+  const user = await getDistributionUserProfile(id);
+  return userDepartmentIds(user).some((dep) => expertDeps.has(dep));
+}
+
 async function getPreviousExpert(companyId, currentDealId) {
   // v77: предыдущий эксперт = ответственный по последней УСПЕШНО закрытой
   // производственной сделке компании, а не просто по последней изменённой сделке CRM.
@@ -2396,6 +2456,7 @@ async function getPreviousExpert(companyId, currentDealId) {
     }, 10);
     const prev = deals.find((d) => String(d.ID) !== String(currentDealId || ''));
     if (!prev || !prev.ASSIGNED_BY_ID) return null;
+    if (!(await isProductionDistributionExpert(prev.ASSIGNED_BY_ID))) return null;
     const expertName = await getDistributionUserName(prev.ASSIGNED_BY_ID);
     return {
       dealId: prev.ID,
@@ -2426,6 +2487,7 @@ async function getActiveProductionDealsForCompany(companyId, currentDealId) {
     for (const d of deals) {
       if (String(d.ID) === String(currentDealId || '')) continue;
       if (!d.ASSIGNED_BY_ID) continue;
+      if (!(await isProductionDistributionExpert(d.ASSIGNED_BY_ID))) continue;
       const expertName = await getDistributionUserName(d.ASSIGNED_BY_ID);
       out.push({
         dealId: d.ID,
@@ -2444,37 +2506,55 @@ async function getActiveProductionDealsForCompany(companyId, currentDealId) {
 }
 
 async function getDistributionTeamLoad() {
-  // Считаем текущую загрузку по незакрытым сделкам Производства.
-  // Если DISTRIBUTION_EXPERT_IDS задан — сравниваем только этих экспертов.
-  // Иначе берём всех ответственных, у которых сейчас есть активные сделки в Производстве.
+  // v85: в рекомендациях только эксперты отдела Производства.
   try {
     const deals = await bitrixRestList('crm.deal.list', {
-      filter: {
-        CATEGORY_ID: config.autopilotCategoryId || 28,
-        CLOSED: 'N',
-      },
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, CLOSED: 'N' },
       select: ['ID', 'ASSIGNED_BY_ID', 'STAGE_ID'],
       order: { ID: 'DESC' },
     }, 1000);
 
-    const configured = new Set((config.distributionExpertIds || []).map(String));
     const counts = new Map();
+    const candidateIds = new Set();
     for (const d of deals) {
       const id = String(d.ASSIGNED_BY_ID || '').trim();
-      if (!id || id === String(TANYA_USER_ID)) continue;
-      if (configured.size && !configured.has(id)) continue;
+      if (!id || !(await isProductionDistributionExpert(id))) continue;
+      candidateIds.add(id);
       counts.set(id, (counts.get(id) || 0) + 1);
     }
 
-    // Если список задан явно, показываем также экспертов с нулевой загрузкой.
-    if (configured.size) {
-      for (const id of configured) if (!counts.has(id)) counts.set(id, 0);
+    const explicit = (config.distributionExpertIds || []).map(String);
+    for (const id of (explicit.length ? explicit : (config.distributionExpertSeedIds || []).map(String))) {
+      if (await isProductionDistributionExpert(id)) {
+        candidateIds.add(id);
+        if (!counts.has(id)) counts.set(id, 0);
+      }
+    }
+
+    if (!explicit.length) {
+      try {
+        const deptIds = await getProductionExpertDepartmentIds();
+        if (deptIds.size) {
+          const users = await bitrixRestList('user.get', { filter: { ACTIVE: 'Y' } }, 500);
+          for (const user of users) {
+            const id = String(user.ID || '').trim();
+            if (!id || id === String(TANYA_USER_ID)) continue;
+            if (!userDepartmentIds(user).some((dep) => deptIds.has(dep))) continue;
+            candidateIds.add(id);
+            if (!counts.has(id)) counts.set(id, 0);
+            distributionUserProfileCache.set(id, user);
+          }
+        }
+      } catch (e) {
+        console.warn(`[unassigned] Не удалось добавить экспертов с нулевой загрузкой: ${e.message || e}`);
+      }
     }
 
     const rows = [];
-    for (const [expertId, activeCount] of counts.entries()) {
+    for (const expertId of candidateIds) {
+      if (!(await isProductionDistributionExpert(expertId))) continue;
       const expertName = await getDistributionUserName(expertId);
-      rows.push({ expertId, expertName: expertName || `ID ${expertId}`, activeCount });
+      rows.push({ expertId, expertName: expertName || `ID ${expertId}`, activeCount: counts.get(expertId) || 0 });
     }
     rows.sort((a, b) => a.activeCount - b.activeCount || a.expertName.localeCompare(b.expertName, 'ru'));
     return rows;
@@ -2619,7 +2699,7 @@ async function notifyTanyaAboutUnassignedDeal(deal) {
       fields: {
         ENTITY_ID: dealId,
         ENTITY_TYPE: 'deal',
-        COMMENT: `[MAVIS_UNASSIGNED_NOTIFY] at=${new Date().toISOString()}\n${recommendation}`,
+        COMMENT: `ИИгорь — контроль распределения.\n${recommendation}`,
       },
     });
   } catch (_) {}
@@ -2636,9 +2716,11 @@ async function getLastUnassignedNotificationAt(dealId) {
     }, 30);
     for (const c of comments) {
       const text = String(c.COMMENT || '');
-      if (!text.includes('[MAVIS_UNASSIGNED_NOTIFY]')) continue;
+      const isLegacy = text.includes('[MAVIS_UNASSIGNED_NOTIFY]');
+      const isClean = text.includes('ИИгорь — контроль распределения.');
+      if (!isLegacy && !isClean) continue;
       const m = text.match(/at=([^\s]+)/);
-      const d = new Date(m ? m[1] : c.CREATED || '');
+      const d = new Date(m ? m[1] : c.CREATED || c.DATE_CREATE || '');
       if (!Number.isNaN(d.getTime())) return d;
     }
   } catch (_) {}
@@ -5012,6 +5094,363 @@ async function checkCollectionStageStuck() {
   } catch (e) { console.error('[stageMonitor] checkCollectionStageStuck:', e.message); }
 }
 
+
+// ============================================================================
+// v85: CJM БЛОК 5 — «Сбор информации»: 3 дня клиенту / 7 дней руководителю
+// Новый сценарий работает отдельно от legacy 5/10-дневного мониторинга.
+// ============================================================================
+
+const COLLECTION_3D_TEXT = 'ИИгорь — контроль сбора информации: 3 дня.';
+const COLLECTION_7D_TEXT = 'ИИгорь — контроль сбора информации: 7 дней.';
+
+async function timelineHasHumanSignature(dealId, signature, limit = 120) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID','COMMENT','DATE_CREATE','CREATED'],
+      order: { ID: 'DESC' },
+    }, limit);
+    return comments.some((c) => String(c.COMMENT || '').includes(signature));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function clientDocsLatestStateWithTime(dealId) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      select: ['ID','COMMENT','DATE_CREATE','CREATED'],
+      order: { ID: 'DESC' },
+    }, 120);
+    for (const c of comments) {
+      const text = String(c.COMMENT || '');
+      if (!text.includes(CLIENT_DOCS_STATE_MARKER)) continue;
+      const obj = clientDocsParseMarkerJson(text, CLIENT_DOCS_STATE_MARKER);
+      if (!obj) continue;
+      const at = new Date(obj.at || c.DATE_CREATE || c.CREATED || 0);
+      return { state: obj, at: Number.isNaN(at.getTime()) ? null : at };
+    }
+  } catch (_) {}
+  return { state: { docs: [], complete: false, missing: [] }, at: null };
+}
+
+function elapsedDaysExact(from, to = new Date()) {
+  const a = new Date(from || 0).getTime();
+  const b = new Date(to || 0).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return 0;
+  return (b - a) / 86400000;
+}
+
+function buildCollectionClientReminder(service, missing) {
+  const docList = getDocumentListForService(service);
+  const fallback = clientDocsRequiredDocs(docList);
+  const concrete = (Array.isArray(missing) && missing.length ? missing : fallback)
+    .map((x) => String(x || '').trim()).filter(Boolean);
+  return [
+    actsMinskGreeting(),
+    '',
+    'Напоминаем по документам для продолжения работы.',
+    '',
+    'Сейчас необходимо предоставить:',
+    ...concrete.slice(0, 25).map((x) => `• ${x}`),
+    '',
+    'Документы, пожалуйста, направляйте на нашу почту: mavis.group@mail.ru',
+  ].join('\n').trim();
+}
+
+async function checkCollectionCjmBlock5() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled || !config.collectionControlEnabled) return;
+  const prepStageId = getPreparationStageId();
+  if (!prepStageId || !isWorkingHour(new Date())) return;
+
+  try {
+    const fields = await discoverSelectionFieldsV85();
+    const select = ['ID','TITLE','ASSIGNED_BY_ID','MOVED_TIME','COMPANY_ID','CONTACT_ID',
+      config.serviceFieldCode || process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+      ...selectionFieldCodesV85(fields),
+      ...preferredContactFieldCandidates(),
+    ];
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: prepStageId },
+      select: [...new Set(select.filter(Boolean))],
+      order: { MOVED_TIME: 'ASC' },
+    }, 200);
+
+    const now = new Date();
+    for (const deal of deals) {
+      if (await isDealAiDisabledAsync(deal)) continue;
+      const service = await resolveDealServiceName(deal);
+      if (!clientDocsTargetService(service)) continue;
+
+      const movedAt = new Date(deal.MOVED_TIME || deal.DATE_MODIFY || 0);
+      if (Number.isNaN(movedAt.getTime())) continue;
+      const { state, at: lastDocsAt } = await clientDocsLatestStateWithTime(deal.ID);
+      if (state && state.complete === true) continue;
+
+      const selection = await getSelectionContextV85(deal, fields);
+      const waitingBase = lastDocsAt && lastDocsAt > movedAt ? lastDocsAt : movedAt;
+      const stageDays = elapsedDaysExact(movedAt, now);
+      const waitDays = elapsedDaysExact(waitingBase, now);
+      const testMin = Math.max(0, Number(config.collectionTestMinutes || 0));
+      const waitMinutes = (now - waitingBase) / 60000;
+      const stageMinutes = (now - movedAt) / 60000;
+      const reminderDue = testMin > 0 ? waitMinutes >= testMin : waitDays >= Number(config.collectionReminderDays || 3);
+      const leaderDue = testMin > 0 ? stageMinutes >= testMin * 2 : stageDays >= Number(config.collectionLeaderDays || 7);
+
+      if (reminderDue && !(await timelineHasHumanSignature(deal.ID, COLLECTION_3D_TEXT))) {
+        if (selection.need && ['mavis','client','contractor'].includes(selection.mode)) {
+          const modeText = selection.mode === 'mavis' ? 'подбор выполняет Mavis' : selection.mode === 'client' ? 'специалиста ищет клиент' : 'подбор через подрядчика';
+          await bitrixRestCall('crm.timeline.comment.add', { fields: {
+            ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+            COMMENT: `${COLLECTION_3D_TEXT}\nКлиентский пуш по документам не отправлялся: сейчас работа зависит от подбора специалиста (${modeText}${selection.who ? `; ищем: ${selection.who}` : ''}).`,
+          }}).catch(() => {});
+        } else {
+          const reminder = buildCollectionClientReminder(service, state && state.missing);
+          const sent = await sendClientTextByPreferredChannel(deal, reminder, `Напоминание по документам: ${deal.TITLE}`).catch((e) => ({ ok:false, error:e.message || String(e) }));
+          if (sent.ok) {
+            const missing = Array.isArray(state && state.missing) && state.missing.length
+              ? state.missing.map((x) => `— ${x}`).join('\n')
+              : clientDocsRequiredDocs(getDocumentListForService(service)).map((x) => `— ${x}`).join('\n');
+            await bitrixRestCall('crm.timeline.comment.add', { fields: {
+              ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+              COMMENT: `${COLLECTION_3D_TEXT}\nКлиенту отправлено напоминание через ${sent.channel}.\n\nНе хватает:\n${missing}`,
+            }}).catch(() => {});
+          } else {
+            console.warn(`[collection-v85] deal=${deal.ID}: 3 дня, но пуш не отправлен: ${sent.error || 'ошибка канала'}`);
+          }
+        }
+      }
+
+      if (leaderDue && !(await timelineHasHumanSignature(deal.ID, COLLECTION_7D_TEXT))) {
+        const user = await getDistributionUserProfile(deal.ASSIGNED_BY_ID);
+        const expertName = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : `ID ${deal.ASSIGNED_BY_ID || '?'}`;
+        const received = Array.isArray(state && state.docs) ? state.docs.map((d) => `${d.documentType || 'документ'}${d.person ? ` — ${d.person}` : ''}`) : [];
+        const missing = Array.isArray(state && state.missing) && state.missing.length ? state.missing : clientDocsRequiredDocs(getDocumentListForService(service));
+        const reason = selection.need
+          ? `подбор специалиста: ${selection.mode === 'mavis' ? 'Mavis' : selection.mode === 'client' ? 'клиент самостоятельно' : selection.mode || 'не определено'}${selection.who ? `; ищем ${selection.who}` : ''}`
+          : (missing.length ? 'не собран полный комплект документов' : 'причина требует проверки экспертом');
+        const msg = [
+          'Сделка зависла на «Сбор информации» 7 дней.',
+          '',
+          `Компания: ${deal.TITLE}`,
+          `Эксперт: ${expertName}`,
+          `Услуга: ${service}`,
+          `Причина: ${reason}`,
+          '',
+          'Получено:',
+          ...(received.length ? received.slice(0,20).map((x) => `— ${x}`) : ['— пока ничего не зафиксировано']),
+          '',
+          'Не хватает:',
+          ...(missing.length ? missing.slice(0,25).map((x) => `— ${x}`) : ['— требуется ручная проверка']),
+          '',
+          `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
+        ].join('\n');
+        await bitrixRestCall('im.message.add', { DIALOG_ID: config.clientDocsLeaderId || TANYA_USER_ID, MESSAGE: msg }).catch(() => {});
+        await bitrixRestCall('crm.timeline.comment.add', { fields: {
+          ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+          COMMENT: `${COLLECTION_7D_TEXT}\nРуководитель уведомлён. Причина: ${reason}.`,
+        }}).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error('[collection-v85] Ошибка блока 5:', e.message || e);
+  }
+}
+
+// ============================================================================
+// v85: CJM БЛОК 6 — «Подбор»: кто ищет + актуальная воронка Прорабы
+// ============================================================================
+
+let selectionFieldsV85Cache = null;
+
+function selectionFieldLabelV85(f) {
+  return [f && f.EDIT_FORM_LABEL, f && f.LIST_COLUMN_LABEL, f && f.LIST_FILTER_LABEL, f && f.FIELD_NAME]
+    .filter(Boolean).join(' ');
+}
+
+async function discoverSelectionFieldsV85() {
+  if (selectionFieldsV85Cache) return selectionFieldsV85Cache;
+  let all = [];
+  try { all = await bitrixRestList('crm.deal.userfield.list', {}, 500); } catch (_) {}
+  const by = (rx, fallback) => {
+    const f = all.find((x) => rx.test(normalizeControlValue(selectionFieldLabelV85(x))));
+    if (f) return f;
+    return all.find((x) => String(x.FIELD_NAME || '') === fallback) || { FIELD_NAME: fallback, LIST: [] };
+  };
+  selectionFieldsV85Cache = {
+    need: by(/нужен.*подбор|подбор.*нужен/, FIELD_NEEDS_SELECTION),
+    mode: by(/способ.*подбор|силами.*кого|кто.*ищет|подбор.*(mavis|мавис|самостоятель)/, FIELD_MAVIS_SELECTION),
+    who: by(/кого.*(ищ|подбира)|специалист.*подбор/, FIELD_WHO_WE_SEARCH),
+  };
+  console.log(`[selection-v85] Поля: нужен=${selectionFieldsV85Cache.need.FIELD_NAME}; способ=${selectionFieldsV85Cache.mode.FIELD_NAME}; кого=${selectionFieldsV85Cache.who.FIELD_NAME}.`);
+  return selectionFieldsV85Cache;
+}
+
+function selectionFieldCodesV85(fields) {
+  return [
+    fields && fields.need && fields.need.FIELD_NAME,
+    fields && fields.mode && fields.mode.FIELD_NAME,
+    fields && fields.who && fields.who.FIELD_NAME,
+    FIELD_NEEDS_SELECTION, FIELD_MAVIS_SELECTION, FIELD_WHO_WE_SEARCH,
+  ].filter(Boolean);
+}
+
+function decodeSelectionFieldV85(meta, raw) {
+  const values = Array.isArray(raw) ? raw : [raw];
+  const list = Array.isArray(meta && (meta.LIST || meta.list)) ? (meta.LIST || meta.list) : [];
+  const map = new Map(list.map((x) => [String(x.ID || x.id || ''), String(x.VALUE || x.value || '')]));
+  return values.map((v) => map.get(String(v)) || String(v || '')).filter(Boolean).join(' ').trim();
+}
+
+async function getSelectionContextV85(deal, fields = null) {
+  fields = fields || await discoverSelectionFieldsV85();
+  const needRaw = deal[fields.need.FIELD_NAME] ?? deal[FIELD_NEEDS_SELECTION];
+  const modeRaw = deal[fields.mode.FIELD_NAME] ?? deal[FIELD_MAVIS_SELECTION];
+  const whoRaw = deal[fields.who.FIELD_NAME] ?? deal[FIELD_WHO_WE_SEARCH];
+  const needText = normalizeControlValue(decodeSelectionFieldV85(fields.need, needRaw));
+  const modeText = normalizeControlValue(decodeSelectionFieldV85(fields.mode, modeRaw));
+  const who = decodeSelectionFieldV85(fields.who, whoRaw) || String(whoRaw || '').trim();
+  const need = !!needText && !/(^|\s)(нет|no|false|0)(\s|$)/.test(needText) && /(да|yes|true|1|нуж|подбор)/.test(needText);
+  let mode = null;
+  if (/(mavis|мавис|наш|силами компании|мы ищ)/.test(modeText)) mode = 'mavis';
+  else if (/(самостоятель|клиент|сами|своими силами)/.test(modeText)) mode = 'client';
+  else if (/(подрядчик|виалми)/.test(modeText)) mode = 'contractor';
+  // fallback старого boolean «Подбор наш (Mavis)».
+  if (!mode && (String(modeRaw).toLowerCase() === 'да' || modeRaw === true || String(modeRaw) === '1')) mode = 'mavis';
+  return { need, mode, who, needText, modeText };
+}
+
+async function resolveSelectionStageV85() {
+  try {
+    const stages = await bitrixRestCall('crm.dealcategory.stage.list', { id: config.autopilotCategoryId || 28 });
+    const list = Array.isArray(stages) ? stages : [];
+    const found = list.find((x) => /(^|\s)подбор(\s|$)/i.test(String(x.NAME || x.TITLE || '')));
+    if (found) return String(found.STATUS_ID || found.ID || '');
+  } catch (_) {}
+  return STAGE_IDS.selection;
+}
+
+async function findForemanCandidatesV85(request, limit = 5) {
+  const cfg = fgForemanCfg();
+  const { rows } = await fgLoadForemen(cfg);
+  const free = rows.filter((f) => String(f.STAGE_ID) === String(cfg.stageFree) && !fgForemanIsExpiring(f, cfg));
+  const normalized = fgNormalize(request || '');
+  const works = fgDetectWorks(normalized);
+  let matched = free.filter((f) => {
+    const field = fgNormWorkType(f[cfg.fieldWorkType]);
+    if (works.length) return works.some((w) => field.includes(w) || w.includes(field));
+    if (!normalized || !field) return false;
+    const tokens = normalized.split(/\s+/).filter((x) => x.length >= 4);
+    return tokens.some((t) => field.includes(t));
+  });
+  return matched.slice(0, limit);
+}
+
+async function createSelectionExpertTaskV85(deal, title, description) {
+  const dl = addWorkingDays(new Date(), 1); dl.setHours(18,0,0,0);
+  return bitrixRestCall('tasks.task.add', { fields: {
+    TITLE: title,
+    DESCRIPTION: description,
+    RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+    DEADLINE: toMinskLocalIso(dl),
+    UF_CRM_TASK: [`D_${deal.ID}`],
+    PRIORITY: 1,
+  }});
+}
+
+async function checkSelectionCjmBlock6() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled || !config.selectionControlEnabled) return;
+  if (!isWorkingHour(new Date())) return;
+  const stageId = await resolveSelectionStageV85();
+  if (!stageId) return;
+  try {
+    const fields = await discoverSelectionFieldsV85();
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.autopilotCategoryId || 28, STAGE_ID: stageId },
+      select: [...new Set(['ID','TITLE','ASSIGNED_BY_ID','MOVED_TIME','COMPANY_ID', ...selectionFieldCodesV85(fields)])],
+      order: { MOVED_TIME: 'ASC' },
+    }, 200);
+    const now = new Date();
+    for (const deal of deals) {
+      if (await isDealAiDisabledAsync(deal)) continue;
+      const ctx = await getSelectionContextV85(deal, fields);
+      if (!ctx.need || !ctx.mode) continue;
+      const movedAt = new Date(deal.MOVED_TIME || 0);
+      if (Number.isNaN(movedAt.getTime())) continue;
+      const elapsedDays = elapsedDaysExact(movedAt, now);
+      const testMin = Math.max(0, Number(config.selectionTestMinutes || 0));
+      const elapsedMinutes = (now - movedAt) / 60000;
+      const everyDays = Math.max(1, Number(config.selectionExpertEveryDays || 7));
+      const cycle = testMin > 0 ? Math.floor(elapsedMinutes / testMin) : Math.floor(elapsedDays / everyDays);
+      const dueExpert = testMin > 0 ? elapsedMinutes >= testMin : elapsedDays >= everyDays;
+      const dueLeader = testMin > 0 ? elapsedMinutes >= testMin * 2 : elapsedDays >= Number(config.selectionLeaderDays || 14);
+      const humanCycle = Math.max(1, cycle);
+      const signature = `ИИгорь — контроль подбора: период ${humanCycle}.`;
+
+      if (dueExpert && !(await timelineHasHumanSignature(deal.ID, signature))) {
+        const user = await getDistributionUserProfile(deal.ASSIGNED_BY_ID);
+        const expertName = user ? (user.NAME || '').trim() : 'Эксперт';
+        if (ctx.mode === 'client') {
+          await createSelectionExpertTaskV85(
+            deal,
+            `${expertName}, уточни нашли ли людей — ${ctx.who || 'специалист'}`,
+            `Клиент по сделке «${deal.TITLE}» ищет специалиста самостоятельно.\n\nКого ищут: ${ctx.who || 'не указано'}.\n\nУточни у клиента, нашли ли человека и можем ли двигаться дальше по аттестации.\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`
+          );
+          await bitrixRestCall('crm.timeline.comment.add', { fields: {
+            ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+            COMMENT: `${signature}\nЭксперту поставлена задача уточнить статус самостоятельного подбора: ${ctx.who || 'специалист'}.`,
+          }}).catch(() => {});
+        } else if (ctx.mode === 'mavis') {
+          const candidates = await findForemanCandidatesV85(ctx.who, 5);
+          const candidateText = candidates.length
+            ? candidates.map((f,i) => `${i+1}. ${fgForemanCandidateText(f, fgForemanCfg())}`).join('\n')
+            : 'Сейчас в воронке «Прорабы» подходящих свободных кандидатов не найдено.';
+          await createSelectionExpertTaskV85(
+            deal,
+            `${expertName}, актуальные кандидаты по подбору — ${ctx.who || 'специалист'}`,
+            `По сделке «${deal.TITLE}» подбор выполняет Mavis.\n\nКого ищем: ${ctx.who || 'не указано'}.\n\n${candidateText}\n\nПроверь кандидатов и обнови статус подбора в сделке.\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`
+          );
+          await bitrixRestCall('crm.timeline.comment.add', { fields: {
+            ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal',
+            COMMENT: `${signature}\nЭксперту отправлена актуальная подборка по запросу «${ctx.who || 'специалист'}». Найдено кандидатов: ${candidates.length}.`,
+          }}).catch(() => {});
+        } else {
+          await createSelectionExpertTaskV85(
+            deal,
+            `${expertName}, проверь статус подбора — ${ctx.who || 'специалист'}`,
+            `По сделке «${deal.TITLE}» способ подбора указан как «подрядчик».\nКого ищем: ${ctx.who || 'не указано'}.\nПроверь текущий статус и зафиксируй результат в сделке.`
+          );
+          await bitrixRestCall('crm.timeline.comment.add', { fields: {
+            ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${signature}\nЭксперту поставлена задача проверить статус подбора через подрядчика.`,
+          }}).catch(() => {});
+        }
+      }
+
+      const leaderSignature = 'ИИгорь — контроль подбора: 14 дней.';
+      if (dueLeader && !(await timelineHasHumanSignature(deal.ID, leaderSignature))) {
+        let candidateSummary = '';
+        if (ctx.mode === 'mavis') {
+          const candidates = await findForemanCandidatesV85(ctx.who, 5);
+          candidateSummary = candidates.length
+            ? `\n\nСейчас в базе есть кандидаты:\n${candidates.map((f) => `— ${fgForemanCandidateText(f, fgForemanCfg())}`).join('\n')}`
+            : '\n\nСейчас подходящих свободных кандидатов в воронке «Прорабы» не найдено.';
+        }
+        const user = await getDistributionUserProfile(deal.ASSIGNED_BY_ID);
+        const expertName = user ? `${user.NAME || ''} ${user.LAST_NAME || ''}`.trim() : `ID ${deal.ASSIGNED_BY_ID || '?'}`;
+        const modeText = ctx.mode === 'mavis' ? 'подбор Mavis' : ctx.mode === 'client' ? 'клиент ищет самостоятельно' : 'подрядчик';
+        const msg = `Подбор длится 14 дней.\n\nКомпания: ${deal.TITLE}\nЭксперт: ${expertName}\nКого ищем: ${ctx.who || 'не указано'}\nСпособ: ${modeText}${candidateSummary}\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`;
+        await bitrixRestCall('im.message.add', { DIALOG_ID: TANYA_USER_ID, MESSAGE: msg }).catch(() => {});
+        await bitrixRestCall('crm.timeline.comment.add', { fields: {
+          ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${leaderSignature}\nРуководитель уведомлён о затянувшемся подборе: ${ctx.who || 'специалист'}.`,
+        }}).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error('[selection-v85] Ошибка блока 6:', e.message || e);
+  }
+}
+
 // ---- Пункт 7: "Документы готовы" — сообщение клиенту с правилами заверения ----
 async function checkDocsReadyStage() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
@@ -5278,8 +5717,8 @@ async function checkSelectionStage() {
 
 async function runStageMonitoring() {
   await checkExpertFirstCallReminder();
-  await checkCollectionStageStuck();
-  await checkSelectionStage();
+  if (!config.collectionControlEnabled) await checkCollectionStageStuck();
+  if (!config.selectionControlEnabled) await checkSelectionStage();
   await checkDocsReadyStage();
   await checkWonStage();
   await checkRefundStage();
@@ -5357,8 +5796,11 @@ async function runAutopilotPollingCycle() {
       await checkPendingDocsReminders();
     }
 
-    // v44: мониторинг стадий с автонапоминаниями/задачами выключен по умолчанию.
-    // Иначе ассистент начинает писать/ставить задачи по факту движения стадии без звонка эксперта.
+    // v85: согласованные CJM блоки 5–6 работают отдельно от старого общего мониторинга.
+    if (config.collectionControlEnabled) await checkCollectionCjmBlock5();
+    if (config.selectionControlEnabled) await checkSelectionCjmBlock6();
+
+    // v44: остальные старые сценарии стадий пока только по отдельному флагу.
     if (config.stageMonitoringEnabled) await runStageMonitoring();
 
     // Проверяем нераспределённые сделки — уведомляем Таню если висят 4+ рабочих часа.
@@ -9252,8 +9694,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v78 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'auto'}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v85 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
