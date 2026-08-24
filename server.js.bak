@@ -3651,150 +3651,6 @@ function preferredChannelLabel(channel) {
   return { telegram: 'Telegram', viber: 'Viber', email: 'Email' }[channel] || 'не определён';
 }
 
-// v84: для актов при нескольких контактах НЕ используем CONTACT_ID наугад/по умолчанию.
-// Выбираем контакт, с которым в этой сделке была последняя переписка (email/чат/мессенджер).
-// Если контактов несколько, а переписку однозначно определить не удалось — автоотправку блокируем.
-async function actsGetDealContactIds(deal) {
-  const ids = [];
-  const add = (v) => {
-    const m = String(v || '').match(/\d+/);
-    if (m && !ids.includes(m[0])) ids.push(m[0]);
-  };
-  add(deal && deal.CONTACT_ID);
-  if (deal && deal.ID) {
-    try {
-      const raw = await bitrixRestCall('crm.deal.contact.items.get', { id: deal.ID });
-      const rows = Array.isArray(raw) ? raw : (raw && (raw.items || raw.ITEMS || raw.result)) || [];
-      for (const row of Array.isArray(rows) ? rows : []) add(row && (row.CONTACT_ID || row.contactId || row.ID || row.id));
-    } catch (e) {
-      console.warn(`[acts-recipient] deal=${deal && deal.ID}: не смог получить список контактов сделки: ${e.message || e}`);
-    }
-  }
-  return ids;
-}
-
-async function actsGetContactProfile(contactId) {
-  if (!contactId) return null;
-  try {
-    return await bitrixRestCall('crm.contact.get', { id: contactId });
-  } catch (e) {
-    console.warn(`[acts-recipient] contact=${contactId}: не смог получить контакт: ${e.message || e}`);
-    return null;
-  }
-}
-
-function actsContactLabel(contact, contactId = '') {
-  const name = [contact && contact.NAME, contact && contact.SECOND_NAME, contact && contact.LAST_NAME]
-    .map((x) => actsCleanText(x || '')).filter(Boolean).join(' ');
-  return name || `контакт ${contactId || (contact && contact.ID) || '?'}`;
-}
-
-function actsContactPhone(contact) {
-  const phones = Array.isArray(contact && contact.PHONE) ? contact.PHONE : [];
-  const raw = phones.find((x) => x && x.VALUE) || null;
-  return raw ? normalizePhoneDigits(raw.VALUE) : '';
-}
-
-function actsContactEmail(contact) {
-  const emails = Array.isArray(contact && contact.EMAIL) ? contact.EMAIL : [];
-  const raw = emails.find((x) => x && x.VALUE) || null;
-  return raw ? String(raw.VALUE).trim() : '';
-}
-
-function actsActivityTimeMs(a) {
-  const candidates = [a && a.LAST_UPDATED, a && a.END_TIME, a && a.START_TIME, a && a.CREATED, a && a.ID];
-  for (const v of candidates) {
-    const n = Date.parse(String(v || ''));
-    if (Number.isFinite(n)) return n;
-  }
-  const id = Number(a && a.ID || 0);
-  return Number.isFinite(id) ? id : 0;
-}
-
-function actsActivityIsCall(a) {
-  const typeId = String(a && a.TYPE_ID || '');
-  const text = [a && a.PROVIDER_ID, a && a.PROVIDER_TYPE_ID, a && a.SUBJECT, a && a.DESCRIPTION]
-    .map((x) => String(x || '').toLowerCase()).join(' ');
-  return typeId === '2' || /call|voximplant|asterisk|zruchna|telephon|звон|телеф/.test(text);
-}
-
-function actsActivityLooksLikeCorrespondence(a) {
-  if (!a || actsActivityIsCall(a)) return false;
-  const typeId = String(a.TYPE_ID || '');
-  const text = [a.PROVIDER_ID, a.PROVIDER_TYPE_ID, a.SUBJECT, a.DESCRIPTION]
-    .map((x) => String(x || '').toLowerCase()).join(' ');
-  if (typeId === '4') return true; // Email
-  if (/wazzup|openline|imopen|telegram|viber|whatsapp|chat|message|messenger|email|mail|письм|сообщен|чат/.test(text)) return true;
-  const comm = Array.isArray(a.COMMUNICATIONS) ? a.COMMUNICATIONS : [];
-  return comm.some((c) => {
-    const t = String(c && (c.TYPE || c.TYPE_ID || '')).toLowerCase();
-    return t === 'email' || t === 'im' || t === 'chat' || t === 'telegram' || t === 'viber' || t === 'whatsapp';
-  });
-}
-
-function actsActivityContactIds(a, allowedIds) {
-  const allowed = new Set((allowedIds || []).map(String));
-  const out = [];
-  const comm = Array.isArray(a && a.COMMUNICATIONS) ? a.COMMUNICATIONS : [];
-  for (const c of comm) {
-    const entityType = String(c && (c.ENTITY_TYPE_ID || c.entityTypeId || '') || '');
-    const id = String(c && (c.ENTITY_ID || c.entityId || '') || '').match(/\d+/)?.[0] || '';
-    if (!id || !allowed.has(id)) continue;
-    // ENTITY_TYPE_ID=3 — контакт. Если поле отсутствует, всё равно допускаем ID из списка контактов сделки.
-    if (entityType && entityType !== '3') continue;
-    if (!out.includes(id)) out.push(id);
-  }
-  return out;
-}
-
-async function actsResolveRecipientContact(deal, preferredContactId = '') {
-  const contactIds = await actsGetDealContactIds(deal);
-  if (!contactIds.length) {
-    return { ok: false, reason: 'В сделке не найден ни один контакт.' };
-  }
-
-  // Для повторного пуша используем тот же контакт, которому отправили сам акт.
-  if (preferredContactId && contactIds.includes(String(preferredContactId))) {
-    const contact = await actsGetContactProfile(preferredContactId);
-    if (contact) return { ok: true, contactId: String(preferredContactId), contact, source: 'stored', label: actsContactLabel(contact, preferredContactId) };
-  }
-
-  if (contactIds.length === 1) {
-    const contact = await actsGetContactProfile(contactIds[0]);
-    if (!contact) return { ok: false, reason: `Не удалось открыть единственный контакт ${contactIds[0]}.` };
-    return { ok: true, contactId: contactIds[0], contact, source: 'single', label: actsContactLabel(contact, contactIds[0]) };
-  }
-
-  let activities = [];
-  try {
-    activities = await bitrixRestList('crm.activity.list', {
-      filter: { OWNER_TYPE_ID: 2, OWNER_ID: deal.ID },
-      order: { LAST_UPDATED: 'DESC', ID: 'DESC' },
-      select: ['ID','TYPE_ID','PROVIDER_ID','PROVIDER_TYPE_ID','SUBJECT','DESCRIPTION','DIRECTION','START_TIME','END_TIME','LAST_UPDATED','COMMUNICATIONS'],
-    }, 200);
-  } catch (e) {
-    console.warn(`[acts-recipient] deal=${deal.ID}: не смог получить активности: ${e.message || e}`);
-  }
-
-  activities = (activities || []).slice().sort((a,b) => actsActivityTimeMs(b) - actsActivityTimeMs(a));
-  for (const activity of activities) {
-    if (!actsActivityLooksLikeCorrespondence(activity)) continue;
-    const ids = actsActivityContactIds(activity, contactIds);
-    if (!ids.length) continue;
-    const contact = await actsGetContactProfile(ids[0]);
-    if (!contact) continue;
-    console.log(`[acts-recipient] deal=${deal.ID}: из ${contactIds.length} контактов выбран ${actsContactLabel(contact, ids[0])} (#${ids[0]}) — последняя переписка activity=${activity.ID}.`);
-    return { ok: true, contactId: ids[0], contact, source: 'last-correspondence', activityId: String(activity.ID || ''), label: actsContactLabel(contact, ids[0]) };
-  }
-
-  // ВАЖНО: при нескольких контактах не берём основной CONTACT_ID как случайный fallback.
-  return {
-    ok: false,
-    reason: `В сделке ${contactIds.length} контакта(ов), но не удалось однозначно определить контакт по последней переписке. Автоотправка акта заблокирована, чтобы не написать неактуальному человеку.`,
-    contactIds,
-  };
-}
-
 async function getContactPhone(deal) {
   if (deal && deal.CONTACT_ID) {
     try {
@@ -6660,7 +6516,7 @@ function actsPushMessage() {
   return `${actsMinskGreeting()}\n\nРанее направляли вам акт выполненных работ сообщением выше, но пока не получили подписанный скан. Наша бухгалтерия очень просит вернуть подписанный акт. Будем вам очень признательны, если сможете направить его ответным сообщением.`;
 }
 
-async function actsSendReminderEmail(deal, contactId, email, text, taskId, sequence) {
+async function actsSendReminderEmail(deal, email, text, taskId, sequence) {
   const responsibleId = Number(deal.ASSIGNED_BY_ID || deal.assignedById || 1);
   let staff = null;
   try {
@@ -6668,7 +6524,7 @@ async function actsSendReminderEmail(deal, contactId, email, text, taskId, seque
     staff = Array.isArray(u) ? u[0] : u;
   } catch (_) {}
   const senderName = (staff && `${staff.NAME || ''} ${staff.LAST_NAME || ''}`.trim()) || config.emailSenderName || 'Mavis Group';
-  const entityId = Number(contactId || 0);
+  const entityId = Number(deal.CONTACT_ID || deal.COMPANY_ID || 0);
   const fields = {
     OWNER_TYPE_ID: 2,
     OWNER_ID: Number(deal.ID),
@@ -6681,7 +6537,7 @@ async function actsSendReminderEmail(deal, contactId, email, text, taskId, seque
     COMPLETED: 'Y',
     START_TIME: new Date().toISOString(),
     END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-    COMMUNICATIONS: [{ VALUE: email, ENTITY_ID: entityId, ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+    COMMUNICATIONS: [{ VALUE: email, ENTITY_ID: entityId, ENTITY_TYPE_ID: deal.CONTACT_ID ? 3 : 4, TYPE: 'EMAIL' }],
   };
   if (staff && staff.EMAIL) fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${staff.EMAIL}>` };
   return bitrixRestCall('crm.activity.add', { fields });
@@ -6691,24 +6547,14 @@ async function actsSendPush(state, deal, sequence) {
   const channel = actsNormalizeChannelKey(state.channel) || await detectPreferredChannelResolved(deal);
   if (!channel) return { ok: false, error: 'Не удалось определить канал первоначальной отправки акта.' };
   const text = actsPushMessage();
-
-  // v84: пуш обязательно идёт тому же контакту, которому был отправлен сам акт.
-  // Для старых состояний без contactId один раз восстанавливаем контакт по последней переписке.
-  const recipient = await actsResolveRecipientContact(deal, state.contactId || '');
-  if (!recipient.ok) return { ok: false, error: recipient.reason || 'Не удалось определить контакт для пуша.' };
-  if (!state.contactId) {
-    state.contactId = String(recipient.contactId || '');
-    actsPushStates.set(String(state.taskId), state);
-  }
-
   if (channel === 'email') {
-    const email = actsContactEmail(recipient.contact);
-    if (!email) return { ok: false, error: `У контакта «${recipient.label}» нет email для Email-пуша.` };
-    await actsSendReminderEmail(deal, recipient.contactId, email, text, state.taskId, sequence);
-    return { ok: true, channel: 'Email', contactId: recipient.contactId, contact: maskEmailForLog(email), contactLabel: recipient.label };
+    const email = await getContactEmail(deal);
+    if (!email) return { ok: false, error: 'Для Email-пуша не найден email контакта/компании.' };
+    await actsSendReminderEmail(deal, email, text, state.taskId, sequence);
+    return { ok: true, channel: 'Email', contact: maskEmailForLog(email) };
   }
-  const phone = actsContactPhone(recipient.contact);
-  if (!phone) return { ok: false, error: `У контакта «${recipient.label}» нет телефона для ${preferredChannelLabel(channel)}-пуша.` };
+  const phone = await getContactPhone(deal);
+  if (!phone) return { ok: false, error: `Для ${preferredChannelLabel(channel)}-пуша не найден телефон.` };
   const ch = getConfiguredWazzupChannel(channel);
   if (!ch || !ch.channelId || ch.key !== channel) return { ok: false, error: `${preferredChannelLabel(channel)} не настроен в Wazzup.` };
   const sent = await sendWazzupMessageInternal({
@@ -6719,7 +6565,7 @@ async function actsSendPush(state, deal, sequence) {
     ignoreStrictPreferredChannel: true,
     crmMessageId: `mavis-acts-push-${channel}-${deal.ID}-${state.taskId}-${sequence}`,
   });
-  return { ok: true, channel: preferredChannelLabel(channel), contactId: recipient.contactId, contactLabel: recipient.label, contact: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'), raw: sent };
+  return { ok: true, channel: preferredChannelLabel(channel), contact: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'), raw: sent };
 }
 
 function actsNextWorkingDeadlineIso(now = new Date()) {
@@ -6764,14 +6610,14 @@ async function actsCreateCallTaskIfNeeded(state, deal, comments) {
   return true;
 }
 
-async function actsRegisterPushState({ taskId, dealId, channel, contactId = '', sentAtMs = Date.now(), originalFileName = '' }) {
+async function actsRegisterPushState({ taskId, dealId, channel, sentAtMs = Date.now(), originalFileName = '' }) {
   if (!config.actsPushEnabled || !taskId || !dealId) return;
   actsPushStates.set(String(taskId), {
-    taskId: String(taskId), dealId: String(dealId), channel: actsNormalizeChannelKey(channel), contactId: String(contactId || ''),
+    taskId: String(taskId), dealId: String(dealId), channel: actsNormalizeChannelKey(channel),
     sentAtMs: Number(sentAtMs || Date.now()), lastMessageAtMs: Number(sentAtMs || Date.now()),
     pushCount: 0, originalFileName: actsCleanText(originalFileName || ''),
   });
-  console.log(`[acts-push] Зарегистрирован контроль task=${taskId}, deal=${dealId}, channel=${actsNormalizeChannelKey(channel) || channel}, contact=${contactId || 'не сохранён'}, следующий пуш после ${new Date(actsNextPushDueFrom(sentAtMs)).toISOString()}.`);
+  console.log(`[acts-push] Зарегистрирован контроль task=${taskId}, deal=${dealId}, channel=${actsNormalizeChannelKey(channel) || channel}, следующий пуш после ${new Date(actsNextPushDueFrom(sentAtMs)).toISOString()}.`);
 }
 
 async function actsRecoverPushStatesFromBitrix(options = {}) {
@@ -6841,9 +6687,7 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
         const lastMessageAtMs = lastPush ? actsParseTimelineCreated(lastPush) : sentAtMs;
         const channel = actsExtractChannelFromSentComment(sentComment.COMMENT) || await detectPreferredChannelResolved(await bitrixRestCall('crm.deal.get', { id: dealId }));
         const originalMatch = String(sentComment.COMMENT || '').match(/Файл:\s*([^\n]+)/i);
-        const contactMatch = String(sentComment.COMMENT || '').match(/\[MAVIS_ACTS_PUSH_STATE\][^\n]*contactId=(\d+)/i);
-        const recoveredContactId = contactMatch ? String(contactMatch[1]) : '';
-        actsPushStates.set(taskId, { taskId, dealId: String(dealId), channel, contactId: recoveredContactId, sentAtMs, lastMessageAtMs, pushCount: pushComments.length, originalFileName: originalMatch ? actsCleanText(originalMatch[1]) : '' });
+        actsPushStates.set(taskId, { taskId, dealId: String(dealId), channel, sentAtMs, lastMessageAtMs, pushCount: pushComments.length, originalFileName: originalMatch ? actsCleanText(originalMatch[1]) : '' });
         restored++;
       } catch (e) {
         stats.errors++;
@@ -8169,7 +8013,7 @@ app.get('/api/acts/file/:token/:filename', (req, res) => {
   return res.status(200).send(item.buffer);
 });
 
-async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file) {
+async function sendActEmailThroughBitrix(deal, toEmail, text, file) {
   const dealId = deal.ID;
   const responsibleId = deal.ASSIGNED_BY_ID || 1;
   let staff = null;
@@ -8192,7 +8036,7 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file) {
     COMPLETED: 'Y',
     START_TIME: new Date().toISOString(),
     END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(deal.CONTACT_ID || 0), ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
   };
 
   if (staff && staff.EMAIL) {
@@ -8214,11 +8058,8 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   if (!config.actsSendToClientEnabled) {
     return { skipped: true, message: 'ACTS_SEND_TO_CLIENT_ENABLED=false' };
   }
-
-  // v84 HARD BLOCK: без реального файла акта клиенту не уходит НИ текст, НИ письмо.
-  // Раньше file.url мог существовать, текст уже уходил, а фактическое скачивание файла падало позже.
   if (!file || !file.url) {
-    return { ok: false, skipped: true, message: 'В задаче не найден файл акта. Автоотправка полностью заблокирована: пустое сообщение клиенту не отправляю.' };
+    return { ok: false, skipped: true, message: 'В задаче не найден доступный для скачивания файл акта.' };
   }
 
   const preferredChannel = await detectPreferredChannelResolved(deal);
@@ -8227,54 +8068,32 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     return { ok: false, skipped: true, message: `В сделке не распознано поле «Предпочитаемый канал связи» (поле ${pref.code || 'не найдено'}, значение ${String(pref.raw || 'пусто')}). Нужно выбрать Email / Telegram / Viber.` };
   }
 
-  // v84: при нескольких контактах выбираем того, с кем была последняя переписка.
-  const recipient = await actsResolveRecipientContact(deal);
-  if (!recipient.ok) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: recipient.reason || 'Не удалось определить актуальный контакт для отправки.' };
-  }
-
   const text = actsBuildClientMessage(deal, task, file);
   const taskId = String(actsTaskField(task, ['id','ID']) || '');
-  const contactId = String(recipient.contactId || '');
 
   if (preferredChannel === 'email') {
-    const email = actsContactEmail(recipient.contact);
+    const email = await getContactEmail(deal);
     if (!email) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: `Выбран актуальный контакт «${recipient.label}», но у него нет email. На email компании/другого контакта автоматически НЕ переключаюсь.` };
+      return { ok: false, skipped: true, channel: 'Email', message: 'В сделке выбран Email, но email не найден ни у основного контакта, ни у компании.' };
     }
-
-    // Для email требуем именно прикрепляемый Bitrix-файл, а не просто ссылку.
-    const storageIds = actsBuildEmailStorageElementIds(file);
-    if (!storageIds.length) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: 'Файл найден, но Bitrix не дал attachment-id для вложения в письмо. Пустое письмо без акта не отправляю.' };
-    }
-    try {
-      await actsDownloadRealFile(file); // валидация: URL реально отдаёт бинарный файл, а не HTML/PHP-заглушку
-    } catch (e) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: `Файл акта не удалось скачать/проверить (${e.message || e}). Письмо без файла не отправляю.` };
-    }
-
-    await sendActEmailThroughBitrix(deal, contactId, email, text, file);
+    await sendActEmailThroughBitrix(deal, email, text, file);
     return {
       ok: true,
       channel: 'Email',
-      contactId,
-      contactLabel: recipient.label,
-      recipientSource: recipient.source,
       email: maskEmailForLog(email),
       file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
-      note: `Письмо отправлено через Bitrix (COMPLETED=Y) контакту «${recipient.label}».`,
+      note: 'Письмо отправлено через Bitrix (COMPLETED=Y).',
     };
   }
 
-  const phone = actsContactPhone(recipient.contact);
+  const phone = await getContactPhone(deal);
   if (!phone) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), contactId, message: `Выбран актуальный контакт «${recipient.label}», но у него нет телефона. На другого контакта автоматически НЕ переключаюсь.` };
+    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но телефон не найден ни у основного контакта, ни у компании.` };
   }
 
   const ch = getConfiguredWazzupChannel(preferredChannel);
   if (!ch || !ch.channelId || ch.key !== preferredChannel) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), contactId, message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но именно этот Wazzup-канал не настроен в Render. На другой канал автоматически НЕ переключаюсь.` };
+    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но именно этот Wazzup-канал не настроен в Render. На другой канал автоматически НЕ переключаюсь.` };
   }
 
   const textMarker = `[MAVIS_ACTS_TEXT_SENT] task=${taskId}`;
@@ -8284,27 +8103,27 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
 
   let textResult = null;
   let fileResult = null;
-  let preparedFile = null;
-
-  // v84: сначала убеждаемся, что реальный файл можно скачать и подготовить.
-  // Только после успешной проверки разрешаем вообще отправлять клиенту что-либо.
-  if (!fileAlreadySent) {
-    try {
-      preparedFile = await actsPrepareWazzupFile(file);
-    } catch (e) {
-      return {
-        ok: false,
-        skipped: true,
-        channel: preferredChannelLabel(preferredChannel),
-        contactId,
-        message: `Не удалось подготовить реальный файл акта (${e.message || e}). Сообщение без файла клиенту НЕ отправлено.`,
-      };
-    }
-  }
-
   try {
-    // Сначала отправляем файл. Если Wazzup отверг файл — текст не уйдёт и не будет "пустого" сообщения.
+    if (!textAlreadySent) {
+      textResult = await sendWazzupMessageInternal({
+        channelKey: preferredChannel,
+        text,
+        phone,
+        dealId: deal.ID,
+        // Канал уже разрешён по enum/тексту выше; sync-проверка внутри Wazzup не умеет enum ID.
+        ignoreStrictPreferredChannel: true,
+        crmMessageId: taskId ? `mavis-acts-text-${preferredChannel}-${deal.ID}-${taskId}` : '',
+      });
+      if (taskId) {
+        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${textMarker}
+Технический маркер: текст сообщения по акту успешно отправлен через ${preferredChannelLabel(preferredChannel)}.` } });
+      }
+    }
+
     if (!fileAlreadySent) {
+      // v67: сначала реально скачиваем байты из Bitrix и только потом даём Wazzup
+      // короткую публичную ссылку с исходным именем/расширением.
+      const preparedFile = await actsPrepareWazzupFile(file);
       fileResult = await sendWazzupFileInternal({
         channelKey: preferredChannel,
         contentUri: preparedFile.url,
@@ -8314,30 +8133,14 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
         crmMessageId: taskId ? `mavis-acts-file-${preferredChannel}-${deal.ID}-${taskId}` : '',
       });
       if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${fileMarker}\nТехнический маркер: файл акта успешно отправлен через ${preferredChannelLabel(preferredChannel)} контакту #${contactId}.` } });
-      }
-    }
-
-    // Текст отправляем только если файл уже был отправлен раньше или только что успешно ушёл.
-    if (!textAlreadySent) {
-      textResult = await sendWazzupMessageInternal({
-        channelKey: preferredChannel,
-        text,
-        phone,
-        dealId: deal.ID,
-        ignoreStrictPreferredChannel: true,
-        crmMessageId: taskId ? `mavis-acts-text-${preferredChannel}-${deal.ID}-${taskId}` : '',
-      });
-      if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${textMarker}\nТехнический маркер: текст сообщения по акту успешно отправлен через ${preferredChannelLabel(preferredChannel)} контакту #${contactId}.` } });
+        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${fileMarker}
+Технический маркер: файл акта успешно отправлен через ${preferredChannelLabel(preferredChannel)}.` } });
       }
     }
   } catch (e) {
     return {
       ok: false,
       channel: preferredChannelLabel(preferredChannel),
-      contactId,
-      contactLabel: recipient.label,
       error: e.message || String(e),
       possiblyDelivered: Boolean(e.possiblyDelivered),
       partial: { textSent: textAlreadySent || Boolean(textResult), fileSent: fileAlreadySent || Boolean(fileResult) },
@@ -8347,9 +8150,6 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   return {
     ok: true,
     channel: (fileResult && fileResult.channel && fileResult.channel.label) || (textResult && textResult.channel && textResult.channel.label) || preferredChannelLabel(preferredChannel),
-    contactId,
-    contactLabel: recipient.label,
-    recipientSource: recipient.source,
     phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
     file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
     partial: { textSent: true, fileSent: true },
@@ -8463,11 +8263,11 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       ? files.map((f) => `— ${f.name || f.id}${f.url ? `\n  ${f.url}` : ''}`).join('\n')
       : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
     const sendLines = sendResult && sendResult.ok
-      ? `✅ Клиенту отправлено через ${sendResult.channel || 'предпочитаемый канал'}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.contactLabel || 'не определён'} (#${sendResult.contactId || '?'}) — ${sendResult.phone || sendResult.email || 'скрыт'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
-      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый канал связи», наличие актуального контакта по последней переписке, телефон/email этого контакта, настройки Wazzup Telegram/Viber и файл акта в задаче.`;
+      ? `✅ Клиенту отправлено через ${sendResult.channel || 'предпочитаемый канал'}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.phone || sendResult.email || 'скрыт'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
+      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый канал связи», телефон/email основного контакта, настройки Wazzup Telegram/Viber и прямую ссылку на файл в задаче.`;
 
     const pushStateLine = sendResult && sendResult.ok
-      ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()}`
+      ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} sentAt=${new Date().toISOString()}`
       : '';
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
@@ -8477,7 +8277,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       },
     });
     if (sendResult && sendResult.ok) {
-      await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, contactId: sendResult.contactId || '', sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '' });
+      await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '' });
     }
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
   }
