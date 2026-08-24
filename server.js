@@ -5839,10 +5839,36 @@ async function runAutopilotPollingCycle() {
       return;
     }
 
+    // v89: тестовую сделку CJM обрабатываем ПЕРВОЙ и напрямую по ID,
+    // ДО обхода всей очереди. Ранее она могла вообще не попасть в первые 50
+    // сделок стадии или ждать, пока STT на других сделках отработает все retry.
+    const preprocessedIds = new Set();
+    if (config.cjmTestMode && config.cjmTestDealId) {
+      try {
+        const testDealRaw = await bitrixRestCall('crm.deal.get', { id: config.cjmTestDealId });
+        const testDeal = testDealRaw && (testDealRaw.result || testDealRaw);
+        if (!testDeal || !testDeal.ID) {
+          console.warn(`[autopilot-test] Сделка ${config.cjmTestDealId} не найдена через crm.deal.get.`);
+        } else if (Number(testDeal.CATEGORY_ID || 0) !== Number(config.autopilotCategoryId || 28)) {
+          console.warn(`[autopilot-test] Сделка ${testDeal.ID} не в Производстве: CATEGORY_ID=${testDeal.CATEGORY_ID}.`);
+        } else if (!stageIds.includes(String(testDeal.STAGE_ID || ''))) {
+          console.warn(`[autopilot-test] Сделка ${testDeal.ID} сейчас на стадии ${testDeal.STAGE_ID}, а Ход работы запускается на [${stageIds.join(', ')}].`);
+        } else {
+          console.log(`[autopilot-test] ПРИОРИТЕТ: напрямую запускаю CJM для сделки ${testDeal.ID} "${testDeal.TITLE || ''}", stage=${testDeal.STAGE_ID}.`);
+          // Для тестовой сделки старые in-memory DONE не блокируют новый прогон.
+          autopilotProcessed.delete(String(testDeal.ID));
+          await runServerAutopilotForDeal(testDeal, testDeal.STAGE_ID);
+          preprocessedIds.add(String(testDeal.ID));
+        }
+      } catch (testErr) {
+        console.error(`[autopilot-test] Не удалось приоритетно обработать сделку ${config.cjmTestDealId}: ${testErr.message || testErr}`);
+      }
+    }
+
     // v80: работаем по ВСЕМ подходящим сделкам Производства.
     // EXECUTOR_TEST_DEAL_ID / LIVE_CHAT_TEST_DEAL_ID больше не ограничивают фоновый автопилот.
     // Единственный общий аварийный выключатель — AUTOPILOT_ENABLED=false.
-    console.log('[autopilot] v80: массовый режим — ищу все сделки на целевых стадиях без ограничения одной тестовой сделкой.');
+    console.log('[autopilot] v89: массовый режим — после приоритетного CJM-теста обхожу все сделки на целевых стадиях.');
 
     // Собираем сделки по каждой стадии отдельно (Bitrix не поддерживает массив в STAGE_ID фильтре).
     const allDeals = [];
@@ -5879,6 +5905,7 @@ async function runAutopilotPollingCycle() {
     console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] по всей воронке Производства; testFirst=${config.cjmTestDealId || 'none'}.`);
 
     for (const deal of allDeals) {
+      if (preprocessedIds.has(String(deal.ID))) continue;
       if (autopilotProcessed.has(String(deal.ID))) continue;
       const alreadyDone = await dealAlreadyProcessed(deal.ID);
       if (alreadyDone) continue;
@@ -9795,8 +9822,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v88 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON.`);
+  console.log(`MAVIS Bitrix Expert Assistant v89 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
