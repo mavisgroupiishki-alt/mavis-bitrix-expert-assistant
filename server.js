@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
+const nodemailer = require('nodemailer');
+const AdmZip = require('adm-zip');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9832,7 +9834,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v96: ВОЗВРАТ ОРИГИНАЛОВ — файлы из старых комментариев + отправка без вложения + безопасный historical
+// v97: ВОЗВРАТ ОРИГИНАЛОВ — email из договора/счёта без CRM + SMTP + разбор старых комментариев
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9862,6 +9864,23 @@ const DOC_RETURN_RECOVERY_TASK_IDS = new Set(
     .map((x) => x.trim())
     .filter(Boolean)
 );
+
+const DOC_RETURN_SMTP_HOST = String(process.env.MAIL_SMTP_HOST || 'smtp.mail.ru').trim();
+const DOC_RETURN_SMTP_PORT = Number(process.env.MAIL_SMTP_PORT || 465);
+const DOC_RETURN_SMTP_SECURE =
+  String(process.env.MAIL_SMTP_SECURE || 'true').toLowerCase() !== 'false';
+const DOC_RETURN_SMTP_USER = String(
+  process.env.MAIL_SMTP_USER || process.env.MAIL_IMAP_USER || config.emailFrom || ''
+).trim();
+const DOC_RETURN_SMTP_PASSWORD = String(
+  process.env.MAIL_SMTP_PASSWORD || process.env.MAIL_IMAP_PASSWORD || ''
+);
+const DOC_RETURN_MAX_ACTIONS_PER_CYCLE = Math.max(
+  1,
+  Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 15)
+);
+
+let docReturnSmtpTransport = null;
 
 const DOC_RETURN_COMMENT_1 = 'Автоматическое напоминание №1 о возврате оригинала отправлено.';
 const DOC_RETURN_COMMENT_2 = 'Автоматическое напоминание №2 о возврате оригинала отправлено.';
@@ -9925,7 +9944,8 @@ function docReturnFirstEmail(entity) {
 }
 
 async function docReturnResolveRecipient(deal) {
-  // 1. Приоритет: email компании.
+  if (!deal) return { ok: false, reason: 'crm-deal-not-linked' };
+
   const companyId = String(deal && deal.COMPANY_ID || '').trim();
   if (companyId && companyId !== '0') {
     try {
@@ -9946,7 +9966,6 @@ async function docReturnResolveRecipient(deal) {
     }
   }
 
-  // 2. Fallback: контакт сделки.
   try {
     const recipient = await actsResolveRecipientContact(deal);
     if (recipient && recipient.ok && recipient.contact) {
@@ -9966,9 +9985,191 @@ async function docReturnResolveRecipient(deal) {
     console.warn(`[doc-return] contact resolver: ${e.message || e}`);
   }
 
+  return { ok: false, reason: 'crm-email-not-found' };
+}
+
+function docReturnExtractEmailsFromText(value) {
+  const source = String(value || '');
+  const matches = source.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig) || [];
+  const out = [];
+  const seen = new Set();
+
+  for (const raw of matches) {
+    const email = String(raw || '')
+      .replace(/^[<("'«]+/, '')
+      .replace(/[>)"',;:»]+$/, '')
+      .trim()
+      .toLowerCase();
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+    out.push(email);
+  }
+  return out;
+}
+
+function docReturnOwnEmails() {
+  const set = new Set();
+  const candidates = [
+    config.emailFrom,
+    process.env.EMAIL_FROM,
+    process.env.MAIL_IMAP_USER,
+    process.env.MAIL_SMTP_USER,
+    'mavis.group@mail.ru',
+  ];
+  for (const v of candidates) {
+    const e = String(v || '').trim().toLowerCase();
+    if (e) set.add(e);
+  }
+  return set;
+}
+
+function docReturnPickClientEmail(emails) {
+  const own = docReturnOwnEmails();
+  const cleaned = (emails || [])
+    .map((x) => String(x || '').trim().toLowerCase())
+    .filter(Boolean);
+
+  const external = cleaned.filter((email) => {
+    if (own.has(email)) return false;
+    const domain = String(email.split('@')[1] || '').toLowerCase();
+    if (domain === 'mavisgroup.by' || domain.endsWith('.mavisgroup.by')) return false;
+    return true;
+  });
+
+  return external[0] || cleaned.find((e) => !own.has(e)) || '';
+}
+
+function docReturnDecodeXmlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function docReturnExtractEmailsFromBuffer(buffer, fileName = '') {
+  const name = String(fileName || '').toLowerCase();
+  const found = [];
+
+  const addFrom = (value) => {
+    for (const email of docReturnExtractEmailsFromText(value)) {
+      if (!found.includes(email)) found.push(email);
+    }
+  };
+
+  if (/\.docx$/i.test(name)) {
+    try {
+      const zip = new AdmZip(buffer);
+      const entries = zip.getEntries();
+      for (const entry of entries) {
+        const entryName = String(entry.entryName || '');
+        if (
+          /^word\/document\.xml$/i.test(entryName) ||
+          /^word\/header\d*\.xml$/i.test(entryName) ||
+          /^word\/footer\d*\.xml$/i.test(entryName) ||
+          /^word\/comments\.xml$/i.test(entryName)
+        ) {
+          const xml = entry.getData().toString('utf8');
+          addFrom(docReturnDecodeXmlEntities(xml.replace(/<[^>]+>/g, ' ')));
+        }
+      }
+    } catch (e) {
+      console.warn(`[doc-return] DOCX parse ${fileName}: ${e.message || e}`);
+    }
+  }
+
+  try { addFrom(buffer.toString('latin1')); } catch (_) {}
+  try { addFrom(buffer.toString('utf8')); } catch (_) {}
+  try { addFrom(buffer.toString('utf16le')); } catch (_) {}
+
+  return found;
+}
+
+function docReturnFileEmailPriority(file) {
+  const name = String(file && file.name || '').toLowerCase().replace(/ё/g, 'е');
+  if (/договор|contract/.test(name)) return 0;
+  if (/счет|invoice/.test(name)) return 1;
+  if (/акт|act/.test(name)) return 2;
+  return 3;
+}
+
+async function docReturnResolveEmailFromTaskAndFiles(basic, mergedFiles, downloadCache) {
+  const crm = await docReturnResolveRecipient(basic.deal);
+  if (crm.ok) return crm;
+
+  const commentRows = await docReturnGetTaskCommentRows(basic.taskId);
+  const textual = [
+    basic.title,
+    docReturnTaskValue(basic.task, ['description', 'DESCRIPTION']) || '',
+    ...commentRows.map((c) =>
+      c && (
+        c.POST_MESSAGE || c.postMessage ||
+        c.MESSAGE || c.message ||
+        c.TEXT || c.text || ''
+      )
+    ),
+  ].join('\n');
+
+  const textEmail = docReturnPickClientEmail(docReturnExtractEmailsFromText(textual));
+  if (textEmail) {
+    return {
+      ok: true,
+      email: textEmail,
+      entityId: 0,
+      entityTypeId: 0,
+      source: 'task-text',
+      label: 'Email из задачи',
+    };
+  }
+
+  const ordered = [...(mergedFiles || [])].sort(
+    (a, b) => docReturnFileEmailPriority(a) - docReturnFileEmailPriority(b)
+  );
+
+  for (const file of ordered.slice(0, 20)) {
+    if (!file || !file.url) continue;
+    const key = `${file.id || ''}:${file.attachedId || ''}:${file.url || ''}:${file.name || ''}`;
+
+    let downloaded = downloadCache.get(key);
+    if (downloaded === undefined) {
+      try {
+        downloaded = await actsDownloadRealFile(file);
+      } catch (e) {
+        downloaded = null;
+        console.warn(`[doc-return] task=${basic.taskId}: email-scan файл ${file.name}: ${e.message || e}`);
+      }
+      downloadCache.set(key, downloaded);
+    }
+
+    if (!downloaded || !downloaded.buffer) continue;
+
+    const emails = docReturnExtractEmailsFromBuffer(
+      downloaded.buffer,
+      downloaded.fileName || file.name || ''
+    );
+    const email = docReturnPickClientEmail(emails);
+    if (email) {
+      console.log(
+        `[doc-return] task=${basic.taskId}: email найден внутри документа ${downloaded.fileName || file.name}: ` +
+        docReturnMaskEmail(email)
+      );
+      return {
+        ok: true,
+        email,
+        entityId: 0,
+        entityTypeId: 0,
+        source: 'document',
+        label: `Email из документа ${downloaded.fileName || file.name || ''}`.trim(),
+        emailSourceFile: downloaded.fileName || file.name || '',
+      };
+    }
+  }
+
   return {
     ok: false,
-    reason: 'В связанной компании и контактах сделки не найден email. Письмо не отправлено.',
+    reason:
+      'Не найден email: нет подходящей CRM-связи/почты и в прикреплённых документах email не найден.',
   };
 }
 
@@ -10127,11 +10328,18 @@ async function docReturnLoadBasicContext(taskId, task = null) {
   task = task || await docReturnLoadTask(taskId);
 
   const dealIds = actsExtractDealIdsFromTask(task);
-  if (!dealIds.length) throw new Error('В задаче нет связанной CRM-сделки D_....');
+  let dealId = '';
+  let deal = null;
 
-  const dealId = String(dealIds[0]);
-  const deal = await bitrixRestCall('crm.deal.get', { id: Number(dealId) });
-  if (!deal) throw new Error(`Сделка ${dealId} не найдена.`);
+  if (dealIds.length) {
+    dealId = String(dealIds[0]);
+    try {
+      deal = await bitrixRestCall('crm.deal.get', { id: Number(dealId) });
+    } catch (e) {
+      console.warn(`[doc-return] task=${taskId}: не смог открыть CRM-сделку ${dealId}: ${e.message || e}`);
+      deal = null;
+    }
+  }
 
   return {
     taskId: String(taskId),
@@ -10141,7 +10349,6 @@ async function docReturnLoadBasicContext(taskId, task = null) {
     title: String(docReturnTaskValue(task, ['title', 'TITLE']) || ''),
   };
 }
-
 
 async function docReturnGetTaskCommentRows(taskId) {
   try {
@@ -10164,18 +10371,11 @@ async function docReturnGetTaskCommentRows(taskId) {
 }
 
 async function docReturnResolveCommentFiles(taskId) {
-  const rows = await docReturnGetTaskCommentRows(taskId);
+  const listRows = await docReturnGetTaskCommentRows(taskId);
   const files = [];
   const seen = new Set();
 
-  for (const comment of rows) {
-    const attached =
-      comment && (
-        comment.ATTACHED_OBJECTS ||
-        comment.attachedObjects ||
-        comment.attached_objects
-      );
-
+  const addObjects = (comment, attached) => {
     const objects = attached && typeof attached === 'object'
       ? Object.values(attached)
       : [];
@@ -10198,8 +10398,10 @@ async function docReturnResolveCommentFiles(taskId) {
         obj.VIEW_URL || obj.viewUrl || ''
       ).trim();
       const date = String(
-        comment.POST_DATE || comment.postDate ||
-        comment.DATE || comment.date || ''
+        comment && (
+          comment.POST_DATE || comment.postDate ||
+          comment.DATE || comment.date || ''
+        ) || ''
       ).trim();
 
       if (!name && !fileId && !attachedId) continue;
@@ -10217,11 +10419,42 @@ async function docReturnResolveCommentFiles(taskId) {
         source: 'task-comment',
       });
     }
+  };
+
+  for (const row of listRows.slice(0, 100)) {
+    let full = row;
+    let attached =
+      row && (
+        row.ATTACHED_OBJECTS ||
+        row.attachedObjects ||
+        row.attached_objects
+      );
+
+    if (!attached || !Object.keys(attached || {}).length) {
+      const itemId = String(row && (row.ID || row.id) || '').trim();
+      if (itemId) {
+        try {
+          const got = await bitrixRestCall('task.commentitem.get', {
+            TASKID: Number(taskId),
+            ITEMID: Number(itemId),
+          });
+          full = got && (got.item || got.ITEM || got) || row;
+          attached =
+            full && (
+              full.ATTACHED_OBJECTS ||
+              full.attachedObjects ||
+              full.attached_objects
+            );
+        } catch (_) {}
+      }
+    }
+
+    addObjects(full, attached);
   }
 
   if (files.length) {
     console.log(
-      `[doc-return] task=${taskId}: найдено файлов в предыдущих комментариях=${files.length}: ` +
+      `[doc-return] task=${taskId}: файлов из старых комментариев=${files.length}: ` +
       files.slice(0, 10).map((f) => f.name).join(', ')
     );
   }
@@ -10235,10 +10468,17 @@ async function docReturnShouldManageHistoricalEmailTask(task) {
   if (taskId === DOC_RETURN_TEST_TASK_ID) return true;
   if (DOC_RETURN_RECOVERY_TASK_IDS.has(taskId)) return true;
 
-  // Новые задачи после запуска v94/v95 продолжаем вести штатно.
+  // Новые задачи после запуска продолжаем вести штатно.
   const startMs = docReturnParseMs(DOC_RETURN_PRODUCTION_START_ISO);
   const createdMs = docReturnCreatedMs(task);
   if (createdMs && startMs && createdMs >= startMs) return true;
+
+  // Старые задачи, которые наша автоматизация уже передвинула/изменила после запуска,
+  // тоже обязательно дожимаем — это текущая пачка просрочки в «Эл. Почта».
+  const changedMs = docReturnParseMs(
+    docReturnTaskValue(task, ['changedDate', 'CHANGED_DATE', 'changed_date'])
+  );
+  if (changedMs && startMs && changedMs >= startMs) return true;
 
   // Старые задачи, которые уже реально вошли в НАШ цикл и имеют наши комментарии,
   // продолжаем вести до письма №2 / Звонка.
@@ -10256,14 +10496,7 @@ async function docReturnShouldManageHistoricalEmailTask(task) {
 }
 
 async function docReturnLoadSendContext(basic) {
-  const recipient = await docReturnResolveRecipient(basic.deal);
-  if (!recipient.ok) throw new Error(recipient.reason);
-
-  // 1) Текущие вложения / результат / task chat.
   const fileResolution = await actsResolveTaskFiles(basic.task);
-
-  // 2) Старые комментарии задачи. В интерфейсе Bitrix они могут быть свернуты
-  // под «Показать пинги», но API возвращает ATTACHED_OBJECTS.
   const commentFiles = await docReturnResolveCommentFiles(basic.taskId);
 
   const mergedFiles = [];
@@ -10276,24 +10509,40 @@ async function docReturnLoadSendContext(basic) {
     mergedFiles.push(f);
   }
 
+  const downloadCache = new Map();
+
+  const recipient = await docReturnResolveEmailFromTaskAndFiles(
+    basic,
+    mergedFiles,
+    downloadCache
+  );
+  if (!recipient.ok) throw new Error(recipient.reason);
+
   const file = docReturnPickFile(mergedFiles, basic.title);
 
   let downloaded = null;
   let fileWarning = '';
 
   if (file && file.url) {
-    try {
-      downloaded = await actsDownloadRealFile(file);
-      if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) {
+    const cacheKey = `${file.id || ''}:${file.attachedId || ''}:${file.url || ''}:${file.name || ''}`;
+    downloaded = downloadCache.get(cacheKey);
+
+    if (downloaded === undefined) {
+      try {
+        downloaded = await actsDownloadRealFile(file);
+      } catch (e) {
         downloaded = null;
-        fileWarning = `Файл «${file.name || 'без названия'}» найден, но пустой. Письмо отправится без вложения.`;
+        fileWarning =
+          `Файл «${file.name || 'без названия'}» найден, но не скачался (${e.message || e}). ` +
+          'Письмо отправится без вложения.';
+        console.warn(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
       }
-    } catch (e) {
-      fileWarning =
-        `Файл «${file.name || 'без названия'}» найден, но не скачался (${e.message || e}). ` +
-        'Письмо отправится без вложения.';
-      console.warn(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
+      downloadCache.set(cacheKey, downloaded);
+    }
+
+    if (downloaded && (!downloaded.buffer || !downloaded.buffer.length)) {
       downloaded = null;
+      fileWarning = `Файл «${file.name || 'без названия'}» найден, но пустой. Письмо отправится без вложения.`;
     }
   } else {
     fileWarning = 'Файл в задаче и предыдущих комментариях не найден. Письмо отправится без вложения.';
@@ -10338,21 +10587,21 @@ async function docReturnReadState(basic) {
   let call = joined.includes(DOC_RETURN_CALL_COMMENT);
 
   // Совместимость с уже прошедшим первым тестом 47208.
-  if (!first) {
+  if (basic.dealId && !first) {
     first = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_1} task=${basic.taskId}`,
       100
     );
   }
-  if (!second) {
+  if (basic.dealId && !second) {
     second = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_2} task=${basic.taskId}`,
       100
     );
   }
-  if (!call) {
+  if (basic.dealId && !call) {
     call = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_CALL_MARKER} task=${basic.taskId}`,
@@ -10389,58 +10638,125 @@ async function docReturnAddTaskComment(task, text) {
   }
 }
 
+function docReturnGetSmtpTransport() {
+  if (docReturnSmtpTransport) return docReturnSmtpTransport;
+
+  if (!DOC_RETURN_SMTP_USER || !DOC_RETURN_SMTP_PASSWORD) {
+    throw new Error(
+      'Нет CRM-связи для отправки через Bitrix и не настроена SMTP-почта. ' +
+      'Нужны MAIL_SMTP_USER/MAIL_SMTP_PASSWORD или уже существующие MAIL_IMAP_USER/MAIL_IMAP_PASSWORD.'
+    );
+  }
+
+  docReturnSmtpTransport = nodemailer.createTransport({
+    host: DOC_RETURN_SMTP_HOST,
+    port: DOC_RETURN_SMTP_PORT,
+    secure: DOC_RETURN_SMTP_SECURE,
+    auth: {
+      user: DOC_RETURN_SMTP_USER,
+      pass: DOC_RETURN_SMTP_PASSWORD,
+    },
+  });
+
+  return docReturnSmtpTransport;
+}
+
+async function docReturnSendViaSmtp(ctx, subject, body) {
+  const transporter = docReturnGetSmtpTransport();
+  const fromAddress = String(
+    config.emailFrom || process.env.EMAIL_FROM || DOC_RETURN_SMTP_USER
+  ).trim() || DOC_RETURN_SMTP_USER;
+  const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
+
+  const mail = {
+    from: `${senderName} <${fromAddress}>`,
+    to: ctx.recipient.email,
+    subject,
+    text: body,
+  };
+
+  if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
+    mail.attachments = [{
+      filename: String(ctx.downloaded.fileName || 'document'),
+      content: ctx.downloaded.buffer,
+      contentType: ctx.downloaded.contentType || undefined,
+    }];
+  }
+
+  const info = await transporter.sendMail(mail);
+  return {
+    smtp: true,
+    messageId: info && info.messageId || '',
+    accepted: info && info.accepted || [],
+  };
+}
+
 async function docReturnSendEmail(ctx, sequence) {
   const subject = 'Срочно! Возврат оригинала!';
   const fileName = ctx.downloaded && ctx.downloaded.fileName
     ? ctx.downloaded.fileName
     : (ctx.file && ctx.file.name ? ctx.file.name : '');
   const body = docReturnBuildBody(ctx.title, fileName);
-  const responsibleId = Number(ctx.deal.ASSIGNED_BY_ID || 1);
 
-  const fields = {
-    TYPE_ID: 4,
-    SUBJECT: subject,
-    DESCRIPTION: body,
-    DESCRIPTION_TYPE: 1,
-    DIRECTION: 2,
-    OWNER_TYPE_ID: 2,
-    OWNER_ID: Number(ctx.deal.ID),
-    RESPONSIBLE_ID: responsibleId,
-    COMPLETED: 'Y',
-    START_TIME: new Date().toISOString(),
-    END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-    COMMUNICATIONS: [{
-      VALUE: ctx.recipient.email,
-      ENTITY_ID: Number(ctx.recipient.entityId || 0),
-      ENTITY_TYPE_ID: Number(ctx.recipient.entityTypeId || 3),
-      TYPE: 'EMAIL',
-    }],
-  };
+  if (
+    ctx.deal &&
+    ctx.recipient &&
+    Number(ctx.recipient.entityId || 0) > 0 &&
+    [3, 4].includes(Number(ctx.recipient.entityTypeId || 0))
+  ) {
+    const responsibleId = Number(ctx.deal.ASSIGNED_BY_ID || 1);
 
-  // Вложение НЕ обязательное. Если нашли и реально скачали — прикладываем.
-  // Если нет — отправляем только текст письма.
-  if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
-    fields.FILES = [{
-      fileData: [
-        String(ctx.downloaded.fileName || 'document'),
-        ctx.downloaded.buffer.toString('base64'),
-      ],
-    }];
+    const fields = {
+      TYPE_ID: 4,
+      SUBJECT: subject,
+      DESCRIPTION: body,
+      DESCRIPTION_TYPE: 1,
+      DIRECTION: 2,
+      OWNER_TYPE_ID: 2,
+      OWNER_ID: Number(ctx.deal.ID),
+      RESPONSIBLE_ID: responsibleId,
+      COMPLETED: 'Y',
+      START_TIME: new Date().toISOString(),
+      END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      COMMUNICATIONS: [{
+        VALUE: ctx.recipient.email,
+        ENTITY_ID: Number(ctx.recipient.entityId || 0),
+        ENTITY_TYPE_ID: Number(ctx.recipient.entityTypeId || 3),
+        TYPE: 'EMAIL',
+      }],
+    };
+
+    if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
+      fields.FILES = [{
+        fileData: [
+          String(ctx.downloaded.fileName || 'document'),
+          ctx.downloaded.buffer.toString('base64'),
+        ],
+      }];
+    }
+
+    const emailFrom = String(config.emailFrom || process.env.EMAIL_FROM || '').trim();
+    const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
+    if (emailFrom) {
+      fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${emailFrom}>` };
+    }
+
+    const activityId = await bitrixRestCall('crm.activity.add', { fields });
+    console.log(
+      `[doc-return] email #${sequence} task=${ctx.taskId}; transport=Bitrix; ` +
+      `to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
+      `file=${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`
+    );
+    return activityId;
   }
 
-  const emailFrom = String(config.emailFrom || process.env.EMAIL_FROM || '').trim();
-  const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
-  if (emailFrom) {
-    fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${emailFrom}>` };
-  }
-
-  const activityId = await bitrixRestCall('crm.activity.add', { fields });
+  const smtpResult = await docReturnSendViaSmtp(ctx, subject, body);
   console.log(
-    `[doc-return] email #${sequence} task=${ctx.taskId}; ` +
-    `to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
+    `[doc-return] email #${sequence} task=${ctx.taskId}; transport=SMTP; ` +
+    `source=${ctx.recipient.source}; to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
     `file=${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`
   );
-  return activityId;
+  return smtpResult;
 }
 
 async function docReturnSetDeadline(taskId, deadline) {
@@ -10504,7 +10820,15 @@ function docReturnReminderComment(sequence, ctx, nextDeadline) {
   return [
     sequence === 1 ? DOC_RETURN_COMMENT_1 : DOC_RETURN_COMMENT_2,
     `Email: ${ctx.recipient.email}`,
-    `Источник email: ${ctx.recipient.source === 'company' ? 'компания в CRM' : 'контакт в CRM'}`,
+    `Источник email: ${
+      ctx.recipient.source === 'company'
+        ? 'компания в CRM'
+        : ctx.recipient.source === 'contact'
+          ? 'контакт в CRM'
+          : ctx.recipient.source === 'document'
+            ? `документ${ctx.recipient.emailSourceFile ? ` — ${ctx.recipient.emailSourceFile}` : ''}`
+            : 'текст задачи/комментария'
+    }`,
     `Документ: ${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`,
     `Следующий срок контроля: ${docReturnDateRu(nextDeadline)}.`,
   ].join('\n');
@@ -10525,11 +10849,13 @@ async function docReturnSendReminder(basic, sequence) {
   // Legacy-маркер сохраняем только для надёжного восстановления состояния,
   // но в комментарии самой задачи никакой технической строки нет.
   const marker = sequence === 1 ? DOC_RETURN_LEGACY_MARKER_1 : DOC_RETURN_LEGACY_MARKER_2;
-  await fgAddCommentOnce(
-    ctx.dealId,
-    `${marker} task=${ctx.taskId}`,
-    `Система возврата оригиналов: email-напоминание №${sequence} отправлено. Следующий контроль ${docReturnDateRu(nextDeadline)}.`
-  ).catch(() => {});
+  if (ctx.dealId) {
+    await fgAddCommentOnce(
+      ctx.dealId,
+      `${marker} task=${ctx.taskId}`,
+      `Система возврата оригиналов: email-напоминание №${sequence} отправлено. Следующий контроль ${docReturnDateRu(nextDeadline)}.`
+    ).catch(() => {});
+  }
 
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
@@ -10554,11 +10880,13 @@ async function docReturnMoveToCall(basic, stages) {
   await docReturnMoveStage(basic.taskId, stages.call);
   await docReturnAddTaskComment(basic.task, DOC_RETURN_CALL_COMMENT);
 
-  await fgAddCommentOnce(
-    basic.dealId,
-    `${DOC_RETURN_LEGACY_CALL_MARKER} task=${basic.taskId}`,
-    'Система возврата оригиналов: два email-напоминания отправлены, задача передана на ручной звонок.'
-  ).catch(() => {});
+  if (basic.dealId) {
+    await fgAddCommentOnce(
+      basic.dealId,
+      `${DOC_RETURN_LEGACY_CALL_MARKER} task=${basic.taskId}`,
+      'Система возврата оригиналов: два email-напоминания отправлены, задача передана на ручной звонок.'
+    ).catch(() => {});
+  }
 
   console.log(`[doc-return] CALL task=${basic.taskId}; moved to stage=${stages.call}`);
 
@@ -10599,17 +10927,19 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
     const expired = docReturnIsDeadlineExpired(currentTask);
     let movedFromSent = false;
 
-    // Стадия «Отправлены»: сначала убеждаемся, что есть связанная сделка и email.
-    // Файл НЕ обязателен, поэтому его наличие здесь не проверяем.
+    // Стадия «Отправлены»: до перемещения делаем полный preflight.
+    // Email может быть из CRM, текста задачи или из договора/счёта.
+    // Файл для самого письма необязателен.
     if (stageId === stages.sent) {
       if (!expired) {
         return { ok: true, skipped: true, taskId, stage: 'sent', reason: 'deadline-not-expired' };
       }
 
       const preflightBasic = await docReturnLoadBasicContext(taskId, currentTask);
-      const preflightRecipient = await docReturnResolveRecipient(preflightBasic.deal);
-      if (!preflightRecipient.ok) {
-        throw new Error(preflightRecipient.reason);
+      const preflightState = await docReturnReadState(preflightBasic);
+
+      if (!preflightState.first) {
+        await docReturnLoadSendContext(preflightBasic);
       }
 
       currentTask = await docReturnMoveStage(taskId, stages.email);
@@ -10629,19 +10959,7 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
       };
     }
 
-    let basic = null;
-    try {
-      basic = await docReturnLoadBasicContext(taskId, currentTask);
-    } catch (e) {
-      // Несколько старых задач v95 уже успел ошибочно передвинуть в «Эл. Почта»
-      // до проверки CRM. Возвращаем только известные recovery-задачи обратно в «Отправлены».
-      if (DOC_RETURN_RECOVERY_TASK_IDS.has(taskId) && /нет связанной CRM-сделки/i.test(String(e.message || e))) {
-        await docReturnMoveStage(taskId, stages.sent).catch(() => {});
-        console.warn(`[doc-return] RECOVERY task=${taskId}: нет CRM-связи, вернул в «Отправлены».`);
-      }
-      throw e;
-    }
-
+    let basic = await docReturnLoadBasicContext(taskId, currentTask);
     const state = await docReturnReadState(basic);
 
     // Новый обычный кейс: пришли из «Отправлены», первого письма ещё не было.
@@ -10794,9 +11112,14 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
   }
 
   const results = [];
+  let actionCount = 0;
+
   for (const taskId of ids) {
+    if (actionCount >= DOC_RETURN_MAX_ACTIONS_PER_CYCLE) break;
+
     const result = await docReturnProcessTask(taskId, trigger);
     results.push(result);
+    if (result && result.action) actionCount++;
   }
 
   const actionable = results.filter((r) => r && r.action);
@@ -10804,7 +11127,7 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
 
   console.log(
     `[doc-return] poll ${trigger}: checked=${results.length}; actions=${actionable.length}; ` +
-    `errors=${errors.length}; newOnly=${DOC_RETURN_INCLUDE_HISTORICAL ? 'NO' : `YES from ${DOC_RETURN_PRODUCTION_START_ISO}`}`
+    `errors=${errors.length}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; newOnly=${DOC_RETURN_INCLUDE_HISTORICAL ? 'NO' : `YES from ${DOC_RETURN_PRODUCTION_START_ISO}`}`
   );
 
   return { ok: errors.length === 0, checked: results.length, actions: actionable, errors };
@@ -10845,7 +11168,7 @@ async function docReturnDryRun(taskId) {
     projectId: DOC_RETURN_PROJECT_ID,
     taskTitle: basic.title,
     dealId: basic.dealId,
-    dealTitle: basic.deal.TITLE || '',
+    dealTitle: basic.deal ? (basic.deal.TITLE || '') : '',
     stageId,
     stages: { sent: stages.sent, email: stages.email, call: stages.call },
     deadline: docReturnTaskValue(task, ['deadline', 'DEADLINE']) || '',
@@ -10897,7 +11220,7 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v96 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v97 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}`
 );
