@@ -9831,6 +9831,389 @@ app.get('/api/get-deal-fields', async (req, res) => {
   }
 });
 
+// ============================================================================
+// v91 TEST — ВОЗВРАТ ОРИГИНАЛОВ: первое email-напоминание только для задачи 47208
+// ============================================================================
+// Безопасный пилот:
+// - обрабатывается ТОЛЬКО задача 47208 из проекта 36;
+// - email берём сначала из компании связанной сделки, затем из контакта;
+// - письмо без реально прикрепляемого файла не отправляем;
+// - после успешной отправки ставим новый дедлайн +14 календарных дней;
+// - результат фиксируем комментарием в чате задачи;
+// - повторный вызов защищён маркером в комментариях задачи.
+// После успешного пилота этот блок можно расширить на весь проект и добавить 2-й цикл/стадию «Звонок».
+
+const DOC_RETURN_TEST_TASK_ID = String(process.env.DOC_RETURN_TEST_TASK_ID || '47208');
+const DOC_RETURN_PROJECT_ID = String(process.env.DOC_RETURN_PROJECT_ID || '36');
+const DOC_RETURN_MARKER_1 = '[MAVIS_DOC_RETURN_REMINDER_1]';
+
+function docReturnFirstEmail(entity) {
+  const rows = Array.isArray(entity && entity.EMAIL) ? entity.EMAIL : [];
+  for (const row of rows) {
+    const email = String(row && row.VALUE || '').trim();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return email;
+  }
+  return '';
+}
+
+function docReturnEmailFromText(value) {
+  const text = String(value || '');
+  const match = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0].trim() : '';
+}
+
+async function docReturnResolveRecipient(deal, task) {
+  // 1. По ТЗ для пилота в приоритете email компании из связанной сделки.
+  const companyId = String(deal && deal.COMPANY_ID || '').trim();
+  if (companyId && companyId !== '0') {
+    try {
+      const company = await bitrixRestCall('crm.company.get', { id: Number(companyId) });
+      const email = docReturnFirstEmail(company);
+      if (email) {
+        return {
+          ok: true,
+          email,
+          entityId: Number(companyId),
+          entityTypeId: 4,
+          source: 'company',
+          label: String(company && company.TITLE || `Компания ${companyId}`),
+        };
+      }
+    } catch (e) {
+      console.warn(`[doc-return] company ${companyId}: не смог получить email: ${e.message || e}`);
+    }
+  }
+
+  // 2. Основной контакт сделки.
+  const contactId = String(deal && deal.CONTACT_ID || '').trim();
+  if (contactId && contactId !== '0') {
+    try {
+      const contact = await bitrixRestCall('crm.contact.get', { id: Number(contactId) });
+      const email = docReturnFirstEmail(contact);
+      if (email) {
+        const label = [contact && contact.NAME, contact && contact.LAST_NAME].filter(Boolean).join(' ').trim() || `Контакт ${contactId}`;
+        return { ok: true, email, entityId: Number(contactId), entityTypeId: 3, source: 'contact', label };
+      }
+    } catch (e) {
+      console.warn(`[doc-return] contact ${contactId}: не смог получить email: ${e.message || e}`);
+    }
+  }
+
+  // 3. Если у сделки несколько контактов — используем уже проверенную логику выбора актуального контакта.
+  try {
+    const recipient = await actsResolveRecipientContact(deal);
+    if (recipient && recipient.ok && recipient.contact) {
+      const email = actsContactEmail(recipient.contact);
+      if (email) {
+        return {
+          ok: true,
+          email,
+          entityId: Number(recipient.contactId || 0),
+          entityTypeId: 3,
+          source: `deal-contact:${recipient.source || 'resolved'}`,
+          label: recipient.label || `Контакт ${recipient.contactId}`,
+        };
+      }
+    }
+  } catch (e) {
+    console.warn(`[doc-return] deal=${deal && deal.ID}: не смог выбрать email из контактов сделки: ${e.message || e}`);
+  }
+
+  // 4. Безопасный текстовый fallback: если email явно записан в описании задачи/комментарии сделки.
+  const textEmail = docReturnEmailFromText([
+    actsTaskField(task, ['description','DESCRIPTION']),
+    deal && deal.COMMENTS,
+  ].filter(Boolean).join('\n'));
+  if (textEmail) {
+    return { ok: true, email: textEmail, entityId: 0, entityTypeId: 3, source: 'task/deal-text', label: 'email из текста задачи/сделки' };
+  }
+
+  return {
+    ok: false,
+    reason: 'Email не найден ни у компании, ни у контакта связанной сделки. В пилоте письмо не отправляю.',
+  };
+}
+
+function docReturnDocKinds(text) {
+  const s = String(text || '').toLowerCase().replace(/ё/g, 'е');
+  const kinds = [];
+  if (/договор|contract/.test(s)) kinds.push('договор');
+  if (/счет|сч[её]т|invoice/.test(s)) kinds.push('счёт');
+  if (/акт|\bact\b/.test(s)) kinds.push('акт');
+  return kinds;
+}
+
+function docReturnDocumentPhrase(taskTitle, fileName) {
+  const kinds = [...new Set([...docReturnDocKinds(taskTitle), ...docReturnDocKinds(fileName)])];
+  if (kinds.length === 1 && kinds[0] === 'договор') return 'договора';
+  if (kinds.length === 1 && kinds[0] === 'счёт') return 'счёта';
+  if (kinds.length === 1 && kinds[0] === 'акт') return 'акта';
+  if (kinds.includes('договор') && kinds.includes('счёт') && !kinds.includes('акт')) return 'договора и счёта';
+  if (kinds.includes('договор') && kinds.includes('акт') && !kinds.includes('счёт')) return 'договора и акта';
+  if (kinds.includes('счёт') && kinds.includes('акт') && !kinds.includes('договор')) return 'счёта и акта';
+  if (kinds.length >= 3) return 'договора, счёта и акта';
+  return 'документа';
+}
+
+function docReturnPickAttachableFile(files, taskTitle) {
+  const attachable = (files || []).filter((f) => f && actsBuildEmailStorageElementIds(f).length > 0);
+  if (!attachable.length) return null;
+
+  const taskKinds = docReturnDocKinds(taskTitle);
+  const score = (f) => {
+    const name = String(f && f.name || '').toLowerCase().replace(/ё/g, 'е');
+    let n = 0;
+    if (taskKinds.includes('договор') && /договор|contract/.test(name)) n += 100;
+    if (taskKinds.includes('счёт') && /счет|сч[её]т|invoice/.test(name)) n += 100;
+    if (taskKinds.includes('акт') && /акт|\bact\b/.test(name)) n += 100;
+    if (/\.(pdf|docx?|xlsx?)$/i.test(name)) n += 20;
+    const ts = Date.parse(String(f && f.date || ''));
+    if (Number.isFinite(ts)) n += Math.min(10, Math.max(0, ts / 1e13));
+    return n;
+  };
+
+  return attachable.slice().sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+function docReturnMessage(taskTitle, fileName) {
+  const phrase = docReturnDocumentPhrase(taskTitle, fileName);
+  return [
+    'Здравствуйте!',
+    '',
+    `Нам не вернулся наш экземпляр подписанного с Вашей стороны ${phrase}.`,
+    '',
+    'Просьба распечатать в 1 экз., поставить подпись и печать и отправить нам по адресу:',
+    '',
+    '220140, г. Минск, ул. Домбровская, д. 9, офис 12.2.2.',
+    '',
+    'Получатель ООО «Мавис групп».',
+    '',
+    '',
+    'С Уважением, Жихарева Анна',
+    '',
+    'MAVIS GROUP',
+    '',
+    '+375333316898',
+  ].join('\n');
+}
+
+function docReturnDeadlinePlus14() {
+  const now = new Date();
+  const minskDate = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now);
+  const [year, month, day] = minskDate.split('-').map(Number);
+  // Минск в 2026 году UTC+3 без сезонного перевода времени.
+  const targetUtc = new Date(Date.UTC(year, month - 1, day + 14, 15, 0, 0)); // 18:00 Минск
+  return toMinskLocalIso(targetUtc);
+}
+
+function docReturnFormatMinsk(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value || '');
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Minsk',
+    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+  }).format(d);
+}
+
+async function docReturnLoadTask(taskId) {
+  const raw = await bitrixRestCall('tasks.task.get', {
+    taskId: Number(taskId),
+    select: [
+      'ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS',
+      'RESPONSIBLE_ID','CREATED_BY','DEADLINE','CHAT_ID',
+      'UF_CRM_TASK','UF_TASK_WEBDAV_FILES',
+    ],
+  });
+  return raw && (raw.task || raw.TASK || raw);
+}
+
+async function docReturnTaskHasMarker(task) {
+  const chatId = String(actsTaskField(task, ['chatId','CHAT_ID','chat_id']) || '').trim();
+  if (chatId) {
+    try {
+      const dialog = await bitrixRestCall('im.dialog.messages.get', { DIALOG_ID: `chat${chatId}`, LIMIT: 50 });
+      if (JSON.stringify(dialog || {}).includes(DOC_RETURN_MARKER_1)) return true;
+    } catch (e) {
+      console.warn(`[doc-return] task=${actsTaskField(task,['id','ID'])}: не смог проверить chat marker: ${e.message || e}`);
+    }
+  }
+
+  // Legacy fallback для порталов, где task chat недоступен вебхуку.
+  try {
+    const taskId = Number(actsTaskField(task, ['id','ID']));
+    const rows = await bitrixRestCall('task.commentitem.getlist', { TASKID: taskId, ORDER: { ID: 'DESC' }, FILTER: {} });
+    if (JSON.stringify(rows || {}).includes(DOC_RETURN_MARKER_1)) return true;
+  } catch (_) {}
+
+  return false;
+}
+
+async function docReturnAddTaskComment(task, message) {
+  const chatId = String(actsTaskField(task, ['chatId','CHAT_ID','chat_id']) || '').trim();
+  if (chatId) {
+    try {
+      await bitrixRestCall('im.message.add', { DIALOG_ID: `chat${chatId}`, MESSAGE: message });
+      return 'task-chat';
+    } catch (e) {
+      console.warn(`[doc-return] task=${actsTaskField(task,['id','ID'])}: im.message.add не сработал: ${e.message || e}`);
+    }
+  }
+
+  const taskId = Number(actsTaskField(task, ['id','ID']));
+  await bitrixRestCall('task.commentitem.add', { TASKID: taskId, FIELDS: { POST_MESSAGE: message } });
+  return 'task-commentitem';
+}
+
+async function docReturnSendEmail({ deal, recipient, file, taskTitle, taskId }) {
+  const storageIds = actsBuildEmailStorageElementIds(file);
+  if (!storageIds.length) throw new Error('У выбранного файла нет attachment-id Bitrix. Письмо без файла заблокировано.');
+
+  // До отправки убеждаемся, что файл реально доступен, а не HTML/PHP-заглушка.
+  await actsDownloadRealFile(file);
+
+  const responsibleId = Number(deal.ASSIGNED_BY_ID || 1);
+  let staff = null;
+  try {
+    const u = await bitrixRestCall('user.get', { ID: responsibleId });
+    staff = Array.isArray(u) ? u[0] : u;
+  } catch (_) {}
+
+  const fields = {
+    TYPE_ID: 4,
+    SUBJECT: `Возврат оригинала документа — ${deal.TITLE || taskTitle || `задача ${taskId}`}`,
+    DESCRIPTION: docReturnMessage(taskTitle, file && file.name),
+    DESCRIPTION_TYPE: 1,
+    DIRECTION: 2,
+    OWNER_TYPE_ID: 2,
+    OWNER_ID: Number(deal.ID),
+    RESPONSIBLE_ID: responsibleId,
+    COMPLETED: 'Y',
+    START_TIME: new Date().toISOString(),
+    END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    COMMUNICATIONS: [{
+      VALUE: recipient.email,
+      ENTITY_ID: Number(recipient.entityId || 0),
+      ENTITY_TYPE_ID: Number(recipient.entityTypeId || 3),
+      TYPE: 'EMAIL',
+    }],
+    STORAGE_TYPE_ID: 3,
+    STORAGE_ELEMENT_IDS: storageIds,
+  };
+
+  const configuredFrom = String(config.emailFrom || process.env.EMAIL_FROM || '').trim();
+  if (configuredFrom) {
+    fields.SETTINGS = { MESSAGE_FROM: `Жихарева Анна <${configuredFrom}>` };
+  } else if (staff && staff.EMAIL) {
+    fields.SETTINGS = { MESSAGE_FROM: `Жихарева Анна <${staff.EMAIL}>` };
+  }
+
+  return bitrixRestCall('crm.activity.add', { fields });
+}
+
+async function docReturnReminderHandler(req, res) {
+  const taskId = String(actsReqTaskId(req) || '').trim();
+  try {
+    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+
+    // ЖЁСТКАЯ ЗАЩИТА пилота: любой другой task_id игнорируется.
+    if (taskId !== DOC_RETURN_TEST_TASK_ID) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        taskId,
+        reason: `TEST MODE: разрешена только задача ${DOC_RETURN_TEST_TASK_ID}`,
+      });
+    }
+
+    const task = await docReturnLoadTask(taskId);
+    if (!task) throw new Error(`Задача ${taskId} не найдена`);
+
+    const groupId = String(actsTaskField(task, ['groupId','GROUP_ID','group_id']) || '').trim();
+    if (groupId !== DOC_RETURN_PROJECT_ID) {
+      throw new Error(`Защитный стоп: задача ${taskId} относится к проекту ${groupId || 'не определён'}, ожидался проект ${DOC_RETURN_PROJECT_ID}`);
+    }
+
+    if (await docReturnTaskHasMarker(task)) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        duplicate: true,
+        taskId,
+        reason: 'Напоминание №1 уже зафиксировано в задаче — повторно письмо не отправляю.',
+      });
+    }
+
+    const dealIds = actsExtractDealIdsFromTask(task);
+    if (!dealIds.length) throw new Error('В задаче не найдена связанная CRM-сделка (D_...). Письмо не отправлено.');
+    const dealId = String(dealIds[0]);
+    const deal = await bitrixRestCall('crm.deal.get', { id: Number(dealId) });
+    if (!deal) throw new Error(`Связанная сделка ${dealId} не найдена`);
+
+    const recipient = await docReturnResolveRecipient(deal, task);
+    if (!recipient.ok) throw new Error(recipient.reason || 'Не удалось определить email клиента');
+
+    const resolved = await actsResolveTaskFiles(task);
+    const allFiles = resolved && Array.isArray(resolved.files) ? resolved.files : [];
+    const taskTitle = String(actsTaskField(task, ['title','TITLE']) || '');
+    const file = docReturnPickAttachableFile(allFiles, taskTitle);
+    if (!file) {
+      const names = allFiles.map((f) => `${f.name || f.id || 'файл'}${actsBuildEmailStorageElementIds(f).length ? ':attachable' : ':no-attachment-id'}`);
+      throw new Error(`Не найден файл задачи, который Bitrix может прикрепить к email. Найдено: ${names.join(', ') || '0 файлов'}. Письмо без файла заблокировано.`);
+    }
+
+    const activityId = await docReturnSendEmail({ deal, recipient, file, taskTitle, taskId });
+
+    const nextDeadline = docReturnDeadlinePlus14();
+    await bitrixRestCall('tasks.task.update', {
+      taskId: Number(taskId),
+      fields: { DEADLINE: nextDeadline },
+    });
+
+    const comment = [
+      DOC_RETURN_MARKER_1,
+      'Автоматическое напоминание №1 о возврате оригинала отправлено.',
+      `Email: ${recipient.email}`,
+      `Источник email: ${recipient.source}`,
+      `Сделка: ${deal.TITLE || deal.ID} (#${deal.ID})`,
+      `Файл: ${file.name || file.id}`,
+      `Новый дедлайн: ${docReturnFormatMinsk(nextDeadline)} (+14 календарных дней).`,
+      `CRM activity: ${typeof activityId === 'object' ? JSON.stringify(activityId) : String(activityId || '')}`,
+    ].join('\n');
+
+    let commentVia = '';
+    try {
+      commentVia = await docReturnAddTaskComment(task, comment);
+    } catch (e) {
+      // Письмо уже ушло — поэтому не бросаем 500 и не провоцируем повторную рассылку роботом.
+      commentVia = `comment-error:${e.message || e}`;
+      console.error(`[doc-return] task=${taskId}: письмо отправлено, но комментарий не добавлен: ${e.message || e}`);
+    }
+
+    console.log(`[doc-return] task=${taskId}: reminder #1 sent to ${maskEmailForLog(recipient.email)}; file=${file.name}; deadline=${nextDeadline}; comment=${commentVia}`);
+    return res.status(200).json({
+      ok: true,
+      taskId,
+      dealId,
+      sentTo: maskEmailForLog(recipient.email),
+      recipientSource: recipient.source,
+      file: { id: file.id || '', attachedId: file.attachedId || '', name: file.name || '' },
+      nextDeadline,
+      activityId,
+      commentVia,
+    });
+  } catch (e) {
+    console.error(`[doc-return] task=${taskId || '?'}: ${e.message || e}`);
+    return res.status(500).json({ ok: false, taskId: taskId || null, error: e.message || String(e) });
+  }
+}
+
+// Исходящий вебхук Bitrix может вызвать URL как GET или POST — поддерживаем оба варианта.
+app.get('/api/doc-return-reminder', docReturnReminderHandler);
+app.post('/api/doc-return-reminder', docReturnReminderHandler);
+
+
 app.listen(PORT, () => {
   console.log(`MAVIS Bitrix Expert Assistant v89 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
