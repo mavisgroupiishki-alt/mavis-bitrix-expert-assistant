@@ -9834,7 +9834,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v98: ВОЗВРАТ ОРИГИНАЛОВ — запрет писем на MAVIS + оригинальные DOC/DOCX вложения через SMTP
+// v99: ВОЗВРАТ ОРИГИНАЛОВ — SMTP подтверждение + точная копия в IMAP «Отправленные»
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9875,6 +9875,18 @@ const DOC_RETURN_SMTP_USER = String(
 const DOC_RETURN_SMTP_PASSWORD = String(
   process.env.MAIL_SMTP_PASSWORD || process.env.MAIL_IMAP_PASSWORD || ''
 );
+
+const DOC_RETURN_IMAP_HOST = String(process.env.MAIL_IMAP_HOST || 'imap.mail.ru').trim();
+const DOC_RETURN_IMAP_PORT = Number(process.env.MAIL_IMAP_PORT || 993);
+const DOC_RETURN_IMAP_SECURE =
+  String(process.env.MAIL_IMAP_SECURE || 'true').toLowerCase() !== 'false';
+const DOC_RETURN_IMAP_USER = String(
+  process.env.MAIL_IMAP_USER || process.env.MAIL_SMTP_USER || DOC_RETURN_SMTP_USER
+).trim();
+const DOC_RETURN_IMAP_PASSWORD = String(
+  process.env.MAIL_IMAP_PASSWORD || process.env.MAIL_SMTP_PASSWORD || DOC_RETURN_SMTP_PASSWORD
+);
+const DOC_RETURN_CONFIRMED_TEXT = 'Отправка подтверждена почтовым сервером.';
 const DOC_RETURN_MAX_ACTIONS_PER_CYCLE = Math.max(
   1,
   Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 5)
@@ -10625,59 +10637,60 @@ function docReturnEmailFromReminderComment(comment) {
   return match ? String(match[1] || '').trim().toLowerCase() : '';
 }
 
-function docReturnHasValidReminderComment(comments, markerText) {
+function docReturnReminderCommentStatus(comments, markerText) {
+  let verified = false;
+  let invalidOwnMail = false;
+  let legacyUnverified = false;
+
   for (const comment of comments || []) {
     const value = String(comment || '');
     if (!value.includes(markerText)) continue;
 
     const email = docReturnEmailFromReminderComment(value);
-
-    // Старый корректный тест 47208 мог иметь комментарий без новых служебных полей.
-    // Если email указан — обязательно должен быть внешним.
     if (email && docReturnIsForbiddenRecipient(email)) {
-      console.warn(
-        `[doc-return] найден старый комментарий «${markerText}», но получатель ` +
-        `${docReturnMaskEmail(email)} — MAVIS. Такое письмо НЕ считаю напоминанием.`
-      );
+      invalidOwnMail = true;
       continue;
     }
 
-    return true;
+    if (value.includes(DOC_RETURN_CONFIRMED_TEXT)) {
+      verified = true;
+    } else {
+      legacyUnverified = true;
+    }
   }
-  return false;
+
+  return { verified, invalidOwnMail, legacyUnverified };
 }
 
 async function docReturnReadState(basic) {
   const taskComments = await docReturnReadTaskComments(basic.taskId);
 
-  const invalidFirst = taskComments.some((comment) => {
-    const value = String(comment || '');
-    if (!value.includes(DOC_RETURN_COMMENT_1)) return false;
-    const email = docReturnEmailFromReminderComment(value);
-    return Boolean(email && docReturnIsForbiddenRecipient(email));
-  });
+  const firstStatus = docReturnReminderCommentStatus(taskComments, DOC_RETURN_COMMENT_1);
+  const secondStatus = docReturnReminderCommentStatus(taskComments, DOC_RETURN_COMMENT_2);
 
-  const invalidSecond = taskComments.some((comment) => {
-    const value = String(comment || '');
-    if (!value.includes(DOC_RETURN_COMMENT_2)) return false;
-    const email = docReturnEmailFromReminderComment(value);
-    return Boolean(email && docReturnIsForbiddenRecipient(email));
-  });
-
-  let first = docReturnHasValidReminderComment(taskComments, DOC_RETURN_COMMENT_1);
-  let second = docReturnHasValidReminderComment(taskComments, DOC_RETURN_COMMENT_2);
+  let first = firstStatus.verified;
+  let second = secondStatus.verified;
   let call = taskComments.some((comment) => String(comment || '').includes(DOC_RETURN_CALL_COMMENT));
 
-  // Legacy timeline нужен только когда нет доказательства неправильной отправки.
-  // Иначе v97 мог пометить timeline после письма на нашу же почту.
-  if (basic.dealId && !first && !invalidFirst) {
+  // Для legacy timeline доверяем только если в самой задаче нет сомнительного старого комментария.
+  if (
+    basic.dealId &&
+    !first &&
+    !firstStatus.invalidOwnMail &&
+    !firstStatus.legacyUnverified
+  ) {
     first = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_1} task=${basic.taskId}`,
       100
     );
   }
-  if (basic.dealId && !second && !invalidSecond) {
+  if (
+    basic.dealId &&
+    !second &&
+    !secondStatus.invalidOwnMail &&
+    !secondStatus.legacyUnverified
+  ) {
     second = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_2} task=${basic.taskId}`,
@@ -10697,8 +10710,10 @@ async function docReturnReadState(basic) {
     second,
     call,
     reminders: second ? 2 : first ? 1 : 0,
-    invalidOwnMailFirst: invalidFirst,
-    invalidOwnMailSecond: invalidSecond,
+    invalidOwnMailFirst: firstStatus.invalidOwnMail,
+    invalidOwnMailSecond: secondStatus.invalidOwnMail,
+    legacyUnverifiedFirst: firstStatus.legacyUnverified,
+    legacyUnverifiedSecond: secondStatus.legacyUnverified,
   };
 }
 
@@ -10746,24 +10761,83 @@ function docReturnGetSmtpTransport() {
   return docReturnSmtpTransport;
 }
 
-async function docReturnSendViaSmtp(ctx, subject, body) {
-  docReturnAssertExternalRecipient(ctx && ctx.recipient && ctx.recipient.email, ctx && ctx.taskId);
 
-  const transporter = docReturnGetSmtpTransport();
-  const fromAddress = String(
-    config.emailFrom || process.env.EMAIL_FROM || DOC_RETURN_SMTP_USER
-  ).trim() || DOC_RETURN_SMTP_USER;
+async function docReturnFindSentMailbox(client) {
+  const boxes = await client.list();
+
+  const special = boxes.find((box) =>
+    String(box && box.specialUse || '').toLowerCase() === '\\sent'
+  );
+  if (special && special.path) return special.path;
+
+  const named = boxes.find((box) =>
+    /(^|\/)(sent|sent items|отправлен|отправленные|исходящ)/i.test(
+      String(box && box.path || box && box.name || '')
+    )
+  );
+  if (named && named.path) return named.path;
+
+  // Mail.ru обычно отдаёт specialUse=\Sent, поэтому сюда попадём только при нестандартной папке.
+  throw new Error('Не удалось определить папку «Отправленные» через IMAP.');
+}
+
+async function docReturnAppendToSent(rawMessage) {
+  if (!DOC_RETURN_IMAP_USER || !DOC_RETURN_IMAP_PASSWORD) {
+    throw new Error(
+      'Нет IMAP-доступа для сохранения копии в «Отправленные». ' +
+      'Нужны MAIL_IMAP_USER и MAIL_IMAP_PASSWORD.'
+    );
+  }
+
+  const client = new ImapFlow({
+    host: DOC_RETURN_IMAP_HOST,
+    port: DOC_RETURN_IMAP_PORT,
+    secure: DOC_RETURN_IMAP_SECURE,
+    auth: {
+      user: DOC_RETURN_IMAP_USER,
+      pass: DOC_RETURN_IMAP_PASSWORD,
+    },
+    logger: false,
+  });
+
+  try {
+    await client.connect();
+    const sentPath = await docReturnFindSentMailbox(client);
+    const result = await client.append(
+      sentPath,
+      rawMessage,
+      ['\\Seen'],
+      new Date()
+    );
+    console.log(
+      `[doc-return] IMAP copy saved: folder=${sentPath}; uid=${result && result.uid || 'n/a'}`
+    );
+    return { ok: true, folder: sentPath, uid: result && result.uid || null };
+  } finally {
+    try { await client.logout(); } catch (_) {}
+  }
+}
+
+async function docReturnBuildRawMail(ctx, subject, body) {
+  const fromAddress = String(DOC_RETURN_SMTP_USER || '').trim();
+  if (!fromAddress) {
+    throw new Error('MAIL_SMTP_USER не задан — нельзя сформировать отправителя.');
+  }
+
   const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
+  const messageId =
+    `<mavis-doc-return-${String(ctx.taskId || 'task')}-${Date.now()}@mail.ru>`;
 
   const mail = {
     from: `${senderName} <${fromAddress}>`,
     to: ctx.recipient.email,
+    replyTo: fromAddress,
     subject,
     text: body,
+    date: new Date(),
+    messageId,
   };
 
-  // ВАЖНО: передаём Nodemailer исходный Buffer файла, а не base64-объект Bitrix.
-  // Имя и расширение остаются ровно такими, как у прикреплённого DOC/DOCX/PDF.
   if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
     const originalName = String(
       ctx.downloaded.fileName ||
@@ -10782,11 +10856,98 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
     }];
   }
 
-  const info = await transporter.sendMail(mail);
+  // Собираем ровно один RFC822/MIME message и именно его:
+  // 1) отправляем SMTP,
+  // 2) кладём в IMAP «Отправленные».
+  const compiler = nodemailer.createTransport({
+    streamTransport: true,
+    buffer: true,
+    newline: 'unix',
+  });
+
+  const built = await compiler.sendMail(mail);
+  const raw = Buffer.isBuffer(built.message)
+    ? built.message
+    : Buffer.from(built.message);
+
+  return {
+    raw,
+    messageId,
+    envelope: {
+      from: fromAddress,
+      to: [ctx.recipient.email],
+    },
+  };
+}
+
+async function docReturnSendViaSmtp(ctx, subject, body) {
+  docReturnAssertExternalRecipient(ctx && ctx.recipient && ctx.recipient.email, ctx && ctx.taskId);
+
+  const transporter = docReturnGetSmtpTransport();
+  const built = await docReturnBuildRawMail(ctx, subject, body);
+
+  const info = await transporter.sendMail({
+    envelope: built.envelope,
+    raw: built.raw,
+  });
+
+  const accepted = Array.isArray(info && info.accepted)
+    ? info.accepted.map((x) => String(x || '').toLowerCase())
+    : [];
+  const rejected = Array.isArray(info && info.rejected)
+    ? info.rejected.map((x) => String(x || '').toLowerCase())
+    : [];
+  const target = String(ctx.recipient.email || '').toLowerCase();
+
+  if (!accepted.includes(target) || rejected.includes(target)) {
+    throw new Error(
+      `SMTP не подтвердил получателя ${ctx.recipient.email}. ` +
+      `accepted=${accepted.join(',') || 'нет'}; rejected=${rejected.join(',') || 'нет'}.`
+    );
+  }
+
+  // После подтверждения SMTP сохраняем ТОЧНО ТО ЖЕ MIME-письмо в «Отправленные».
+  // Если IMAP временно не ответил, повторяем несколько раз, но само письмо повторно НЕ шлём.
+  let sentCopy = null;
+  let lastAppendError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      sentCopy = await docReturnAppendToSent(built.raw);
+      lastAppendError = null;
+      break;
+    } catch (e) {
+      lastAppendError = e;
+      console.warn(
+        `[doc-return] IMAP Sent append attempt ${attempt}/3 failed: ${e.message || e}`
+      );
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+
+  if (lastAppendError) {
+    // Письмо уже принято SMTP — повторная отправка опасна дублем.
+    // Возвращаем sent=true, но явно отмечаем, что копию в Sent сохранить не удалось.
+    return {
+      smtp: true,
+      sent: true,
+      messageId: built.messageId,
+      accepted,
+      rejected,
+      sentCopySaved: false,
+      sentCopyError: lastAppendError.message || String(lastAppendError),
+    };
+  }
+
   return {
     smtp: true,
-    messageId: info && info.messageId || '',
-    accepted: info && info.accepted || [],
+    sent: true,
+    messageId: built.messageId,
+    accepted,
+    rejected,
+    sentCopySaved: true,
+    sentFolder: sentCopy && sentCopy.folder || '',
+    sentUid: sentCopy && sentCopy.uid || null,
   };
 }
 
@@ -10871,8 +11032,8 @@ async function docReturnMoveStage(taskId, stageId) {
   return check;
 }
 
-function docReturnReminderComment(sequence, ctx, nextDeadline) {
-  return [
+function docReturnReminderComment(sequence, ctx, nextDeadline, sendResult = null) {
+  const lines = [
     sequence === 1 ? DOC_RETURN_COMMENT_1 : DOC_RETURN_COMMENT_2,
     `Email: ${ctx.recipient.email}`,
     `Источник email: ${
@@ -10886,7 +11047,16 @@ function docReturnReminderComment(sequence, ctx, nextDeadline) {
     }`,
     `Документ: ${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`,
     `Следующий срок контроля: ${docReturnDateRu(nextDeadline)}.`,
-  ].join('\n');
+    DOC_RETURN_CONFIRMED_TEXT,
+  ];
+
+  if (sendResult && sendResult.sentCopySaved) {
+    lines.push(`Копия сохранена в «Отправленные»${sendResult.sentFolder ? ` (${sendResult.sentFolder})` : ''}.`);
+  } else if (sendResult && sendResult.sentCopySaved === false) {
+    lines.push('Письмо принято почтовым сервером, но копия в «Отправленные» не сохранилась.');
+  }
+
+  return lines.join('\n');
 }
 
 async function docReturnSendReminder(basic, sequence) {
@@ -10895,10 +11065,14 @@ async function docReturnSendReminder(basic, sequence) {
 
   const activityId = await docReturnSendEmail(ctx, sequence);
 
-  // Дедлайн меняем только ПОСЛЕ успешной отправки.
+  if (!activityId || activityId.sent !== true) {
+    throw new Error('Почтовый сервер не подтвердил отправку. Комментарий и дедлайн не меняю.');
+  }
+
+  // Дедлайн меняем только ПОСЛЕ подтверждённой SMTP-отправки.
   await docReturnSetDeadline(ctx.taskId, nextDeadline);
 
-  const comment = docReturnReminderComment(sequence, ctx, nextDeadline);
+  const comment = docReturnReminderComment(sequence, ctx, nextDeadline, activityId);
   const commentVia = await docReturnAddTaskComment(ctx.task, comment);
 
   // Legacy-маркер сохраняем только для надёжного восстановления состояния,
@@ -11017,7 +11191,27 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
     let basic = await docReturnLoadBasicContext(taskId, currentTask);
     const state = await docReturnReadState(basic);
 
-    // Новый обычный кейс: пришли из «Отправлены», первого письма ещё не было.
+    // Старые комментарии v97/v98 без SMTP-подтверждения считаем сомнительными.
+    // Не шлём повторно автоматически, чтобы не задублировать письмо клиенту.
+    if (
+      (state.legacyUnverifiedFirst && !state.invalidOwnMailFirst) ||
+      (state.legacyUnverifiedSecond && !state.invalidOwnMailSecond)
+    ) {
+      console.warn(
+        `[doc-return] UNVERIFIED LEGACY task=${taskId}: есть старый комментарий «отправлено», ` +
+        'но нет нового SMTP-подтверждения. Автоповтор заблокирован до проверки.'
+      );
+      return {
+        ok: true,
+        skipped: true,
+        taskId,
+        reason: 'legacy-unverified-send',
+        state,
+      };
+    }
+
+    // Новый обычный кейс: первого подтверждённого письма ещё не было.
+    // Если старое письмо ушло на нашу же почту, оно НЕ считается напоминанием и будет исправлено.
     if (!state.first) {
       return await docReturnSendReminder(basic, 1);
     }
@@ -11275,7 +11469,7 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v98 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v99 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}`
 );
