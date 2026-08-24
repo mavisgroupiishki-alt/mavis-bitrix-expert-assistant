@@ -9834,7 +9834,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v100: ВОЗВРАТ ОРИГИНАЛОВ — защита от дублей между polling/webhook/несколькими процессами
+// v101: ВОЗВРАТ ОРИГИНАЛОВ — очередь без зависания на старых задачах без email
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9891,6 +9891,14 @@ const DOC_RETURN_MAX_ACTIONS_PER_CYCLE = Math.max(
   1,
   Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 1)
 );
+const DOC_RETURN_MAX_CHECKS_PER_CYCLE = Math.max(
+  1,
+  Number(process.env.DOC_RETURN_MAX_CHECKS_PER_CYCLE || 20)
+);
+const DOC_RETURN_ERROR_COOLDOWN_MINUTES = Math.max(
+  1,
+  Number(process.env.DOC_RETURN_ERROR_COOLDOWN_MINUTES || 60)
+);
 const DOC_RETURN_ALLOW_WEBHOOK =
   String(process.env.DOC_RETURN_ALLOW_WEBHOOK || 'false').toLowerCase() === 'true';
 const DOC_RETURN_DISTRIBUTED_LOCK_TTL_MS = Math.max(
@@ -9900,6 +9908,8 @@ const DOC_RETURN_DISTRIBUTED_LOCK_TTL_MS = Math.max(
 
 let docReturnSmtpTransport = null;
 let docReturnCycleRunning = false;
+let docReturnQueueCursor = 0;
+const docReturnErrorCooldownUntil = new Map();
 
 const DOC_RETURN_COMMENT_1 = 'Автоматическое напоминание №1 о возврате оригинала отправлено.';
 const DOC_RETURN_COMMENT_2 = 'Автоматическое напоминание №2 о возврате оригинала отправлено.';
@@ -11473,8 +11483,25 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
       reason: state.call ? 'already-in-call-flow' : 'nothing-to-do',
     };
   } catch (e) {
-    console.error(`[doc-return] ERROR task=${taskId}: ${e.message || e}`);
-    return { ok: false, taskId, error: e.message || String(e) };
+    const errorText = e.message || String(e);
+
+    // Старые задачи без email больше не должны тормозить всю очередь.
+    // После неудачной попытки откладываем конкретную задачу на час,
+    // а polling продолжает проверять следующие задачи.
+    if (
+      /Не найден email/i.test(errorText) ||
+      /crm-external-email-not-found/i.test(errorText)
+    ) {
+      const until = Date.now() + DOC_RETURN_ERROR_COOLDOWN_MINUTES * 60 * 1000;
+      docReturnErrorCooldownUntil.set(taskId, until);
+      console.warn(
+        `[doc-return] COOLDOWN task=${taskId}: email не найден; ` +
+        `повтор не раньше чем через ${DOC_RETURN_ERROR_COOLDOWN_MINUTES} мин.`
+      );
+    }
+
+    console.error(`[doc-return] ERROR task=${taskId}: ${errorText}`);
+    return { ok: false, taskId, error: errorText };
   } finally {
     docReturnLocks.delete(taskId);
   }
@@ -11570,13 +11597,44 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
 
   const results = [];
   let actionCount = 0;
+  let checksCount = 0;
 
-  for (const taskId of ids) {
+  // v101: не начинаем каждый цикл снова с самых старых ID.
+  // Иначе несколько старых задач без email бесконечно стояли первыми
+  // и до остальных документов очередь практически не доходила.
+  const allIds = Array.from(ids);
+  const totalIds = allIds.length;
+  const startIndex = totalIds ? (docReturnQueueCursor % totalIds) : 0;
+  const orderedIds = totalIds
+    ? [...allIds.slice(startIndex), ...allIds.slice(0, startIndex)]
+    : [];
+
+  let traversed = 0;
+
+  for (const taskId of orderedIds) {
     if (actionCount >= DOC_RETURN_MAX_ACTIONS_PER_CYCLE) break;
+    if (checksCount >= DOC_RETURN_MAX_CHECKS_PER_CYCLE) break;
+
+    traversed++;
+
+    const cooldownUntil = Number(docReturnErrorCooldownUntil.get(String(taskId)) || 0);
+    if (cooldownUntil > Date.now()) {
+      continue;
+    }
+    if (cooldownUntil) {
+      docReturnErrorCooldownUntil.delete(String(taskId));
+    }
+
+    checksCount++;
 
     const result = await docReturnProcessTask(taskId, trigger);
     results.push(result);
     if (result && result.action) actionCount++;
+  }
+
+  // Следующий цикл начинает с другого места очереди.
+  if (totalIds) {
+    docReturnQueueCursor = (startIndex + Math.max(traversed, 1)) % totalIds;
   }
 
   const actionable = results.filter((r) => r && r.action);
@@ -11584,7 +11642,9 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
 
   console.log(
     `[doc-return] poll ${trigger}: checked=${results.length}; actions=${actionable.length}; ` +
-    `errors=${errors.length}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; newOnly=${DOC_RETURN_INCLUDE_HISTORICAL ? 'NO' : `YES from ${DOC_RETURN_PRODUCTION_START_ISO}`}`
+    `errors=${errors.length}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
+    `maxChecks=${DOC_RETURN_MAX_CHECKS_PER_CYCLE}; cursor=${docReturnQueueCursor}/${totalIds}; ` +
+    `newOnly=${DOC_RETURN_INCLUDE_HISTORICAL ? 'NO' : `YES from ${DOC_RETURN_PRODUCTION_START_ISO}`}`
   );
 
   return { ok: errors.length === 0, checked: results.length, actions: actionable, errors };
@@ -11695,10 +11755,11 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v100 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v101 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
-  `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}`
+  `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
+  `maxChecks=${DOC_RETURN_MAX_CHECKS_PER_CYCLE}; cooldownMin=${DOC_RETURN_ERROR_COOLDOWN_MINUTES}`
 );
 
 app.listen(PORT, () => {
