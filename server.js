@@ -9831,16 +9831,43 @@ app.get('/api/get-deal-fields', async (req, res) => {
   }
 });
 
-
 // ============================================================================
-// v91: ВОЗВРАТ ОРИГИНАЛОВ — тестовый email-контур только для задачи 47208
-// Робот Bitrix вызывает POST /api/doc-return-reminder?task_id=47208.
-// GET этого же URL — только безопасная диагностика, письмо НЕ отправляет.
+// v94: ВОЗВРАТ ОРИГИНАЛОВ — полный автоматический цикл
+//
+// Логика:
+// 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
+// 2) «Эл. Почта» + истёк новый дедлайн -> письмо №2 -> дедлайн +14 дней.
+// 3) «Эл. Почта» + истёк второй дедлайн -> «Звонок», третьего письма нет.
+// 4) «Приедут, не отправляем» и любые другие стадии не трогаем.
+//
+// Безопасность:
+// - тестовая задача 47208 разрешена всегда;
+// - остальные задачи автоматически обрабатываются только если созданы после даты запуска;
+// - исторический хвост не трогаем, пока DOC_RETURN_INCLUDE_HISTORICAL=true не задан явно.
 // ============================================================================
 
+const DOC_RETURN_ENABLED = String(process.env.DOC_RETURN_ENABLED || 'true').toLowerCase() !== 'false';
 const DOC_RETURN_TEST_TASK_ID = String(process.env.DOC_RETURN_TEST_TASK_ID || '47208');
 const DOC_RETURN_PROJECT_ID = String(process.env.DOC_RETURN_PROJECT_ID || '36');
-const DOC_RETURN_MARKER = '[MAVIS_DOC_RETURN_REMINDER_1]';
+const DOC_RETURN_POLL_MINUTES = Math.max(1, Number(process.env.DOC_RETURN_POLL_MINUTES || 5));
+const DOC_RETURN_PRODUCTION_START_ISO = String(
+  process.env.DOC_RETURN_PRODUCTION_START_ISO || '2026-08-24T13:22:00+03:00'
+);
+const DOC_RETURN_INCLUDE_HISTORICAL =
+  String(process.env.DOC_RETURN_INCLUDE_HISTORICAL || 'false').toLowerCase() === 'true';
+
+const DOC_RETURN_COMMENT_1 = 'Автоматическое напоминание №1 о возврате оригинала отправлено.';
+const DOC_RETURN_COMMENT_2 = 'Автоматическое напоминание №2 о возврате оригинала отправлено.';
+const DOC_RETURN_CALL_COMMENT =
+  'Два email-напоминания отправлены. Документы не получены. Передано на ручной звонок.';
+
+// Legacy-маркеры нужны только чтобы корректно продолжить уже начатый тест 47208.
+const DOC_RETURN_LEGACY_MARKER_1 = '[MAVIS_DOC_RETURN_REMINDER_1]';
+const DOC_RETURN_LEGACY_MARKER_2 = '[MAVIS_DOC_RETURN_REMINDER_2]';
+const DOC_RETURN_LEGACY_CALL_MARKER = '[MAVIS_DOC_RETURN_CALL]';
+
+const docReturnLocks = new Set();
+let docReturnStageCache = { at: 0, sent: '', email: '', call: '', rows: [] };
 
 function docReturnReqTaskId(req) {
   const src = Object.assign({}, req.query || {}, req.body || {});
@@ -9856,14 +9883,42 @@ function docReturnTaskValue(task, names) {
   return actsTaskField(task, names);
 }
 
+function docReturnParseMs(value) {
+  const n = Date.parse(String(value || ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function docReturnIsDeadlineExpired(task, nowMs = Date.now()) {
+  const ms = docReturnParseMs(docReturnTaskValue(task, ['deadline', 'DEADLINE']));
+  return ms > 0 && ms <= nowMs;
+}
+
+function docReturnCreatedMs(task) {
+  return docReturnParseMs(
+    docReturnTaskValue(task, ['createdDate', 'CREATED_DATE', 'created_date', 'createdAt', 'CREATED_AT'])
+  );
+}
+
+function docReturnIsEligible(task) {
+  const taskId = String(docReturnTaskValue(task, ['id', 'ID']) || '');
+  if (taskId === DOC_RETURN_TEST_TASK_ID) return true;
+  if (DOC_RETURN_INCLUDE_HISTORICAL) return true;
+
+  const createdMs = docReturnCreatedMs(task);
+  const startMs = docReturnParseMs(DOC_RETURN_PRODUCTION_START_ISO);
+  return Boolean(createdMs && startMs && createdMs >= startMs);
+}
+
 function docReturnFirstEmail(entity) {
   const emails = Array.isArray(entity && entity.EMAIL) ? entity.EMAIL : [];
-  const item = emails.find((x) => x && x.VALUE && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(x.VALUE).trim()));
+  const item = emails.find(
+    (x) => x && x.VALUE && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(x.VALUE).trim())
+  );
   return item ? String(item.VALUE).trim() : '';
 }
 
 async function docReturnResolveRecipient(deal) {
-  // 1. Приоритет пользователя: email компании из CRM.
+  // 1. Приоритет: email компании.
   const companyId = String(deal && deal.COMPANY_ID || '').trim();
   if (companyId && companyId !== '0') {
     try {
@@ -9884,7 +9939,7 @@ async function docReturnResolveRecipient(deal) {
     }
   }
 
-  // 2. Если у компании email нет — берём актуальный контакт сделки.
+  // 2. Fallback: контакт сделки.
   try {
     const recipient = await actsResolveRecipientContact(deal);
     if (recipient && recipient.ok && recipient.contact) {
@@ -9937,11 +9992,13 @@ function docReturnPickFile(files, taskTitle) {
   };
   const newest = (arr) => [...arr].sort((a, b) => ts(b) - ts(a))[0] || null;
 
+  // Если файл того же типа найден — предпочитаем его.
   if (rx) {
     const matching = usable.filter((f) => rx.test(String(f.name || '')));
     if (matching.length) return newest(matching);
   }
 
+  // Fallback оставляем специально: в тестовых/старых задачах название файла может быть условным.
   const docs = usable.filter((f) => /\.(pdf|docx?|xlsx?)$/i.test(String(f.name || '')));
   return newest(docs.length ? docs : usable);
 }
@@ -9966,7 +10023,7 @@ function docReturnBuildBody(taskTitle, fileName) {
 }
 
 function docReturnNextDeadline() {
-  // +14 календарных дней, контроль в 18:00 по Минску.
+  // +14 календарных дней, 18:00 по Минску.
   const now = new Date();
   const minskParts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Minsk',
@@ -10001,19 +10058,184 @@ function docReturnMaskEmail(email) {
   return `${parts[0].slice(0, 2)}***@${parts[1]}`;
 }
 
-async function docReturnEmailAlreadySent(dealId, taskId) {
-  try {
-    const activities = await bitrixRestList('crm.activity.list', {
-      filter: { OWNER_TYPE_ID: 2, OWNER_ID: Number(dealId), TYPE_ID: 4 },
-      order: { ID: 'DESC' },
-      select: ['ID', 'SUBJECT', 'CREATED', 'START_TIME', 'END_TIME'],
-    }, 100);
-    const token = `[T${taskId}]`;
-    return activities.some((a) => String(a && a.SUBJECT || '').includes(token));
-  } catch (e) {
-    console.warn(`[doc-return] duplicate-check: ${e.message || e}`);
-    return false;
+function docReturnNormalizeStageTitle(value) {
+  return actsCleanText(value || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+async function docReturnResolveStages(force = false) {
+  const now = Date.now();
+  if (!force && docReturnStageCache.sent && docReturnStageCache.email && docReturnStageCache.call &&
+      now - docReturnStageCache.at < 30 * 60 * 1000) {
+    return docReturnStageCache;
   }
+
+  const raw = await bitrixRestCall('task.stages.get', { entityId: Number(DOC_RETURN_PROJECT_ID) });
+  const rows = raw && typeof raw === 'object' ? Object.values(raw) : [];
+
+  const findBy = (fn) => {
+    const row = rows.find((st) => fn(docReturnNormalizeStageTitle(st && (st.TITLE || st.title))));
+    return row ? String(row.ID || row.id || '') : '';
+  };
+
+  const sent = findBy((t) => /^отправлен/.test(t));
+  const email = findBy((t) => /(^|\s)эл\.?\s*почт/.test(t) || /электрон.*почт/.test(t));
+  const call = findBy((t) => /^звонок/.test(t) || /^звон/.test(t));
+
+  if (!sent || !email || !call) {
+    const available = rows.map((st) => `${st.ID || st.id}:${st.TITLE || st.title}`).join(', ');
+    throw new Error(
+      `Не смог определить стадии возврата оригиналов. ` +
+      `Отправлены=${sent || 'нет'}, Эл.Почта=${email || 'нет'}, Звонок=${call || 'нет'}. ` +
+      `Доступные стадии: ${available}`
+    );
+  }
+
+  docReturnStageCache = { at: now, sent, email, call, rows };
+  console.log(`[doc-return] stages: Отправлены=${sent}; Эл.Почта=${email}; Звонок=${call}`);
+  return docReturnStageCache;
+}
+
+async function docReturnLoadTask(taskId) {
+  const raw = await bitrixRestCall('tasks.task.get', {
+    taskId: Number(taskId),
+    select: [
+      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
+      'RESPONSIBLE_ID', 'CREATED_BY', 'CREATED_DATE', 'CHANGED_DATE',
+      'DEADLINE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+    ],
+  });
+  const task = raw && (raw.task || raw.TASK || raw);
+  if (!task) throw new Error(`Задача ${taskId} не найдена.`);
+
+  const groupId = String(docReturnTaskValue(task, ['groupId', 'GROUP_ID', 'group_id']) || '');
+  if (groupId !== DOC_RETURN_PROJECT_ID) {
+    throw new Error(
+      `Защитный стоп: задача ${taskId} не из проекта ${DOC_RETURN_PROJECT_ID} (GROUP_ID=${groupId || 'пусто'}).`
+    );
+  }
+  return task;
+}
+
+async function docReturnLoadBasicContext(taskId, task = null) {
+  task = task || await docReturnLoadTask(taskId);
+
+  const dealIds = actsExtractDealIdsFromTask(task);
+  if (!dealIds.length) throw new Error('В задаче нет связанной CRM-сделки D_....');
+
+  const dealId = String(dealIds[0]);
+  const deal = await bitrixRestCall('crm.deal.get', { id: Number(dealId) });
+  if (!deal) throw new Error(`Сделка ${dealId} не найдена.`);
+
+  return {
+    taskId: String(taskId),
+    task,
+    dealId,
+    deal,
+    title: String(docReturnTaskValue(task, ['title', 'TITLE']) || ''),
+  };
+}
+
+async function docReturnLoadSendContext(basic) {
+  const recipient = await docReturnResolveRecipient(basic.deal);
+  if (!recipient.ok) throw new Error(recipient.reason);
+
+  // task attachments -> task result -> task chat.
+  const fileResolution = await actsResolveTaskFiles(basic.task);
+  const file = docReturnPickFile(fileResolution.files || [], basic.title);
+  if (!file || !file.url) {
+    throw new Error(
+      `В задаче ${basic.taskId} не найден реальный файл для отправки. ` +
+      `Проверены вложения задачи, результат и task chat. Письмо без файла заблокировано.`
+    );
+  }
+
+  const downloaded = await actsDownloadRealFile(file);
+  if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) {
+    throw new Error(`Файл «${file.name || 'без названия'}» не удалось скачать. Письмо не отправлено.`);
+  }
+
+  return {
+    ...basic,
+    recipient,
+    file,
+    downloaded,
+    fileCandidates: (fileResolution.files || []).map((f) => ({
+      name: String(f && f.name || ''),
+      source: String(f && f.source || ''),
+      id: String(f && f.id || ''),
+      attachedId: String(f && f.attachedId || ''),
+      hasUrl: Boolean(f && f.url),
+    })),
+  };
+}
+
+async function docReturnReadTaskComments(taskId) {
+  try {
+    const raw = await bitrixRestCall('task.commentitem.getlist', {
+      TASKID: Number(taskId),
+      ORDER: { ID: 'DESC' },
+      FILTER: {},
+    });
+    const rows = Array.isArray(raw)
+      ? raw
+      : (raw && Array.isArray(raw.items))
+        ? raw.items
+        : (raw && Array.isArray(raw.result))
+          ? raw.result
+          : [];
+
+    return rows.map((c) =>
+      String(
+        c && (
+          c.POST_MESSAGE || c.postMessage ||
+          c.MESSAGE || c.message ||
+          c.TEXT || c.text || ''
+        )
+      )
+    ).filter(Boolean);
+  } catch (e) {
+    console.warn(`[doc-return] task=${taskId}: не смог прочитать комментарии задачи: ${e.message || e}`);
+    return [];
+  }
+}
+
+async function docReturnReadState(basic) {
+  const taskComments = await docReturnReadTaskComments(basic.taskId);
+  const joined = taskComments.join('\n');
+
+  let first = joined.includes(DOC_RETURN_COMMENT_1);
+  let second = joined.includes(DOC_RETURN_COMMENT_2);
+  let call = joined.includes(DOC_RETURN_CALL_COMMENT);
+
+  // Совместимость с уже прошедшим первым тестом 47208.
+  if (!first) {
+    first = await fgTimelineHasMarker(
+      basic.dealId,
+      `${DOC_RETURN_LEGACY_MARKER_1} task=${basic.taskId}`,
+      100
+    );
+  }
+  if (!second) {
+    second = await fgTimelineHasMarker(
+      basic.dealId,
+      `${DOC_RETURN_LEGACY_MARKER_2} task=${basic.taskId}`,
+      100
+    );
+  }
+  if (!call) {
+    call = await fgTimelineHasMarker(
+      basic.dealId,
+      `${DOC_RETURN_LEGACY_CALL_MARKER} task=${basic.taskId}`,
+      100
+    );
+  }
+
+  return {
+    first,
+    second,
+    call,
+    reminders: second ? 2 : first ? 1 : 0,
+  };
 }
 
 async function docReturnAddTaskComment(task, text) {
@@ -10037,62 +10259,8 @@ async function docReturnAddTaskComment(task, text) {
   }
 }
 
-async function docReturnLoadContext(taskId) {
-  const raw = await bitrixRestCall('tasks.task.get', {
-    taskId: Number(taskId),
-    select: [
-      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
-      'RESPONSIBLE_ID', 'CREATED_BY', 'DEADLINE', 'CHAT_ID',
-      'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
-    ],
-  });
-  const task = raw && (raw.task || raw.TASK || raw);
-  if (!task) throw new Error(`Задача ${taskId} не найдена.`);
-
-  const groupId = String(docReturnTaskValue(task, ['groupId', 'GROUP_ID', 'group_id']) || '');
-  if (groupId !== DOC_RETURN_PROJECT_ID) {
-    throw new Error(`Защитный стоп: задача ${taskId} не из проекта ${DOC_RETURN_PROJECT_ID} (GROUP_ID=${groupId || 'пусто'}).`);
-  }
-
-  const dealIds = actsExtractDealIdsFromTask(task);
-  if (!dealIds.length) throw new Error('В задаче нет связанной CRM-сделки D_....');
-  const dealId = String(dealIds[0]);
-  const deal = await bitrixRestCall('crm.deal.get', { id: Number(dealId) });
-  if (!deal) throw new Error(`Сделка ${dealId} не найдена.`);
-
-  const recipient = await docReturnResolveRecipient(deal);
-  if (!recipient.ok) throw new Error(recipient.reason);
-
-  // Используем уже проверенный resolver проекта «Акты и счета»:
-  // task attachments -> task result -> task chat.
-  const fileResolution = await actsResolveTaskFiles(task);
-  const file = docReturnPickFile(fileResolution.files || [], docReturnTaskValue(task, ['title', 'TITLE']) || '');
-  if (!file || !file.url) {
-    throw new Error(
-      `В задаче ${taskId} не найден реальный файл для отправки. ` +
-      `Проверены вложения задачи, результат и task chat. Письмо без файла заблокировано.`
-    );
-  }
-
-  const downloaded = await actsDownloadRealFile(file);
-  if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) {
-    throw new Error(`Файл «${file.name || 'без названия'}» не удалось скачать. Письмо не отправлено.`);
-  }
-
-  return {
-    taskId: String(taskId),
-    task,
-    dealId,
-    deal,
-    recipient,
-    file,
-    downloaded,
-    title: String(docReturnTaskValue(task, ['title', 'TITLE']) || ''),
-  };
-}
-
-async function docReturnSendEmail(ctx) {
-  const subject = `[T${ctx.taskId}] Возврат оригинала документа — ${ctx.title || ctx.deal.TITLE || ctx.taskId}`;
+async function docReturnSendEmail(ctx, sequence) {
+  const subject = 'Срочно! Возврат оригинала!';
   const body = docReturnBuildBody(ctx.title, ctx.downloaded.fileName);
   const responsibleId = Number(ctx.deal.ASSIGNED_BY_ID || 1);
 
@@ -10114,8 +10282,6 @@ async function docReturnSendEmail(ctx) {
       ENTITY_TYPE_ID: Number(ctx.recipient.entityTypeId || 3),
       TYPE: 'EMAIL',
     }],
-    // Вкладываем реальные бинарные данные, поэтому работает и для файла из task chat,
-    // где attachedId часто отсутствует.
     FILES: [{
       fileData: [
         String(ctx.downloaded.fileName || ctx.file.name || 'document'),
@@ -10130,158 +10296,375 @@ async function docReturnSendEmail(ctx) {
     fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${emailFrom}>` };
   }
 
-  return await bitrixRestCall('crm.activity.add', { fields });
+  const activityId = await bitrixRestCall('crm.activity.add', { fields });
+  console.log(
+    `[doc-return] email #${sequence} task=${ctx.taskId}; ` +
+    `to=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded.fileName}`
+  );
+  return activityId;
 }
 
-async function docReturnHandle(req, res, dryRun = false) {
-  const taskId = docReturnReqTaskId(req);
+async function docReturnSetDeadline(taskId, deadline) {
+  await bitrixRestCall('tasks.task.update', {
+    taskId: Number(taskId),
+    fields: { DEADLINE: deadline },
+  });
+}
+
+async function docReturnMoveStage(taskId, stageId) {
+  await bitrixRestCall('tasks.task.update', {
+    taskId: Number(taskId),
+    fields: { STAGE_ID: String(stageId) },
+  });
+}
+
+function docReturnReminderComment(sequence, ctx, nextDeadline) {
+  return [
+    sequence === 1 ? DOC_RETURN_COMMENT_1 : DOC_RETURN_COMMENT_2,
+    `Email: ${ctx.recipient.email}`,
+    `Источник email: ${ctx.recipient.source === 'company' ? 'компания в CRM' : 'контакт в CRM'}`,
+    `Документ: ${ctx.downloaded.fileName}`,
+    `Следующий срок контроля: ${docReturnDateRu(nextDeadline)}.`,
+  ].join('\n');
+}
+
+async function docReturnSendReminder(basic, sequence) {
+  const ctx = await docReturnLoadSendContext(basic);
+  const nextDeadline = docReturnNextDeadline();
+
+  const activityId = await docReturnSendEmail(ctx, sequence);
+
+  // Дедлайн меняем только ПОСЛЕ успешной отправки.
+  await docReturnSetDeadline(ctx.taskId, nextDeadline);
+
+  const comment = docReturnReminderComment(sequence, ctx, nextDeadline);
+  const commentVia = await docReturnAddTaskComment(ctx.task, comment);
+
+  // Legacy-маркер сохраняем только для надёжного восстановления состояния,
+  // но в комментарии самой задачи никакой технической строки нет.
+  const marker = sequence === 1 ? DOC_RETURN_LEGACY_MARKER_1 : DOC_RETURN_LEGACY_MARKER_2;
+  await fgAddCommentOnce(
+    ctx.dealId,
+    `${marker} task=${ctx.taskId}`,
+    `Система возврата оригиналов: email-напоминание №${sequence} отправлено. Следующий контроль ${docReturnDateRu(nextDeadline)}.`
+  ).catch(() => {});
+
+  console.log(
+    `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
+    `email=${docReturnMaskEmail(ctx.recipient.email)}; deadline=${nextDeadline}`
+  );
+
+  return {
+    ok: true,
+    action: `reminder-${sequence}`,
+    taskId: ctx.taskId,
+    dealId: ctx.dealId,
+    email: docReturnMaskEmail(ctx.recipient.email),
+    file: ctx.downloaded.fileName,
+    nextDeadline,
+    activityId,
+    commentVia,
+  };
+}
+
+async function docReturnMoveToCall(basic, stages) {
+  await docReturnMoveStage(basic.taskId, stages.call);
+  await docReturnAddTaskComment(basic.task, DOC_RETURN_CALL_COMMENT);
+
+  await fgAddCommentOnce(
+    basic.dealId,
+    `${DOC_RETURN_LEGACY_CALL_MARKER} task=${basic.taskId}`,
+    'Система возврата оригиналов: два email-напоминания отправлены, задача передана на ручной звонок.'
+  ).catch(() => {});
+
+  console.log(`[doc-return] CALL task=${basic.taskId}; moved to stage=${stages.call}`);
+
+  return {
+    ok: true,
+    action: 'move-to-call',
+    taskId: basic.taskId,
+    dealId: basic.dealId,
+    stageId: stages.call,
+  };
+}
+
+async function docReturnProcessTask(taskId, trigger = 'poll') {
+  taskId = String(taskId || '').trim();
+  if (!taskId) return { ok: false, skipped: true, reason: 'no-task-id' };
+  if (docReturnLocks.has(taskId)) {
+    return { ok: true, skipped: true, reason: 'locked', taskId };
+  }
+
+  docReturnLocks.add(taskId);
   try {
-    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+    const task = await docReturnLoadTask(taskId);
 
-    // Жёсткий тестовый предохранитель: любые другие задачи ничего не делают.
-    if (taskId !== DOC_RETURN_TEST_TASK_ID) {
-      return res.status(200).json({
+    if (!docReturnIsEligible(task)) {
+      return {
         ok: true,
         skipped: true,
-        testMode: true,
         taskId,
-        allowedTaskId: DOC_RETURN_TEST_TASK_ID,
-        message: `Тестовый режим: разрешена только задача ${DOC_RETURN_TEST_TASK_ID}.`,
-      });
+        reason: 'historical-protection',
+        createdDate: docReturnTaskValue(task, ['createdDate', 'CREATED_DATE']) || '',
+        productionStart: DOC_RETURN_PRODUCTION_START_ISO,
+      };
     }
 
-    const ctx = await docReturnLoadContext(taskId);
-    const nextDeadline = docReturnNextDeadline();
+    const stages = await docReturnResolveStages();
+    let stageId = String(docReturnTaskValue(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+    const expired = docReturnIsDeadlineExpired(task);
 
-    if (dryRun) {
-      console.log(
-        `[doc-return] DRY RUN task=${taskId}; deal=${ctx.dealId}; ` +
-        `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded.fileName}`
-      );
-      return res.json({
-        ok: true,
-        dryRun: true,
-        taskId,
-        projectId: DOC_RETURN_PROJECT_ID,
-        taskTitle: ctx.title,
-        dealId: ctx.dealId,
-        dealTitle: ctx.deal.TITLE || '',
-        recipient: {
-          source: ctx.recipient.source,
-          label: ctx.recipient.label,
-          email: docReturnMaskEmail(ctx.recipient.email),
-        },
-        file: {
-          name: ctx.downloaded.fileName,
-          bytes: ctx.downloaded.buffer.length,
-          source: ctx.file.source || '',
-        },
-        nextDeadline,
-        subject: `[T${taskId}] Возврат оригинала документа — ${ctx.title || ctx.deal.TITLE || taskId}`,
-        preview: docReturnBuildBody(ctx.title, ctx.downloaded.fileName),
-        note: 'GET — только диагностика. Письмо НЕ отправлено.',
-      });
-    }
-
-    if (await docReturnEmailAlreadySent(ctx.dealId, taskId)) {
-      console.log(`[doc-return] task=${taskId}: письмо с [T${taskId}] уже существует — дубль заблокирован.`);
-      return res.status(200).json({
-        ok: true,
-        skipped: true,
-        duplicate: true,
-        taskId,
-        message: 'Письмо уже найдено в CRM по уникальному токену задачи. Повторная отправка заблокирована.',
-      });
-    }
-
-    const activityId = await docReturnSendEmail(ctx);
-
-    // Только после успешного создания/отправки email меняем дедлайн.
-    await bitrixRestCall('tasks.task.update', {
-      taskId: Number(taskId),
-      fields: { DEADLINE: nextDeadline },
-    });
-
-    const comment = [
-      DOC_RETURN_MARKER,
-      'Автоматическое напоминание №1 о возврате оригинала отправлено.',
-      `Email: ${ctx.recipient.email}`,
-      `Источник email: ${ctx.recipient.source === 'company' ? 'компания в CRM' : 'контакт в CRM'}`,
-      `Документ: ${ctx.downloaded.fileName}`,
-      `Следующий срок контроля: ${docReturnDateRu(nextDeadline)}.`,
-      `Тема письма: [T${taskId}]`,
-    ].join('\n');
-
-    let commentVia = '';
-    try {
-      commentVia = await docReturnAddTaskComment(ctx.task, comment);
-    } catch (e) {
-      console.warn(`[doc-return] task=${taskId}: письмо отправлено, но комментарий в задачу не добавился: ${e.message || e}`);
-    }
-
-    // Дополнительный маркер в timeline сделки — для аудита и защиты от потери task-комментария.
-    try {
-      await bitrixRestCall('crm.timeline.comment.add', {
-        fields: {
-          ENTITY_ID: Number(ctx.dealId),
-          ENTITY_TYPE: 'deal',
-          COMMENT: `${DOC_RETURN_MARKER} task=${taskId}\nEmail-напоминание №1 отправлено. Документ: ${ctx.downloaded.fileName}. Следующий контроль: ${docReturnDateRu(nextDeadline)}.`,
-        },
-      });
-    } catch (_) {}
-
-    console.log(
-      `[doc-return] SENT task=${taskId}; deal=${ctx.dealId}; ` +
-      `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded.fileName}; ` +
-      `deadline=${nextDeadline}`
-    );
-
-    return res.json({
-      ok: true,
-      sent: true,
-      taskId,
-      dealId: ctx.dealId,
-      email: docReturnMaskEmail(ctx.recipient.email),
-      recipientSource: ctx.recipient.source,
-      file: ctx.downloaded.fileName,
-      nextDeadline,
-      activityId,
-      commentVia,
-    });
-  } catch (e) {
-    console.error(`[doc-return] ERROR task=${taskId || '?'}: ${e.message || e}`);
-
-    // Если email/файл не определены, клиенту ничего не отправляем и дедлайн не меняем.
-    try {
-      if (taskId === DOC_RETURN_TEST_TASK_ID) {
-        const raw = await bitrixRestCall('tasks.task.get', {
-          taskId: Number(taskId),
-          select: ['ID', 'CHAT_ID'],
-        });
-        const task = raw && (raw.task || raw.TASK || raw);
-        if (task) {
-          await docReturnAddTaskComment(
-            task,
-            `[MAVIS_DOC_RETURN_ERROR]\nАвтоматическое email-напоминание НЕ отправлено.\nПричина: ${e.message || e}`
-          ).catch(() => {});
-        }
+    // Стадия «Отправлены»: ждём только дедлайн.
+    if (stageId === stages.sent) {
+      if (!expired) {
+        return { ok: true, skipped: true, taskId, stage: 'sent', reason: 'deadline-not-expired' };
       }
-    } catch (_) {}
 
-    return res.status(500).json({ ok: false, taskId, error: e.message || String(e) });
+      await docReturnMoveStage(taskId, stages.email);
+      stageId = stages.email;
+      console.log(`[doc-return] MOVE task=${taskId}: Отправлены -> Эл. Почта (${trigger})`);
+      // После автоматического перехода продолжаем в том же цикле и отправляем письмо №1.
+    }
+
+    // Другие стадии, включая «Приедут, не отправляем», не трогаем.
+    if (stageId !== stages.email) {
+      return {
+        ok: true,
+        skipped: true,
+        taskId,
+        reason: 'stage-not-managed',
+        stageId,
+      };
+    }
+
+    const basic = await docReturnLoadBasicContext(taskId, task);
+    const state = await docReturnReadState(basic);
+
+    // В «Эл. Почта» без первого письма — отправляем первое сразу.
+    // Это работает и после автоматического движения, и как backup если робот Bitrix не вызвался.
+    if (!state.first) {
+      return await docReturnSendReminder(basic, 1);
+    }
+
+    // Первое уже ушло: до нового дедлайна ничего не делаем.
+    if (!docReturnIsDeadlineExpired(task)) {
+      return {
+        ok: true,
+        skipped: true,
+        taskId,
+        reminders: state.reminders,
+        reason: 'deadline-not-expired',
+        deadline: docReturnTaskValue(task, ['deadline', 'DEADLINE']) || '',
+      };
+    }
+
+    // Дедлайн после письма №1 истёк -> письмо №2.
+    if (state.first && !state.second) {
+      return await docReturnSendReminder(basic, 2);
+    }
+
+    // Дедлайн после письма №2 истёк -> «Звонок», третьего email нет.
+    if (state.second && !state.call) {
+      return await docReturnMoveToCall(basic, stages);
+    }
+
+    return {
+      ok: true,
+      skipped: true,
+      taskId,
+      reminders: state.reminders,
+      reason: state.call ? 'already-in-call-flow' : 'nothing-to-do',
+    };
+  } catch (e) {
+    console.error(`[doc-return] ERROR task=${taskId}: ${e.message || e}`);
+    return { ok: false, taskId, error: e.message || String(e) };
+  } finally {
+    docReturnLocks.delete(taskId);
   }
 }
 
-// GET безопасен и нужен для первой проверки после deploy.
-app.get('/api/doc-return-reminder', async (req, res) => docReturnHandle(req, res, true));
+async function docReturnListStageTasks(stageId, limit = 1000) {
+  // Сначала пробуем сузить список по дате создания прямо в Bitrix.
+  if (!DOC_RETURN_INCLUDE_HISTORICAL) {
+    try {
+      return await bitrixRestList('tasks.task.list', {
+        filter: {
+          GROUP_ID: Number(DOC_RETURN_PROJECT_ID),
+          STAGE_ID: String(stageId),
+          '>=CREATED_DATE': DOC_RETURN_PRODUCTION_START_ISO,
+        },
+        select: [
+          'ID', 'TITLE', 'GROUP_ID', 'STAGE_ID', 'DEADLINE',
+          'CREATED_DATE', 'CHANGED_DATE', 'UF_CRM_TASK',
+        ],
+        order: { ID: 'ASC' },
+      }, limit);
+    } catch (e) {
+      console.warn(`[doc-return] stage-list filtered fallback: ${e.message || e}`);
+    }
+  }
 
-// POST вызывает робот Bitrix и реально отправляет письмо.
-app.post('/api/doc-return-reminder', async (req, res) => docReturnHandle(req, res, false));
+  // Fallback: читаем стадию и фильтруем локально.
+  const rows = await bitrixRestList('tasks.task.list', {
+    filter: {
+      GROUP_ID: Number(DOC_RETURN_PROJECT_ID),
+      STAGE_ID: String(stageId),
+    },
+    select: [
+      'ID', 'TITLE', 'GROUP_ID', 'STAGE_ID', 'DEADLINE',
+      'CREATED_DATE', 'CHANGED_DATE', 'UF_CRM_TASK',
+    ],
+    order: { ID: 'ASC' },
+  }, limit);
 
-console.log(`[doc-return] endpoint active: /api/doc-return-reminder; TEST_TASK_ID=${DOC_RETURN_TEST_TASK_ID}; PROJECT_ID=${DOC_RETURN_PROJECT_ID}`);
+  return rows.filter((task) => docReturnIsEligible(task));
+}
 
+async function docReturnRunPollingCycle(trigger = 'interval') {
+  if (!DOC_RETURN_ENABLED || !config.bitrixWebhookUrl) {
+    return { ok: true, skipped: true, reason: 'disabled-or-no-bitrix' };
+  }
+
+  const stages = await docReturnResolveStages();
+  const ids = new Set();
+
+  // Тестовая задача всегда контролируется отдельно — независимо от даты создания.
+  if (DOC_RETURN_TEST_TASK_ID) ids.add(DOC_RETURN_TEST_TASK_ID);
+
+  // Новые задачи на «Отправлены» и «Эл. Почта».
+  const [sentTasks, emailTasks] = await Promise.all([
+    docReturnListStageTasks(stages.sent, 1000),
+    docReturnListStageTasks(stages.email, 1000),
+  ]);
+
+  for (const task of [...sentTasks, ...emailTasks]) {
+    const id = String(docReturnTaskValue(task, ['id', 'ID']) || '');
+    if (id) ids.add(id);
+  }
+
+  const results = [];
+  for (const taskId of ids) {
+    const result = await docReturnProcessTask(taskId, trigger);
+    results.push(result);
+  }
+
+  const actionable = results.filter((r) => r && r.action);
+  const errors = results.filter((r) => r && r.ok === false);
+
+  console.log(
+    `[doc-return] poll ${trigger}: checked=${results.length}; actions=${actionable.length}; ` +
+    `errors=${errors.length}; newOnly=${DOC_RETURN_INCLUDE_HISTORICAL ? 'NO' : `YES from ${DOC_RETURN_PRODUCTION_START_ISO}`}`
+  );
+
+  return { ok: errors.length === 0, checked: results.length, actions: actionable, errors };
+}
+
+async function docReturnDryRun(taskId) {
+  const task = await docReturnLoadTask(taskId);
+  const stages = await docReturnResolveStages();
+  const stageId = String(docReturnTaskValue(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+  const basic = await docReturnLoadBasicContext(taskId, task);
+  const state = await docReturnReadState(basic);
+
+  let send = null;
+  try {
+    send = await docReturnLoadSendContext(basic);
+  } catch (e) {
+    send = { error: e.message || String(e) };
+  }
+
+  let nextAction = 'ничего';
+  if (stageId === stages.sent) {
+    nextAction = docReturnIsDeadlineExpired(task)
+      ? 'перевести в «Эл. Почта» и отправить письмо №1'
+      : 'ждать дедлайн на стадии «Отправлены»';
+  } else if (stageId === stages.email) {
+    if (!state.first) nextAction = 'отправить письмо №1';
+    else if (!docReturnIsDeadlineExpired(task)) nextAction = `ждать дедлайн после письма №${state.reminders}`;
+    else if (!state.second) nextAction = 'отправить письмо №2';
+    else if (!state.call) nextAction = 'перевести в «Звонок» без третьего письма';
+  } else if (stageId === stages.call) {
+    nextAction = 'ручной звонок';
+  }
+
+  return {
+    ok: true,
+    dryRun: true,
+    taskId: String(taskId),
+    projectId: DOC_RETURN_PROJECT_ID,
+    taskTitle: basic.title,
+    dealId: basic.dealId,
+    dealTitle: basic.deal.TITLE || '',
+    stageId,
+    stages: { sent: stages.sent, email: stages.email, call: stages.call },
+    deadline: docReturnTaskValue(task, ['deadline', 'DEADLINE']) || '',
+    deadlineExpired: docReturnIsDeadlineExpired(task),
+    state,
+    eligible: docReturnIsEligible(task),
+    productionStart: DOC_RETURN_PRODUCTION_START_ISO,
+    includeHistorical: DOC_RETURN_INCLUDE_HISTORICAL,
+    recipient: send && send.recipient ? {
+      source: send.recipient.source,
+      label: send.recipient.label,
+      email: docReturnMaskEmail(send.recipient.email),
+    } : null,
+    file: send && send.downloaded ? {
+      name: send.downloaded.fileName,
+      bytes: send.downloaded.buffer.length,
+      source: send.file && send.file.source || '',
+    } : null,
+    fileError: send && send.error ? send.error : '',
+    subject: 'Срочно! Возврат оригинала!',
+    nextAction,
+    note: 'GET — только диагностика. Письма и перемещения не выполняются.',
+  };
+}
+
+// GET — безопасная диагностика.
+app.get('/api/doc-return-reminder', async (req, res) => {
+  const taskId = docReturnReqTaskId(req) || DOC_RETURN_TEST_TASK_ID;
+  try {
+    const result = await docReturnDryRun(taskId);
+    return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ ok: false, taskId, error: e.message || String(e) });
+  }
+});
+
+// POST — реальная обработка одной задачи.
+// Текущий тестовый робот Bitrix может продолжать вызывать task_id=47208.
+// В бою серверный polling не зависит от этого робота.
+app.post('/api/doc-return-reminder', async (req, res) => {
+  const taskId = docReturnReqTaskId(req);
+  if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+
+  const result = await docReturnProcessTask(taskId, 'webhook');
+  return res.status(result.ok === false ? 500 : 200).json(result);
+});
+
+console.log(
+  `[doc-return] v94 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
+  `historical=${DOC_RETURN_INCLUDE_HISTORICAL}`
+);
 
 app.listen(PORT, () => {
+  if (DOC_RETURN_ENABLED && config.bitrixWebhookUrl) {
+    const docReturnPollMs = DOC_RETURN_POLL_MINUTES * 60 * 1000;
+    console.log(`[doc-return] Автоконтроль включён: каждые ${DOC_RETURN_POLL_MINUTES} мин.`);
+    setTimeout(() => {
+      docReturnRunPollingCycle('startup').catch((e) =>
+        console.error(`[doc-return] startup poll: ${e.message || e}`)
+      );
+    }, 10000);
+    setInterval(() => {
+      docReturnRunPollingCycle('interval').catch((e) =>
+        console.error(`[doc-return] interval poll: ${e.message || e}`)
+      );
+    }, docReturnPollMs);
+  } else {
+    console.log('[doc-return] Автоконтроль выключен: нужен DOC_RETURN_ENABLED=true и BITRIX_WEBHOOK_URL.');
+  }
   console.log(`MAVIS Bitrix Expert Assistant v89 is running on port ${PORT}`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
