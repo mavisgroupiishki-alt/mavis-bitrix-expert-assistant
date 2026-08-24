@@ -9832,7 +9832,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v94: ВОЗВРАТ ОРИГИНАЛОВ — полный автоматический цикл
+// v96: ВОЗВРАТ ОРИГИНАЛОВ — файлы из старых комментариев + отправка без вложения + безопасный historical
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9855,6 +9855,13 @@ const DOC_RETURN_PRODUCTION_START_ISO = String(
 );
 const DOC_RETURN_INCLUDE_HISTORICAL =
   String(process.env.DOC_RETURN_INCLUDE_HISTORICAL || 'false').toLowerCase() === 'true';
+
+const DOC_RETURN_RECOVERY_TASK_IDS = new Set(
+  String(process.env.DOC_RETURN_RECOVERY_TASK_IDS || '29072,30464,33014,33494')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
 
 const DOC_RETURN_COMMENT_1 = 'Автоматическое напоминание №1 о возврате оригинала отправлено.';
 const DOC_RETURN_COMMENT_2 = 'Автоматическое напоминание №2 о возврате оригинала отправлено.';
@@ -10135,31 +10142,171 @@ async function docReturnLoadBasicContext(taskId, task = null) {
   };
 }
 
+
+async function docReturnGetTaskCommentRows(taskId) {
+  try {
+    const raw = await bitrixRestCall('task.commentitem.getlist', {
+      TASKID: Number(taskId),
+      ORDER: { ID: 'DESC' },
+      FILTER: {},
+    });
+    return Array.isArray(raw)
+      ? raw
+      : (raw && Array.isArray(raw.items))
+        ? raw.items
+        : (raw && Array.isArray(raw.result))
+          ? raw.result
+          : [];
+  } catch (e) {
+    console.warn(`[doc-return] task=${taskId}: комментарии недоступны: ${e.message || e}`);
+    return [];
+  }
+}
+
+async function docReturnResolveCommentFiles(taskId) {
+  const rows = await docReturnGetTaskCommentRows(taskId);
+  const files = [];
+  const seen = new Set();
+
+  for (const comment of rows) {
+    const attached =
+      comment && (
+        comment.ATTACHED_OBJECTS ||
+        comment.attachedObjects ||
+        comment.attached_objects
+      );
+
+    const objects = attached && typeof attached === 'object'
+      ? Object.values(attached)
+      : [];
+
+    for (const obj of objects) {
+      if (!obj) continue;
+
+      const attachedId = String(
+        obj.ATTACHMENT_ID || obj.attachmentId || obj.ID || obj.id || ''
+      ).trim();
+      const fileId = String(
+        obj.FILE_ID || obj.fileId || obj.OBJECT_ID || obj.objectId || ''
+      ).trim();
+      const name = actsCleanText(
+        obj.NAME || obj.name || obj.TITLE || obj.title || ''
+      );
+      const url = String(
+        obj.DOWNLOAD_URL || obj.downloadUrl ||
+        obj.URL || obj.url ||
+        obj.VIEW_URL || obj.viewUrl || ''
+      ).trim();
+      const date = String(
+        comment.POST_DATE || comment.postDate ||
+        comment.DATE || comment.date || ''
+      ).trim();
+
+      if (!name && !fileId && !attachedId) continue;
+
+      const key = `${attachedId}:${fileId}:${name}:${url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      files.push({
+        id: fileId,
+        attachedId,
+        name: name || (fileId ? `файл ${fileId}` : `вложение ${attachedId}`),
+        url,
+        date,
+        source: 'task-comment',
+      });
+    }
+  }
+
+  if (files.length) {
+    console.log(
+      `[doc-return] task=${taskId}: найдено файлов в предыдущих комментариях=${files.length}: ` +
+      files.slice(0, 10).map((f) => f.name).join(', ')
+    );
+  }
+
+  return files;
+}
+
+async function docReturnShouldManageHistoricalEmailTask(task) {
+  const taskId = String(docReturnTaskValue(task, ['id', 'ID']) || '');
+  if (!taskId) return false;
+  if (taskId === DOC_RETURN_TEST_TASK_ID) return true;
+  if (DOC_RETURN_RECOVERY_TASK_IDS.has(taskId)) return true;
+
+  // Новые задачи после запуска v94/v95 продолжаем вести штатно.
+  const startMs = docReturnParseMs(DOC_RETURN_PRODUCTION_START_ISO);
+  const createdMs = docReturnCreatedMs(task);
+  if (createdMs && startMs && createdMs >= startMs) return true;
+
+  // Старые задачи, которые уже реально вошли в НАШ цикл и имеют наши комментарии,
+  // продолжаем вести до письма №2 / Звонка.
+  const comments = await docReturnReadTaskComments(taskId);
+  const joined = comments.join('\n');
+  if (
+    joined.includes(DOC_RETURN_COMMENT_1) ||
+    joined.includes(DOC_RETURN_COMMENT_2) ||
+    joined.includes(DOC_RETURN_CALL_COMMENT)
+  ) return true;
+
+  // Старые задачи, которые до включения historical уже стояли в «Эл. Почта»,
+  // не трогаем: неизвестно, отправляли ли им письма вручную.
+  return false;
+}
+
 async function docReturnLoadSendContext(basic) {
   const recipient = await docReturnResolveRecipient(basic.deal);
   if (!recipient.ok) throw new Error(recipient.reason);
 
-  // task attachments -> task result -> task chat.
+  // 1) Текущие вложения / результат / task chat.
   const fileResolution = await actsResolveTaskFiles(basic.task);
-  const file = docReturnPickFile(fileResolution.files || [], basic.title);
-  if (!file || !file.url) {
-    throw new Error(
-      `В задаче ${basic.taskId} не найден реальный файл для отправки. ` +
-      `Проверены вложения задачи, результат и task chat. Письмо без файла заблокировано.`
-    );
+
+  // 2) Старые комментарии задачи. В интерфейсе Bitrix они могут быть свернуты
+  // под «Показать пинги», но API возвращает ATTACHED_OBJECTS.
+  const commentFiles = await docReturnResolveCommentFiles(basic.taskId);
+
+  const mergedFiles = [];
+  const seen = new Set();
+  for (const f of [...(fileResolution.files || []), ...commentFiles]) {
+    if (!f) continue;
+    const key = `${String(f.attachedId || '')}:${String(f.id || '')}:${String(f.name || '')}:${String(f.url || '')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    mergedFiles.push(f);
   }
 
-  const downloaded = await actsDownloadRealFile(file);
-  if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) {
-    throw new Error(`Файл «${file.name || 'без названия'}» не удалось скачать. Письмо не отправлено.`);
+  const file = docReturnPickFile(mergedFiles, basic.title);
+
+  let downloaded = null;
+  let fileWarning = '';
+
+  if (file && file.url) {
+    try {
+      downloaded = await actsDownloadRealFile(file);
+      if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) {
+        downloaded = null;
+        fileWarning = `Файл «${file.name || 'без названия'}» найден, но пустой. Письмо отправится без вложения.`;
+      }
+    } catch (e) {
+      fileWarning =
+        `Файл «${file.name || 'без названия'}» найден, но не скачался (${e.message || e}). ` +
+        'Письмо отправится без вложения.';
+      console.warn(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
+      downloaded = null;
+    }
+  } else {
+    fileWarning = 'Файл в задаче и предыдущих комментариях не найден. Письмо отправится без вложения.';
+    console.log(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
   }
 
   return {
     ...basic,
     recipient,
-    file,
+    file: file || null,
     downloaded,
-    fileCandidates: (fileResolution.files || []).map((f) => ({
+    fileWarning,
+    fileCandidates: mergedFiles.map((f) => ({
       name: String(f && f.name || ''),
       source: String(f && f.source || ''),
       id: String(f && f.id || ''),
@@ -10170,33 +10317,16 @@ async function docReturnLoadSendContext(basic) {
 }
 
 async function docReturnReadTaskComments(taskId) {
-  try {
-    const raw = await bitrixRestCall('task.commentitem.getlist', {
-      TASKID: Number(taskId),
-      ORDER: { ID: 'DESC' },
-      FILTER: {},
-    });
-    const rows = Array.isArray(raw)
-      ? raw
-      : (raw && Array.isArray(raw.items))
-        ? raw.items
-        : (raw && Array.isArray(raw.result))
-          ? raw.result
-          : [];
-
-    return rows.map((c) =>
-      String(
-        c && (
-          c.POST_MESSAGE || c.postMessage ||
-          c.MESSAGE || c.message ||
-          c.TEXT || c.text || ''
-        )
+  const rows = await docReturnGetTaskCommentRows(taskId);
+  return rows.map((c) =>
+    String(
+      c && (
+        c.POST_MESSAGE || c.postMessage ||
+        c.MESSAGE || c.message ||
+        c.TEXT || c.text || ''
       )
-    ).filter(Boolean);
-  } catch (e) {
-    console.warn(`[doc-return] task=${taskId}: не смог прочитать комментарии задачи: ${e.message || e}`);
-    return [];
-  }
+    )
+  ).filter(Boolean);
 }
 
 async function docReturnReadState(basic) {
@@ -10261,7 +10391,10 @@ async function docReturnAddTaskComment(task, text) {
 
 async function docReturnSendEmail(ctx, sequence) {
   const subject = 'Срочно! Возврат оригинала!';
-  const body = docReturnBuildBody(ctx.title, ctx.downloaded.fileName);
+  const fileName = ctx.downloaded && ctx.downloaded.fileName
+    ? ctx.downloaded.fileName
+    : (ctx.file && ctx.file.name ? ctx.file.name : '');
+  const body = docReturnBuildBody(ctx.title, fileName);
   const responsibleId = Number(ctx.deal.ASSIGNED_BY_ID || 1);
 
   const fields = {
@@ -10282,13 +10415,18 @@ async function docReturnSendEmail(ctx, sequence) {
       ENTITY_TYPE_ID: Number(ctx.recipient.entityTypeId || 3),
       TYPE: 'EMAIL',
     }],
-    FILES: [{
+  };
+
+  // Вложение НЕ обязательное. Если нашли и реально скачали — прикладываем.
+  // Если нет — отправляем только текст письма.
+  if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
+    fields.FILES = [{
       fileData: [
-        String(ctx.downloaded.fileName || ctx.file.name || 'document'),
+        String(ctx.downloaded.fileName || 'document'),
         ctx.downloaded.buffer.toString('base64'),
       ],
-    }],
-  };
+    }];
+  }
 
   const emailFrom = String(config.emailFrom || process.env.EMAIL_FROM || '').trim();
   const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
@@ -10299,23 +10437,67 @@ async function docReturnSendEmail(ctx, sequence) {
   const activityId = await bitrixRestCall('crm.activity.add', { fields });
   console.log(
     `[doc-return] email #${sequence} task=${ctx.taskId}; ` +
-    `to=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded.fileName}`
+    `to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
+    `file=${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`
   );
   return activityId;
 }
 
 async function docReturnSetDeadline(taskId, deadline) {
+  const targetMs = docReturnParseMs(deadline);
+  if (!targetMs) throw new Error(`Некорректный новый дедлайн: ${deadline}`);
+
+  // Legacy tasks.task.update на текущем портале обычно принимает DEADLINE.
   await bitrixRestCall('tasks.task.update', {
     taskId: Number(taskId),
     fields: { DEADLINE: deadline },
   });
+
+  // Обязательно перечитываем задачу: Bitrix иногда отвечает success, но Kanban/поле
+  // фактически остаются без изменения.
+  let check = await docReturnLoadTask(taskId);
+  let actual = String(docReturnTaskValue(check, ['deadline', 'DEADLINE']) || '');
+  let actualMs = docReturnParseMs(actual);
+
+  // Если legacy casing не применился — пробуем современное имя поля deadline.
+  if (!actualMs || Math.abs(actualMs - targetMs) > 60 * 1000) {
+    await bitrixRestCall('tasks.task.update', {
+      taskId: Number(taskId),
+      fields: { deadline },
+    });
+    check = await docReturnLoadTask(taskId);
+    actual = String(docReturnTaskValue(check, ['deadline', 'DEADLINE']) || '');
+    actualMs = docReturnParseMs(actual);
+  }
+
+  if (!actualMs || Math.abs(actualMs - targetMs) > 60 * 1000) {
+    throw new Error(
+      `Bitrix не применил дедлайн. Ожидалось ${deadline}, фактически ${actual || 'пусто'}.`
+    );
+  }
+
+  console.log(`[doc-return] deadline task=${taskId}: ${actual}`);
+  return check;
 }
 
 async function docReturnMoveStage(taskId, stageId) {
-  await bitrixRestCall('tasks.task.update', {
-    taskId: Number(taskId),
-    fields: { STAGE_ID: String(stageId) },
+  // Для Kanban проекта нужен именно task.stages.movetask.
+  // STAGE_ID через tasks.task.update может вернуть success, но карточку не передвинуть.
+  await bitrixRestCall('task.stages.movetask', {
+    id: Number(taskId),
+    stageId: Number(stageId),
   });
+
+  const check = await docReturnLoadTask(taskId);
+  const actualStage = String(docReturnTaskValue(check, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+  if (actualStage !== String(stageId)) {
+    throw new Error(
+      `Bitrix не переместил задачу ${taskId}: ожидалась стадия ${stageId}, фактически ${actualStage || 'пусто'}.`
+    );
+  }
+
+  console.log(`[doc-return] stage task=${taskId}: moved to ${actualStage}`);
+  return check;
 }
 
 function docReturnReminderComment(sequence, ctx, nextDeadline) {
@@ -10323,7 +10505,7 @@ function docReturnReminderComment(sequence, ctx, nextDeadline) {
     sequence === 1 ? DOC_RETURN_COMMENT_1 : DOC_RETURN_COMMENT_2,
     `Email: ${ctx.recipient.email}`,
     `Источник email: ${ctx.recipient.source === 'company' ? 'компания в CRM' : 'контакт в CRM'}`,
-    `Документ: ${ctx.downloaded.fileName}`,
+    `Документ: ${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`,
     `Следующий срок контроля: ${docReturnDateRu(nextDeadline)}.`,
   ].join('\n');
 }
@@ -10360,7 +10542,8 @@ async function docReturnSendReminder(basic, sequence) {
     taskId: ctx.taskId,
     dealId: ctx.dealId,
     email: docReturnMaskEmail(ctx.recipient.email),
-    file: ctx.downloaded.fileName,
+    file: ctx.downloaded ? ctx.downloaded.fileName : null,
+    sentWithoutAttachment: !ctx.downloaded,
     nextDeadline,
     activityId,
     commentVia,
@@ -10411,19 +10594,28 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
     }
 
     const stages = await docReturnResolveStages();
-    let stageId = String(docReturnTaskValue(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
-    const expired = docReturnIsDeadlineExpired(task);
+    let currentTask = task;
+    let stageId = String(docReturnTaskValue(currentTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+    const expired = docReturnIsDeadlineExpired(currentTask);
+    let movedFromSent = false;
 
-    // Стадия «Отправлены»: ждём только дедлайн.
+    // Стадия «Отправлены»: сначала убеждаемся, что есть связанная сделка и email.
+    // Файл НЕ обязателен, поэтому его наличие здесь не проверяем.
     if (stageId === stages.sent) {
       if (!expired) {
         return { ok: true, skipped: true, taskId, stage: 'sent', reason: 'deadline-not-expired' };
       }
 
-      await docReturnMoveStage(taskId, stages.email);
-      stageId = stages.email;
+      const preflightBasic = await docReturnLoadBasicContext(taskId, currentTask);
+      const preflightRecipient = await docReturnResolveRecipient(preflightBasic.deal);
+      if (!preflightRecipient.ok) {
+        throw new Error(preflightRecipient.reason);
+      }
+
+      currentTask = await docReturnMoveStage(taskId, stages.email);
+      stageId = String(docReturnTaskValue(currentTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+      movedFromSent = true;
       console.log(`[doc-return] MOVE task=${taskId}: Отправлены -> Эл. Почта (${trigger})`);
-      // После автоматического перехода продолжаем в том же цикле и отправляем письмо №1.
     }
 
     // Другие стадии, включая «Приедут, не отправляем», не трогаем.
@@ -10437,34 +10629,71 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
       };
     }
 
-    const basic = await docReturnLoadBasicContext(taskId, task);
+    let basic = null;
+    try {
+      basic = await docReturnLoadBasicContext(taskId, currentTask);
+    } catch (e) {
+      // Несколько старых задач v95 уже успел ошибочно передвинуть в «Эл. Почта»
+      // до проверки CRM. Возвращаем только известные recovery-задачи обратно в «Отправлены».
+      if (DOC_RETURN_RECOVERY_TASK_IDS.has(taskId) && /нет связанной CRM-сделки/i.test(String(e.message || e))) {
+        await docReturnMoveStage(taskId, stages.sent).catch(() => {});
+        console.warn(`[doc-return] RECOVERY task=${taskId}: нет CRM-связи, вернул в «Отправлены».`);
+      }
+      throw e;
+    }
+
     const state = await docReturnReadState(basic);
 
-    // В «Эл. Почта» без первого письма — отправляем первое сразу.
-    // Это работает и после автоматического движения, и как backup если робот Bitrix не вызвался.
+    // Новый обычный кейс: пришли из «Отправлены», первого письма ещё не было.
     if (!state.first) {
       return await docReturnSendReminder(basic, 1);
     }
 
+    // Защита/ремонт уже начатого теста или редкой рассинхронизации:
+    // письмо №1 уже существует, но задача почему-то оставалась в «Отправлены»
+    // с просроченным старым дедлайном. Не шлём письмо №2 мгновенно.
+    // Переводим в «Эл. Почта» и восстанавливаем полноценные 14 дней от текущего момента.
+    if (movedFromSent && state.first && !state.second) {
+      const repairedDeadline = docReturnNextDeadline();
+      currentTask = await docReturnSetDeadline(taskId, repairedDeadline);
+
+      console.log(
+        `[doc-return] REPAIR task=${taskId}: reminder #1 уже был; ` +
+        `стадия восстановлена на Эл. Почта, дедлайн=${repairedDeadline}`
+      );
+
+      return {
+        ok: true,
+        action: 'repair-after-reminder-1',
+        taskId,
+        dealId: basic.dealId,
+        reminders: 1,
+        nextDeadline: repairedDeadline,
+        message: 'Первое письмо уже было отправлено ранее. Повтор не отправляю; восстановил стадию и срок +14 дней.',
+      };
+    }
+
     // Первое уже ушло: до нового дедлайна ничего не делаем.
-    if (!docReturnIsDeadlineExpired(task)) {
+    if (!docReturnIsDeadlineExpired(currentTask)) {
       return {
         ok: true,
         skipped: true,
         taskId,
         reminders: state.reminders,
         reason: 'deadline-not-expired',
-        deadline: docReturnTaskValue(task, ['deadline', 'DEADLINE']) || '',
+        deadline: docReturnTaskValue(currentTask, ['deadline', 'DEADLINE']) || '',
       };
     }
 
     // Дедлайн после письма №1 истёк -> письмо №2.
     if (state.first && !state.second) {
+      basic = await docReturnLoadBasicContext(taskId, currentTask);
       return await docReturnSendReminder(basic, 2);
     }
 
     // Дедлайн после письма №2 истёк -> «Звонок», третьего email нет.
     if (state.second && !state.call) {
+      basic = await docReturnLoadBasicContext(taskId, currentTask);
       return await docReturnMoveToCall(basic, stages);
     }
 
@@ -10531,11 +10760,33 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
   // Тестовая задача всегда контролируется отдельно — независимо от даты создания.
   if (DOC_RETURN_TEST_TASK_ID) ids.add(DOC_RETURN_TEST_TASK_ID);
 
-  // Новые задачи на «Отправлены» и «Эл. Почта».
-  const [sentTasks, emailTasks] = await Promise.all([
-    docReturnListStageTasks(stages.sent, 1000),
-    docReturnListStageTasks(stages.email, 1000),
-  ]);
+  // «Отправлены»: при historical=true берём весь старый хвост.
+  const sentTasks = await docReturnListStageTasks(stages.sent, 1000);
+
+  // «Эл. Почта»: старый хвост НЕ обрабатываем вслепую, чтобы не дублировать
+  // письма, которые могли отправляться вручную до запуска автоматизации.
+  const emailAll = await bitrixRestList('tasks.task.list', {
+    filter: {
+      GROUP_ID: Number(DOC_RETURN_PROJECT_ID),
+      STAGE_ID: String(stages.email),
+    },
+    select: [
+      'ID', 'TITLE', 'GROUP_ID', 'STAGE_ID', 'DEADLINE',
+      'CREATED_DATE', 'CHANGED_DATE', 'UF_CRM_TASK',
+    ],
+    order: { ID: 'ASC' },
+  }, 1000);
+
+  const emailTasks = [];
+  for (const task of emailAll) {
+    if (!DOC_RETURN_INCLUDE_HISTORICAL) {
+      if (docReturnIsEligible(task)) emailTasks.push(task);
+      continue;
+    }
+    if (await docReturnShouldManageHistoricalEmailTask(task)) {
+      emailTasks.push(task);
+    }
+  }
 
   for (const task of [...sentTasks, ...emailTasks]) {
     const id = String(docReturnTaskValue(task, ['id', 'ID']) || '');
@@ -10613,6 +10864,9 @@ async function docReturnDryRun(taskId) {
       bytes: send.downloaded.buffer.length,
       source: send.file && send.file.source || '',
     } : null,
+    fileCandidates: send && Array.isArray(send.fileCandidates) ? send.fileCandidates : [],
+    sentWithoutAttachment: Boolean(send && !send.error && !send.downloaded),
+    fileWarning: send && send.fileWarning ? send.fileWarning : '',
     fileError: send && send.error ? send.error : '',
     subject: 'Срочно! Возврат оригинала!',
     nextAction,
@@ -10643,7 +10897,7 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v94 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v96 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}`
 );
