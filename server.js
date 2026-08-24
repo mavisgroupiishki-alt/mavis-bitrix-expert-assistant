@@ -9834,7 +9834,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v101: ВОЗВРАТ ОРИГИНАЛОВ — очередь без зависания на старых задачах без email
+// v102: ВОЗВРАТ ОРИГИНАЛОВ — без технических lock-комментариев в задачах
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9901,10 +9901,6 @@ const DOC_RETURN_ERROR_COOLDOWN_MINUTES = Math.max(
 );
 const DOC_RETURN_ALLOW_WEBHOOK =
   String(process.env.DOC_RETURN_ALLOW_WEBHOOK || 'false').toLowerCase() === 'true';
-const DOC_RETURN_DISTRIBUTED_LOCK_TTL_MS = Math.max(
-  60_000,
-  Number(process.env.DOC_RETURN_DISTRIBUTED_LOCK_TTL_MS || 300_000)
-);
 
 let docReturnSmtpTransport = null;
 let docReturnCycleRunning = false;
@@ -11077,243 +11073,159 @@ function docReturnReminderComment(sequence, ctx, nextDeadline, sendResult = null
 }
 
 
-function docReturnSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function docReturnLockMessage(sequence, token, ts) {
-  return `[MAVIS_DOC_RETURN_LOCK] seq=${sequence} token=${token} ts=${ts}`;
-}
-
-function docReturnParseLockComment(row) {
-  const message = String(
-    row && (
-      row.POST_MESSAGE || row.postMessage ||
-      row.MESSAGE || row.message ||
-      row.TEXT || row.text || ''
-    ) || ''
-  );
-  const m = message.match(/\[MAVIS_DOC_RETURN_LOCK\]\s+seq=(\d+)\s+token=([^\s]+)\s+ts=(\d+)/);
-  if (!m) return null;
-
-  return {
-    id: Number(row && (row.ID || row.id) || 0),
-    sequence: Number(m[1]),
-    token: String(m[2]),
-    ts: Number(m[3]),
-    message,
-  };
-}
-
-async function docReturnDeleteLockComment(taskId, commentId) {
-  if (!commentId) return;
+async function docReturnCleanupTechnicalLockComments(taskId) {
   try {
-    await bitrixRestCall('task.commentitem.delete', {
-      TASKID: Number(taskId),
-      ITEMID: Number(commentId),
-    });
+    const rows = await docReturnGetTaskCommentRows(taskId);
+    for (const row of rows.slice(0, 100)) {
+      const message = String(
+        row && (
+          row.POST_MESSAGE || row.postMessage ||
+          row.MESSAGE || row.message ||
+          row.TEXT || row.text || ''
+        ) || ''
+      );
+      if (!message.includes('[MAVIS_DOC_RETURN_LOCK]')) continue;
+
+      const itemId = Number(row && (row.ID || row.id) || 0);
+      if (!itemId) continue;
+
+      try {
+        await bitrixRestCall('task.commentitem.delete', {
+          TASKID: Number(taskId),
+          ITEMID: itemId,
+        });
+        console.log(`[doc-return] cleanup technical lock-comment task=${taskId}; comment=${itemId}`);
+      } catch (e) {
+        console.warn(
+          `[doc-return] cleanup lock-comment task=${taskId}; comment=${itemId}: ${e.message || e}`
+        );
+      }
+    }
   } catch (e) {
-    console.warn(
-      `[doc-return] task=${taskId}: не смог удалить служебный lock-comment ${commentId}: ${e.message || e}`
-    );
+    console.warn(`[doc-return] cleanup technical comments task=${taskId}: ${e.message || e}`);
   }
-}
-
-async function docReturnAcquireDistributedLock(basic, sequence) {
-  const taskId = String(basic.taskId);
-  const token =
-    `${Date.now()}-${process.pid || 0}-${Math.random().toString(36).slice(2, 12)}`;
-  const ts = Date.now();
-  const message = docReturnLockMessage(sequence, token, ts);
-
-  // Lock создаём именно как комментарий задачи — он хранится в Bitrix,
-  // поэтому его видят и другой Render-процесс, и webhook, и параллельный polling.
-  const addResult = await bitrixRestCall('task.commentitem.add', {
-    TASKID: Number(taskId),
-    FIELDS: { POST_MESSAGE: message },
-  });
-
-  const ownId = Number(
-    addResult && (
-      addResult.ID || addResult.id ||
-      addResult.ITEM_ID || addResult.itemId ||
-      addResult
-    ) || 0
-  );
-
-  // Даём Bitrix время распространить комментарий между параллельными запросами.
-  await docReturnSleep(1800);
-
-  const rows = await docReturnGetTaskCommentRows(taskId);
-  const now = Date.now();
-  const active = [];
-  const stale = [];
-
-  for (const row of rows) {
-    const lock = docReturnParseLockComment(row);
-    if (!lock || lock.sequence !== Number(sequence)) continue;
-    if (now - lock.ts > DOC_RETURN_DISTRIBUTED_LOCK_TTL_MS) stale.push(lock);
-    else active.push(lock);
-  }
-
-  // Старые lock-комментарии после падения процесса чистим.
-  for (const lock of stale.slice(0, 20)) {
-    await docReturnDeleteLockComment(taskId, lock.id);
-  }
-
-  // Один и тот же победитель у всех процессов: минимальный ID комментария.
-  active.sort((a, b) => {
-    if (a.id && b.id && a.id !== b.id) return a.id - b.id;
-    if (a.ts !== b.ts) return a.ts - b.ts;
-    return a.token.localeCompare(b.token);
-  });
-
-  const winner = active[0] || null;
-  const own = active.find((x) => x.token === token) || null;
-
-  if (!winner || !own || winner.token !== token) {
-    if (own && own.id) await docReturnDeleteLockComment(taskId, own.id);
-    console.warn(
-      `[doc-return] DUPLICATE BLOCK task=${taskId} seq=${sequence}: ` +
-      `параллельный процесс уже получил lock. Письмо НЕ отправляю.`
-    );
-    return { acquired: false, token, commentId: ownId || (own && own.id) || 0 };
-  }
-
-  // После получения распределённого lock ещё раз перечитываем состояние.
-  // Это критично: другой процесс мог успеть отправить письмо прямо перед lock.
-  const freshTask = await docReturnLoadTask(taskId);
-  const freshBasic = await docReturnLoadBasicContext(taskId, freshTask);
-  const freshState = await docReturnReadState(freshBasic);
-
-  if (
-    (sequence === 1 && freshState.first) ||
-    (sequence === 2 && freshState.second)
-  ) {
-    await docReturnDeleteLockComment(taskId, own.id || ownId);
-    console.warn(
-      `[doc-return] DUPLICATE BLOCK task=${taskId} seq=${sequence}: ` +
-      `напоминание уже зафиксировано после повторной проверки.`
-    );
-    return {
-      acquired: false,
-      alreadySent: true,
-      token,
-      commentId: own.id || ownId,
-      freshState,
-    };
-  }
-
-  return {
-    acquired: true,
-    token,
-    commentId: own.id || ownId,
-    freshBasic,
-    freshState,
-  };
 }
 
 async function docReturnSendReminder(basic, sequence) {
-  const lock = await docReturnAcquireDistributedLock(basic, sequence);
+  // v102: никаких технических комментариев-lock в задаче.
+  // Защита от дублей обеспечивается:
+  // 1) webhook выключен по умолчанию,
+  // 2) polling не пересекается внутри процесса,
+  // 3) task-level local lock уже есть в docReturnProcessTask,
+  // 4) перед SMTP перечитываем состояние и дедлайн ещё раз.
+  await docReturnCleanupTechnicalLockComments(basic.taskId);
 
-  if (!lock.acquired) {
+  let freshTask = await docReturnLoadTask(basic.taskId);
+  let freshBasic = await docReturnLoadBasicContext(basic.taskId, freshTask);
+  let freshState = await docReturnReadState(freshBasic);
+
+  if (sequence === 1 && freshState.first) {
     return {
       ok: true,
       skipped: true,
-      taskId: basic.taskId,
-      reason: lock.alreadySent ? 'already-sent-after-lock-check' : 'distributed-lock-lost',
-      sequence,
+      taskId: freshBasic.taskId,
+      reason: 'reminder-1-already-sent',
     };
   }
 
-  try {
-    // Используем свежую задачу, перечитанную уже ПОСЛЕ распределённого lock.
-    let lockedBasic = lock.freshBasic || basic;
-    const lockedState = lock.freshState || await docReturnReadState(lockedBasic);
-
-    if (sequence === 1 && lockedState.first) {
+  if (sequence === 2) {
+    if (freshState.second) {
       return {
         ok: true,
         skipped: true,
-        taskId: lockedBasic.taskId,
-        reason: 'reminder-1-already-sent',
+        taskId: freshBasic.taskId,
+        reason: 'reminder-2-already-sent',
       };
     }
-
-    if (sequence === 2) {
-      if (lockedState.second) {
-        return {
-          ok: true,
-          skipped: true,
-          taskId: lockedBasic.taskId,
-          reason: 'reminder-2-already-sent',
-        };
-      }
-      if (!lockedState.first) {
-        throw new Error('Защитный стоп: нельзя отправлять письмо №2 без подтверждённого письма №1.');
-      }
-
-      const freshTask = await docReturnLoadTask(lockedBasic.taskId);
-      if (!docReturnIsDeadlineExpired(freshTask)) {
-        return {
-          ok: true,
-          skipped: true,
-          taskId: lockedBasic.taskId,
-          reason: 'deadline-not-expired-after-lock',
-        };
-      }
-      lockedBasic = await docReturnLoadBasicContext(lockedBasic.taskId, freshTask);
+    if (!freshState.first) {
+      throw new Error('Защитный стоп: нельзя отправлять письмо №2 без подтверждённого письма №1.');
     }
-
-    const ctx = await docReturnLoadSendContext(lockedBasic);
-    const nextDeadline = docReturnNextDeadline();
-
-    // Последняя проверка адреса непосредственно перед SMTP.
-    docReturnAssertExternalRecipient(ctx.recipient.email, ctx.taskId);
-
-    const activityId = await docReturnSendEmail(ctx, sequence);
-
-    if (!activityId || activityId.sent !== true) {
-      throw new Error('Почтовый сервер не подтвердил отправку. Комментарий и дедлайн не меняю.');
+    if (!docReturnIsDeadlineExpired(freshTask)) {
+      return {
+        ok: true,
+        skipped: true,
+        taskId: freshBasic.taskId,
+        reason: 'deadline-not-expired-before-send',
+      };
     }
+  }
 
-    // Дедлайн и комментарий меняем только ПОСЛЕ подтверждённой SMTP-отправки.
-    await docReturnSetDeadline(ctx.taskId, nextDeadline);
+  // Короткая повторная проверка перед отправкой.
+  await new Promise((resolve) => setTimeout(resolve, 1200));
 
-    const comment = docReturnReminderComment(sequence, ctx, nextDeadline, activityId);
-    const commentVia = await docReturnAddTaskComment(ctx.task, comment);
+  freshTask = await docReturnLoadTask(basic.taskId);
+  freshBasic = await docReturnLoadBasicContext(basic.taskId, freshTask);
+  freshState = await docReturnReadState(freshBasic);
 
-    const marker = sequence === 1 ? DOC_RETURN_LEGACY_MARKER_1 : DOC_RETURN_LEGACY_MARKER_2;
-    if (ctx.dealId) {
-      await fgAddCommentOnce(
-        ctx.dealId,
-        `${marker} task=${ctx.taskId}`,
-        `Система возврата оригиналов: email-напоминание №${sequence} отправлено. Следующий контроль ${docReturnDateRu(nextDeadline)}.`
-      ).catch(() => {});
-    }
-
-    console.log(
-      `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
-      `email=${docReturnMaskEmail(ctx.recipient.email)}; deadline=${nextDeadline}; ` +
-      `dedupeLock=${lock.token}`
-    );
-
+  if (sequence === 1 && freshState.first) {
     return {
       ok: true,
-      action: `reminder-${sequence}`,
-      taskId: ctx.taskId,
-      dealId: ctx.dealId,
-      email: docReturnMaskEmail(ctx.recipient.email),
-      file: ctx.downloaded ? ctx.downloaded.fileName : null,
-      sentWithoutAttachment: !ctx.downloaded,
-      nextDeadline,
-      activityId,
-      commentVia,
-      dedupeLock: lock.token,
+      skipped: true,
+      taskId: freshBasic.taskId,
+      reason: 'reminder-1-already-sent-recheck',
     };
-  } finally {
-    await docReturnDeleteLockComment(basic.taskId, lock.commentId);
   }
+  if (sequence === 2) {
+    if (freshState.second) {
+      return {
+        ok: true,
+        skipped: true,
+        taskId: freshBasic.taskId,
+        reason: 'reminder-2-already-sent-recheck',
+      };
+    }
+    if (!docReturnIsDeadlineExpired(freshTask)) {
+      return {
+        ok: true,
+        skipped: true,
+        taskId: freshBasic.taskId,
+        reason: 'deadline-not-expired-recheck',
+      };
+    }
+  }
+
+  const ctx = await docReturnLoadSendContext(freshBasic);
+  const nextDeadline = docReturnNextDeadline();
+
+  docReturnAssertExternalRecipient(ctx.recipient.email, ctx.taskId);
+
+  const activityId = await docReturnSendEmail(ctx, sequence);
+
+  if (!activityId || activityId.sent !== true) {
+    throw new Error('Почтовый сервер не подтвердил отправку. Комментарий и дедлайн не меняю.');
+  }
+
+  await docReturnSetDeadline(ctx.taskId, nextDeadline);
+
+  const comment = docReturnReminderComment(sequence, ctx, nextDeadline, activityId);
+  const commentVia = await docReturnAddTaskComment(ctx.task, comment);
+
+  const marker = sequence === 1 ? DOC_RETURN_LEGACY_MARKER_1 : DOC_RETURN_LEGACY_MARKER_2;
+  if (ctx.dealId) {
+    await fgAddCommentOnce(
+      ctx.dealId,
+      `${marker} task=${ctx.taskId}`,
+      `Система возврата оригиналов: email-напоминание №${sequence} отправлено. Следующий контроль ${docReturnDateRu(nextDeadline)}.`
+    ).catch(() => {});
+  }
+
+  console.log(
+    `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
+    `email=${docReturnMaskEmail(ctx.recipient.email)}; deadline=${nextDeadline}; dedupe=v102-clean`
+  );
+
+  return {
+    ok: true,
+    action: `reminder-${sequence}`,
+    taskId: ctx.taskId,
+    dealId: ctx.dealId,
+    email: docReturnMaskEmail(ctx.recipient.email),
+    file: ctx.downloaded ? ctx.downloaded.fileName : null,
+    sentWithoutAttachment: !ctx.downloaded,
+    nextDeadline,
+    activityId,
+    commentVia,
+  };
 }
 
 async function docReturnMoveToCall(basic, stages) {
@@ -11755,7 +11667,7 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v101 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v102 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
