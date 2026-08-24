@@ -4115,6 +4115,30 @@ async function buildDealContext(deal, transcript) {
   };
 }
 
+
+function buildNoCallTestWorkResult(deal, context, defaultDocDeadline) {
+  const service = String((context && context.service) || detectServiceFromDeal(deal) || 'услуге').trim();
+  const isAtt = /атт|аттестац/i.test(service);
+  const isSpk = /спк|стк|свидетельств.*техн/i.test(service);
+  const greeting = typeof actsMinskGreeting === 'function' ? actsMinskGreeting() : 'Добрый день!';
+  let base;
+  if (isAtt) {
+    base = `${greeting}\n\nФиксируем дальнейший ход работы по ${service}.\n\nЧто делаем мы:\n1. Проверяем организацию и специалистов по требованиям аттестации.\n2. Проверяем образование, стаж, должности и действующие аттестаты специалистов.\n3. После получения полного комплекта документов определяем, чего не хватает и что необходимо дооформить.\n4. Готовим аттестационное дело и документы для подачи.\n5. Контролируем замечания и статус рассмотрения.\n\nСрок предоставления документов: до ${defaultDocDeadline}.`;
+  } else if (isSpk) {
+    base = `${greeting}\n\nФиксируем дальнейший ход работы по ${service}.\n\nЧто делаем мы:\n1. Проверяем специалистов и средства измерений.\n2. Проверяем комплектность документов.\n3. После получения полного комплекта готовим документы для подачи.\n4. Контролируем статус рассмотрения.\n\nСрок предоставления документов: до ${defaultDocDeadline}.`;
+  } else {
+    base = `${greeting}\n\nФиксируем дальнейший ход работы по ${service}.\n\nПосле получения полного комплекта документов мы их проверим, сообщим, чего не хватает, и подготовим дальнейшие действия.\n\nСрок предоставления документов: до ${defaultDocDeadline}.`;
+  }
+  return {
+    call_qualified: true,
+    call_reason: 'тестовый ход работы без звонка',
+    deadline_mentioned: false,
+    documents_due_date: null,
+    client_message: base,
+    comment: `Тестовый Ход работы сформирован без звонка, только по данным сделки.\nУслуга: ${service}.\nСрок предоставления документов: до ${defaultDocDeadline}.\nСледующий шаг: получить документы от клиента, проверить комплектность и продолжить работу по CJM.`,
+  };
+}
+
 async function runServerAutopilotForDeal(deal, stageId) {
   const dealId = deal.ID;
   const logPrefix = `[autopilot deal=${dealId}]`;
@@ -4301,15 +4325,26 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
 Если эксперт назвал срок — переведи его в конкретную дату.
 Если срок не назван — укажи стандартный дедлайн +2 календарных дня, который дан выше.`;
 
-    const rawText = await callAiChatCompletion({
-      model: config.aiModel,
-      temperature: 0.1,  // ниже temperature для точного заполнения
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-    });
     let aiResult = {};
-    try { aiResult = JSON.parse(rawText); } catch (_) {
-      const match = rawText.match(/\{[\s\S]*\}/);
-      if (match) try { aiResult = JSON.parse(match[0]); } catch (_2) { aiResult = {}; }
+    if (noCallTestMode) {
+      // v88: тест Бобика БЕЗ звонка больше не зависит от ИИ-ответа.
+      // Это делает тест детерминированным: сообщение строится из услуги + стандартного перечня документов.
+      aiResult = buildNoCallTestWorkResult(deal, context, defaultDocDeadline);
+      const deadlineDate = new Date(nowForPrompt.getTime() + 2 * 24 * 60 * 60 * 1000);
+      aiResult.documents_due_date = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).format(deadlineDate);
+      console.log(`${logPrefix} v88 TEST: Ход работы без звонка сформирован детерминированно, без вызова ИИ.`);
+    } else {
+      const rawText = await callAiChatCompletion({
+        model: config.aiModel,
+        temperature: 0.1,
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+      });
+      try { aiResult = JSON.parse(rawText); } catch (_) {
+        const match = rawText.match(/\{[\s\S]*\}/);
+        if (match) try { aiResult = JSON.parse(match[0]); } catch (_2) { aiResult = {}; }
+      }
     }
 
     const callQualifiedRaw = aiResult.call_qualified;
@@ -5833,7 +5868,15 @@ async function runAutopilotPollingCycle() {
       }
     }
 
-    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] по всей воронке Производства.`);
+    // v88: тестовую сделку ставим первой, чтобы она не ждала обработки десятков боевых сделок.
+    if (config.cjmTestMode && config.cjmTestDealId) {
+      allDeals.sort((a, b) => {
+        const aa = String(a.ID) === String(config.cjmTestDealId) ? 0 : 1;
+        const bb = String(b.ID) === String(config.cjmTestDealId) ? 0 : 1;
+        return aa - bb;
+      });
+    }
+    console.log(`[autopilot] Цикл: найдено ${allDeals.length} сделок на стадиях [${stageIds.join(', ')}] по всей воронке Производства; testFirst=${config.cjmTestDealId || 'none'}.`);
 
     for (const deal of allDeals) {
       if (autopilotProcessed.has(String(deal.ID))) continue;
@@ -5841,7 +5884,7 @@ async function runAutopilotPollingCycle() {
       if (alreadyDone) continue;
       // Передаём первую стадию (Эксперт назначен) как эталон для поиска сопутствующих сделок.
       await runServerAutopilotForDeal(deal, deal.STAGE_ID);
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     // Проверяем ожидающие задачи-триггеры Этапа 4 (эксперт поставил галочку).
@@ -9752,8 +9795,8 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MAVIS Bitrix Expert Assistant v86 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}.`);
+  console.log(`MAVIS Bitrix Expert Assistant v88 is running on port ${PORT}`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
