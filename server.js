@@ -9834,7 +9834,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 });
 
 // ============================================================================
-// v97: ВОЗВРАТ ОРИГИНАЛОВ — email из договора/счёта без CRM + SMTP + разбор старых комментариев
+// v98: ВОЗВРАТ ОРИГИНАЛОВ — запрет писем на MAVIS + оригинальные DOC/DOCX вложения через SMTP
 //
 // Логика:
 // 1) «Отправлены» + истёк дедлайн -> «Эл. Почта» -> письмо №1 -> дедлайн +14 дней.
@@ -9877,7 +9877,7 @@ const DOC_RETURN_SMTP_PASSWORD = String(
 );
 const DOC_RETURN_MAX_ACTIONS_PER_CYCLE = Math.max(
   1,
-  Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 15)
+  Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 5)
 );
 
 let docReturnSmtpTransport = null;
@@ -9946,12 +9946,14 @@ function docReturnFirstEmail(entity) {
 async function docReturnResolveRecipient(deal) {
   if (!deal) return { ok: false, reason: 'crm-deal-not-linked' };
 
+  // 1. Компания. Если там стоит наша собственная почта — НЕ используем её,
+  // а продолжаем искать контакт / документ.
   const companyId = String(deal && deal.COMPANY_ID || '').trim();
   if (companyId && companyId !== '0') {
     try {
       const company = await bitrixRestCall('crm.company.get', { id: Number(companyId) });
       const email = docReturnFirstEmail(company);
-      if (email) {
+      if (email && !docReturnIsForbiddenRecipient(email)) {
         return {
           ok: true,
           email,
@@ -9961,16 +9963,23 @@ async function docReturnResolveRecipient(deal) {
           label: String(company && company.TITLE || `Компания ${companyId}`),
         };
       }
+      if (email) {
+        console.warn(
+          `[doc-return] deal=${deal.ID || '?'}: email компании ${docReturnMaskEmail(email)} ` +
+          'заблокирован как адрес MAVIS/отправителя.'
+        );
+      }
     } catch (e) {
       console.warn(`[doc-return] company ${companyId}: ${e.message || e}`);
     }
   }
 
+  // 2. Контакт. Та же жёсткая проверка.
   try {
     const recipient = await actsResolveRecipientContact(deal);
     if (recipient && recipient.ok && recipient.contact) {
       const email = actsContactEmail(recipient.contact);
-      if (email) {
+      if (email && !docReturnIsForbiddenRecipient(email)) {
         return {
           ok: true,
           email,
@@ -9980,12 +9989,18 @@ async function docReturnResolveRecipient(deal) {
           label: recipient.label || `Контакт ${recipient.contactId}`,
         };
       }
+      if (email) {
+        console.warn(
+          `[doc-return] deal=${deal.ID || '?'}: email контакта ${docReturnMaskEmail(email)} ` +
+          'заблокирован как адрес MAVIS/отправителя.'
+        );
+      }
     }
   } catch (e) {
     console.warn(`[doc-return] contact resolver: ${e.message || e}`);
   }
 
-  return { ok: false, reason: 'crm-email-not-found' };
+  return { ok: false, reason: 'crm-external-email-not-found' };
 }
 
 function docReturnExtractEmailsFromText(value) {
@@ -10016,6 +10031,7 @@ function docReturnOwnEmails() {
     process.env.MAIL_SMTP_USER,
     'mavis.group@mail.ru',
   ];
+
   for (const v of candidates) {
     const e = String(v || '').trim().toLowerCase();
     if (e) set.add(e);
@@ -10023,20 +10039,46 @@ function docReturnOwnEmails() {
   return set;
 }
 
-function docReturnPickClientEmail(emails) {
+function docReturnIsForbiddenRecipient(email) {
+  const value = String(email || '').trim().toLowerCase();
+  if (!value) return true;
+
   const own = docReturnOwnEmails();
+  if (own.has(value)) return true;
+
+  // ЖЁСТКИЙ стоп: автоматизация возврата оригиналов никогда не пишет
+  // на собственные адреса MAVIS, даже если такой email ошибочно записан в CRM
+  // или встречается внутри нашего шаблона договора/счёта.
+  if (value === 'mavis.group@mail.ru') return true;
+
+  const domain = String(value.split('@')[1] || '').toLowerCase();
+  if (
+    domain === 'mavisgroup.by' ||
+    domain.endsWith('.mavisgroup.by') ||
+    domain === 'mavis-group.by' ||
+    domain.endsWith('.mavis-group.by')
+  ) return true;
+
+  return false;
+}
+
+function docReturnAssertExternalRecipient(email, taskId = '') {
+  if (docReturnIsForbiddenRecipient(email)) {
+    throw new Error(
+      `ЗАЩИТНЫЙ СТОП: адрес ${String(email || 'пусто')} относится к MAVIS/отправителю. ` +
+      `Письмо по задаче ${taskId || '?'} НЕ отправлено.`
+    );
+  }
+  return true;
+}
+
+function docReturnPickClientEmail(emails) {
   const cleaned = (emails || [])
     .map((x) => String(x || '').trim().toLowerCase())
     .filter(Boolean);
 
-  const external = cleaned.filter((email) => {
-    if (own.has(email)) return false;
-    const domain = String(email.split('@')[1] || '').toLowerCase();
-    if (domain === 'mavisgroup.by' || domain.endsWith('.mavisgroup.by')) return false;
-    return true;
-  });
-
-  return external[0] || cleaned.find((e) => !own.has(e)) || '';
+  // Никакого fallback на нашу почту. Если внешнего email нет — возвращаем пусто.
+  return cleaned.find((email) => !docReturnIsForbiddenRecipient(email)) || '';
 }
 
 function docReturnDecodeXmlEntities(value) {
@@ -10578,23 +10620,64 @@ async function docReturnReadTaskComments(taskId) {
   ).filter(Boolean);
 }
 
+function docReturnEmailFromReminderComment(comment) {
+  const match = String(comment || '').match(/(?:^|\n)\s*Email:\s*([^\s<>"']+@[^\s<>"']+)/i);
+  return match ? String(match[1] || '').trim().toLowerCase() : '';
+}
+
+function docReturnHasValidReminderComment(comments, markerText) {
+  for (const comment of comments || []) {
+    const value = String(comment || '');
+    if (!value.includes(markerText)) continue;
+
+    const email = docReturnEmailFromReminderComment(value);
+
+    // Старый корректный тест 47208 мог иметь комментарий без новых служебных полей.
+    // Если email указан — обязательно должен быть внешним.
+    if (email && docReturnIsForbiddenRecipient(email)) {
+      console.warn(
+        `[doc-return] найден старый комментарий «${markerText}», но получатель ` +
+        `${docReturnMaskEmail(email)} — MAVIS. Такое письмо НЕ считаю напоминанием.`
+      );
+      continue;
+    }
+
+    return true;
+  }
+  return false;
+}
+
 async function docReturnReadState(basic) {
   const taskComments = await docReturnReadTaskComments(basic.taskId);
-  const joined = taskComments.join('\n');
 
-  let first = joined.includes(DOC_RETURN_COMMENT_1);
-  let second = joined.includes(DOC_RETURN_COMMENT_2);
-  let call = joined.includes(DOC_RETURN_CALL_COMMENT);
+  const invalidFirst = taskComments.some((comment) => {
+    const value = String(comment || '');
+    if (!value.includes(DOC_RETURN_COMMENT_1)) return false;
+    const email = docReturnEmailFromReminderComment(value);
+    return Boolean(email && docReturnIsForbiddenRecipient(email));
+  });
 
-  // Совместимость с уже прошедшим первым тестом 47208.
-  if (basic.dealId && !first) {
+  const invalidSecond = taskComments.some((comment) => {
+    const value = String(comment || '');
+    if (!value.includes(DOC_RETURN_COMMENT_2)) return false;
+    const email = docReturnEmailFromReminderComment(value);
+    return Boolean(email && docReturnIsForbiddenRecipient(email));
+  });
+
+  let first = docReturnHasValidReminderComment(taskComments, DOC_RETURN_COMMENT_1);
+  let second = docReturnHasValidReminderComment(taskComments, DOC_RETURN_COMMENT_2);
+  let call = taskComments.some((comment) => String(comment || '').includes(DOC_RETURN_CALL_COMMENT));
+
+  // Legacy timeline нужен только когда нет доказательства неправильной отправки.
+  // Иначе v97 мог пометить timeline после письма на нашу же почту.
+  if (basic.dealId && !first && !invalidFirst) {
     first = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_1} task=${basic.taskId}`,
       100
     );
   }
-  if (basic.dealId && !second) {
+  if (basic.dealId && !second && !invalidSecond) {
     second = await fgTimelineHasMarker(
       basic.dealId,
       `${DOC_RETURN_LEGACY_MARKER_2} task=${basic.taskId}`,
@@ -10614,6 +10697,8 @@ async function docReturnReadState(basic) {
     second,
     call,
     reminders: second ? 2 : first ? 1 : 0,
+    invalidOwnMailFirst: invalidFirst,
+    invalidOwnMailSecond: invalidSecond,
   };
 }
 
@@ -10662,6 +10747,8 @@ function docReturnGetSmtpTransport() {
 }
 
 async function docReturnSendViaSmtp(ctx, subject, body) {
+  docReturnAssertExternalRecipient(ctx && ctx.recipient && ctx.recipient.email, ctx && ctx.taskId);
+
   const transporter = docReturnGetSmtpTransport();
   const fromAddress = String(
     config.emailFrom || process.env.EMAIL_FROM || DOC_RETURN_SMTP_USER
@@ -10675,11 +10762,23 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
     text: body,
   };
 
+  // ВАЖНО: передаём Nodemailer исходный Buffer файла, а не base64-объект Bitrix.
+  // Имя и расширение остаются ровно такими, как у прикреплённого DOC/DOCX/PDF.
   if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
+    const originalName = String(
+      ctx.downloaded.fileName ||
+      (ctx.file && ctx.file.name) ||
+      'document'
+    );
+
     mail.attachments = [{
-      filename: String(ctx.downloaded.fileName || 'document'),
-      content: ctx.downloaded.buffer,
-      contentType: ctx.downloaded.contentType || undefined,
+      filename: originalName,
+      content: Buffer.from(ctx.downloaded.buffer),
+      contentType: actsMimeByFileName(
+        originalName,
+        ctx.downloaded.contentType || ''
+      ),
+      contentDisposition: 'attachment',
     }];
   }
 
@@ -10698,64 +10797,20 @@ async function docReturnSendEmail(ctx, sequence) {
     : (ctx.file && ctx.file.name ? ctx.file.name : '');
   const body = docReturnBuildBody(ctx.title, fileName);
 
-  if (
-    ctx.deal &&
-    ctx.recipient &&
-    Number(ctx.recipient.entityId || 0) > 0 &&
-    [3, 4].includes(Number(ctx.recipient.entityTypeId || 0))
-  ) {
-    const responsibleId = Number(ctx.deal.ASSIGNED_BY_ID || 1);
+  // Финальный предохранитель — срабатывает независимо от того,
+  // откуда пришёл email: CRM, договор, счёт или комментарий.
+  docReturnAssertExternalRecipient(ctx.recipient.email, ctx.taskId);
 
-    const fields = {
-      TYPE_ID: 4,
-      SUBJECT: subject,
-      DESCRIPTION: body,
-      DESCRIPTION_TYPE: 1,
-      DIRECTION: 2,
-      OWNER_TYPE_ID: 2,
-      OWNER_ID: Number(ctx.deal.ID),
-      RESPONSIBLE_ID: responsibleId,
-      COMPLETED: 'Y',
-      START_TIME: new Date().toISOString(),
-      END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      COMMUNICATIONS: [{
-        VALUE: ctx.recipient.email,
-        ENTITY_ID: Number(ctx.recipient.entityId || 0),
-        ENTITY_TYPE_ID: Number(ctx.recipient.entityTypeId || 3),
-        TYPE: 'EMAIL',
-      }],
-    };
-
-    if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
-      fields.FILES = [{
-        fileData: [
-          String(ctx.downloaded.fileName || 'document'),
-          ctx.downloaded.buffer.toString('base64'),
-        ],
-      }];
-    }
-
-    const emailFrom = String(config.emailFrom || process.env.EMAIL_FROM || '').trim();
-    const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
-    if (emailFrom) {
-      fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${emailFrom}>` };
-    }
-
-    const activityId = await bitrixRestCall('crm.activity.add', { fields });
-    console.log(
-      `[doc-return] email #${sequence} task=${ctx.taskId}; transport=Bitrix; ` +
-      `to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
-      `file=${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`
-    );
-    return activityId;
-  }
-
+  // v98: всегда SMTP. Так исходный DOC/DOCX/PDF прикладывается как настоящий
+  // бинарный файл с исходным именем/расширением, а не как нестандартный объект Bitrix.
   const smtpResult = await docReturnSendViaSmtp(ctx, subject, body);
+
   console.log(
-    `[doc-return] email #${sequence} task=${ctx.taskId}; transport=SMTP; ` +
+    `[doc-return] email #${sequence} task=${ctx.taskId}; transport=SMTP-v98; ` +
     `source=${ctx.recipient.source}; to=${docReturnMaskEmail(ctx.recipient.email)}; ` +
     `file=${ctx.downloaded ? ctx.downloaded.fileName : 'без вложения'}`
   );
+
   return smtpResult;
 }
 
@@ -11220,7 +11275,7 @@ app.post('/api/doc-return-reminder', async (req, res) => {
 });
 
 console.log(
-  `[doc-return] v97 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v98 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}`
 );
