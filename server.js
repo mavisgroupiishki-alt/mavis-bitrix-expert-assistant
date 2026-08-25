@@ -11666,6 +11666,23 @@ app.post('/api/doc-return-reminder', async (req, res) => {
   return res.status(result.ok === false ? 500 : 200).json(result);
 });
 
+
+// ============================================================================
+// ЛОКАЛЬНОЕ ПРИЛОЖЕНИЕ BITRIX24: «Возврат оригиналов»
+// Отдельная страница в левом меню Bitrix. Никакого дополнительного пароля:
+// браузер передаёт текущий OAuth-токен Bitrix, сервер валидирует user.current.
+// ============================================================================
+const { registerDocReturnLocalApp } = require('./doc_return_local_app');
+registerDocReturnLocalApp({
+  app,
+  bitrixRestCall,
+  bitrixRestList,
+  actsExtractDealIdsFromTask,
+  actsTaskField,
+  actsCleanText,
+  config,
+});
+
 console.log(
   `[doc-return] v102 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +

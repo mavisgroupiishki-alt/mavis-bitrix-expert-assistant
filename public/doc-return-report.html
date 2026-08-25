@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Возврат оригиналов — MAVIS GROUP</title>
+  <script src="//api.bitrix24.com/api/v1/"></script>
+  <link rel="stylesheet" href="/doc-return-report.css" />
+</head>
+<body>
+  <div class="report-shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">MAVIS GROUP · Акты и договоры</div>
+        <h1>Возврат оригиналов</h1>
+        <p id="period-label" class="hero-subtitle">Текущий остаток · период создания: 2026</p>
+      </div>
+      <div class="hero-actions">
+        <div id="sync-label" class="sync-label">Загрузка…</div>
+        <button id="refresh-btn" class="btn btn-primary">Обновить данные</button>
+        <button id="export-btn" class="btn btn-light">Скачать CSV</button>
+      </div>
+    </header>
+
+    <section class="filters-card">
+      <div class="filter-grid">
+        <label><span>Год создания</span><select id="year-filter"><option value="2026">2026</option><option value="all">Все годы</option></select></label>
+        <label><span>Месяц</span><select id="month-filter"><option value="all">Все месяцы</option></select></label>
+        <label><span>Дата от</span><input id="date-from" type="date" /></label>
+        <label><span>Дата до</span><input id="date-to" type="date" /></label>
+        <label><span>Компания</span><select id="company-filter"><option value="all">Все компании</option></select></label>
+        <label><span>Эксперт</span><select id="expert-filter"><option value="all">Все эксперты</option></select></label>
+        <label><span>Стадия</span><select id="stage-filter"><option value="all">Все стадии</option></select></label>
+        <label><span>Тип документа</span><select id="type-filter"><option value="all">Все типы</option></select></label>
+        <label><span>Просрочка</span><select id="overdue-filter"><option value="all">Все</option><option value="yes">Только просроченные</option><option value="no">Без просрочки</option></select></label>
+        <label class="search-wide"><span>Поиск</span><input id="search-filter" type="search" placeholder="Компания или документ" /></label>
+        <div class="filter-actions"><button id="reset-btn" class="btn btn-ghost">Сбросить фильтры</button></div>
+      </div>
+    </section>
+
+    <div id="loading-card" class="loading-card">
+      <div class="spinner"></div>
+      <div><strong>Загружаю данные из Bitrix24</strong><p>Первое открытие может занять несколько секунд. Дальше фильтры работают мгновенно.</p></div>
+    </div>
+
+    <div id="error-card" class="error-card hidden"></div>
+
+    <main id="report-content" class="hidden">
+      <section class="kpi-grid">
+        <article class="kpi kpi-blue"><span>Не вернулось</span><strong id="kpi-total">0</strong><small>все стадии, кроме «Архив»</small></article>
+        <article class="kpi kpi-red"><span>Просрочено</span><strong id="kpi-overdue">0</strong><small id="kpi-overdue-share">0% от остатка</small></article>
+        <article class="kpi kpi-amber"><span>Эл. Почта</span><strong id="kpi-email">0</strong><small>текущая стадия</small></article>
+        <article class="kpi kpi-purple"><span>Звонок</span><strong id="kpi-call">0</strong><small>текущая стадия</small></article>
+        <article class="kpi kpi-green"><span>Компаний</span><strong id="kpi-companies">0</strong><small>уникальных в выборке</small></article>
+      </section>
+
+      <section class="analytics-grid">
+        <article class="panel">
+          <div class="panel-title-row"><div><h2>Распределение по стадиям</h2><p>Где сейчас находятся невозвращённые документы</p></div></div>
+          <div id="stage-bars" class="bars"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-title-row"><div><h2>TOP-10 компаний</h2><p>По количеству невозвращённых оригиналов</p></div></div>
+          <div id="top-companies" class="bars"></div>
+        </article>
+      </section>
+
+      <section class="analytics-grid analytics-grid-small">
+        <article class="panel">
+          <div class="panel-title-row"><div><h2>По экспертам</h2><p>Текущий остаток документов</p></div></div>
+          <div id="expert-bars" class="bars"></div>
+        </article>
+        <article class="panel insight-panel">
+          <div class="panel-title-row"><div><h2>Контроль качества базы</h2><p>Что требует внимания</p></div></div>
+          <div id="quality-insights" class="insights"></div>
+        </article>
+      </section>
+
+      <section class="panel companies-panel">
+        <div class="panel-title-row companies-heading">
+          <div><h2>Компании с невозвращёнными оригиналами</h2><p>Нажмите на компанию — раскроется список её документов</p></div>
+          <div class="company-summary" id="company-summary"></div>
+        </div>
+        <div class="company-head">
+          <div>Компания</div><div>Эксперт</div><div>Не вернулось</div><div>Просрочено</div><div>Эл. Почта</div><div>Звонок</div><div>Самый старый</div>
+        </div>
+        <div id="companies-list" class="companies-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="history-dialog" class="history-dialog">
+    <div class="dialog-head"><div><div class="eyebrow">История задачи</div><h2 id="history-title">История стадий</h2></div><button id="history-close" class="icon-btn">×</button></div>
+    <div id="history-loading" class="dialog-loading">Загрузка истории…</div>
+    <div id="history-content"></div>
+  </dialog>
+
+  <script src="/doc-return-report.js"></script>
+</body>
+</html>

@@ -3,41 +3,103 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Установка ИИ-ассистента эксперта</title>
+  <title>Установка MAVIS GROUP</title>
   <link rel="stylesheet" href="/styles.css" />
   <script src="//api.bitrix24.com/api/v1/"></script>
 </head>
 <body>
   <main class="install-card">
-    <h1>ИИ-ассистент эксперта MAVIS GROUP</h1>
-    <p>Завершаем установку локального приложения в Bitrix24.</p>
+    <h1>MAVIS GROUP</h1>
+    <p>Завершаем установку локального приложения.</p>
+    <p>Будут добавлены:</p>
+    <ul style="text-align:left;max-width:560px;margin:12px auto 20px;line-height:1.6">
+      <li>вкладка «ИИ-ассистент» в карточке сделки;</li>
+      <li>пункт «Возврат оригиналов» в меню приложений Bitrix24.</li>
+    </ul>
     <button id="finish-install" class="primary">Завершить установку</button>
     <p id="status" class="muted"></p>
   </main>
   <script>
-    function finish() {
-      const status = document.getElementById('status');
-      status.textContent = 'Регистрируем вкладку “ИИ-ассистент” в карточке сделки...';
-      BX24.init(function () {
-        const handler = window.location.origin + '/deal';
-        BX24.callMethod('placement.bind', {
-          PLACEMENT: 'CRM_DEAL_DETAIL_TAB',
-          HANDLER: handler,
-          TITLE: 'ИИ-ассистент',
-          DESCRIPTION: 'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP'
-        }, function (res) {
-          if (res && res.error && res.error()) {
-            status.textContent = 'Не удалось зарегистрировать вкладку: ' + res.error() + '. Проверьте права приложения: crm и placement.';
-            return;
-          }
-          status.textContent = 'Завершаем установку приложения...';
-          BX24.installFinish();
-          status.textContent = 'Установка завершена. В карточке сделки должна появиться вкладка “ИИ-ассистент”.';
+    function call(method, params) {
+      return new Promise((resolve, reject) => {
+        BX24.callMethod(method, params || {}, function (res) {
+          if (res && res.error && res.error()) reject(new Error(res.error_description ? res.error_description() : res.error()));
+          else resolve(res && res.data ? res.data() : null);
         });
       });
     }
+
+    function placementRows(data) {
+      if (Array.isArray(data)) return data;
+      if (data && Array.isArray(data.items)) return data.items;
+      if (data && typeof data === 'object') return Object.values(data);
+      return [];
+    }
+
+    async function bindIfMissing(existing, placement, handler, title, description) {
+      const found = existing.some((row) =>
+        String(row.PLACEMENT || row.placement || '').toUpperCase() === placement &&
+        String(row.HANDLER || row.handler || '').includes(handler.replace(window.location.origin, ''))
+      );
+      if (found) return `${title}: уже добавлено`;
+
+      try {
+        await call('placement.bind', {
+          PLACEMENT: placement,
+          HANDLER: handler,
+          TITLE: title,
+          DESCRIPTION: description,
+          LANG_ALL: {
+            ru: { TITLE: title },
+            en: { TITLE: title }
+          }
+        });
+        return `${title}: добавлено`;
+      } catch (e) {
+        const msg = String(e.message || e);
+        if (/exist|already|handler/i.test(msg)) return `${title}: уже добавлено`;
+        throw e;
+      }
+    }
+
+    async function finish() {
+      const status = document.getElementById('status');
+      const button = document.getElementById('finish-install');
+      button.disabled = true;
+      status.textContent = 'Регистрируем интерфейс приложения…';
+
+      try {
+        await new Promise((resolve) => BX24.init(resolve));
+        let existing = [];
+        try { existing = placementRows(await call('placement.get', {})); } catch (_) {}
+
+        const results = [];
+        results.push(await bindIfMissing(
+          existing,
+          'CRM_DEAL_DETAIL_TAB',
+          window.location.origin + '/deal',
+          'ИИ-ассистент',
+          'ИИ-ассистент эксперта внутри карточки сделки MAVIS GROUP'
+        ));
+        results.push(await bindIfMissing(
+          existing,
+          'LEFT_MENU',
+          window.location.origin + '/doc-return-report',
+          'Возврат оригиналов',
+          'Контроль возврата оригиналов актов, договоров и счетов'
+        ));
+
+        status.textContent = results.join(' · ') + '. Завершаем установку…';
+        BX24.installFinish();
+        status.textContent = 'Готово. Пункт «Возврат оригиналов» появится в группе «Приложения» левого меню.';
+      } catch (e) {
+        status.textContent = 'Ошибка: ' + (e.message || e) + '. Проверьте права приложения: placement, task, crm, user.';
+        button.disabled = false;
+      }
+    }
+
     document.getElementById('finish-install').addEventListener('click', finish);
-    window.addEventListener('load', () => setTimeout(finish, 600));
+    window.addEventListener('load', () => setTimeout(finish, 700));
   </script>
 </body>
 </html>
