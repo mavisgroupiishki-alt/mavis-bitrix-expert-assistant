@@ -9906,6 +9906,12 @@ const DOC_RETURN_CONCURRENCY = Math.max(3, Math.min(5, Number(process.env.DOC_RE
 const DOC_RETURN_MANUAL_STAGE_TITLE = String(process.env.DOC_RETURN_MANUAL_STAGE_TITLE || 'Ручная отправка').trim();
 const DOC_RETURN_MANUAL_STAGE_COLOR = String(process.env.DOC_RETURN_MANUAL_STAGE_COLOR || '#FF8A65').trim();
 
+// v108: письма о возврате оригиналов отправляем только в рабочее окно по Минску.
+// 08:00 включительно — 19:00 не включительно. Значения можно переопределить в Render.
+const DOC_RETURN_SEND_TIMEZONE = String(process.env.DOC_RETURN_SEND_TIMEZONE || 'Europe/Minsk').trim();
+const DOC_RETURN_SEND_START_HOUR = Math.max(0, Math.min(23, Number(process.env.DOC_RETURN_SEND_START_HOUR || 8)));
+const DOC_RETURN_SEND_END_HOUR = Math.max(1, Math.min(24, Number(process.env.DOC_RETURN_SEND_END_HOUR || 19)));
+
 let docReturnSmtpTransport = null;
 let docReturnCycleRunning = false;
 let docReturnQueueCursor = 0;
@@ -10644,6 +10650,31 @@ async function docReturnShouldManageHistoricalEmailTask(task) {
   return false;
 }
 
+function docReturnSendWindowStatus(now = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: DOC_RETURN_SEND_TIMEZONE,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now);
+    const get = (type) => Number((parts.find((p) => p.type === type) || {}).value || 0);
+    const hour = get('hour');
+    const minute = get('minute');
+    const minuteOfDay = hour * 60 + minute;
+    const start = DOC_RETURN_SEND_START_HOUR * 60;
+    const end = DOC_RETURN_SEND_END_HOUR * 60;
+    return {
+      open: minuteOfDay >= start && minuteOfDay < end,
+      hour, minute, minuteOfDay, start, end,
+      label: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    };
+  } catch (e) {
+    // Если Intl неожиданно не смог определить TZ, безопаснее НЕ отправлять письмо.
+    return { open: false, label: 'unknown', error: e.message || String(e) };
+  }
+}
+
 async function docReturnLoadSendContext(basic) {
   const fileResolution = await actsResolveTaskFiles(basic.task);
   const commentFiles = await docReturnResolveCommentFiles(basic.taskId);
@@ -10965,23 +10996,29 @@ async function docReturnBuildRawMail(ctx, subject, body) {
     messageId,
   };
 
-  if (ctx.downloaded && ctx.downloaded.buffer && ctx.downloaded.buffer.length) {
-    const originalName = String(
-      ctx.downloaded.fileName ||
-      (ctx.file && ctx.file.name) ||
-      'document'
+  // v108: ЖЁСТКИЙ ПРЕДОХРАНИТЕЛЬ. Письмо этого процесса физически не может
+  // быть собрано без вложения. Если файла нет — исключение до SMTP.
+  if (!ctx.downloaded || !ctx.downloaded.buffer || !ctx.downloaded.buffer.length) {
+    throw new Error(
+      'Письмо НЕ отправлено: файл для вложения отсутствует непосредственно перед сборкой MIME.'
     );
-
-    mail.attachments = [{
-      filename: originalName,
-      content: Buffer.from(ctx.downloaded.buffer),
-      contentType: actsMimeByFileName(
-        originalName,
-        ctx.downloaded.contentType || ''
-      ),
-      contentDisposition: 'attachment',
-    }];
   }
+
+  const originalName = String(
+    ctx.downloaded.fileName ||
+    (ctx.file && ctx.file.name) ||
+    'document'
+  );
+
+  mail.attachments = [{
+    filename: originalName,
+    content: Buffer.from(ctx.downloaded.buffer),
+    contentType: actsMimeByFileName(
+      originalName,
+      ctx.downloaded.contentType || ''
+    ),
+    contentDisposition: 'attachment',
+  }];
 
   // Собираем ровно один RFC822/MIME message и именно его:
   // 1) отправляем SMTP,
@@ -10996,6 +11033,23 @@ async function docReturnBuildRawMail(ctx, subject, body) {
   const raw = Buffer.isBuffer(built.message)
     ? built.message
     : Buffer.from(built.message);
+
+  // v108: проверяем уже ГОТОВЫЙ RFC822/MIME перед SMTP.
+  // Так мы не доверяем только объекту nodemailer — в самом письме обязан быть attachment-part.
+  const rawHeaderText = raw.toString('latin1');
+  const hasAttachmentDisposition = /Content-Disposition:\s*attachment/i.test(rawHeaderText);
+  const hasAttachmentFilename = /filename(?:\*0\*?|\*)?=/i.test(rawHeaderText) || /name=/i.test(rawHeaderText);
+  if (!hasAttachmentDisposition || !hasAttachmentFilename) {
+    throw new Error(
+      `Письмо НЕ отправлено: MIME-контроль не обнаружил вложение ` +
+      `(disposition=${hasAttachmentDisposition}; filename=${hasAttachmentFilename}).`
+    );
+  }
+
+  console.log(
+    `[doc-return] ATTACHMENT VERIFIED task=${ctx.taskId}; file=${originalName}; ` +
+    `fileBytes=${ctx.downloaded.buffer.length}; mimeBytes=${raw.length}`
+  );
 
   return {
     raw,
@@ -11221,6 +11275,23 @@ async function docReturnCleanupTechnicalLockComments(taskId) {
 }
 
 async function docReturnSendReminder(basic, sequence) {
+  // v108: никаких писем ночью/вечером. 08:00 <= Минск < 19:00.
+  const sendWindow = docReturnSendWindowStatus();
+  if (!sendWindow.open) {
+    console.log(
+      `[doc-return] TIME WINDOW CLOSED task=${basic.taskId}; minsk=${sendWindow.label}; ` +
+      `allowed=${String(DOC_RETURN_SEND_START_HOUR).padStart(2, '0')}:00-` +
+      `${String(DOC_RETURN_SEND_END_HOUR).padStart(2, '0')}:00`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      taskId: String(basic.taskId),
+      reason: 'outside-send-window',
+      minskTime: sendWindow.label,
+    };
+  }
+
   // v102: никаких технических комментариев-lock в задаче.
   // Защита от дублей обеспечивается:
   // 1) webhook выключен по умолчанию,
@@ -11326,7 +11397,7 @@ async function docReturnSendReminder(basic, sequence) {
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
     `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded && ctx.downloaded.fileName || 'NONE'}; ` +
-    `deadline=${nextDeadline}; dedupe=v107-chat-email`
+    `deadline=${nextDeadline}; dedupe=v108-attachment-window`
   );
 
   return {
@@ -11656,6 +11727,21 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
     return { ok: true, skipped: true, reason: 'disabled-or-no-bitrix' };
   }
 
+  const sendWindow = docReturnSendWindowStatus();
+  if (!sendWindow.open) {
+    console.log(
+      `[doc-return] poll ${trigger}: пауза по времени; Минск ${sendWindow.label}; ` +
+      `рассылка разрешена ${String(DOC_RETURN_SEND_START_HOUR).padStart(2, '0')}:00-` +
+      `${String(DOC_RETURN_SEND_END_HOUR).padStart(2, '0')}:00.`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'outside-send-window',
+      minskTime: sendWindow.label,
+    };
+  }
+
   const stages = await docReturnResolveStages();
   const ids = new Set();
 
@@ -11889,12 +11975,13 @@ registerDocReturnLocalApp({
 });
 
 console.log(
-  `[doc-return] v107 EMAIL_ONLY_CHAT_EMAIL active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
+  `[doc-return] v108 EMAIL_ONLY_ATTACHMENT_GUARD_TIME_WINDOW active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
   `maxChecks=${DOC_RETURN_MAX_CHECKS_PER_CYCLE}; concurrency=${DOC_RETURN_CONCURRENCY}; ` +
-  `manualStage=«${DOC_RETURN_MANUAL_STAGE_TITLE}»; cooldownMin=${DOC_RETURN_ERROR_COOLDOWN_MINUTES}`
+  `manualStage=«${DOC_RETURN_MANUAL_STAGE_TITLE}»; cooldownMin=${DOC_RETURN_ERROR_COOLDOWN_MINUTES}; ` +
+  `sendWindow=${String(DOC_RETURN_SEND_START_HOUR).padStart(2, '0')}:00-${String(DOC_RETURN_SEND_END_HOUR).padStart(2, '0')}:00 ${DOC_RETURN_SEND_TIMEZONE}`
 );
 
 app.listen(PORT, () => {
