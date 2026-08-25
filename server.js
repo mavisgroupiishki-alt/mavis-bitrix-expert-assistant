@@ -10293,7 +10293,7 @@ function docReturnBuildBody(taskTitle, fileName) {
     '',
     'С Уважением, Жихарева Анна',
     'MAVIS GROUP',
-    '+375333316898',
+    '+375333315898',
   ].join('\n');
 }
 
@@ -10585,43 +10585,75 @@ async function docReturnLoadSendContext(basic) {
   );
   if (!recipient.ok) throw new Error(recipient.reason);
 
-  const file = docReturnPickFile(mergedFiles, basic.title);
+  // v103: письмо о возврате оригинала НИКОГДА не отправляем без реального файла.
+  // Сначала пробуем наиболее подходящий файл, затем остальные кандидаты — это
+  // спасает старые задачи, где первый найденный attachment уже недоступен, а файл
+  // из старого комментария всё ещё можно скачать.
+  const preferred = docReturnPickFile(mergedFiles, basic.title);
+  const candidates = [];
+  const candidateKeys = new Set();
 
+  const pushCandidate = (f) => {
+    if (!f) return;
+    const key = `${String(f.attachedId || '')}:${String(f.id || '')}:${String(f.url || '')}:${String(f.name || '')}`;
+    if (candidateKeys.has(key)) return;
+    candidateKeys.add(key);
+    candidates.push(f);
+  };
+
+  pushCandidate(preferred);
+  for (const f of mergedFiles) pushCandidate(f);
+
+  let file = null;
   let downloaded = null;
-  let fileWarning = '';
+  const downloadErrors = [];
 
-  if (file && file.url) {
-    const cacheKey = `${file.id || ''}:${file.attachedId || ''}:${file.url || ''}:${file.name || ''}`;
-    downloaded = downloadCache.get(cacheKey);
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.url) {
+      if (candidate) downloadErrors.push(`«${candidate.name || 'без названия'}»: нет ссылки для скачивания`);
+      continue;
+    }
 
-    if (downloaded === undefined) {
+    const cacheKey = `${candidate.id || ''}:${candidate.attachedId || ''}:${candidate.url || ''}:${candidate.name || ''}`;
+    let got = downloadCache.get(cacheKey);
+
+    if (got === undefined) {
       try {
-        downloaded = await actsDownloadRealFile(file);
+        got = await actsDownloadRealFile(candidate);
       } catch (e) {
-        downloaded = null;
-        fileWarning =
-          `Файл «${file.name || 'без названия'}» найден, но не скачался (${e.message || e}). ` +
-          'Письмо отправится без вложения.';
-        console.warn(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
+        got = null;
+        downloadErrors.push(`«${candidate.name || 'без названия'}»: ${e.message || e}`);
       }
-      downloadCache.set(cacheKey, downloaded);
+      downloadCache.set(cacheKey, got);
     }
 
-    if (downloaded && (!downloaded.buffer || !downloaded.buffer.length)) {
-      downloaded = null;
-      fileWarning = `Файл «${file.name || 'без названия'}» найден, но пустой. Письмо отправится без вложения.`;
+    if (got && got.buffer && got.buffer.length) {
+      file = candidate;
+      downloaded = got;
+      break;
     }
-  } else {
-    fileWarning = 'Файл в задаче и предыдущих комментариях не найден. Письмо отправится без вложения.';
-    console.log(`[doc-return] task=${basic.taskId}: ${fileWarning}`);
+
+    if (got && (!got.buffer || !got.buffer.length)) {
+      downloadErrors.push(`«${candidate.name || 'без названия'}»: файл пустой`);
+    }
+  }
+
+  if (!downloaded) {
+    const names = mergedFiles.map((f) => String(f && f.name || '')).filter(Boolean);
+    const details = downloadErrors.slice(0, 8).join('; ');
+    throw new Error(
+      `Письмо НЕ отправлено: не удалось получить реальный файл для вложения. ` +
+      `Найдено файлов: ${names.length ? names.join(', ') : '0'}.` +
+      (details ? ` Ошибки: ${details}` : '')
+    );
   }
 
   return {
     ...basic,
     recipient,
-    file: file || null,
+    file,
     downloaded,
-    fileWarning,
+    fileWarning: '',
     fileCandidates: mergedFiles.map((f) => ({
       name: String(f && f.name || ''),
       source: String(f && f.source || ''),

@@ -1,6 +1,6 @@
 {
   "name": "mavis-bitrix-expert-assistant",
-  "version": "0.18.31-local-return-report",
+  "version": "0.18.31-v103-file-required-phone-fix",
   "description": "MAVIS GROUP Bitrix24 expert assistant server app",
   "main": "server.js",
   "scripts": {
