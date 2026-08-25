@@ -9851,7 +9851,7 @@ app.get('/api/get-deal-fields', async (req, res) => {
 const DOC_RETURN_ENABLED = String(process.env.DOC_RETURN_ENABLED || 'true').toLowerCase() !== 'false';
 const DOC_RETURN_TEST_TASK_ID = String(process.env.DOC_RETURN_TEST_TASK_ID || '47208');
 const DOC_RETURN_PROJECT_ID = String(process.env.DOC_RETURN_PROJECT_ID || '36');
-const DOC_RETURN_POLL_MINUTES = Math.max(1, Number(process.env.DOC_RETURN_POLL_MINUTES || 5));
+const DOC_RETURN_POLL_MINUTES = Math.max(1, Number(process.env.DOC_RETURN_POLL_MINUTES || 1));
 const DOC_RETURN_PRODUCTION_START_ISO = String(
   process.env.DOC_RETURN_PRODUCTION_START_ISO || '2026-08-24T13:22:00+03:00'
 );
@@ -9889,11 +9889,11 @@ const DOC_RETURN_IMAP_PASSWORD = String(
 const DOC_RETURN_CONFIRMED_TEXT = 'Отправка подтверждена почтовым сервером.';
 const DOC_RETURN_MAX_ACTIONS_PER_CYCLE = Math.max(
   1,
-  Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 1)
+  Number(process.env.DOC_RETURN_MAX_ACTIONS_PER_CYCLE || 10)
 );
 const DOC_RETURN_MAX_CHECKS_PER_CYCLE = Math.max(
   1,
-  Number(process.env.DOC_RETURN_MAX_CHECKS_PER_CYCLE || 20)
+  Number(process.env.DOC_RETURN_MAX_CHECKS_PER_CYCLE || 60)
 );
 const DOC_RETURN_ERROR_COOLDOWN_MINUTES = Math.max(
   1,
@@ -9901,6 +9901,9 @@ const DOC_RETURN_ERROR_COOLDOWN_MINUTES = Math.max(
 );
 const DOC_RETURN_ALLOW_WEBHOOK =
   String(process.env.DOC_RETURN_ALLOW_WEBHOOK || 'false').toLowerCase() === 'true';
+const DOC_RETURN_CONCURRENCY = Math.max(1, Math.min(5, Number(process.env.DOC_RETURN_CONCURRENCY || 3)));
+const DOC_RETURN_MANUAL_STAGE_TITLE = String(process.env.DOC_RETURN_MANUAL_STAGE_TITLE || 'Ручная отправка').trim();
+const DOC_RETURN_MANUAL_STAGE_COLOR = String(process.env.DOC_RETURN_MANUAL_STAGE_COLOR || '#FF8A65').trim();
 
 let docReturnSmtpTransport = null;
 let docReturnCycleRunning = false;
@@ -9918,7 +9921,7 @@ const DOC_RETURN_LEGACY_MARKER_2 = '[MAVIS_DOC_RETURN_REMINDER_2]';
 const DOC_RETURN_LEGACY_CALL_MARKER = '[MAVIS_DOC_RETURN_CALL]';
 
 const docReturnLocks = new Set();
-let docReturnStageCache = { at: 0, sent: '', email: '', call: '', rows: [] };
+let docReturnStageCache = { at: 0, sent: '', email: '', call: '', manual: '', rows: [] };
 
 function docReturnReqTaskId(req) {
   const src = Object.assign({}, req.query || {}, req.body || {});
@@ -10339,7 +10342,7 @@ function docReturnNormalizeStageTitle(value) {
 
 async function docReturnResolveStages(force = false) {
   const now = Date.now();
-  if (!force && docReturnStageCache.sent && docReturnStageCache.email && docReturnStageCache.call &&
+  if (!force && docReturnStageCache.sent && docReturnStageCache.email && docReturnStageCache.call && docReturnStageCache.manual &&
       now - docReturnStageCache.at < 30 * 60 * 1000) {
     return docReturnStageCache;
   }
@@ -10355,6 +10358,7 @@ async function docReturnResolveStages(force = false) {
   const sent = findBy((t) => /^отправлен/.test(t));
   const email = findBy((t) => /(^|\s)эл\.?\s*почт/.test(t) || /электрон.*почт/.test(t));
   const call = findBy((t) => /^звонок/.test(t) || /^звон/.test(t));
+  let manual = findBy((t) => t === docReturnNormalizeStageTitle(DOC_RETURN_MANUAL_STAGE_TITLE));
 
   if (!sent || !email || !call) {
     const available = rows.map((st) => `${st.ID || st.id}:${st.TITLE || st.title}`).join(', ');
@@ -10365,8 +10369,36 @@ async function docReturnResolveStages(force = false) {
     );
   }
 
-  docReturnStageCache = { at: now, sent, email, call, rows };
-  console.log(`[doc-return] stages: Отправлены=${sent}; Эл.Почта=${email}; Звонок=${call}`);
+  // v104: отдельная очередь для документов, которые нельзя отправить автоматически.
+  // Если стадии ещё нет — создаём её сами в проекте #36 сразу после «Эл. Почта».
+  if (!manual) {
+    try {
+      const createdId = await bitrixRestCall('task.stages.add', {
+        fields: {
+          TITLE: DOC_RETURN_MANUAL_STAGE_TITLE,
+          COLOR: DOC_RETURN_MANUAL_STAGE_COLOR,
+          AFTER_ID: Number(email),
+          ENTITY_ID: Number(DOC_RETURN_PROJECT_ID),
+        },
+        isAdmin: false,
+      });
+      manual = String(createdId || '');
+      if (!manual) throw new Error('Bitrix не вернул ID новой стадии');
+      rows.push({ ID: manual, TITLE: DOC_RETURN_MANUAL_STAGE_TITLE, COLOR: DOC_RETURN_MANUAL_STAGE_COLOR });
+      console.log(`[doc-return] created manual stage: ${DOC_RETURN_MANUAL_STAGE_TITLE}=${manual}`);
+    } catch (e) {
+      throw new Error(
+        `Не удалось создать стадию «${DOC_RETURN_MANUAL_STAGE_TITLE}»: ${e.message || e}. ` +
+        `Нужны права на управление стадиями проекта ${DOC_RETURN_PROJECT_ID}.`
+      );
+    }
+  }
+
+  docReturnStageCache = { at: now, sent, email, call, manual, rows };
+  console.log(
+    `[doc-return] stages: Отправлены=${sent}; Эл.Почта=${email}; ` +
+    `Ручная отправка=${manual}; Звонок=${call}`
+  );
   return docReturnStageCache;
 }
 
@@ -11243,7 +11275,7 @@ async function docReturnSendReminder(basic, sequence) {
 
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
-    `email=${docReturnMaskEmail(ctx.recipient.email)}; deadline=${nextDeadline}; dedupe=v102-clean`
+    `email=${docReturnMaskEmail(ctx.recipient.email)}; deadline=${nextDeadline}; dedupe=v104-fast-manual`
   );
 
   return {
@@ -11280,6 +11312,67 @@ async function docReturnMoveToCall(basic, stages) {
     taskId: basic.taskId,
     dealId: basic.dealId,
     stageId: stages.call,
+  };
+}
+
+function docReturnIsManualSendError(errorText) {
+  const text = String(errorText || '');
+  return (
+    /Не найден email/i.test(text) ||
+    /crm-external-email-not-found/i.test(text) ||
+    /Письмо НЕ отправлено: не удалось получить реальный файл/i.test(text) ||
+    /ЗАЩИТНЫЙ СТОП: адрес .* относится к MAVIS\/отправителю/i.test(text)
+  );
+}
+
+function docReturnManualReason(errorText) {
+  const text = String(errorText || '');
+  if (/Не найден email|crm-external-email-not-found/i.test(text)) {
+    return 'Не найден корректный email клиента.';
+  }
+  if (/не удалось получить реальный файл/i.test(text)) {
+    return 'Не удалось получить файл для вложения.';
+  }
+  if (/относится к MAVIS\/отправителю/i.test(text)) {
+    return 'В CRM указан служебный/внутренний email вместо адреса клиента.';
+  }
+  return 'Автоматическая отправка невозможна.';
+}
+
+async function docReturnMoveToManual(taskId, originalError) {
+  const stages = await docReturnResolveStages();
+  let task = null;
+  try {
+    task = await docReturnLoadTask(taskId);
+    const currentStage = String(docReturnTaskValue(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+    if (currentStage !== stages.manual) {
+      task = await docReturnMoveStage(taskId, stages.manual);
+    }
+  } catch (e) {
+    console.error(`[doc-return] MANUAL MOVE ERROR task=${taskId}: ${e.message || e}`);
+    throw e;
+  }
+
+  const reason = docReturnManualReason(originalError);
+  const comment =
+    `Автоматическая отправка не выполнена. ${reason}\n` +
+    `Задача перемещена в стадию «${DOC_RETURN_MANUAL_STAGE_TITLE}». ` +
+    `Нужно проверить данные клиента/файл и отправить документ вручную.`;
+
+  try {
+    await docReturnAddTaskComment(task, comment);
+  } catch (e) {
+    console.warn(`[doc-return] manual comment task=${taskId}: ${e.message || e}`);
+  }
+
+  console.warn(`[doc-return] MANUAL task=${taskId}; reason=${reason}`);
+  return {
+    ok: true,
+    action: 'move-to-manual-send',
+    taskId: String(taskId),
+    stageId: stages.manual,
+    reason,
+    originalError: String(originalError || ''),
   };
 }
 
@@ -11429,22 +11522,33 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
   } catch (e) {
     const errorText = e.message || String(e);
 
-    // Старые задачи без email больше не должны тормозить всю очередь.
-    // После неудачной попытки откладываем конкретную задачу на час,
-    // а polling продолжает проверять следующие задачи.
-    if (
-      /Не найден email/i.test(errorText) ||
-      /crm-external-email-not-found/i.test(errorText)
-    ) {
-      const until = Date.now() + DOC_RETURN_ERROR_COOLDOWN_MINUTES * 60 * 1000;
-      docReturnErrorCooldownUntil.set(taskId, until);
-      console.warn(
-        `[doc-return] COOLDOWN task=${taskId}: email не найден; ` +
-        `повтор не раньше чем через ${DOC_RETURN_ERROR_COOLDOWN_MINUTES} мин.`
-      );
+    // v104: ошибки данных не должны зависать в «Эл. Почта» и тормозить очередь.
+    // Такие задачи сразу отправляем в отдельную стадию «Ручная отправка».
+    if (docReturnIsManualSendError(errorText)) {
+      try {
+        return await docReturnMoveToManual(taskId, errorText);
+      } catch (moveError) {
+        console.error(
+          `[doc-return] ERROR task=${taskId}: ${errorText}; ` +
+          `дополнительно не удалось перевести в ручную отправку: ${moveError.message || moveError}`
+        );
+        return {
+          ok: false,
+          taskId,
+          error: errorText,
+          manualMoveError: moveError.message || String(moveError),
+        };
+      }
     }
 
-    console.error(`[doc-return] ERROR task=${taskId}: ${errorText}`);
+    // Временные технические ошибки (SMTP/REST/IMAP) не отправляем в ручную стадию сразу:
+    // оставляем задачу в очереди и повторим автоматически позже.
+    const until = Date.now() + DOC_RETURN_ERROR_COOLDOWN_MINUTES * 60 * 1000;
+    docReturnErrorCooldownUntil.set(taskId, until);
+    console.error(
+      `[doc-return] ERROR task=${taskId}: ${errorText}; ` +
+      `повтор через ${DOC_RETURN_ERROR_COOLDOWN_MINUTES} мин.`
+    );
     return { ok: false, taskId, error: errorText };
   } finally {
     docReturnLocks.delete(taskId);
@@ -11554,26 +11658,43 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
     : [];
 
   let traversed = 0;
+  let cursor = 0;
 
-  for (const taskId of orderedIds) {
-    if (actionCount >= DOC_RETURN_MAX_ACTIONS_PER_CYCLE) break;
-    if (checksCount >= DOC_RETURN_MAX_CHECKS_PER_CYCLE) break;
+  // v104: обрабатываем разные задачи параллельно небольшими пачками.
+  // Внутри одной задачи прежний lock и двойная проверка от дублей сохраняются.
+  while (
+    cursor < orderedIds.length &&
+    actionCount < DOC_RETURN_MAX_ACTIONS_PER_CYCLE &&
+    checksCount < DOC_RETURN_MAX_CHECKS_PER_CYCLE
+  ) {
+    const batch = [];
 
-    traversed++;
+    while (
+      cursor < orderedIds.length &&
+      batch.length < DOC_RETURN_CONCURRENCY &&
+      checksCount + batch.length < DOC_RETURN_MAX_CHECKS_PER_CYCLE
+    ) {
+      const taskId = orderedIds[cursor++];
+      traversed++;
 
-    const cooldownUntil = Number(docReturnErrorCooldownUntil.get(String(taskId)) || 0);
-    if (cooldownUntil > Date.now()) {
-      continue;
+      const cooldownUntil = Number(docReturnErrorCooldownUntil.get(String(taskId)) || 0);
+      if (cooldownUntil > Date.now()) continue;
+      if (cooldownUntil) docReturnErrorCooldownUntil.delete(String(taskId));
+
+      batch.push(String(taskId));
     }
-    if (cooldownUntil) {
-      docReturnErrorCooldownUntil.delete(String(taskId));
+
+    if (!batch.length) continue;
+    checksCount += batch.length;
+
+    const batchResults = await Promise.all(
+      batch.map((taskId) => docReturnProcessTask(taskId, trigger))
+    );
+
+    for (const result of batchResults) {
+      results.push(result);
+      if (result && result.action) actionCount++;
     }
-
-    checksCount++;
-
-    const result = await docReturnProcessTask(taskId, trigger);
-    results.push(result);
-    if (result && result.action) actionCount++;
   }
 
   // Следующий цикл начинает с другого места очереди.
@@ -11716,11 +11837,12 @@ registerDocReturnLocalApp({
 });
 
 console.log(
-  `[doc-return] v102 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
+  `[doc-return] v104 active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
-  `maxChecks=${DOC_RETURN_MAX_CHECKS_PER_CYCLE}; cooldownMin=${DOC_RETURN_ERROR_COOLDOWN_MINUTES}`
+  `maxChecks=${DOC_RETURN_MAX_CHECKS_PER_CYCLE}; concurrency=${DOC_RETURN_CONCURRENCY}; ` +
+  `manualStage=«${DOC_RETURN_MANUAL_STAGE_TITLE}»; cooldownMin=${DOC_RETURN_ERROR_COOLDOWN_MINUTES}`
 );
 
 app.listen(PORT, () => {
