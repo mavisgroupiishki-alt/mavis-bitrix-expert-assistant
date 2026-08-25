@@ -10165,12 +10165,54 @@ function docReturnFileEmailPriority(file) {
   return 3;
 }
 
+async function docReturnGetTaskChatTexts(basic) {
+  const chatId = String(
+    docReturnTaskValue(basic && basic.task, ['chatId', 'CHAT_ID', 'chat_id']) || ''
+  ).trim();
+  if (!chatId) return [];
+
+  try {
+    const dialog = await bitrixRestCall('im.dialog.messages.get', {
+      DIALOG_ID: `chat${chatId}`,
+      LIMIT: 100,
+    });
+
+    const messages =
+      (dialog && Array.isArray(dialog.messages) && dialog.messages) ||
+      (dialog && Array.isArray(dialog.MESSAGES) && dialog.MESSAGES) ||
+      (dialog && dialog.result && Array.isArray(dialog.result.messages) && dialog.result.messages) ||
+      (dialog && dialog.RESULT && Array.isArray(dialog.RESULT.MESSAGES) && dialog.RESULT.MESSAGES) ||
+      [];
+
+    const texts = [];
+    for (const msg of messages) {
+      if (!msg) continue;
+      const value =
+        msg.text || msg.TEXT ||
+        msg.message || msg.MESSAGE ||
+        msg.content || msg.CONTENT ||
+        '';
+      const clean = String(value || '').trim();
+      if (clean) texts.push(clean);
+    }
+
+    if (texts.length) {
+      console.log(`[doc-return] task=${basic.taskId}: прочитано сообщений чата=${texts.length}`);
+    }
+    return texts;
+  } catch (e) {
+    console.warn(`[doc-return] task=${basic.taskId}: не смог прочитать текст чата: ${e.message || e}`);
+    return [];
+  }
+}
+
 async function docReturnResolveEmailFromTaskAndFiles(basic, mergedFiles, downloadCache) {
   const crm = await docReturnResolveRecipient(basic.deal);
   if (crm.ok) return crm;
 
+  // 1. Название/описание задачи и классические комментарии задачи.
   const commentRows = await docReturnGetTaskCommentRows(basic.taskId);
-  const textual = [
+  const taskTextual = [
     basic.title,
     docReturnTaskValue(basic.task, ['description', 'DESCRIPTION']) || '',
     ...commentRows.map((c) =>
@@ -10182,18 +10224,40 @@ async function docReturnResolveEmailFromTaskAndFiles(basic, mergedFiles, downloa
     ),
   ].join('\n');
 
-  const textEmail = docReturnPickClientEmail(docReturnExtractEmailsFromText(textual));
-  if (textEmail) {
+  const taskTextEmail = docReturnPickClientEmail(docReturnExtractEmailsFromText(taskTextual));
+  if (taskTextEmail) {
     return {
       ok: true,
-      email: textEmail,
+      email: taskTextEmail,
       entityId: 0,
       entityTypeId: 0,
       source: 'task-text',
-      label: 'Email из задачи',
+      label: 'Email из задачи/комментария',
     };
   }
 
+  // 2. ВАЖНО v107: сообщения в правом «Чате задачи» Bitrix — это НЕ task.commentitem.
+  // Поэтому email, который сотрудник написал прямо в чат (например YarmolyukAAV@yandex.by),
+  // читаем отдельно через im.dialog.messages.get.
+  const chatTexts = await docReturnGetTaskChatTexts(basic);
+  const chatEmail = docReturnPickClientEmail(
+    docReturnExtractEmailsFromText(chatTexts.join('\n'))
+  );
+  if (chatEmail) {
+    console.log(
+      `[doc-return] task=${basic.taskId}: email найден в чате задачи: ${docReturnMaskEmail(chatEmail)}`
+    );
+    return {
+      ok: true,
+      email: chatEmail,
+      entityId: 0,
+      entityTypeId: 0,
+      source: 'task-chat',
+      label: 'Email из чата задачи',
+    };
+  }
+
+  // 3. Если в CRM/задаче/чате email нет — пробуем документы.
   const ordered = [...(mergedFiles || [])].sort(
     (a, b) => docReturnFileEmailPriority(a) - docReturnFileEmailPriority(b)
   );
@@ -10240,7 +10304,7 @@ async function docReturnResolveEmailFromTaskAndFiles(basic, mergedFiles, downloa
   return {
     ok: false,
     reason:
-      'Не найден email: нет подходящей CRM-связи/почты и в прикреплённых документах email не найден.',
+      'Не найден email: нет внешней почты в CRM, задаче, комментариях, чате задачи и прикреплённых документах.',
   };
 }
 
@@ -11262,7 +11326,7 @@ async function docReturnSendReminder(basic, sequence) {
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
     `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded && ctx.downloaded.fileName || 'NONE'}; ` +
-    `deadline=${nextDeadline}; dedupe=v106-email-only`
+    `deadline=${nextDeadline}; dedupe=v107-chat-email`
   );
 
   return {
@@ -11825,7 +11889,7 @@ registerDocReturnLocalApp({
 });
 
 console.log(
-  `[doc-return] v106 EMAIL_ONLY active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
+  `[doc-return] v107 EMAIL_ONLY_CHAT_EMAIL active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
