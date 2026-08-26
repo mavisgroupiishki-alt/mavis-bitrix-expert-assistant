@@ -17,6 +17,49 @@ const MONTHS = [
 
 const els = {};
 
+const BROWSER_CACHE_VERSION = 'v112';
+const BROWSER_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+let autoRefreshTimer = null;
+
+function browserCacheKey() {
+  const domain = state.auth && state.auth.domain ? state.auth.domain : 'portal';
+  return `mavis-doc-return-report:${BROWSER_CACHE_VERSION}:${domain}`;
+}
+
+function saveBrowserCache(data) {
+  try {
+    localStorage.setItem(browserCacheKey(), JSON.stringify({
+      savedAt: Date.now(),
+      generatedAt: data.generatedAt || state.loadedAt || new Date().toISOString(),
+      rows: Array.isArray(data.rows) ? data.rows : state.raw,
+      stages: Array.isArray(data.stages) ? data.stages : state.stages,
+      cacheSeconds: data.cacheSeconds || 300,
+    }));
+  } catch (_) {}
+}
+
+function restoreBrowserCache() {
+  try {
+    const raw = localStorage.getItem(browserCacheKey());
+    if (!raw) return false;
+    const cached = JSON.parse(raw);
+    if (!cached || !Array.isArray(cached.rows) || !cached.rows.length) return false;
+    if (cached.savedAt && Date.now() - Number(cached.savedAt) > BROWSER_CACHE_MAX_AGE_MS) return false;
+    state.raw = cached.rows;
+    state.stages = Array.isArray(cached.stages) ? cached.stages : [];
+    state.loadedAt = cached.generatedAt || new Date(cached.savedAt || Date.now()).toISOString();
+    populateDynamicFilters();
+    applyFilters();
+    els.loading.classList.add('hidden');
+    els.error.classList.add('hidden');
+    els.content.classList.remove('hidden');
+    els.sync.textContent = `Показываю сохранённые данные на ${fmtDateTime(state.loadedAt)} · обновляю в фоне…`;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function qs(id) { return document.getElementById(id); }
 function fmtNum(value) { return new Intl.NumberFormat('ru-RU').format(Number(value || 0)); }
 function fmtDate(value) {
@@ -316,27 +359,40 @@ function renderAll() {
   try { BX24.fitWindow && BX24.fitWindow(); } catch (_) {}
 }
 
-async function loadData(force = false) {
-  els.loading.classList.remove('hidden');
-  els.content.classList.add('hidden');
+async function loadData(force = false, background = false) {
+  const hasVisibleData = Array.isArray(state.raw) && state.raw.length > 0;
+  if (!hasVisibleData) {
+    els.loading.classList.remove('hidden');
+    els.content.classList.add('hidden');
+  }
   els.error.classList.add('hidden');
   els.refresh.disabled = true;
-  els.sync.textContent = force ? 'Обновляю данные из Bitrix24…' : 'Загружаю данные…';
+  els.sync.textContent = force
+    ? (hasVisibleData ? 'Обновляю данные из Bitrix24 в фоне…' : 'Обновляю данные из Bitrix24…')
+    : (hasVisibleData ? `Данные на ${fmtDateTime(state.loadedAt)} · проверяю обновления…` : 'Загружаю данные…');
   try {
     const data = await apiFetch(`/api/doc-return-report/data${force ? '?force=1' : ''}`);
     state.raw = Array.isArray(data.rows) ? data.rows : [];
     state.stages = Array.isArray(data.stages) ? data.stages : [];
     state.loadedAt = data.generatedAt || new Date().toISOString();
+    saveBrowserCache(data);
     populateDynamicFilters();
     applyFilters();
-    els.sync.textContent = `Данные на ${fmtDateTime(state.loadedAt)} · обновление ≤ ${Math.round((data.cacheSeconds || 300) / 60)} мин`;
+    const freshness = data.refreshing ? ' · сервер обновляет данные в фоне' : '';
+    els.sync.textContent = `Данные на ${fmtDateTime(state.loadedAt)} · автообновление ≤ ${Math.round((data.cacheSeconds || 300) / 60)} мин${freshness}`;
     els.loading.classList.add('hidden');
     els.content.classList.remove('hidden');
   } catch (e) {
     els.loading.classList.add('hidden');
-    els.error.classList.remove('hidden');
-    els.error.textContent = e.message || String(e);
-    els.sync.textContent = 'Ошибка загрузки';
+    if (hasVisibleData || background) {
+      // Старые данные остаются доступны — ошибка фоновой синхронизации не блокирует работу.
+      els.content.classList.remove('hidden');
+      els.sync.textContent = `Показываю данные на ${fmtDateTime(state.loadedAt)} · обновление временно недоступно`;
+    } else {
+      els.error.classList.remove('hidden');
+      els.error.textContent = e.message || String(e);
+      els.sync.textContent = 'Ошибка загрузки';
+    }
   } finally {
     els.refresh.disabled = false;
   }
@@ -467,7 +523,12 @@ async function boot() {
   bindEvents();
   try {
     await initBitrix();
-    await loadData(false);
+    const restored = restoreBrowserCache();
+    // Если браузер уже видел этот отчёт — показываем его мгновенно и синхронизируемся без блокировки экрана.
+    if (restored) loadData(false, true);
+    else await loadData(false);
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = setInterval(() => loadData(false, true), 5 * 60 * 1000);
   } catch (e) {
     els.loading.classList.add('hidden');
     els.error.classList.remove('hidden');
