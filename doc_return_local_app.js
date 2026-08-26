@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v116 FAST_MAILING_AND_CHART';
+  const VERSION = 'v118 INSTANT_CORE_NO_BLOCKING';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -123,6 +123,8 @@ function registerDocReturnLocalApp({
   }));
 
   const reportCache = { at: 0, data: null, promise: null };
+  const coreCache = { at: 0, data: null, promise: null };
+  const CORE_CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CORE_CACHE_SECONDS || 300) * 1000);
   const authCache = new Map();
   const manualNameCache = new Map();
   const storageCache = { at: 0, taskId: '', records: new Map() };
@@ -371,6 +373,98 @@ function registerDocReturnLocalApp({
     return 'other';
   }
 
+  async function loadCoreTasks2026() {
+    // v118: один список по проекту и периоду создания вместо обхода каждой стадии.
+    // Это намеренно облегчённый первый экран: без сотен запросов к сделкам и пользователям.
+    const rows = await bitrixRestList('tasks.task.list', {
+      order: { ID: 'ASC' },
+      filter: { GROUP_ID: PROJECT_ID, '>=CREATED_DATE': HISTORY_START },
+      select: ['ID','TITLE','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','RESPONSIBLE_ID','RESPONSIBLE_NAME','CREATED_DATE','CHANGED_DATE','STATUS_CHANGED_DATE','DEADLINE','UF_CRM_TASK','CHAT_ID'],
+    }, 5000);
+    return (rows || []).filter((task) => {
+      const id = String(taskField(task, ['id','ID']) || '');
+      const title = clean(taskField(task, ['title','TITLE']) || '');
+      const stageId = String(taskField(task, ['stageId','STAGE_ID','stage_id']) ?? '0');
+      return id && title !== STORAGE_TASK_TITLE && stageId !== STAGES.ignoredPrinted;
+    });
+  }
+
+  async function buildCoreReport(force=false) {
+    if (!force && coreCache.data && Date.now() - coreCache.at < CORE_CACHE_MS) return coreCache.data;
+    if (coreCache.promise) return coreCache.promise;
+    coreCache.promise = (async () => {
+      const started = Date.now();
+      const [stages, tasks] = await Promise.all([loadStages(), loadCoreTasks2026()]);
+      const stageMap = new Map(stages.map((s) => [String(s.id), s]));
+
+      // Быстро разрешаем только прямые CRM-компании задачи и ручные ID-карты.
+      // Сделки / поиск по названиям / "последняя сделка" не нужны для первого экрана.
+      const directCompanyIdByTask = new Map();
+      const companyIds = [];
+      for (const task of tasks) {
+        const taskId = String(taskField(task, ['id','ID']) || '');
+        const directCompanyId = extractDirectCompanyId(task) || MANUAL_COMPANY_BY_TASK.get(taskId) || '';
+        if (taskId && directCompanyId) directCompanyIdByTask.set(taskId, String(directCompanyId));
+        if (directCompanyId) companyIds.push(String(directCompanyId));
+      }
+      const companyMap = companyIds.length ? await loadCompaniesByIds(companyIds) : new Map();
+
+      const rows = [];
+      for (const task of tasks) {
+        const taskId = String(taskField(task, ['id','ID']) || '');
+        if (!taskId) continue;
+        const title = clean(taskField(task, ['title','TITLE']) || '');
+        const stageId = String(taskField(task, ['stageId','STAGE_ID','stage_id']) ?? '0');
+        const stageName = (stageMap.get(stageId) && stageMap.get(stageId).title) || (stageId === '0' ? 'Без стадии' : `Стадия ${stageId}`);
+        const group = stageGroup(stageId, stageName);
+        if (group === 'ignored') continue;
+        const companyId = directCompanyIdByTask.get(taskId) || '';
+        const company = companyId ? companyMap.get(companyId) : null;
+        const responsibleName = clean(taskField(task, ['responsibleName','RESPONSIBLE_NAME','responsible_name']) || '');
+        const createdAt = asIso(taskField(task, ['createdDate','CREATED_DATE','created_date']));
+        const changedAt = asIso(taskField(task, ['changedDate','CHANGED_DATE','changed_date']));
+        const statusChangedAt = asIso(taskField(task, ['statusChangedDate','STATUS_CHANGED_DATE','status_changed_date']));
+        const deadline = asIso(taskField(task, ['deadline','DEADLINE']));
+        const overdue = Boolean(deadline && new Date(deadline).getTime() < Date.now());
+        const dealId = extractDealId(task) || '';
+        rows.push({
+          taskId,
+          taskUrl:`https://mavisgroup.bitrix24.by/workgroups/group/${PROJECT_ID}/tasks/task/view/${taskId}/`,
+          title,
+          documentType: classifyDocument(title),
+          serviceArticle: inferServiceArticle(title),
+          stageId, stageName, stageGroup: group,
+          taskStatus: String(taskField(task,['status','STATUS','realStatus','REAL_STATUS']) || ''),
+          companyId: company ? String(company.id) : '',
+          companyName: company ? company.title : (MANUAL_COMPANY_NAME_BY_TASK.get(taskId) || 'Компания не определена'),
+          companySource: company ? 'Компания из элементов CRM задачи' : 'Быстрый режим',
+          expertId: String(taskField(task,['responsibleId','RESPONSIBLE_ID','responsible_id']) || ''),
+          expert: responsibleName || 'Не определён',
+          expertSource: 'Ответственный задачи',
+          dealId,
+          chatId: String(taskField(task,['chatId','CHAT_ID','chat_id']) || ''),
+          createdAt, changedAt, statusChangedAt, deadline,
+          overdue, overdueDays: overdue ? daysSince(deadline) : 0,
+          ageDays: createdAt ? daysSince(createdAt) : 0,
+          createdYear: createdAt ? new Date(createdAt).getFullYear() : null,
+          createdMonth: createdAt ? new Date(createdAt).getMonth() + 1 : null,
+          reportNote:'', returnAnalysis:'', returnStatus:'',
+        });
+      }
+      rows.sort((a,b)=>a.companyName.localeCompare(b.companyName,'ru') || String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
+      const data = {
+        ok:true, version:VERSION, partial:true, generatedAt:new Date().toISOString(), projectId:PROJECT_ID,
+        historyStart:HISTORY_START, durationMs:Date.now()-started, cacheSeconds:Math.round(CORE_CACHE_MS/1000),
+        stages, rows, unmatchedCount:rows.filter(r=>!r.companyId).length, categories:CATEGORIES,
+      };
+      coreCache.at = Date.now();
+      coreCache.data = data;
+      console.log(`[doc-return-local] ${VERSION} CORE rows=${rows.length}; ${data.durationMs}ms`);
+      return data;
+    })().finally(()=>{ coreCache.promise = null; });
+    return coreCache.promise;
+  }
+
   async function buildReport(force=false) {
     if(!force && reportCache.data && Date.now()-reportCache.at<CACHE_MS) return reportCache.data;
     if(reportCache.promise) return reportCache.promise;
@@ -481,19 +575,15 @@ function registerDocReturnLocalApp({
 
   app.all('/doc-return-report',(_req,res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.sendFile(path.join(__dirname,'public','doc-return-report.html'));});
   async function getReportFast(force=false) {
-    // Даже ручная кнопка «Обновить» не должна блокировать экран на минуты.
-    // Если снимок уже есть — отдаём его немедленно и пересобираем данные в фоне.
+    // v118: НИКОГДА не заставляем браузер ждать тяжёлое обогащение CRM.
+    // Первый экран строится из core-данных. Тяжёлый buildReport запускается только вручную/опционально.
     if (reportCache.data) {
-      const stale = Date.now() - reportCache.at >= CACHE_MS;
-      const shouldRefresh = force || stale;
-      if (shouldRefresh && !reportCache.promise) {
-        buildReport(true).catch((e) => console.warn(`[doc-return-local] background refresh: ${e.message || e}`));
-      }
-      return { ...reportCache.data, stale, refreshing: Boolean(reportCache.promise) || shouldRefresh };
+      return { ...reportCache.data, stale: Date.now()-reportCache.at>=CACHE_MS, refreshing:false };
     }
-    // Только самое первое открытие на совершенно чистом сервере вынуждено дождаться первого снимка.
-    return buildReport(false);
+    const core = await buildCoreReport(force);
+    return { ...core, refreshing:false };
   }
+
 
   app.get('/api/doc-return-report/data',async(req,res)=>{try{const auth=await authorize(req);const force=['1','true','yes'].includes(String(req.query.force||'').toLowerCase());const data=await getReportFast(force);res.json({...data,currentUser:auth.user});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const report=reportCache.data || await getReportFast(false);const storage=await loadStorageRecords(false);const responses=mergeResponses(storage,report.rows||[]);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.ready?mailingScanCache.events:[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
@@ -509,8 +599,8 @@ function registerDocReturnLocalApp({
   try { if (fs.existsSync(MAILING_SNAPSHOT_FILE)) { const ms=JSON.parse(fs.readFileSync(MAILING_SNAPSHOT_FILE,'utf8')); if(ms&&Array.isArray(ms.events)){mailingScanCache.events=ms.events;mailingScanCache.ready=true;mailingScanCache.at=Number(ms.at||Date.now());console.log(`[doc-return-local] loaded mailing snapshot events=${ms.events.length}`);} } } catch(_) {}
   // Не стартуем тяжёлую пересборку сразу после deploy: она раньше конкурировала с первым открытием отчёта
   // и с расчётом истории, из-за чего Bitrix мог отвечать по несколько минут.
-  const warmupDelay=Math.max(30000,Number(process.env.DOC_RETURN_REPORT_WARMUP_DELAY_MS||60000));
-  setTimeout(()=>{if(!reportCache.data&&!reportCache.promise)buildReport(false).catch(e=>console.warn(`[doc-return-local] warmup: ${e.message||e}`));},warmupDelay).unref?.();
+  // v118: прогреваем только лёгкий core. Полный CRM-enrichment больше не стартует сам.
+  setTimeout(()=>buildCoreReport(false).catch(e=>console.warn(`[doc-return-local] core warmup: ${e.message||e}`)),5000).unref?.();
   // v116: тяжелый полный пересчет больше не запускается каждые 5–10 минут автоматически.
   // Обновление данных выполняется по кнопке/запросу и не конкурирует с расчетом рассылки.
 

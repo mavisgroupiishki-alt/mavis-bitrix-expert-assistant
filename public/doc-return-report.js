@@ -20,7 +20,7 @@ const MONTHS = [
   [1, 'Январь'], [2, 'Февраль'], [3, 'Март'], [4, 'Апрель'], [5, 'Май'], [6, 'Июнь'],
   [7, 'Июль'], [8, 'Август'], [9, 'Сентябрь'], [10, 'Октябрь'], [11, 'Ноябрь'], [12, 'Декабрь'],
 ];
-const CACHE_KEY = 'mavis:return-originals:v114:snapshot'; // stable key: не теряем мгновенный снимок после обновления версии
+const CACHE_KEY = 'mavis:return-originals:stable:snapshot'; // stable key: не теряем мгновенный снимок после обновления версии
 const MAILING_CAMPAIGN_START = new Date('2026-08-26T00:00:00+03:00');
 const els = {};
 
@@ -481,7 +481,12 @@ async function saveTaskEdit() {
 
 function cachedSnapshotLoad() {
   try {
-    const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+    let cached = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+    if (!cached || !Array.isArray(cached.rows)) {
+      for (const legacy of ['mavis:return-originals:v114:snapshot','mavis:return-originals:v113:snapshot']) {
+        try { const x = JSON.parse(localStorage.getItem(legacy) || 'null'); if (x && Array.isArray(x.rows)) { cached = x; break; } } catch (_) {}
+      }
+    }
     if (!cached || !Array.isArray(cached.rows)) return false;
     state.raw = cached.rows; state.stages = Array.isArray(cached.stages) ? cached.stages : []; state.loadedAt = cached.generatedAt || null;
     populateDynamicFilters(); applyFilters(); els.loading.classList.add('hidden'); els.content.classList.remove('hidden'); els.sync.textContent = `Показываю сохранённые данные на ${fmtDateTime(state.loadedAt)} · обновляю в фоне…`; return true;
@@ -496,7 +501,7 @@ async function loadData(force = false) {
     const data = await apiFetch(`/api/doc-return-report/data${force ? '?force=1' : ''}`);
     state.raw = Array.isArray(data.rows) ? data.rows : []; state.stages = Array.isArray(data.stages) ? data.stages : []; state.loadedAt = data.generatedAt || new Date().toISOString();
     saveSnapshot(data); populateDynamicFilters(); applyFilters(); els.loading.classList.add('hidden'); els.content.classList.remove('hidden');
-    const suffix = data.refreshing ? ' · обновление в фоне' : ` · обновление ≤ ${Math.round((data.cacheSeconds || 300) / 60)} мин`;
+    const suffix = data.partial ? ' · быстрый режим' : (data.refreshing ? ' · обновление в фоне' : ` · обновление ≤ ${Math.round((data.cacheSeconds || 300) / 60)} мин`);
     els.sync.textContent = `Данные на ${fmtDateTime(state.loadedAt)}${suffix}`;
   } catch (e) {
     if (!hasData) { els.loading.classList.add('hidden'); els.error.classList.remove('hidden'); els.error.textContent = e.message || String(e); }
