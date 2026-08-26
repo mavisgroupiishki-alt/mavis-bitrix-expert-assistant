@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v113 FULL_REPORT_EDITABLE';
+  const VERSION = 'v116 FAST_MAILING_AND_CHART';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -129,6 +129,8 @@ function registerDocReturnLocalApp({
   const mailingScanCache = { at: 0, ready: false, scanning: false, events: [], error: '', promise: null };
   const historyIndexCache = { at: 0, ready: false, scanning: false, months: [], items: [], error: '', promise: null };
   const SNAPSHOT_FILE = '/tmp/mavis_doc_return_report_snapshot.json';
+  const MAILING_SNAPSHOT_FILE = '/tmp/mavis_doc_return_mailing_snapshot.json';
+  const MAILING_CAMPAIGN_START = Date.parse(process.env.DOC_RETURN_MAILING_START || '2026-08-26T00:00:00+03:00');
 
   function clean(value) {
     if (typeof actsCleanText === 'function') return actsCleanText(value || '');
@@ -338,7 +340,25 @@ function registerDocReturnLocalApp({
     const message=`${STORAGE_MARKER} ${toBase64Url(record)}`;
     await oauthCall(auth.domain,auth.accessToken,'task.commentitem.add',{TASKID:Number(taskId),FIELDS:{POST_MESSAGE:message}});
     storageCache.records.set(`${record.kind}:${record.key}`,record);storageCache.at=Date.now();
-    if(kind==='taskOverride'){reportCache.at=0;reportCache.data=null;historyIndexCache.ready=false;historyIndexCache.at=0;}
+    if(kind==='taskOverride'){
+      // Не очищаем готовый снимок: пользователь должен продолжать видеть отчёт мгновенно.
+      // Новый снимок пересоберётся в фоне.
+      reportCache.at=0;
+      if(reportCache.data&&Array.isArray(reportCache.data.rows)){
+        const row=reportCache.data.rows.find((x)=>String(x.taskId)===String(key));
+        if(row&&data){
+          if(data.companyId)row.companyId=String(data.companyId);
+          if(data.companyName)row.companyName=clean(data.companyName);
+          if(data.expert)row.expert=clean(data.expert);
+          if(data.serviceArticle)row.serviceArticle=clean(data.serviceArticle);
+          if(Object.prototype.hasOwnProperty.call(data,'reportNote'))row.reportNote=clean(data.reportNote);
+          if(Object.prototype.hasOwnProperty.call(data,'returnAnalysis'))row.returnAnalysis=clean(data.returnAnalysis);
+          if(Object.prototype.hasOwnProperty.call(data,'returnStatus'))row.returnStatus=clean(data.returnStatus);
+          row.companySource='Ручная правка в отчёте';
+        }
+      }
+      historyIndexCache.ready=false;historyIndexCache.at=0;
+    }
     return record;
   }
 
@@ -413,12 +433,12 @@ function registerDocReturnLocalApp({
     if(mailingScanCache.promise)return mailingScanCache.promise;
     mailingScanCache.scanning=true;mailingScanCache.error='';
     mailingScanCache.promise=(async()=>{try{
-      const report=await buildReport(false);const rows=report.rows.filter(r=>r.stageGroup==='control'||r.stageGroup==='returned'||r.stageId===STAGES.sent);const commands={};for(const r of rows)commands[`c${r.taskId}`]=`task.commentitem.getlist?TASKID=${encodeURIComponent(r.taskId)}&ORDER[ID]=asc`;
+      const report=reportCache.data || await buildReport(false);const rows=report.rows.filter(r=>{const id=String(r.stageId||'');const t=Date.parse(r.statusChangedAt||r.changedAt||r.createdAt||'');if(!Number.isFinite(t)||t<MAILING_CAMPAIGN_START)return false;return id===STAGES.sent||id===STAGES.email||id===STAGES.call||r.stageGroup==='returned';});const commands={};for(const r of rows)commands[`c${r.taskId}`]=`task.commentitem.getlist?TASKID=${encodeURIComponent(r.taskId)}&ORDER[ID]=asc`;
       const results=await batchCommands(commands);const events=[];const needChat=[];
       for(const r of rows){const raw=results[`c${r.taskId}`];const items=Array.isArray(raw)?raw:(raw&&Array.isArray(raw.items)?raw.items:[]);const found=parseReminderEvents(items,r.taskId,'comment');events.push(...found);if(!found.length&&r.chatId)needChat.push(r);}
       // Fallback: некоторые старые версии писали служебное сообщение в чат задачи.
       if(needChat.length){const chatCmd={};for(const r of needChat)chatCmd[`m${r.taskId}`]=`im.dialog.messages.get?DIALOG_ID=${encodeURIComponent(`chat${r.chatId}`)}`;const chatResults=await batchCommands(chatCmd).catch(()=>({}));for(const r of needChat){const raw=chatResults[`m${r.taskId}`];const items=raw&&Array.isArray(raw.messages)?raw.messages:(Array.isArray(raw)?raw:[]);events.push(...parseReminderEvents(items,r.taskId,'chat'));}}
-      events.sort((a,b)=>String(a.sentAt).localeCompare(String(b.sentAt)));mailingScanCache.at=Date.now();mailingScanCache.ready=true;mailingScanCache.events=events;mailingScanCache.error='';return mailingScanCache;
+      const campaignEvents=events.filter(e=>{const t=Date.parse(e.sentAt||'');return Number.isFinite(t)&&t>=MAILING_CAMPAIGN_START;});campaignEvents.sort((a,b)=>String(a.sentAt).localeCompare(String(b.sentAt)));mailingScanCache.at=Date.now();mailingScanCache.ready=true;mailingScanCache.events=campaignEvents;mailingScanCache.error='';try{fs.writeFileSync(MAILING_SNAPSHOT_FILE,JSON.stringify({at:mailingScanCache.at,events:campaignEvents}));}catch(_){}return mailingScanCache;
     }catch(e){mailingScanCache.error=e.message||String(e);mailingScanCache.ready=false;return mailingScanCache;}finally{mailingScanCache.scanning=false;mailingScanCache.promise=null;}})();return mailingScanCache.promise;
   }
 
@@ -459,23 +479,24 @@ function registerDocReturnLocalApp({
     const raw=await bitrixRestCall('tasks.task.history.list',{taskId:Number(taskId),filter:{FIELD:'STAGE_ID'},order:{createdDate:'DESC'}});const list=historyEventList(raw);const stages=await loadStages();const stageMap=new Map(stages.map(s=>[String(s.id),s.title]));return list.map(event=>{const value=historyEventValue(event);const fromId=String(value.from??value.FROM??'');const toId=String(value.to??value.TO??'');return{id:String(event&&(event.id||event.ID)||''),createdAt:String(event&&(event.createdDate||event.CREATED_DATE)||''),fromId,toId,from:stageMap.get(fromId)||fromId||'—',to:stageMap.get(toId)||toId||'—',user:clean(`${event&&event.user&&(event.user.name||event.user.NAME)||''} ${event&&event.user&&(event.user.lastName||event.user.LAST_NAME)||''}`)};});
   }
 
-  app.all('/doc-return-report',(_req,res)=>res.sendFile(path.join(__dirname,'public','doc-return-report.html')));
+  app.all('/doc-return-report',(_req,res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.sendFile(path.join(__dirname,'public','doc-return-report.html'));});
   async function getReportFast(force=false) {
-    if (force) return buildReport(true);
-    // Если есть хотя бы один готовый снимок — отдаём его сразу, даже если TTL уже истёк.
-    // Обновление запускаем в фоне, чтобы пользователь не ждал 1–2 минуты при открытии отчёта.
+    // Даже ручная кнопка «Обновить» не должна блокировать экран на минуты.
+    // Если снимок уже есть — отдаём его немедленно и пересобираем данные в фоне.
     if (reportCache.data) {
       const stale = Date.now() - reportCache.at >= CACHE_MS;
-      if (stale && !reportCache.promise) {
+      const shouldRefresh = force || stale;
+      if (shouldRefresh && !reportCache.promise) {
         buildReport(true).catch((e) => console.warn(`[doc-return-local] background refresh: ${e.message || e}`));
       }
-      return { ...reportCache.data, stale, refreshing: Boolean(reportCache.promise) || stale };
+      return { ...reportCache.data, stale, refreshing: Boolean(reportCache.promise) || shouldRefresh };
     }
+    // Только самое первое открытие на совершенно чистом сервере вынуждено дождаться первого снимка.
     return buildReport(false);
   }
 
   app.get('/api/doc-return-report/data',async(req,res)=>{try{const auth=await authorize(req);const force=['1','true','yes'].includes(String(req.query.force||'').toLowerCase());const data=await getReportFast(force);res.json({...data,currentUser:auth.user});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
-  app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const [report,storage]=await Promise.all([buildReport(false),loadStorageRecords(false)]);const responses=mergeResponses(storage,report.rows);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.ready?mailingScanCache.events:[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
+  app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const report=reportCache.data || await getReportFast(false);const storage=await loadStorageRecords(false);const responses=mergeResponses(storage,report.rows||[]);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.ready?mailingScanCache.events:[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.post('/api/doc-return-report/mailing/refresh',async(req,res)=>{try{await authorize(req);buildMailingScan(true).catch(()=>{});res.json({ok:true,started:true});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.get('/api/doc-return-report/history-index',async(req,res)=>{try{await authorize(req);if(!historyIndexCache.ready&&!historyIndexCache.scanning)buildHistoryIndex(false).catch(()=>{});res.json({ok:true,ready:historyIndexCache.ready,scanning:historyIndexCache.scanning,error:historyIndexCache.error,months:historyIndexCache.ready?historyIndexCache.months:[]});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.post('/api/doc-return-report/history-index/refresh',async(req,res)=>{try{await authorize(req);buildHistoryIndex(true).catch(()=>{});res.json({ok:true,started:true});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
@@ -483,11 +504,15 @@ function registerDocReturnLocalApp({
   app.get('/api/doc-return-report/company-search',async(req,res)=>{try{const auth=await authorize(req);const q=clean(req.query.q||'');if(q.length<2)return res.json({ok:true,rows:[]});const rows=await oauthList(auth.domain,auth.accessToken,'crm.company.list',{order:{TITLE:'ASC'},filter:{'%TITLE':q},select:['ID','TITLE','ASSIGNED_BY_ID']},50);res.json({ok:true,rows:rows.map(c=>({id:String(c.ID||c.id||''),title:clean(c.TITLE||c.title||''),assignedById:String(c.ASSIGNED_BY_ID||c.assignedById||'')})).filter(c=>c.id&&c.title).slice(0,30)});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.get('/api/doc-return-report/task-history/:taskId',async(req,res)=>{try{await authorize(req);const taskId=String(req.params.taskId||'').replace(/\D/g,'');if(!taskId)return res.status(400).json({ok:false,error:'taskId не указан'});res.json({ok:true,taskId,rows:await loadTaskStageHistory(taskId)});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
 
-  // Тёплый кэш: после старта сервера данные начинают собираться сами, не дожидаясь открытия отчёта.
+  // Тёплый кэш: если Render не перезапускался, готовый снимок поднимается мгновенно.
   try { if (fs.existsSync(SNAPSHOT_FILE)) { const snap=JSON.parse(fs.readFileSync(SNAPSHOT_FILE,'utf8')); if(snap&&Array.isArray(snap.rows)){reportCache.data=snap;reportCache.at=Date.now();console.log(`[doc-return-local] loaded instant snapshot rows=${snap.rows.length}`);} } } catch(_) {}
-  // Сразу после старта обновляем снимок в фоне. Наличие старого снимка не блокирует открытие отчёта.
-  setTimeout(()=>buildReport(true).catch(e=>console.warn(`[doc-return-local] warmup: ${e.message||e}`)),2500);
-  setInterval(()=>buildReport(true).catch(e=>console.warn(`[doc-return-local] refresh: ${e.message||e}`)),Math.max(CACHE_MS,5*60*1000)).unref?.();
+  try { if (fs.existsSync(MAILING_SNAPSHOT_FILE)) { const ms=JSON.parse(fs.readFileSync(MAILING_SNAPSHOT_FILE,'utf8')); if(ms&&Array.isArray(ms.events)){mailingScanCache.events=ms.events;mailingScanCache.ready=true;mailingScanCache.at=Number(ms.at||Date.now());console.log(`[doc-return-local] loaded mailing snapshot events=${ms.events.length}`);} } } catch(_) {}
+  // Не стартуем тяжёлую пересборку сразу после deploy: она раньше конкурировала с первым открытием отчёта
+  // и с расчётом истории, из-за чего Bitrix мог отвечать по несколько минут.
+  const warmupDelay=Math.max(30000,Number(process.env.DOC_RETURN_REPORT_WARMUP_DELAY_MS||60000));
+  setTimeout(()=>{if(!reportCache.data&&!reportCache.promise)buildReport(false).catch(e=>console.warn(`[doc-return-local] warmup: ${e.message||e}`));},warmupDelay).unref?.();
+  // v116: тяжелый полный пересчет больше не запускается каждые 5–10 минут автоматически.
+  // Обновление данных выполняется по кнопке/запросу и не конкурирует с расчетом рассылки.
 
   console.log(`[doc-return-local] ${VERSION}; route=/doc-return-report; project=${PROJECT_ID}; historyStart=${HISTORY_START}`);
 }

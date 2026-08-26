@@ -1,17 +1,20 @@
 <!doctype html>
 <html lang="ru">
 <head>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Возврат оригиналов — MAVIS GROUP</title>
   <script src="//api.bitrix24.com/api/v1/"></script>
-  <link rel="stylesheet" href="/doc-return-report.css" />
+  <link rel="stylesheet" href="/doc-return-report.css?v=115" />
 </head>
 <body>
   <div class="report-shell">
     <header class="hero">
       <div>
-        <div class="eyebrow">MAVIS GROUP · Акты и договоры</div>
+        <div class="eyebrow">MAVIS GROUP · Акты и договоры · v115</div>
         <h1>Возврат оригиналов</h1>
         <p id="period-label" class="hero-subtitle">Текущий остаток · период создания: 2026</p>
       </div>
@@ -69,11 +72,11 @@
 
         <section class="panel dynamics-panel">
           <div class="panel-title-row">
-            <div><h2>Динамика возврата по месяцам</h2><p>Сколько отправили, сколько вернулось и сколько оставалось невозвращённым на конец каждого месяца</p></div>
+            <div><h2>Динамика возврата по месяцам</h2><p>Быстрая динамика по месяцам: сколько отправлено, вернулось и осталось невозвращённым в текущем срезе</p></div>
             <button id="history-refresh-btn" class="btn btn-light btn-small">Обновить динамику</button>
           </div>
           <div id="history-status" class="subtle-status"></div>
-          <div id="history-months" class="month-dynamics"><div class="empty-state">История рассчитывается отдельно и не блокирует открытие отчёта.</div></div>
+          <div id="history-months" class="month-dynamics"><div class="empty-state">Динамика не считается автоматически. Нажмите «Обновить динамику», когда она нужна.</div></div>
         </section>
 
         <section class="analytics-grid">
@@ -192,6 +195,6 @@
     <div class="dialog-actions"><button id="response-add-save" class="btn btn-primary">Добавить</button></div>
   </dialog>
 
-  <script src="/doc-return-report.js"></script>
+  <script src="/doc-return-report.js?v=117"></script>
 </body>
 </html>

@@ -20,7 +20,8 @@ const MONTHS = [
   [1, 'Январь'], [2, 'Февраль'], [3, 'Март'], [4, 'Апрель'], [5, 'Май'], [6, 'Июнь'],
   [7, 'Июль'], [8, 'Август'], [9, 'Сентябрь'], [10, 'Октябрь'], [11, 'Ноябрь'], [12, 'Декабрь'],
 ];
-const CACHE_KEY = 'mavis:return-originals:v113:snapshot';
+const CACHE_KEY = 'mavis:return-originals:v114:snapshot'; // stable key: не теряем мгновенный снимок после обновления версии
+const MAILING_CAMPAIGN_START = new Date('2026-08-26T00:00:00+03:00');
 const els = {};
 
 function qs(id) { return document.getElementById(id); }
@@ -145,18 +146,26 @@ function currentPeriodText() {
   return parts.length ? parts.join(' · ') : 'Все время';
 }
 
+function controlRows(rows = state.filtered) {
+  return rows.filter((r) => r.stageGroup === 'early' || r.stageGroup === 'control');
+}
+function sentAndReturnedRows(rows = state.filtered) {
+  return rows.filter((r) => String(r.stageId) === '1132' || r.stageGroup === 'control' || r.stageGroup === 'returned');
+}
+
 function renderKpis() {
   const rows = state.filtered;
+  const active = controlRows(rows);
   const early = rows.filter((r) => r.stageGroup === 'early').length;
   const control = rows.filter((r) => r.stageGroup === 'control').length;
   const returned = rows.filter((r) => r.stageGroup === 'returned').length;
-  const sentBaseRows = rows.filter((r) => String(r.stageId) === '1132' || r.stageGroup === 'control' || r.stageGroup === 'returned');
+  const sentBaseRows = sentAndReturnedRows(rows);
   const sentBase = sentBaseRows.length;
   const notReturnedAfterSend = sentBaseRows.filter((r) => r.stageGroup !== 'returned').length;
-  const overdue = rows.filter((r) => r.overdue).length;
-  const email = rows.filter((r) => String(r.stageId) === '1126' || /эл\.\s*почта/i.test(r.stageName)).length;
-  const call = rows.filter((r) => String(r.stageId) === '1128' || /^звонок$/i.test(r.stageName)).length;
-  const companies = new Set(rows.map((r) => r.companyId || `name:${r.companyName}`)).size;
+  const overdue = active.filter((r) => r.overdue).length;
+  const email = active.filter((r) => String(r.stageId) === '1126' || /эл\.\s*почта/i.test(r.stageName)).length;
+  const call = active.filter((r) => String(r.stageId) === '1128' || /^звонок$/i.test(r.stageName)).length;
+  const companies = new Set(active.map((r) => r.companyId || `name:${r.companyName}`)).size;
   els.kpiEarly.textContent = fmtNum(early);
   els.kpiControl.textContent = fmtNum(control);
   els.kpiReturned.textContent = fmtNum(returned);
@@ -165,12 +174,13 @@ function renderKpis() {
   els.kpiReturnedShare.textContent = fmtPct(returned, sentBase);
   els.kpiSentBase.textContent = `${fmtNum(returned)} из ${fmtNum(sentBase)} отправленных`;
   els.kpiOverdue.textContent = fmtNum(overdue);
-  els.kpiOverdueShare.textContent = `${fmtPct(overdue, rows.length)} от выборки`;
+  els.kpiOverdueShare.textContent = `${fmtPct(overdue, active.length)} от невозвращённых`;
   els.kpiEmail.textContent = fmtNum(email);
   els.kpiCall.textContent = fmtNum(call);
   els.kpiCompanies.textContent = fmtNum(companies);
-  els.periodLabel.textContent = `Текущий остаток · период создания: ${currentPeriodText()}`;
+  els.periodLabel.textContent = `Период создания: ${currentPeriodText()} · вернувшиеся учитываются отдельно`;
 }
+
 function countBy(rows, keyFn) {
   const map = new Map();
   for (const row of rows) { const key = keyFn(row) || 'Не определено'; map.set(key, (map.get(key) || 0) + 1); }
@@ -212,9 +222,9 @@ function renderCompanyDocuments(company) {
     </tr>`).join('')}
   </tbody></table></div>`;
 }
-function renderCompanies() {
-  const companies = groupCompanies(state.filtered);
-  els.companySummary.textContent = `${fmtNum(companies.length)} компаний · ${fmtNum(state.filtered.length)} документов`;
+function renderCompanies(rows = controlRows(state.filtered)) {
+  const companies = groupCompanies(rows);
+  els.companySummary.textContent = `${fmtNum(companies.length)} компаний · ${fmtNum(rows.length)} невозвращённых документов`;
   if (!companies.length) { els.companies.innerHTML = '<div class="empty-state">По выбранным фильтрам ничего не найдено</div>'; return; }
   els.companies.innerHTML = companies.map((company) => {
     const open = state.expandedCompany === company.key;
@@ -228,7 +238,7 @@ function renderCompanies() {
   }).join('');
 }
 function qualityRows(kind) {
-  const rows = state.filtered;
+  const rows = controlRows(state.filtered);
   if (kind === 'unmatched') return rows.filter((r) => !r.companyId);
   if (kind === 'noDeadline') return rows.filter((r) => !r.deadline);
   if (kind === 'older90') return rows.filter((r) => Number(r.ageDays || 0) >= 90);
@@ -244,10 +254,12 @@ function renderQuality() {
 }
 function renderControl() {
   renderKpis();
-  renderBars(els.stageBars, countBy(state.filtered, (r) => r.stageName), 14);
-  renderBars(els.topCompanies, groupCompanies(state.filtered).map((c) => ({ label: c.name, value: c.rows.length })), 10, 'red');
-  renderBars(els.expertBars, countBy(state.filtered, (r) => r.expert), 12, 'green');
-  renderQuality(); renderCompanies();
+  const active = controlRows(state.filtered);
+  renderBars(els.stageBars, countBy(active, (r) => r.stageName), 14);
+  renderBars(els.topCompanies, groupCompanies(active).map((c) => ({ label: c.name, value: c.rows.length })), 10, 'red');
+  renderBars(els.expertBars, countBy(active, (r) => r.expert), 12, 'green');
+  renderQuality();
+  renderCompanies(active);
   try { BX24.fitWindow && BX24.fitWindow(); } catch (_) {}
 }
 
@@ -262,27 +274,47 @@ function openQuality(kind) {
   els.qualityDialog.showModal();
 }
 
-async function loadHistoryIndex(force = false) {
-  if (state.history.loading) return;
-  state.history.loading = true; els.historyStatus.textContent = force ? 'Пересчитываю динамику…' : 'Загружаю динамику…';
-  try {
-    if (force) await apiFetch('/api/doc-return-report/history-index/refresh', { method: 'POST', body: '{}' });
-    const data = await apiFetch('/api/doc-return-report/history-index');
-    state.history.ready = Boolean(data.ready); state.history.scanning = Boolean(data.scanning); state.history.error = data.error || ''; state.history.months = Array.isArray(data.months) ? data.months : [];
-    renderHistoryMonths();
-    if (!state.history.ready && state.history.scanning) setTimeout(() => loadHistoryIndex(false), 5000);
-  } catch (e) { state.history.error = e.message || String(e); renderHistoryMonths(); }
-  finally { state.history.loading = false; }
+function fastHistoryRows() {
+  const year = Number(els.year && els.year.value !== 'all' ? els.year.value : 2026);
+  const now = new Date();
+  const maxMonth = year === now.getFullYear() ? now.getMonth() + 1 : 12;
+  const rows = [];
+  for (let month = 1; month <= maxMonth; month++) {
+    const cohort = state.raw.filter((r) => {
+      const d = new Date(r.createdAt || 0);
+      return Number.isFinite(d.getTime()) && d.getFullYear() === year && d.getMonth() + 1 === month && (String(r.stageId) === '1132' || r.stageGroup === 'control' || r.stageGroup === 'returned');
+    });
+    const sent = cohort.length;
+    const returned = cohort.filter((r) => r.stageGroup === 'returned').length;
+    rows.push({ year, month, sentNew: sent, returnedNew: returned, outstanding: Math.max(0, sent - returned), returnRate: sent ? Number((returned / sent * 100).toFixed(1)) : 0 });
+  }
+  return rows;
+}
+function renderFastHistoryChart(rows) {
+  if (!rows.length) return '';
+  const W=980,H=280,L=48,R=18,T=20,B=38;
+  const max=Math.max(1,...rows.flatMap(r=>[r.sentNew,r.returnedNew,r.outstanding]));
+  const x=(i)=>L+(rows.length===1?0:i*(W-L-R)/(rows.length-1));
+  const y=(v)=>T+(H-T-B)*(1-v/max);
+  const line=(key)=>rows.map((r,i)=>`${i?'L':'M'} ${x(i).toFixed(1)} ${y(r[key]).toFixed(1)}`).join(' ');
+  const grid=[0,.25,.5,.75,1].map(fr=>{const yy=y(max*fr);return `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#e8edf5"/><text x="${L-7}" y="${yy+4}" text-anchor="end" font-size="11" fill="#78869d">${Math.round(max*fr)}</text>`;}).join('');
+  const labels=rows.map((r,i)=>`<text x="${x(i)}" y="${H-10}" text-anchor="middle" font-size="11" fill="#78869d">${monthLabel(r.month).slice(0,3)}</text>`).join('');
+  return `<div class="fast-chart-wrap"><div class="fast-chart-legend"><span>● Отправлено</span><span>● Вернулось</span><span>● Не вернулось</span></div><svg viewBox="0 0 ${W} ${H}" class="fast-chart-svg">${grid}${labels}<path d="${line('sentNew')}" fill="none" stroke="#2f80ed" stroke-width="4"/><path d="${line('returnedNew')}" fill="none" stroke="#34a875" stroke-width="4"/><path d="${line('outstanding')}" fill="none" stroke="#e45c72" stroke-width="4"/></svg></div>`;
+}
+async function loadHistoryIndex() {
+  state.history.loaded = true;
+  state.history.ready = true;
+  state.history.scanning = false;
+  state.history.error = '';
+  state.history.months = fastHistoryRows();
+  renderHistoryMonths();
 }
 function renderHistoryMonths() {
-  if (state.history.error) { els.historyStatus.textContent = `Ошибка: ${state.history.error}`; return; }
-  if (!state.history.ready) { els.historyStatus.textContent = state.history.scanning ? 'История рассчитывается в фоне. Отчёт можно использовать дальше.' : 'История ещё не рассчитана.'; return; }
-  els.historyStatus.textContent = 'Динамика рассчитана.';
-  const year = Number(els.year.value === 'all' ? 2026 : els.year.value);
-  const rows = state.history.months.filter((r) => Number(r.year) === year);
-  els.historyMonths.innerHTML = rows.length ? `<table class="summary-table"><thead><tr><th>Месяц</th><th>Отправлено за месяц</th><th>Вернулось за месяц</th><th>Не вернулось на конец месяца</th><th>Отправлено накопительно</th><th>Вернулось накопительно</th><th>% возврата</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td>${monthLabel(r.month)}</td><td>${fmtNum(r.sentNew)}</td><td>${fmtNum(r.returnedNew)}</td><td class="strong-cell">${fmtNum(r.outstanding)}</td><td>${fmtNum(r.sentCumulative)}</td><td>${fmtNum(r.returnedCumulative)}</td><td>${String(r.returnRate).replace('.', ',')}%</td></tr>`).join('')}
-  </tbody></table>` : '<div class="empty-state">Нет месячной истории</div>';
+  const rows = fastHistoryRows();
+  state.history.months = rows;
+  if (els.historyStatus) els.historyStatus.textContent = 'График строится сразу по текущему снимку — без 10-минутного расчёта истории.';
+  if (!els.historyMonths) return;
+  els.historyMonths.innerHTML = renderFastHistoryChart(rows) + (rows.length ? `<table class="summary-table"><thead><tr><th>Месяц</th><th>Отправлено</th><th>Вернулось</th><th>Не вернулось</th><th>% возврата</th></tr></thead><tbody>${rows.map((r)=>`<tr><td>${monthLabel(r.month)}</td><td>${fmtNum(r.sentNew)}</td><td>${fmtNum(r.returnedNew)}</td><td class="strong-cell">${fmtNum(r.outstanding)}</td><td>${String(r.returnRate).replace('.', ',')}%</td></tr>`).join('')}</tbody></table>` : '<div class="empty-state">Нет данных</div>');
 }
 
 function mailingPeriodFilter(dateValue) {
@@ -356,17 +388,22 @@ function renderResponsesTable() {
 function renderMailing() {
   if (!state.mailing.loaded) return;
   renderMailingKpis(); renderMailingMonthly(); renderResponsesTable();
-  const scanText = state.mailing.scanError ? `Ошибка сканирования рассылки: ${state.mailing.scanError}` : state.mailing.scanReady ? `Рассылка посчитана: ${fmtNum(state.mailing.events.length)} подтверждённых email.` : state.mailing.scanScanning ? 'Считаю фактически отправленные письма в фоне…' : 'Рассылка ещё не рассчитана.';
+  const scanText = state.mailing.scanError ? `Ошибка подсчёта рассылки: ${state.mailing.scanError}` : state.mailing.scanReady ? `Рассылка посчитана строго по подтверждённым служебным сообщениям: ${fmtNum(state.mailing.events.length)} email.` : state.mailing.scanScanning ? 'Считаю только подтверждённую рассылку по служебным сообщениям в задачах…' : 'Рассылка ещё не рассчитана.';
   els.mailingStatus.textContent = scanText;
   renderReturns();
 }
+function provisionalMailingEvents() {
+  // v117: стадия НЕ считается фактом рассылки. Нужна подтверждающая служебная запись в задаче.
+  return [];
+}
+
 async function loadMailing(force = false) {
   if (state.mailing.loading) return; state.mailing.loading = true;
   try {
     if (force) await apiFetch('/api/doc-return-report/mailing/refresh', { method:'POST', body:'{}' });
     const data = await apiFetch('/api/doc-return-report/mailing');
     state.mailing.loaded = true; state.mailing.responses = Array.isArray(data.responses) ? data.responses : []; state.mailing.categories = Array.isArray(data.categories) ? data.categories : [];
-    const scan = data.scan || {}; state.mailing.events = Array.isArray(scan.events) ? scan.events : []; state.mailing.scanReady = Boolean(scan.ready); state.mailing.scanScanning = Boolean(scan.scanning); state.mailing.scanError = scan.error || '';
+    const scan = data.scan || {}; state.mailing.events = Array.isArray(scan.events) ? scan.events : []; state.mailing.scanReady = Boolean(scan.ready); state.mailing.scanScanning = Boolean(scan.scanning); state.mailing.scanError = scan.error || ''; if (!state.mailing.scanReady) state.mailing.events = [];
     populateMailingCategories(); renderMailing();
     if (!state.mailing.scanReady && state.mailing.scanScanning) setTimeout(() => loadMailing(false), 5000);
   } catch (e) { els.mailingStatus.textContent = `Ошибка: ${e.message || e}`; }
@@ -482,7 +519,11 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === `tab-${tab}`));
   if (tab === 'mailing' && !state.mailing.loaded) loadMailing(false);
   if (tab === 'returns') { if (!state.mailing.loaded) loadMailing(false); else renderReturns(); }
-  if (tab === 'control' && !state.history.loaded) { state.history.loaded = true; loadHistoryIndex(false); }
+  // Историю по месяцам больше НЕ считаем автоматически: это самый тяжёлый запрос.
+  // Она запускается только по кнопке «Обновить динамику».
+  if (tab === 'control' && !state.history.loaded) {
+    els.historyStatus.textContent = 'Динамика по месяцам считается отдельно — нажми «Обновить динамику», когда она нужна.';
+  }
   try { BX24.fitWindow && BX24.fitWindow(); } catch (_) {}
 }
 
@@ -532,7 +573,8 @@ async function boot() {
   try {
     await initBitrix();
     if (!hadCache) await loadData(false); else loadData(false);
-    state.history.loaded = true; loadHistoryIndex(false);
+    state.history.loaded = true;
+    loadHistoryIndex(false);
   } catch (e) {
     if (!hadCache) { els.loading.classList.add('hidden');els.error.classList.remove('hidden');els.error.innerHTML=`<strong>Не удалось открыть локальное приложение.</strong><br>${escapeHtml(e.message||String(e))}`; }
   }
