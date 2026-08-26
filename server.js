@@ -10620,33 +10620,21 @@ async function docReturnResolveCommentFiles(taskId) {
 async function docReturnShouldManageHistoricalEmailTask(task) {
   const taskId = String(docReturnTaskValue(task, ['id', 'ID']) || '');
   if (!taskId) return false;
-  if (taskId === DOC_RETURN_TEST_TASK_ID) return true;
-  if (DOC_RETURN_RECOVERY_TASK_IDS.has(taskId)) return true;
 
-  // Новые задачи после запуска продолжаем вести штатно.
-  const startMs = docReturnParseMs(DOC_RETURN_PRODUCTION_START_ISO);
-  const createdMs = docReturnCreatedMs(task);
-  if (createdMs && startMs && createdMs >= startMs) return true;
-
-  // Старые задачи, которые наша автоматизация уже передвинула/изменила после запуска,
-  // тоже обязательно дожимаем — это текущая пачка просрочки в «Эл. Почта».
-  const changedMs = docReturnParseMs(
-    docReturnTaskValue(task, ['changedDate', 'CHANGED_DATE', 'changed_date'])
-  );
-  if (changedMs && startMs && changedMs >= startMs) return true;
-
-  // Старые задачи, которые уже реально вошли в НАШ цикл и имеют наши комментарии,
-  // продолжаем вести до письма №2 / Звонка.
+  // v110 STRICT STAGE OWNERSHIP:
+  // «Эл. Почта» НИКОГДА не является источником для первого письма.
+  // Мы продолжаем контроль на этой стадии только если уже есть подтверждённый
+  // комментарий НАШЕЙ автоматизации о реально отправленном письме №1/№2.
+  // Дата создания/изменения задачи, recovery IDs и ручные перемещения больше
+  // не дают права автоматизации трогать задачу в «Эл. Почта».
   const comments = await docReturnReadTaskComments({ taskId, task });
-  const joined = comments.join('\n');
-  if (
-    joined.includes(DOC_RETURN_COMMENT_1) ||
-    joined.includes(DOC_RETURN_COMMENT_2) ||
-    joined.includes(DOC_RETURN_CALL_COMMENT)
-  ) return true;
+  for (const comment of comments) {
+    const text = String(comment || '');
+    const isOurReminder = text.includes(DOC_RETURN_COMMENT_1) || text.includes(DOC_RETURN_COMMENT_2);
+    if (isOurReminder && text.includes(DOC_RETURN_CONFIRMED_TEXT)) return true;
+    if (text.includes(DOC_RETURN_CALL_COMMENT)) return true;
+  }
 
-  // Старые задачи, которые до включения historical уже стояли в «Эл. Почта»,
-  // не трогаем: неизвестно, отправляли ли им письма вручную.
   return false;
 }
 
@@ -11328,7 +11316,7 @@ async function docReturnSendReminder(basic, sequence) {
   let freshBasic = await docReturnLoadBasicContext(basic.taskId, freshTask);
   let freshState = await docReturnReadState(freshBasic);
 
-  // v109 HARD DEDUPE: после успешного письма мы всегда ставим новый срок +14 дней.
+  // v110 HARD DEDUPE: после успешного письма мы всегда ставим новый срок +14 дней.
   // Даже если Bitrix временно не отдал комментарий/чат, письмо №1 нельзя отправлять
   // повторно при будущем дедлайне. Это независимый второй предохранитель.
   if (sequence === 1 && !docReturnIsDeadlineExpired(freshTask)) {
@@ -11448,7 +11436,7 @@ async function docReturnSendReminder(basic, sequence) {
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
     `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded && ctx.downloaded.fileName || 'NONE'}; ` +
-    `deadline=${nextDeadline}; dedupe=v109-chat-dedupe-deadline-guard`
+    `deadline=${nextDeadline}; dedupe=v110-strict-stage-ownership`
   );
 
   return {
@@ -11616,7 +11604,7 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
     let basic = await docReturnLoadBasicContext(taskId, currentTask);
     const state = await docReturnReadState(basic);
 
-    // v109: жёсткая страховка от повторного письма №1.
+    // v110: жёсткая страховка от повторного письма №1.
     // Если задача уже стоит в «Эл. Почта» и её дедлайн в будущем, значит текущий
     // цикл контроля ещё не наступил. НИЧЕГО не отправляем, даже если API Bitrix
     // по какой-то причине не вернул предыдущий комментарий.
@@ -11650,9 +11638,21 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
       );
     }
 
-    // Новый обычный кейс: первого подтверждённого письма ещё не было.
-    // Если старое письмо ушло на нашу же почту, оно НЕ считается напоминанием и будет исправлено.
+    // v110: письмо №1 разрешено ТОЛЬКО при входе со стадии «Отправлены».
+    // Если задача уже была в «Эл. Почта» до этого цикла и нет подтверждённого
+    // первого письма нашей автоматизации — вообще её не трогаем и тем более
+    // не переводим в «Ручная отправка».
     if (!state.first) {
+      if (!movedFromSent) {
+        console.log(`[doc-return] SKIP EMAIL STAGE task=${taskId}: first reminder may only start from «Отправлены».`);
+        return {
+          ok: true,
+          skipped: true,
+          taskId,
+          reason: 'email-stage-not-owned-no-first-reminder',
+          stageId,
+        };
+      }
       return await docReturnSendReminder(basic, 1);
     }
 
@@ -11714,8 +11714,26 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
   } catch (e) {
     const errorText = e.message || String(e);
 
-    // v104: ошибки данных не должны зависать в «Эл. Почта» и тормозить очередь.
-    // Такие задачи сразу отправляем в отдельную стадию «Ручная отправка».
+    // v110: если ошибка возникла у задачи, которая уже находится в «Эл. Почта»,
+    // но не имеет подтверждённого первого письма нашей автоматизации, НЕ ТРОГАЕМ её.
+    // В «Ручная отправка» могут уходить ошибки только из нашего собственного контура.
+    try {
+      const guardTask = await docReturnLoadTask(taskId);
+      const guardStages = await docReturnResolveStages();
+      const guardStageId = String(docReturnTaskValue(guardTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+      if (guardStageId === guardStages.email) {
+        const guardBasic = await docReturnLoadBasicContext(taskId, guardTask);
+        const guardState = await docReturnReadState(guardBasic);
+        if (!guardState.first && !guardState.second && !guardState.call) {
+          console.warn(`[doc-return] EMAIL STAGE PROTECTED task=${taskId}: error ignored, task left untouched: ${errorText}`);
+          return { ok: true, skipped: true, taskId, reason: 'email-stage-protected-on-error', error: errorText };
+        }
+      }
+    } catch (guardError) {
+      console.warn(`[doc-return] email-stage protection check failed task=${taskId}: ${guardError.message || guardError}`);
+    }
+
+    // Ошибки данных нашего собственного контура отправляем в «Ручная отправка».
     if (docReturnIsManualSendError(errorText)) {
       try {
         return await docReturnMoveToManual(taskId, errorText);
@@ -11820,8 +11838,9 @@ async function docReturnRunPollingCycle(trigger = 'interval') {
   // «Отправлены»: при historical=true берём весь старый хвост.
   const sentTasks = await docReturnListStageTasks(stages.sent, 1000);
 
-  // «Эл. Почта»: старый хвост НЕ обрабатываем вслепую, чтобы не дублировать
-  // письма, которые могли отправляться вручную до запуска автоматизации.
+  // «Эл. Почта»: v110 — берём ТОЛЬКО задачи, в которых уже есть подтверждённый
+  // комментарий нашей автоматизации. Любые остальные задачи на этой стадии
+  // полностью вне контура: не отправляем, не двигаем, не переводим в ручную.
   const emailAll = await bitrixRestList('tasks.task.list', {
     filter: {
       GROUP_ID: Number(DOC_RETURN_PROJECT_ID),
@@ -12044,7 +12063,7 @@ registerDocReturnLocalApp({
 });
 
 console.log(
-  `[doc-return] v109 EMAIL_ONLY_NO_DUPLICATES active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
+  `[doc-return] v110 STRICT_SENT_ONLY_START active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
