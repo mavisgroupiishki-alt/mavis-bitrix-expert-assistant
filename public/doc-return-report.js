@@ -258,10 +258,51 @@ function renderQuality() {
   const older90 = state.filtered.filter((r) => Number(r.ageDays || 0) >= 90).length;
   const older180 = state.filtered.filter((r) => Number(r.ageDays || 0) >= 180).length;
   els.quality.innerHTML = `
-    <div class="insight ${unmatched ? 'danger' : ''}"><strong>${fmtNum(unmatched)}</strong><span>Компания не определена</span></div>
-    <div class="insight ${noDeadline ? 'warning' : ''}"><strong>${fmtNum(noDeadline)}</strong><span>Без дедлайна</span></div>
-    <div class="insight"><strong>${fmtNum(older90)}</strong><span>В работе 90+ дней</span></div>
-    <div class="insight"><strong>${fmtNum(older180)}</strong><span>В работе 180+ дней</span></div>`;
+    <button type="button" class="insight quality-clickable ${unmatched ? 'danger' : ''}" data-quality="unmatched" title="Показать задачи, где компания не определена"><strong>${fmtNum(unmatched)}</strong><span>Компания не определена</span><small>Нажмите, чтобы открыть список</small></button>
+    <button type="button" class="insight quality-clickable ${noDeadline ? 'warning' : ''}" data-quality="no-deadline" title="Показать задачи без дедлайна"><strong>${fmtNum(noDeadline)}</strong><span>Без дедлайна</span><small>Нажмите, чтобы открыть список</small></button>
+    <button type="button" class="insight quality-clickable" data-quality="older90" title="Показать задачи в работе 90+ дней"><strong>${fmtNum(older90)}</strong><span>В работе 90+ дней</span><small>Нажмите, чтобы открыть список</small></button>
+    <button type="button" class="insight quality-clickable" data-quality="older180" title="Показать задачи в работе 180+ дней"><strong>${fmtNum(older180)}</strong><span>В работе 180+ дней</span><small>Нажмите, чтобы открыть список</small></button>`;
+}
+
+function qualityRows(kind) {
+  if (kind === 'unmatched') return state.filtered.filter((r) => !r.companyId);
+  if (kind === 'no-deadline') return state.filtered.filter((r) => !r.deadline);
+  if (kind === 'older90') return state.filtered.filter((r) => Number(r.ageDays || 0) >= 90);
+  if (kind === 'older180') return state.filtered.filter((r) => Number(r.ageDays || 0) >= 180);
+  return [];
+}
+
+function qualityTitle(kind) {
+  return ({
+    unmatched: 'Компания не определена',
+    'no-deadline': 'Задачи без дедлайна',
+    older90: 'В работе 90+ дней',
+    older180: 'В работе 180+ дней',
+  })[kind] || 'Контроль качества базы';
+}
+
+function showQualityDetails(kind) {
+  const rows = qualityRows(kind).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+  els.qualityTitle.textContent = qualityTitle(kind);
+  els.qualitySummary.textContent = `${fmtNum(rows.length)} задач · период создания: ${currentPeriodText()}`;
+  els.qualityContent.innerHTML = rows.length ? `
+    <div class="quality-table-wrap">
+      <table class="docs-table quality-table">
+        <thead><tr><th>Компания</th><th>Документ / задача</th><th>Стадия</th><th>Создан</th><th>Дедлайн</th><th>Эксперт</th><th></th></tr></thead>
+        <tbody>${rows.map((row) => `
+          <tr>
+            <td>${row.companyId ? escapeHtml(row.companyName) : '<span class="quality-missing">Не определена</span>'}</td>
+            <td class="doc-title">${escapeHtml(row.title)}</td>
+            <td><span class="stage-chip">${escapeHtml(row.stageName)}</span></td>
+            <td>${fmtDate(row.createdAt)}</td>
+            <td>${row.deadline ? fmtDate(row.deadline) : '<span class="quality-missing">Нет</span>'}</td>
+            <td>${escapeHtml(row.expert)}</td>
+            <td><button class="link-btn quality-open-task" data-url="${escapeHtml(row.taskUrl)}">Открыть задачу</button></td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>` : '<div class="empty-state">Здесь всё в порядке — задач нет.</div>';
+  els.qualityDialog.showModal();
+  try { BX24.fitWindow && BX24.fitWindow(); } catch (_) {}
 }
 
 function renderAll() {
@@ -390,6 +431,22 @@ function bindEvents() {
     renderCompanies();
     try { BX24.fitWindow && BX24.fitWindow(); } catch (_) {}
   });
+  els.quality.addEventListener('click', (event) => {
+    const card = event.target.closest('[data-quality]');
+    if (card) showQualityDetails(card.dataset.quality);
+  });
+  els.qualityContent.addEventListener('click', (event) => {
+    const openButton = event.target.closest('.quality-open-task');
+    if (!openButton) return;
+    const url = openButton.dataset.url;
+    try {
+      const parsed = new URL(url);
+      if (BX24.openPath) return BX24.openPath(parsed.pathname);
+    } catch (_) {}
+    window.open(url, '_blank', 'noopener');
+  });
+  els.qualityClose.addEventListener('click', () => els.qualityDialog.close());
+  els.qualityDialog.addEventListener('click', (event) => { if (event.target === els.qualityDialog) els.qualityDialog.close(); });
   els.historyClose.addEventListener('click', () => els.historyDialog.close());
   els.historyDialog.addEventListener('click', (event) => { if (event.target === els.historyDialog) els.historyDialog.close(); });
 }
@@ -403,6 +460,7 @@ async function boot() {
     kpiTotal: qs('kpi-total'), kpiOverdue: qs('kpi-overdue'), kpiEmail: qs('kpi-email'), kpiCall: qs('kpi-call'), kpiCompanies: qs('kpi-companies'), kpiOverdueShare: qs('kpi-overdue-share'),
     stageBars: qs('stage-bars'), topCompanies: qs('top-companies'), expertBars: qs('expert-bars'), quality: qs('quality-insights'),
     companies: qs('companies-list'), companySummary: qs('company-summary'),
+    qualityDialog: qs('quality-dialog'), qualityTitle: qs('quality-title'), qualitySummary: qs('quality-summary'), qualityContent: qs('quality-content'), qualityClose: qs('quality-close'),
     historyDialog: qs('history-dialog'), historyTitle: qs('history-title'), historyLoading: qs('history-loading'), historyContent: qs('history-content'), historyClose: qs('history-close'),
   });
   populateStaticFilters();

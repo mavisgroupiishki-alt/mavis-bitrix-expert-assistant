@@ -128,3 +128,27 @@ h1 { font-size: 34px; margin: 5px 0 4px; letter-spacing: -.03em; }
   .search-wide { grid-column: span 2; }
   .analytics-grid, .analytics-grid-small { grid-template-columns: 1fr; }
 }
+
+
+/* v111: кликабельный контроль качества базы */
+.quality-clickable {
+  width: 100%;
+  border: 1px solid #dfe6f0;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+.quality-clickable:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 25px rgba(31, 64, 120, .12);
+  border-color: #8fb6ff;
+}
+.quality-clickable:focus-visible { outline: 3px solid rgba(47, 128, 237, .25); outline-offset: 2px; }
+.quality-clickable small { display:block; margin-top:8px; color:#70809c; font-size:12px; font-weight:600; }
+.quality-dialog { width:min(1180px, 96vw); max-width:none; }
+.quality-dialog-summary { margin:-4px 0 16px; color:#687895; font-size:14px; }
+.quality-table-wrap { overflow:auto; max-height:66vh; border:1px solid #e5ebf3; border-radius:14px; }
+.quality-table { min-width:980px; }
+.quality-table thead th { position:sticky; top:0; background:#f6f9fd; z-index:2; }
+.quality-missing { color:#d83d53; font-weight:800; }
