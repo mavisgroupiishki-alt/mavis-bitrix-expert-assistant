@@ -10637,7 +10637,7 @@ async function docReturnShouldManageHistoricalEmailTask(task) {
 
   // Старые задачи, которые уже реально вошли в НАШ цикл и имеют наши комментарии,
   // продолжаем вести до письма №2 / Звонка.
-  const comments = await docReturnReadTaskComments(taskId);
+  const comments = await docReturnReadTaskComments({ taskId, task });
   const joined = comments.join('\n');
   if (
     joined.includes(DOC_RETURN_COMMENT_1) ||
@@ -10777,17 +10777,41 @@ async function docReturnLoadSendContext(basic) {
   };
 }
 
-async function docReturnReadTaskComments(taskId) {
-  const rows = await docReturnGetTaskCommentRows(taskId);
-  return rows.map((c) =>
+async function docReturnReadTaskComments(taskOrBasic) {
+  // v109: Bitrix24 может показывать комментарии задачи в правом чате, но
+  // task.commentitem.getlist их не всегда возвращает. Из-за этого старый код
+  // "не видел" собственный комментарий об уже отправленном напоминании и
+  // мог повторно отправить письмо №1. Теперь читаем ОБА источника.
+  let basic;
+  if (taskOrBasic && typeof taskOrBasic === 'object' && taskOrBasic.taskId) {
+    basic = taskOrBasic;
+  } else {
+    const taskId = String(taskOrBasic || '').trim();
+    const task = await docReturnLoadTask(taskId);
+    basic = { taskId, task };
+  }
+
+  const rows = await docReturnGetTaskCommentRows(basic.taskId);
+  const classic = rows.map((c) =>
     String(
       c && (
         c.POST_MESSAGE || c.postMessage ||
         c.MESSAGE || c.message ||
         c.TEXT || c.text || ''
       )
-    )
+    ).trim()
   ).filter(Boolean);
+
+  const chat = await docReturnGetTaskChatTexts(basic);
+  const merged = [...new Set([...classic, ...(chat || [])].map((x) => String(x || '').trim()).filter(Boolean))];
+
+  if (chat && chat.length) {
+    console.log(
+      `[doc-return] DEDUPE READ task=${basic.taskId}: classic=${classic.length}; chat=${chat.length}; merged=${merged.length}`
+    );
+  }
+
+  return merged;
 }
 
 function docReturnEmailFromReminderComment(comment) {
@@ -10821,7 +10845,7 @@ function docReturnReminderCommentStatus(comments, markerText) {
 }
 
 async function docReturnReadState(basic) {
-  const taskComments = await docReturnReadTaskComments(basic.taskId);
+  const taskComments = await docReturnReadTaskComments(basic);
 
   const firstStatus = docReturnReminderCommentStatus(taskComments, DOC_RETURN_COMMENT_1);
   const secondStatus = docReturnReminderCommentStatus(taskComments, DOC_RETURN_COMMENT_2);
@@ -11304,6 +11328,21 @@ async function docReturnSendReminder(basic, sequence) {
   let freshBasic = await docReturnLoadBasicContext(basic.taskId, freshTask);
   let freshState = await docReturnReadState(freshBasic);
 
+  // v109 HARD DEDUPE: после успешного письма мы всегда ставим новый срок +14 дней.
+  // Даже если Bitrix временно не отдал комментарий/чат, письмо №1 нельзя отправлять
+  // повторно при будущем дедлайне. Это независимый второй предохранитель.
+  if (sequence === 1 && !docReturnIsDeadlineExpired(freshTask)) {
+    console.warn(
+      `[doc-return] DUPLICATE BLOCK task=${freshBasic.taskId}: reminder #1 blocked because deadline is still in future (${docReturnTaskValue(freshTask, ['deadline', 'DEADLINE']) || 'n/a'}).`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      taskId: freshBasic.taskId,
+      reason: 'reminder-1-future-deadline-hard-dedupe',
+    };
+  }
+
   if (sequence === 1 && freshState.first) {
     return {
       ok: true,
@@ -11341,6 +11380,18 @@ async function docReturnSendReminder(basic, sequence) {
   freshTask = await docReturnLoadTask(basic.taskId);
   freshBasic = await docReturnLoadBasicContext(basic.taskId, freshTask);
   freshState = await docReturnReadState(freshBasic);
+
+  if (sequence === 1 && !docReturnIsDeadlineExpired(freshTask)) {
+    console.warn(
+      `[doc-return] DUPLICATE BLOCK RECHECK task=${freshBasic.taskId}: reminder #1 blocked because deadline is still in future (${docReturnTaskValue(freshTask, ['deadline', 'DEADLINE']) || 'n/a'}).`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      taskId: freshBasic.taskId,
+      reason: 'reminder-1-future-deadline-hard-dedupe-recheck',
+    };
+  }
 
   if (sequence === 1 && freshState.first) {
     return {
@@ -11397,7 +11448,7 @@ async function docReturnSendReminder(basic, sequence) {
   console.log(
     `[doc-return] SENT #${sequence} task=${ctx.taskId}; deal=${ctx.dealId}; ` +
     `email=${docReturnMaskEmail(ctx.recipient.email)}; file=${ctx.downloaded && ctx.downloaded.fileName || 'NONE'}; ` +
-    `deadline=${nextDeadline}; dedupe=v108-attachment-window`
+    `deadline=${nextDeadline}; dedupe=v109-chat-dedupe-deadline-guard`
   );
 
   return {
@@ -11564,6 +11615,24 @@ async function docReturnProcessTask(taskId, trigger = 'poll') {
 
     let basic = await docReturnLoadBasicContext(taskId, currentTask);
     const state = await docReturnReadState(basic);
+
+    // v109: жёсткая страховка от повторного письма №1.
+    // Если задача уже стоит в «Эл. Почта» и её дедлайн в будущем, значит текущий
+    // цикл контроля ещё не наступил. НИЧЕГО не отправляем, даже если API Bitrix
+    // по какой-то причине не вернул предыдущий комментарий.
+    if (!state.first && !docReturnIsDeadlineExpired(currentTask)) {
+      console.warn(
+        `[doc-return] DUPLICATE SAFETY HOLD task=${taskId}: no readable reminder marker, ` +
+        `but deadline is in future (${docReturnTaskValue(currentTask, ['deadline', 'DEADLINE']) || 'n/a'}). No email sent.`
+      );
+      return {
+        ok: true,
+        skipped: true,
+        taskId,
+        reason: 'future-deadline-without-readable-marker',
+        deadline: docReturnTaskValue(currentTask, ['deadline', 'DEADLINE']) || '',
+      };
+    }
 
     // Старые комментарии v97/v98 без SMTP-подтверждения считаем сомнительными.
     // Не шлём повторно автоматически, чтобы не задублировать письмо клиенту.
@@ -11975,7 +12044,7 @@ registerDocReturnLocalApp({
 });
 
 console.log(
-  `[doc-return] v108 EMAIL_ONLY_ATTACHMENT_GUARD_TIME_WINDOW active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
+  `[doc-return] v109 EMAIL_ONLY_NO_DUPLICATES active: project=${DOC_RETURN_PROJECT_ID}; testTask=${DOC_RETURN_TEST_TASK_ID || 'none'}; ` +
   `poll=${DOC_RETURN_POLL_MINUTES}m; productionStart=${DOC_RETURN_PRODUCTION_START_ISO}; ` +
   `historical=${DOC_RETURN_INCLUDE_HISTORICAL}; ` +
   `allowWebhook=${DOC_RETURN_ALLOW_WEBHOOK}; maxActions=${DOC_RETURN_MAX_ACTIONS_PER_CYCLE}; ` +
