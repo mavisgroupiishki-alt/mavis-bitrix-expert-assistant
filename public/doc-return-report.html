@@ -22,77 +22,137 @@
       </div>
     </header>
 
-    <section class="filters-card">
-      <div class="filter-grid">
-        <label><span>Год создания</span><select id="year-filter"><option value="2026">2026</option><option value="all">Все годы</option></select></label>
-        <label><span>Месяц</span><select id="month-filter"><option value="all">Все месяцы</option></select></label>
-        <label><span>Дата от</span><input id="date-from" type="date" /></label>
-        <label><span>Дата до</span><input id="date-to" type="date" /></label>
-        <label><span>Компания</span><select id="company-filter"><option value="all">Все компании</option></select></label>
-        <label><span>Эксперт</span><select id="expert-filter"><option value="all">Все эксперты</option></select></label>
-        <label><span>Стадия</span><select id="stage-filter"><option value="all">Все стадии</option></select></label>
-        <label><span>Тип документа</span><select id="type-filter"><option value="all">Все типы</option></select></label>
-        <label><span>Просрочка</span><select id="overdue-filter"><option value="all">Все</option><option value="yes">Только просроченные</option><option value="no">Без просрочки</option></select></label>
-        <label class="search-wide"><span>Поиск</span><input id="search-filter" type="search" placeholder="Компания или документ" /></label>
-        <div class="filter-actions"><button id="reset-btn" class="btn btn-ghost">Сбросить фильтры</button></div>
+    <nav class="report-tabs" aria-label="Разделы отчёта">
+      <button class="report-tab active" data-tab="control">Контроль оригиналов</button>
+      <button class="report-tab" data-tab="mailing">Отчёт по рассылке</button>
+      <button class="report-tab" data-tab="returns">Возвраты / потенциальные</button>
+    </nav>
+
+    <section id="tab-control" class="tab-panel active">
+      <section class="filters-card">
+        <div class="filter-grid">
+          <label><span>Год создания</span><select id="year-filter"><option value="2026">2026</option><option value="all">Все годы</option></select></label>
+          <label><span>Месяц</span><select id="month-filter"><option value="all">Все месяцы</option></select></label>
+          <label><span>Дата от</span><input id="date-from" type="date" /></label>
+          <label><span>Дата до</span><input id="date-to" type="date" /></label>
+          <label><span>Компания</span><select id="company-filter"><option value="all">Все компании</option></select></label>
+          <label><span>Эксперт</span><select id="expert-filter"><option value="all">Все эксперты</option></select></label>
+          <label><span>Стадия</span><select id="stage-filter"><option value="all">Все стадии</option></select></label>
+          <label><span>Тип документа</span><select id="type-filter"><option value="all">Все типы</option></select></label>
+          <label><span>Просрочка</span><select id="overdue-filter"><option value="all">Все</option><option value="yes">Только просроченные</option><option value="no">Без просрочки</option></select></label>
+          <label class="search-wide"><span>Поиск</span><input id="search-filter" type="search" placeholder="Компания или документ" /></label>
+          <div class="filter-actions"><button id="reset-btn" class="btn btn-ghost">Сбросить фильтры</button></div>
+        </div>
+      </section>
+
+      <div id="loading-card" class="loading-card">
+        <div class="spinner"></div>
+        <div><strong>Загружаю данные из Bitrix24</strong><p>Если есть сохранённый снимок — отчёт появится сразу, актуализация продолжится в фоне.</p></div>
       </div>
+      <div id="error-card" class="error-card hidden"></div>
+
+      <main id="report-content" class="hidden">
+        <section class="kpi-grid kpi-grid-control">
+          <article class="kpi kpi-blue"><span>Ещё не отправлено клиенту</span><strong id="kpi-early">0</strong><small>стадии от «Новые» до «Отправлены» включительно</small></article>
+          <article class="kpi kpi-amber"><span>Отправлено, но не вернулось</span><strong id="kpi-control">0</strong><small>контроль после отправки</small></article>
+          <article class="kpi kpi-green"><span>Вернулось</span><strong id="kpi-returned">0</strong><small>«СКАН ЕСТЬ» + «Архив»</small></article>
+          <article class="kpi kpi-red"><span>Не вернулось после отправки</span><strong id="kpi-not-returned-share">0%</strong><small id="kpi-not-returned-count">0 документов</small></article>
+          <article class="kpi kpi-teal"><span>Вернулось от отправленных</span><strong id="kpi-returned-share">0%</strong><small id="kpi-sent-base">0 отправлено</small></article>
+          <article class="kpi kpi-purple"><span>Просрочено</span><strong id="kpi-overdue">0</strong><small id="kpi-overdue-share">0% от выборки</small></article>
+        </section>
+
+        <section class="secondary-kpis">
+          <div class="mini-kpi"><span>Эл. Почта</span><strong id="kpi-email">0</strong></div>
+          <div class="mini-kpi"><span>Звонок</span><strong id="kpi-call">0</strong></div>
+          <div class="mini-kpi"><span>Компаний</span><strong id="kpi-companies">0</strong></div>
+        </section>
+
+        <section class="panel dynamics-panel">
+          <div class="panel-title-row">
+            <div><h2>Динамика возврата по месяцам</h2><p>Сколько отправили, сколько вернулось и сколько оставалось невозвращённым на конец каждого месяца</p></div>
+            <button id="history-refresh-btn" class="btn btn-light btn-small">Обновить динамику</button>
+          </div>
+          <div id="history-status" class="subtle-status"></div>
+          <div id="history-months" class="month-dynamics"><div class="empty-state">История рассчитывается отдельно и не блокирует открытие отчёта.</div></div>
+        </section>
+
+        <section class="analytics-grid">
+          <article class="panel">
+            <div class="panel-title-row"><div><h2>Распределение по стадиям</h2><p>Где сейчас находятся документы</p></div></div>
+            <div id="stage-bars" class="bars"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-title-row"><div><h2>TOP-10 компаний</h2><p>По количеству документов в текущей выборке</p></div></div>
+            <div id="top-companies" class="bars"></div>
+          </article>
+        </section>
+
+        <section class="analytics-grid analytics-grid-small">
+          <article class="panel">
+            <div class="panel-title-row"><div><h2>По экспертам</h2><p>Текущий остаток документов</p></div></div>
+            <div id="expert-bars" class="bars"></div>
+          </article>
+          <article class="panel insight-panel">
+            <div class="panel-title-row"><div><h2>Контроль качества базы</h2><p>Карточки кликабельны — открывают конкретные задачи</p></div></div>
+            <div id="quality-insights" class="insights"></div>
+          </article>
+        </section>
+
+        <section class="panel companies-panel">
+          <div class="panel-title-row companies-heading">
+            <div><h2>Компании и документы</h2><p>Нажмите на компанию — раскроется список документов. В строке документа можно исправить компанию, эксперта и статью услуги.</p></div>
+            <div class="company-summary" id="company-summary"></div>
+          </div>
+          <div class="company-head">
+            <div>Компания</div><div>Эксперт</div><div>Документов</div><div>Просрочено</div><div>Эл. Почта</div><div>Звонок</div><div>Самый старый</div>
+          </div>
+          <div id="companies-list" class="companies-list"></div>
+        </section>
+      </main>
     </section>
 
-    <div id="loading-card" class="loading-card">
-      <div class="spinner"></div>
-      <div><strong>Загружаю данные из Bitrix24</strong><p>Первое открытие может занять несколько секунд. Дальше фильтры работают мгновенно.</p></div>
-    </div>
-
-    <div id="error-card" class="error-card hidden"></div>
-
-    <main id="report-content" class="hidden">
-      <section class="kpi-grid">
-        <article class="kpi kpi-blue"><span>Не вернулось</span><strong id="kpi-total">0</strong><small>все стадии, кроме «Архив»</small></article>
-        <article class="kpi kpi-red"><span>Просрочено</span><strong id="kpi-overdue">0</strong><small id="kpi-overdue-share">0% от остатка</small></article>
-        <article class="kpi kpi-amber"><span>Эл. Почта</span><strong id="kpi-email">0</strong><small>текущая стадия</small></article>
-        <article class="kpi kpi-purple"><span>Звонок</span><strong id="kpi-call">0</strong><small>текущая стадия</small></article>
-        <article class="kpi kpi-green"><span>Компаний</span><strong id="kpi-companies">0</strong><small>уникальных в выборке</small></article>
-      </section>
-
-      <section class="analytics-grid">
-        <article class="panel">
-          <div class="panel-title-row"><div><h2>Распределение по стадиям</h2><p>Где сейчас находятся невозвращённые документы</p></div></div>
-          <div id="stage-bars" class="bars"></div>
-        </article>
-        <article class="panel">
-          <div class="panel-title-row"><div><h2>TOP-10 компаний</h2><p>По количеству невозвращённых оригиналов</p></div></div>
-          <div id="top-companies" class="bars"></div>
-        </article>
-      </section>
-
-      <section class="analytics-grid analytics-grid-small">
-        <article class="panel">
-          <div class="panel-title-row"><div><h2>По экспертам</h2><p>Текущий остаток документов</p></div></div>
-          <div id="expert-bars" class="bars"></div>
-        </article>
-        <article class="panel insight-panel">
-          <div class="panel-title-row"><div><h2>Контроль качества базы</h2><p>Что требует внимания</p></div></div>
-          <div id="quality-insights" class="insights"></div>
-        </article>
-      </section>
-
-      <section class="panel companies-panel">
-        <div class="panel-title-row companies-heading">
-          <div><h2>Компании с невозвращёнными оригиналами</h2><p>Нажмите на компанию — раскроется список её документов</p></div>
-          <div class="company-summary" id="company-summary"></div>
+    <section id="tab-mailing" class="tab-panel">
+      <section class="mailing-toolbar panel compact-panel">
+        <div>
+          <h2>Отчёт по рассылке</h2>
+          <p>Все показатели считаются от фактически отправленных документов. Категорию ответа и статью услуги можно менять вручную.</p>
         </div>
-        <div class="company-head">
-          <div>Компания</div><div>Эксперт</div><div>Не вернулось</div><div>Просрочено</div><div>Эл. Почта</div><div>Звонок</div><div>Самый старый</div>
+        <div class="toolbar-actions">
+          <label><span>Год</span><select id="mailing-year"><option value="2026">2026</option><option value="all">Все годы</option></select></label>
+          <label><span>Месяц</span><select id="mailing-month"><option value="all">Все месяцы</option></select></label>
+          <label><span>Категория</span><select id="mailing-category"><option value="all">Все категории</option></select></label>
+          <button id="mailing-add-btn" class="btn btn-primary">+ Добавить ответ</button>
+          <button id="mailing-refresh-btn" class="btn btn-light">Пересчитать рассылку</button>
         </div>
-        <div id="companies-list" class="companies-list"></div>
       </section>
-    </main>
+      <div id="mailing-status" class="subtle-status"></div>
+      <section id="mailing-kpis" class="mailing-kpis"></section>
+      <section class="panel">
+        <div class="panel-title-row"><div><h2>Разбивка по месяцам</h2><p>Отправленные письма, ответы и категории ответов</p></div></div>
+        <div id="mailing-monthly" class="table-scroll"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title-row"><div><h2>Все ответы клиентов</h2><p>Таблица редактируется почти как Google Sheets: меняйте поля прямо в строке и нажимайте «Сохранить».</p></div></div>
+        <div id="responses-table" class="table-scroll"></div>
+      </section>
+    </section>
+
+    <section id="tab-returns" class="tab-panel">
+      <section class="panel compact-panel">
+        <div class="panel-title-row">
+          <div><h2>Возвраты / потенциальные возвраты</h2><p>Отдельный список всех финансово или управленчески проблемных случаев для ручного разбора.</p></div>
+        </div>
+      </section>
+      <div id="returns-summary" class="secondary-kpis"></div>
+      <section class="panel">
+        <div id="returns-table" class="table-scroll"></div>
+      </section>
+    </section>
   </div>
 
-
   <dialog id="quality-dialog" class="history-dialog quality-dialog">
-    <div class="dialog-head"><div><div class="eyebrow">Контроль качества базы</div><h2 id="quality-title">Список задач</h2></div><button id="quality-close" class="icon-btn">×</button></div>
-    <div id="quality-summary" class="quality-dialog-summary"></div>
+    <div class="dialog-head"><div><div class="eyebrow">Контроль качества базы</div><h2 id="quality-title">Проблемные записи</h2></div><button id="quality-close" class="icon-btn">×</button></div>
+    <div id="quality-meta" class="dialog-meta"></div>
     <div id="quality-content"></div>
   </dialog>
 
@@ -100,6 +160,36 @@
     <div class="dialog-head"><div><div class="eyebrow">История задачи</div><h2 id="history-title">История стадий</h2></div><button id="history-close" class="icon-btn">×</button></div>
     <div id="history-loading" class="dialog-loading">Загрузка истории…</div>
     <div id="history-content"></div>
+  </dialog>
+
+  <dialog id="task-edit-dialog" class="history-dialog edit-dialog">
+    <div class="dialog-head"><div><div class="eyebrow">Ручная правка</div><h2 id="task-edit-title">Редактировать документ</h2></div><button id="task-edit-close" class="icon-btn">×</button></div>
+    <div class="edit-form-grid">
+      <label class="span-2"><span>Компания</span><input id="task-company-search" type="search" placeholder="Начните вводить название компании" autocomplete="off" /><input id="task-company-id" type="hidden" /></label>
+      <div id="task-company-suggestions" class="company-suggestions span-2"></div>
+      <label><span>Эксперт</span><input id="task-expert" type="text" /></label>
+      <label><span>Статья услуги</span><input id="task-service" type="text" placeholder="Например: СПК" /></label>
+      <label class="span-2"><span>Заметка в отчёте</span><textarea id="task-note" rows="3"></textarea></label>
+      <label><span>Статус возвратного случая</span><input id="task-return-status" type="text" placeholder="Например: потенциальный возврат" /></label>
+      <label><span>Разбор возврата</span><textarea id="task-return-analysis" rows="3"></textarea></label>
+    </div>
+    <div class="dialog-actions"><button id="task-edit-save" class="btn btn-primary">Сохранить</button></div>
+  </dialog>
+
+  <dialog id="response-add-dialog" class="history-dialog edit-dialog">
+    <div class="dialog-head"><div><div class="eyebrow">Отчёт по рассылке</div><h2>Добавить ответ клиента</h2></div><button id="response-add-close" class="icon-btn">×</button></div>
+    <div class="edit-form-grid">
+      <label><span>Дата ответа</span><input id="response-add-date" type="date" /></label>
+      <label><span>ID задачи (необязательно)</span><input id="response-add-task" type="text" inputmode="numeric" /></label>
+      <label><span>Компания</span><input id="response-add-company" type="text" /></label>
+      <label><span>Документ</span><input id="response-add-document" type="text" /></label>
+      <label><span>Категория</span><select id="response-add-category"></select></label>
+      <label><span>Статья услуги</span><input id="response-add-service" type="text" /></label>
+      <label class="span-2"><span>Уточнение</span><input id="response-add-detail" type="text" /></label>
+      <label class="span-2"><span>Комментарий клиента</span><textarea id="response-add-comment" rows="4"></textarea></label>
+      <label><span>Статус</span><input id="response-add-status" type="text" value="Новый" /></label>
+    </div>
+    <div class="dialog-actions"><button id="response-add-save" class="btn btn-primary">Добавить</button></div>
   </dialog>
 
   <script src="/doc-return-report.js"></script>

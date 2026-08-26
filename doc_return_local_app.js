@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v112 FAST_CACHE';
+  const VERSION = 'v113 FULL_REPORT_EDITABLE';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -257,10 +257,29 @@ function registerDocReturnLocalApp({
     return [...byId.values()];
   }
 
-  function extractDealId(task) {
-    if (typeof actsExtractDealIdsFromTask === 'function') { try { const ids = actsExtractDealIdsFromTask(task) || []; if (ids.length) return String(ids[0]); } catch (_) {} }
+  function extractCrmBindings(task) {
     const raw = taskField(task, ['ufCrmTask','UF_CRM_TASK','uf_crm_task','crm','CRM']);
-    const text = Array.isArray(raw) ? raw.join(' ') : JSON.stringify(raw || ''); const match = String(text).match(/D[_:]?(\d+)/i); return match ? match[1] : '';
+    const text = Array.isArray(raw) ? raw.join(' ') : JSON.stringify(raw || '');
+    const dealMatch = String(text).match(/(?:^|[^A-Z])D[_:]?(\d+)/i);
+    // В задачах Bitrix компания в «Элементах CRM» обычно хранится как CO_12345.
+    // Важно: C_ — это контакт, поэтому его намеренно не считаем компанией.
+    const companyMatch = String(text).match(/(?:^|[^A-Z])CO[_:]?(\d+)/i) || String(text).match(/COMPANY[_:]?(\d+)/i);
+    return {
+      dealId: dealMatch ? dealMatch[1] : '',
+      companyId: companyMatch ? companyMatch[1] : '',
+    };
+  }
+  function extractDealId(task) {
+    if (typeof actsExtractDealIdsFromTask === 'function') {
+      try {
+        const ids = actsExtractDealIdsFromTask(task) || [];
+        if (ids.length) return String(ids[0]);
+      } catch (_) {}
+    }
+    return extractCrmBindings(task).dealId;
+  }
+  function extractDirectCompanyId(task) {
+    return extractCrmBindings(task).companyId;
   }
   async function loadDeals(dealIds) {
     const unique = [...new Set(dealIds.map(String).filter(Boolean))]; const lists = await mapLimit(chunk(unique, 50), 5, (ids) => bitrixRestList('crm.deal.list', { order: { DATE_MODIFY: 'DESC' }, filter: { '@ID': ids }, select: ['ID','TITLE','COMPANY_ID','ASSIGNED_BY_ID','DATE_MODIFY'] }, 500));
@@ -337,8 +356,19 @@ function registerDocReturnLocalApp({
     if(reportCache.promise) return reportCache.promise;
     reportCache.promise=(async()=>{
       const started=Date.now(); const [stages,storage]=await Promise.all([loadStages(),loadStorageRecords(force)]); const stageMap=new Map(stages.map(s=>[String(s.id),s])); const tasks=await loadReportTasks(stages);
-      const dealIdByTask=new Map();const dealIds=[];for(const task of tasks){const tid=String(taskField(task,['id','ID'])||'');const did=extractDealId(task);if(tid&&did)dealIdByTask.set(tid,did);if(did)dealIds.push(did);} const dealsById=await loadDeals(dealIds);
-      const companyIds=[];for(const d of dealsById.values()){const id=String(d.COMPANY_ID||d.companyId||'');if(id&&id!=='0')companyIds.push(id);}for(const id of MANUAL_COMPANY_BY_TASK.values())companyIds.push(id);
+      const dealIdByTask=new Map();const directCompanyIdByTask=new Map();const dealIds=[];
+      for(const task of tasks){
+        const tid=String(taskField(task,['id','ID'])||'');
+        const did=extractDealId(task);
+        const directCompanyId=extractDirectCompanyId(task);
+        if(tid&&did)dealIdByTask.set(tid,did);
+        if(tid&&directCompanyId)directCompanyIdByTask.set(tid,directCompanyId);
+        if(did)dealIds.push(did);
+      }
+      const dealsById=await loadDeals(dealIds);
+      const companyIds=[];
+      for(const id of directCompanyIdByTask.values())companyIds.push(id);
+      for(const d of dealsById.values()){const id=String(d.COMPANY_ID||d.companyId||'');if(id&&id!=='0')companyIds.push(id);}for(const id of MANUAL_COMPANY_BY_TASK.values())companyIds.push(id);
       for(const rec of storage.values()){if(rec.kind==='taskOverride'&&rec.data&&rec.data.companyId)companyIds.push(String(rec.data.companyId));}
       const companyMap=await loadCompaniesByIds(companyIds);
       const nameOverrides=[...new Set([...MANUAL_COMPANY_NAME_BY_TASK.values()])];const nameCompanies=await mapLimit(nameOverrides,8,async(name)=>[name,await resolveManualCompanyName(name)]);const manualNameCompany=new Map();for(const [name,c] of nameCompanies){manualNameCompany.set(name,c);if(c&&c.id)companyMap.set(c.id,c);}
@@ -349,8 +379,10 @@ function registerDocReturnLocalApp({
         const dealId=dealIdByTask.get(taskId)||'';const deal=dealId?dealsById.get(dealId):null;const overrideRec=storage.get(`taskOverride:${taskId}`);const override=(overrideRec&&overrideRec.data)||{};
         let company=null;let companySource='Не определено';
         if(override.companyId){company=companyMap.get(String(override.companyId))||{id:String(override.companyId),title:clean(override.companyName||`Компания ${override.companyId}`),assignedById:''};companySource='Ручная правка в отчёте';}
+        const directCompanyId=directCompanyIdByTask.get(taskId)||'';
+        if(!company&&directCompanyId){company=companyMap.get(String(directCompanyId))||null;if(company)companySource='Компания из элементов CRM задачи';}
         const manualId=MANUAL_COMPANY_BY_TASK.get(taskId);if(!company&&manualId){company=companyMap.get(String(manualId))||null;if(company)companySource='Ручное соответствие';}
-        if(!company&&deal){const cid=String(deal.COMPANY_ID||deal.companyId||'');if(cid&&cid!=='0'){company=companyMap.get(cid)||null;if(company)companySource='CRM-связь';}}
+        if(!company&&deal){const cid=String(deal.COMPANY_ID||deal.companyId||'');if(cid&&cid!=='0'){company=companyMap.get(cid)||null;if(company)companySource='CRM-связь сделки';}}
         if(!company){const manualName=MANUAL_COMPANY_NAME_BY_TASK.get(taskId);if(manualName){company=manualNameCompany.get(manualName)||null;if(company)companySource='Ручное название';}}
         if(!company){company=fallbackMatchCompanyByTitle(title,companyMap);if(company)companySource='Название задачи';}
         const latest=company&&latestDealByCompany.get(String(company.id));const latestDeal=latest&&latest.deal;
