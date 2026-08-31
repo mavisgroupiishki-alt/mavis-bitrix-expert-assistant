@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v121 ACTIVE_PRODUCTION_FOLLOWUP';
+  const VERSION = 'v123 ACTIVE_PRODUCTION_NAME_MATCH';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -673,11 +673,28 @@ function registerDocReturnLocalApp({
     if (activeProductionCache.promise) return activeProductionCache.promise;
     activeProductionCache.promise = (async()=>{
       const report = reportCache.data || await getReportFast(false);
+      // Все уже отправленные и пока не вернувшиеся документы. В быстром core-отчёте у части
+      // задач нет прямого COMPANY_ID, хотя есть связанная CRM-сделка. Раньше такие строки
+      // отбрасывались целиком, из-за чего вкладка сильно занижала количество компаний.
       const candidateRows = (report.rows || []).filter((r) => {
         const id = String(r.stageId || '');
         return id === STAGES.sent || r.stageGroup === 'control';
-      }).filter((r)=>r.companyId);
-      const companyIds = [...new Set(candidateRows.map(r=>String(r.companyId)).filter(Boolean))];
+      }).map((r)=>({...r}));
+
+      // Довосстанавливаем компанию через связанную CRM-сделку только для тех строк,
+      // где прямой companyId отсутствует. Это лёгкий точечный запрос, не полный тяжёлый buildReport.
+      const missingDealIds = [...new Set(candidateRows.filter(r=>!r.companyId && r.dealId).map(r=>String(r.dealId)).filter(Boolean))];
+      if (missingDealIds.length) {
+        const linkedDeals = await loadDeals(missingDealIds);
+        for (const row of candidateRows) {
+          if (row.companyId || !row.dealId) continue;
+          const d = linkedDeals.get(String(row.dealId));
+          const cid = d ? String(d.COMPANY_ID || d.companyId || '') : '';
+          if (cid && cid !== '0') row.companyId = cid;
+        }
+      }
+
+      const companyIds = [...new Set(candidateRows.map(r=>String(r.companyId||'')).filter(Boolean))];
       if (!companyIds.length) { activeProductionCache.rows=[]; activeProductionCache.at=Date.now(); return []; }
 
       // Берём активное Производство одним пагинируемым запросом. Это надёжнее, чем большой @COMPANY_ID,
@@ -690,19 +707,46 @@ function registerDocReturnLocalApp({
       const prodStages = Array.isArray(prodStagesRaw) ? prodStagesRaw : (prodStagesRaw && typeof prodStagesRaw==='object' ? Object.values(prodStagesRaw) : []);
       const prodStageMap = new Map(prodStages.map(x=>[String(x.STATUS_ID||x.statusId||x.ID||x.id||''), clean(x.NAME||x.name||x.TITLE||x.title||'')]).filter(x=>x[0]));
       const activeByCompany = new Map();
+      const activeItems = [];
       const userIds=[];
       for (const d of deals || []) {
-        const cid=String(d.COMPANY_ID||d.companyId||''); if(!cid||cid==='0') continue;
-        const item={id:String(d.ID||d.id||''),title:clean(d.TITLE||d.title||''),stageId:String(d.STAGE_ID||d.stageId||''),stageName:prodStageMap.get(String(d.STAGE_ID||d.stageId||''))||String(d.STAGE_ID||d.stageId||''),assignedById:String(d.ASSIGNED_BY_ID||d.assignedById||''),modifiedAt:asIso(d.DATE_MODIFY||d.dateModify||'')};
+        const cid=String(d.COMPANY_ID||d.companyId||'');
+        const item={id:String(d.ID||d.id||''),title:clean(d.TITLE||d.title||''),titleNorm:normalize(d.TITLE||d.title||''),companyId:(cid&&cid!=='0')?cid:'',stageId:String(d.STAGE_ID||d.stageId||''),stageName:prodStageMap.get(String(d.STAGE_ID||d.stageId||''))||String(d.STAGE_ID||d.stageId||''),assignedById:String(d.ASSIGNED_BY_ID||d.assignedById||''),modifiedAt:asIso(d.DATE_MODIFY||d.dateModify||'')};
         if(item.assignedById)userIds.push(item.assignedById);
-        if(!activeByCompany.has(cid))activeByCompany.set(cid,[]); activeByCompany.get(cid).push(item);
+        activeItems.push(item);
+        if(item.companyId){ if(!activeByCompany.has(item.companyId))activeByCompany.set(item.companyId,[]); activeByCompany.get(item.companyId).push(item); }
       }
       const users=await loadUsers(userIds);
+
+      // v123: кроме CRM-связки сопоставляем ещё и ПО НАЗВАНИЮ.
+      // Это нужно для старых/ручных задач «Акты Счета», где CRM-компания или сделка не привязаны,
+      // но название компании есть в самой задаче/отчёте, а в активной сделке Производства — в TITLE.
+      // Сначала всегда приоритет точной связке COMPANY_ID. По названию идём только если по ID ничего не найдено.
+      function findActiveByName(row){
+        const companyNorm=normalize(row.companyName||'');
+        const taskNorm=normalize(row.title||'');
+        if(!companyNorm && !taskNorm) return [];
+        return activeItems.filter((d)=>{
+          const dealNorm=d.titleNorm||'';
+          if(!dealNorm) return false;
+          // Наиболее надёжный вариант: название компании из отчёта входит в название активной сделки
+          // или наоборот (например «БелСтрой, ООО» ↔ «БелСтрой — СПК»).
+          if(companyNorm && companyNorm.length>=4 && (dealNorm.includes(companyNorm)||companyNorm.includes(dealNorm))) return true;
+          // Запасной вариант для задач, где companyName пустой, но название компании есть в TITLE задачи.
+          // Требуем достаточно длинное совпадение, чтобы не ловить случайные короткие слова.
+          if(taskNorm && dealNorm.length>=6 && taskNorm.includes(dealNorm)) return true;
+          return false;
+        });
+      }
+
       const rows=[];
       for(const r of candidateRows){
-        const active=activeByCompany.get(String(r.companyId))||[]; if(!active.length) continue;
+        let active=activeByCompany.get(String(r.companyId))||[];
+        let matchType='company_id';
+        if(!active.length){ active=findActiveByName(r); matchType=active.length?'name':''; }
+        if(!active.length) continue;
         const primary=active[0];
-        rows.push({...r,activeDeals:active.map(d=>({...d,assignedBy:users.get(d.assignedById)||`ID ${d.assignedById||'—'}`})),productionDealId:primary.id,productionDealTitle:primary.title,productionStageId:primary.stageId,productionStageName:primary.stageName,productionAssignedBy:users.get(primary.assignedById)||`ID ${primary.assignedById||'—'}`,productionDealsCount:active.length});
+        rows.push({...r,activeProductionMatchType:matchType,activeDeals:active.map(d=>({...d,assignedBy:users.get(d.assignedById)||`ID ${d.assignedById||'—'}`})),productionDealId:primary.id,productionDealTitle:primary.title,productionStageId:primary.stageId,productionStageName:primary.stageName,productionAssignedBy:users.get(primary.assignedById)||`ID ${primary.assignedById||'—'}`,productionDealsCount:active.length});
       }
       activeProductionCache.rows=rows;activeProductionCache.at=Date.now();return rows;
     })().finally(()=>{activeProductionCache.promise=null;});

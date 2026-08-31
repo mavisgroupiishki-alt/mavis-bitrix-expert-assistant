@@ -698,7 +698,7 @@ async function activeProductionTableClick(event) {
 async function loadActiveProduction(force=false) {
   if(state.activeProduction.loading)return;state.activeProduction.loading=true;
   const status=qs('active-production-status');status.textContent=force?'Обновляю список…':'Загружаю активные сделки Производства…';
-  try{const data=await apiFetch(`/api/doc-return-report/active-production${force?'?force=1':''}`);state.activeProduction.rows=Array.isArray(data.rows)?data.rows:[];state.activeProduction.loaded=true;populateActiveProductionFilters();applyActiveProductionFilters();status.textContent=`Готово: ${fmtNum(state.activeProduction.rows.length)} невозвращённых документов у компаний с активным Производством.`;}catch(e){status.textContent=`Ошибка: ${e.message||e}`;}finally{state.activeProduction.loading=false;}
+  try{const data=await apiFetch(`/api/doc-return-report/active-production${force?'?force=1':''}`);state.activeProduction.rows=Array.isArray(data.rows)?data.rows:[];state.activeProduction.loaded=true;populateActiveProductionFilters();applyActiveProductionFilters();status.textContent=`Готово: найдено ${fmtNum(state.activeProduction.rows.length)} невозвращённых документов у компаний с активным Производством. Ниже число может уменьшаться из-за выбранных фильтров.`;}catch(e){status.textContent=`Ошибка: ${e.message||e}`;}finally{state.activeProduction.loading=false;}
 }
 
 document.addEventListener('DOMContentLoaded', ensureActiveProductionUi);
