@@ -554,7 +554,18 @@ function bindEvents() {
   els.responseAddClose.addEventListener('click',()=>els.responseAddDialog.close());
   els.responseAddCategory.addEventListener('change',()=>{state.responseCategoryTouched=true;});
   els.responseAddComment.addEventListener('input',()=>{if(!state.responseCategoryTouched)els.responseAddCategory.value=inferResponseCategory(els.responseAddComment.value);});
-  els.responseAddSave.addEventListener('click',async()=>{const data={responseDate:els.responseAddDate.value||todayIso(),companyName:els.responseAddCompany.value.trim(),taskId:els.responseAddTask.value.trim(),documentTitle:els.responseAddDocument.value.trim(),category:els.responseAddCategory.value,serviceArticle:els.responseAddService.value.trim(),detail:els.responseAddDetail.value.trim(),comment:els.responseAddComment.value.trim(),status:els.responseAddStatus.value.trim()||'Новый',deleted:false,source:'Добавлено вручную'};if(!data.companyName&&!data.taskId){alert('Укажи компанию или ID задачи.');return;}const result=await apiFetch('/api/doc-return-report/record',{method:'POST',body:JSON.stringify({kind:'response',key:'',data})});state.mailing.responses.unshift({...data,id:result.key});els.responseAddDialog.close();renderMailing();});
+  els.responseAddSave.addEventListener('click',async()=>{
+    const data={responseDate:els.responseAddDate.value||todayIso(),companyName:els.responseAddCompany.value.trim(),taskId:els.responseAddTask.value.trim(),documentTitle:els.responseAddDocument.value.trim(),category:els.responseAddCategory.value,serviceArticle:els.responseAddService.value.trim(),detail:els.responseAddDetail.value.trim(),comment:els.responseAddComment.value.trim(),status:els.responseAddStatus.value.trim()||'Новый',deleted:false,source:'Добавлено вручную'};
+    if(!data.companyName&&!data.taskId){alert('Укажи компанию или ID задачи.');return;}
+    const btn=els.responseAddSave; btn.disabled=true; const oldText=btn.textContent; btn.textContent='Сохраняю…';
+    try{
+      const result=await apiFetch('/api/doc-return-report/record',{method:'POST',body:JSON.stringify({kind:'response',key:'',data})});
+      state.mailing.responses.unshift({...data,id:result.key});
+      els.responseAddDialog.close(); renderMailing();
+    }catch(e){
+      alert(`Ответ не сохранён: ${e.message||e}`);
+    }finally{btn.disabled=false;btn.textContent=oldText;}
+  });
   els.responsesTable.addEventListener('click',async(event)=>{const tr=event.target.closest('tr[data-response-id]');if(!tr)return;if(event.target.closest('.response-save-btn')){event.target.disabled=true;try{await saveResponseRow(tr);}finally{event.target.disabled=false;}}if(event.target.closest('.response-delete-btn'))await deleteResponseRow(tr);});
   els.returnsTable.addEventListener('click',(event)=>{const edit=event.target.closest('.task-edit-btn');if(edit)return openTaskEditor(edit.dataset.task);if(event.target.closest('.switch-mailing-btn'))switchTab('mailing');});
 }

@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v123 ACTIVE_PRODUCTION_NAME_MATCH';
+  const VERSION = 'v124 MAILING_AND_RESPONSE_SAVE_FIX';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -336,16 +336,19 @@ function registerDocReturnLocalApp({
   async function ensureStorageTask(auth) {
     let taskId = await findStorageTaskServer(); if (taskId) return taskId;
     const userId = String(auth.user && (auth.user.ID || auth.user.id) || '');
-    const created = await oauthCall(auth.domain,auth.accessToken,'tasks.task.add',{fields:{TITLE:STORAGE_TASK_TITLE,GROUP_ID:PROJECT_ID,RESPONSIBLE_ID:Number(userId),DESCRIPTION:'Служебная задача локального отчёта. Не удалять. В отчёте не учитывается.'}});
+    const created = await bitrixRestCall('tasks.task.add',{fields:{TITLE:STORAGE_TASK_TITLE,GROUP_ID:PROJECT_ID,RESPONSIBLE_ID:Number(userId),DESCRIPTION:'Служебная задача локального отчёта. Не удалять. В отчёте не учитывается.'}});
     taskId=String(created && (created.task && (created.task.id||created.task.ID) || created.id || created.ID) || '');
     if(!taskId) throw new Error('Не удалось создать служебное хранилище отчёта в Bitrix.');
-    try{await oauthCall(auth.domain,auth.accessToken,'task.stages.movetask',{id:Number(taskId),stageId:Number(STORAGE_STAGE_ID)});}catch(e){console.warn(`[doc-return-local] storage stage move: ${e.message||e}`);}
+    try{await bitrixRestCall('task.stages.movetask',{id:Number(taskId),stageId:Number(STORAGE_STAGE_ID)});}catch(e){console.warn(`[doc-return-local] storage stage move: ${e.message||e}`);}
     storageCache.taskId=taskId; return taskId;
   }
   async function saveStorageRecord(auth, kind, key, data) {
     const taskId=await ensureStorageTask(auth); const record={kind:String(kind),key:String(key),at:new Date().toISOString(),data};
     const message=`${STORAGE_MARKER} ${toBase64Url(record)}`;
-    await oauthCall(auth.domain,auth.accessToken,'task.commentitem.add',{TASKID:Number(taskId),FIELDS:{POST_MESSAGE:message}});
+    // v124: служебные записи сохраняет серверный webhook, а не OAuth текущего пользователя.
+    // У пользователя отчёта может не быть права комментировать техническую задачу — из-за этого
+    // «Добавить ответ» визуально не сохранялся.
+    await bitrixRestCall('task.commentitem.add',{TASKID:Number(taskId),FIELDS:{POST_MESSAGE:message}});
     storageCache.records.set(`${record.kind}:${record.key}`,record);storageCache.at=Date.now();
     if(kind==='taskOverride'){
       // Не очищаем готовый снимок: пользователь должен продолжать видеть отчёт мгновенно.
@@ -527,22 +530,31 @@ function registerDocReturnLocalApp({
   function parseReminderEvents(items,taskId,source='comment'){
     const events=[];for(const item of items||[]){const text=commentText(item);if(!text.includes('Отправка подтверждена почтовым сервером.'))continue;let sequence=0;if(text.includes('Автоматическое напоминание №1 о возврате оригинала отправлено.'))sequence=1;else if(text.includes('Автоматическое напоминание №2 о возврате оригинала отправлено.'))sequence=2;if(!sequence)continue;const email=(text.match(/Email:\s*([^\s<>"']+@[^\s<>"']+)/i)||[])[1]||'';events.push({taskId:String(taskId),sequence,sentAt:commentDate(item),email:String(email).toLowerCase(),source});}return events;
   }
-  async function loadMailingCandidateTasks(changedFromIso) {
-    // v119: рассылка НЕ зависит от года создания задачи.
-    // В кампании есть старые задачи (например, созданные в декабре 2025),
-    // поэтому берём только задачи проекта, которые менялись после старта рассылки/последнего скана.
-    const filter = { GROUP_ID: PROJECT_ID, '>=CHANGED_DATE': changedFromIso || MAILING_CAMPAIGN_START_ISO };
-    const rows = await bitrixRestList('tasks.task.list', {
-      order: { CHANGED_DATE: 'ASC', ID: 'ASC' },
-      filter,
-      select: ['ID','TITLE','STAGE_ID','CREATED_DATE','CHANGED_DATE','STATUS_CHANGED_DATE','CHAT_ID'],
-    }, 3000);
-    return (rows || []).map((task) => ({
+  async function loadMailingCandidateTasks(_changedFromIso) {
+    // v124: не используем CHANGED_DATE для поиска отправленных напоминаний.
+    // Добавление комментария в задачу не обязано менять CHANGED_DATE, поэтому старые задачи
+    // с реально отправленным email раньше выпадали из скана и отчёт показывал 0.
+    // Берём только актуальные стадии "Отправлены" + контрольные стадии, независимо от года создания.
+    const stageIds = [STAGES.sent, ...CONTROL_STAGE_IDS];
+    const all = [];
+    for (const stageId of stageIds) {
+      const rows = await bitrixRestList('tasks.task.list', {
+        order: { ID: 'ASC' },
+        filter: { GROUP_ID: PROJECT_ID, STAGE_ID: String(stageId) },
+        select: ['ID','TITLE','STAGE_ID','CREATED_DATE','CHANGED_DATE','STATUS_CHANGED_DATE','CHAT_ID'],
+      }, 3000).catch((e)=>{
+        console.warn(`[doc-return-local] mailing stage ${stageId}: ${e.message || e}`);
+        return [];
+      });
+      all.push(...(rows || []));
+    }
+    const seen = new Set();
+    return all.map((task) => ({
       taskId: String(taskField(task,['id','ID']) || ''),
       stageId: String(taskField(task,['stageId','STAGE_ID','stage_id']) || ''),
       chatId: String(taskField(task,['chatId','CHAT_ID','chat_id']) || ''),
       changedAt: asIso(taskField(task,['changedDate','CHANGED_DATE','changed_date'])),
-    })).filter((r) => r.taskId);
+    })).filter((r) => r.taskId && !seen.has(r.taskId) && seen.add(r.taskId));
   }
 
   function dedupeMailEvents(events) {
@@ -586,13 +598,10 @@ function registerDocReturnLocalApp({
       let events = dedupeMailEvents(stored && stored.data && Array.isArray(stored.data.events) ? stored.data.events : mailingScanCache.events);
       mailingScanCache.events = events;
 
-      // Если снимок уже есть, проверяем только задачи, изменённые после него (с запасом 2 минуты).
-      let changedFromIso = MAILING_CAMPAIGN_START_ISO;
-      if (!force && stored && stored.at) {
-        const t = Date.parse(stored.at);
-        if (Number.isFinite(t)) changedFromIso = new Date(Math.max(MAILING_CAMPAIGN_START, t - 120000)).toISOString();
-      }
-      const rows = await loadMailingCandidateTasks(changedFromIso);
+      // v124: всегда проверяем ограниченный набор задач в стадиях отправки/контроля.
+      // Это надёжнее CHANGED_DATE и при этом быстро: сканируются не все задачи проекта.
+      const rows = await loadMailingCandidateTasks();
+      console.log(`[doc-return-local] mailing candidates=${rows.length}; snapshotEvents=${events.length}`);
 
       // Сканируем комментарии небольшими batch-порциями и сразу обновляем частичный результат.
       // Поэтому карточки перестают стоять на 0, пока идёт уточнение остатка.
