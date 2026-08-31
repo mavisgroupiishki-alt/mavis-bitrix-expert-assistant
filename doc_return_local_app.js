@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v118 INSTANT_CORE_NO_BLOCKING';
+  const VERSION = 'v119 MAILING_EXACT_INCREMENTAL';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -132,7 +132,8 @@ function registerDocReturnLocalApp({
   const historyIndexCache = { at: 0, ready: false, scanning: false, months: [], items: [], error: '', promise: null };
   const SNAPSHOT_FILE = '/tmp/mavis_doc_return_report_snapshot.json';
   const MAILING_SNAPSHOT_FILE = '/tmp/mavis_doc_return_mailing_snapshot.json';
-  const MAILING_CAMPAIGN_START = Date.parse(process.env.DOC_RETURN_MAILING_START || '2026-08-26T00:00:00+03:00');
+  const MAILING_CAMPAIGN_START_ISO = String(process.env.DOC_RETURN_MAILING_START || process.env.DOC_RETURN_PRODUCTION_START_ISO || '2026-08-24T13:22:00+03:00');
+  const MAILING_CAMPAIGN_START = Date.parse(MAILING_CAMPAIGN_START_ISO);
 
   function clean(value) {
     if (typeof actsCleanText === 'function') return actsCleanText(value || '');
@@ -522,17 +523,94 @@ function registerDocReturnLocalApp({
   function parseReminderEvents(items,taskId,source='comment'){
     const events=[];for(const item of items||[]){const text=commentText(item);if(!text.includes('Отправка подтверждена почтовым сервером.'))continue;let sequence=0;if(text.includes('Автоматическое напоминание №1 о возврате оригинала отправлено.'))sequence=1;else if(text.includes('Автоматическое напоминание №2 о возврате оригинала отправлено.'))sequence=2;if(!sequence)continue;const email=(text.match(/Email:\s*([^\s<>"']+@[^\s<>"']+)/i)||[])[1]||'';events.push({taskId:String(taskId),sequence,sentAt:commentDate(item),email:String(email).toLowerCase(),source});}return events;
   }
+  async function loadMailingCandidateTasks(changedFromIso) {
+    // v119: рассылка НЕ зависит от года создания задачи.
+    // В кампании есть старые задачи (например, созданные в декабре 2025),
+    // поэтому берём только задачи проекта, которые менялись после старта рассылки/последнего скана.
+    const filter = { GROUP_ID: PROJECT_ID, '>=CHANGED_DATE': changedFromIso || MAILING_CAMPAIGN_START_ISO };
+    const rows = await bitrixRestList('tasks.task.list', {
+      order: { CHANGED_DATE: 'ASC', ID: 'ASC' },
+      filter,
+      select: ['ID','TITLE','STAGE_ID','CREATED_DATE','CHANGED_DATE','STATUS_CHANGED_DATE','CHAT_ID'],
+    }, 3000);
+    return (rows || []).map((task) => ({
+      taskId: String(taskField(task,['id','ID']) || ''),
+      stageId: String(taskField(task,['stageId','STAGE_ID','stage_id']) || ''),
+      chatId: String(taskField(task,['chatId','CHAT_ID','chat_id']) || ''),
+      changedAt: asIso(taskField(task,['changedDate','CHANGED_DATE','changed_date'])),
+    })).filter((r) => r.taskId);
+  }
+
+  function dedupeMailEvents(events) {
+    const map = new Map();
+    for (const event of events || []) {
+      if (!event || !event.taskId || !event.sequence) continue;
+      const t = Date.parse(event.sentAt || '');
+      if (!Number.isFinite(t) || t < MAILING_CAMPAIGN_START) continue;
+      map.set(`${event.taskId}:${event.sequence}`, event);
+    }
+    return [...map.values()].sort((a,b)=>String(a.sentAt).localeCompare(String(b.sentAt)));
+  }
+
+  async function persistMailingSnapshot(events) {
+    try {
+      const taskId = await findStorageTaskServer();
+      if (!taskId) return;
+      const record = {
+        kind: 'mailingSnapshot', key: 'current', at: new Date().toISOString(),
+        data: { campaignStart: MAILING_CAMPAIGN_START_ISO, events: dedupeMailEvents(events) },
+      };
+      await bitrixRestCall('task.commentitem.add', {
+        TASKID: Number(taskId),
+        FIELDS: { POST_MESSAGE: `${STORAGE_MARKER} ${toBase64Url(record)}` },
+      });
+      storageCache.records.set('mailingSnapshot:current', record);
+      storageCache.at = Date.now();
+    } catch (e) {
+      console.warn(`[doc-return-local] mailing snapshot persist: ${e.message || e}`);
+    }
+  }
+
   async function buildMailingScan(force=false){
     if(!force&&mailingScanCache.ready&&Date.now()-mailingScanCache.at<10*60*1000)return mailingScanCache;
     if(mailingScanCache.promise)return mailingScanCache.promise;
     mailingScanCache.scanning=true;mailingScanCache.error='';
     mailingScanCache.promise=(async()=>{try{
-      const report=reportCache.data || await buildReport(false);const rows=report.rows.filter(r=>{const id=String(r.stageId||'');const t=Date.parse(r.statusChangedAt||r.changedAt||r.createdAt||'');if(!Number.isFinite(t)||t<MAILING_CAMPAIGN_START)return false;return id===STAGES.sent||id===STAGES.email||id===STAGES.call||r.stageGroup==='returned';});const commands={};for(const r of rows)commands[`c${r.taskId}`]=`task.commentitem.getlist?TASKID=${encodeURIComponent(r.taskId)}&ORDER[ID]=asc`;
-      const results=await batchCommands(commands);const events=[];const needChat=[];
-      for(const r of rows){const raw=results[`c${r.taskId}`];const items=Array.isArray(raw)?raw:(raw&&Array.isArray(raw.items)?raw.items:[]);const found=parseReminderEvents(items,r.taskId,'comment');events.push(...found);if(!found.length&&r.chatId)needChat.push(r);}
-      // Fallback: некоторые старые версии писали служебное сообщение в чат задачи.
-      if(needChat.length){const chatCmd={};for(const r of needChat)chatCmd[`m${r.taskId}`]=`im.dialog.messages.get?DIALOG_ID=${encodeURIComponent(`chat${r.chatId}`)}`;const chatResults=await batchCommands(chatCmd).catch(()=>({}));for(const r of needChat){const raw=chatResults[`m${r.taskId}`];const items=raw&&Array.isArray(raw.messages)?raw.messages:(Array.isArray(raw)?raw:[]);events.push(...parseReminderEvents(items,r.taskId,'chat'));}}
-      const campaignEvents=events.filter(e=>{const t=Date.parse(e.sentAt||'');return Number.isFinite(t)&&t>=MAILING_CAMPAIGN_START;});campaignEvents.sort((a,b)=>String(a.sentAt).localeCompare(String(b.sentAt)));mailingScanCache.at=Date.now();mailingScanCache.ready=true;mailingScanCache.events=campaignEvents;mailingScanCache.error='';try{fs.writeFileSync(MAILING_SNAPSHOT_FILE,JSON.stringify({at:mailingScanCache.at,events:campaignEvents}));}catch(_){}return mailingScanCache;
+      // Сначала поднимаем последний точный снимок из одной служебной задачи — это быстро.
+      const storage = await loadStorageRecords(false).catch(()=>new Map());
+      const stored = storage.get('mailingSnapshot:current');
+      let events = dedupeMailEvents(stored && stored.data && Array.isArray(stored.data.events) ? stored.data.events : mailingScanCache.events);
+      mailingScanCache.events = events;
+
+      // Если снимок уже есть, проверяем только задачи, изменённые после него (с запасом 2 минуты).
+      let changedFromIso = MAILING_CAMPAIGN_START_ISO;
+      if (!force && stored && stored.at) {
+        const t = Date.parse(stored.at);
+        if (Number.isFinite(t)) changedFromIso = new Date(Math.max(MAILING_CAMPAIGN_START, t - 120000)).toISOString();
+      }
+      const rows = await loadMailingCandidateTasks(changedFromIso);
+
+      // Сканируем комментарии небольшими batch-порциями и сразу обновляем частичный результат.
+      // Поэтому карточки перестают стоять на 0, пока идёт уточнение остатка.
+      for (const part of chunk(rows, 40)) {
+        const commands = {};
+        for (const r of part) commands[`c${r.taskId}`] = `task.commentitem.getlist?TASKID=${encodeURIComponent(r.taskId)}&ORDER[ID]=asc`;
+        const results = await batchCommands(commands);
+        for (const r of part) {
+          const raw = results[`c${r.taskId}`];
+          const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.items) ? raw.items : []);
+          events.push(...parseReminderEvents(items, r.taskId, 'comment'));
+        }
+        events = dedupeMailEvents(events);
+        mailingScanCache.events = events;
+        mailingScanCache.at = Date.now();
+      }
+
+      mailingScanCache.at=Date.now();mailingScanCache.ready=true;mailingScanCache.events=dedupeMailEvents(events);mailingScanCache.error='';
+      try{fs.writeFileSync(MAILING_SNAPSHOT_FILE,JSON.stringify({at:mailingScanCache.at,events:mailingScanCache.events}));}catch(_){}
+      // Сохраняем один компактный снимок в Bitrix, чтобы после следующего deploy не считать всё заново.
+      persistMailingSnapshot(mailingScanCache.events).catch(()=>{});
+      return mailingScanCache;
     }catch(e){mailingScanCache.error=e.message||String(e);mailingScanCache.ready=false;return mailingScanCache;}finally{mailingScanCache.scanning=false;mailingScanCache.promise=null;}})();return mailingScanCache.promise;
   }
 
@@ -586,7 +664,7 @@ function registerDocReturnLocalApp({
 
 
   app.get('/api/doc-return-report/data',async(req,res)=>{try{const auth=await authorize(req);const force=['1','true','yes'].includes(String(req.query.force||'').toLowerCase());const data=await getReportFast(force);res.json({...data,currentUser:auth.user});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
-  app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const report=reportCache.data || await getReportFast(false);const storage=await loadStorageRecords(false);const responses=mergeResponses(storage,report.rows||[]);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.ready?mailingScanCache.events:[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
+  app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const report=reportCache.data || await getReportFast(false);const storage=await loadStorageRecords(false);const responses=mergeResponses(storage,report.rows||[]);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.events||[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.post('/api/doc-return-report/mailing/refresh',async(req,res)=>{try{await authorize(req);buildMailingScan(true).catch(()=>{});res.json({ok:true,started:true});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.get('/api/doc-return-report/history-index',async(req,res)=>{try{await authorize(req);if(!historyIndexCache.ready&&!historyIndexCache.scanning)buildHistoryIndex(false).catch(()=>{});res.json({ok:true,ready:historyIndexCache.ready,scanning:historyIndexCache.scanning,error:historyIndexCache.error,months:historyIndexCache.ready?historyIndexCache.months:[]});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.post('/api/doc-return-report/history-index/refresh',async(req,res)=>{try{await authorize(req);buildHistoryIndex(true).catch(()=>{});res.json({ok:true,started:true});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});

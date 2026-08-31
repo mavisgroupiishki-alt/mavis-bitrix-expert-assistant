@@ -21,7 +21,7 @@ const MONTHS = [
   [7, 'Июль'], [8, 'Август'], [9, 'Сентябрь'], [10, 'Октябрь'], [11, 'Ноябрь'], [12, 'Декабрь'],
 ];
 const CACHE_KEY = 'mavis:return-originals:stable:snapshot'; // stable key: не теряем мгновенный снимок после обновления версии
-const MAILING_CAMPAIGN_START = new Date('2026-08-26T00:00:00+03:00');
+const MAILING_CAMPAIGN_START = new Date('2026-08-24T13:22:00+03:00');
 const els = {};
 
 function qs(id) { return document.getElementById(id); }
@@ -388,7 +388,7 @@ function renderResponsesTable() {
 function renderMailing() {
   if (!state.mailing.loaded) return;
   renderMailingKpis(); renderMailingMonthly(); renderResponsesTable();
-  const scanText = state.mailing.scanError ? `Ошибка подсчёта рассылки: ${state.mailing.scanError}` : state.mailing.scanReady ? `Рассылка посчитана строго по подтверждённым служебным сообщениям: ${fmtNum(state.mailing.events.length)} email.` : state.mailing.scanScanning ? 'Считаю только подтверждённую рассылку по служебным сообщениям в задачах…' : 'Рассылка ещё не рассчитана.';
+  const scanText = state.mailing.scanError ? `Ошибка подсчёта рассылки: ${state.mailing.scanError}` : state.mailing.scanReady ? `Рассылка посчитана строго по подтверждённым служебным сообщениям: ${fmtNum(state.mailing.events.length)} email.` : state.mailing.scanScanning ? `Найдено ${fmtNum(state.mailing.events.length)} подтверждённых email · продолжаю считать…` : 'Рассылка ещё не рассчитана.';
   els.mailingStatus.textContent = scanText;
   renderReturns();
 }
@@ -403,9 +403,9 @@ async function loadMailing(force = false) {
     if (force) await apiFetch('/api/doc-return-report/mailing/refresh', { method:'POST', body:'{}' });
     const data = await apiFetch('/api/doc-return-report/mailing');
     state.mailing.loaded = true; state.mailing.responses = Array.isArray(data.responses) ? data.responses : []; state.mailing.categories = Array.isArray(data.categories) ? data.categories : [];
-    const scan = data.scan || {}; state.mailing.events = Array.isArray(scan.events) ? scan.events : []; state.mailing.scanReady = Boolean(scan.ready); state.mailing.scanScanning = Boolean(scan.scanning); state.mailing.scanError = scan.error || ''; if (!state.mailing.scanReady) state.mailing.events = [];
+    const scan = data.scan || {}; state.mailing.events = Array.isArray(scan.events) ? scan.events : []; state.mailing.scanReady = Boolean(scan.ready); state.mailing.scanScanning = Boolean(scan.scanning); state.mailing.scanError = scan.error || ''; // v119: показываем уже найденные подтвержденные письма даже пока скан продолжается.
     populateMailingCategories(); renderMailing();
-    if (!state.mailing.scanReady && state.mailing.scanScanning) setTimeout(() => loadMailing(false), 5000);
+    if (!state.mailing.scanReady && state.mailing.scanScanning) setTimeout(() => loadMailing(false), 2000);
   } catch (e) { els.mailingStatus.textContent = `Ошибка: ${e.message || e}`; }
   finally { state.mailing.loading = false; }
 }
