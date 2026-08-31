@@ -586,3 +586,119 @@ async function boot() {
 }
 
 document.addEventListener('DOMContentLoaded', boot);
+
+// ===== v121: Невозвраты по компаниям с активной сделкой Производства =====
+state.activeProduction = { loaded:false, loading:false, rows:[], filtered:[] };
+
+function ensureActiveProductionUi() {
+  if (document.querySelector('[data-tab="active-production"]')) return;
+  const nav = document.querySelector('.report-tabs');
+  const btn = document.createElement('button');
+  btn.className = 'report-tab';
+  btn.dataset.tab = 'active-production';
+  btn.textContent = 'Невозвраты · активное производство';
+  nav.appendChild(btn);
+
+  const panel = document.createElement('section');
+  panel.id = 'tab-active-production';
+  panel.className = 'tab-panel';
+  panel.innerHTML = `
+    <section class="panel compact-panel active-production-head">
+      <div><h2>Невозвраты по действующим клиентам</h2><p>Только документы, которые уже отправлены и ещё не вернулись, если у компании есть активная сделка в воронке «Производство».</p></div>
+      <button id="active-production-refresh" class="btn btn-light">Обновить</button>
+    </section>
+    <section class="filters-card active-production-filters">
+      <div class="filter-grid">
+        <label><span>Год создания</span><select id="active-year"><option value="2026">2026</option><option value="all">Все годы</option></select></label>
+        <label><span>Месяц</span><select id="active-month"><option value="all">Все месяцы</option></select></label>
+        <label><span>Дата от</span><input id="active-from" type="date" /></label>
+        <label><span>Дата до</span><input id="active-to" type="date" /></label>
+        <label><span>Компания</span><select id="active-company"><option value="all">Все компании</option></select></label>
+        <label><span>Эксперт</span><select id="active-expert"><option value="all">Все эксперты</option></select></label>
+        <label><span>Стадия документа</span><select id="active-stage"><option value="all">Все стадии</option></select></label>
+        <label><span>Тип документа</span><select id="active-type"><option value="all">Все типы</option></select></label>
+        <label><span>Просрочка</span><select id="active-overdue"><option value="all">Все</option><option value="yes">Только просроченные</option><option value="no">Без просрочки</option></select></label>
+        <label class="search-wide"><span>Поиск</span><input id="active-search" type="search" placeholder="Компания, документ или сделка" /></label>
+        <div class="filter-actions"><button id="active-reset" class="btn btn-ghost">Сбросить фильтры</button></div>
+      </div>
+    </section>
+    <div id="active-production-status" class="subtle-status">Открой вкладку — данные загрузятся отдельно и не тормозят основной отчёт.</div>
+    <section id="active-production-kpis" class="secondary-kpis"></section>
+    <section class="panel">
+      <div class="panel-title-row"><div><h2>Компании и невозвращённые документы</h2><p>После сохранения комментария он копируется в задачу «Акты Счета», дедлайн становится +14 календарных дней, стадия — «Звонок».</p></div></div>
+      <div id="active-production-table" class="table-scroll"></div>
+    </section>`;
+  document.querySelector('.report-shell').appendChild(panel);
+
+  populateMonthSelect(qs('active-month'));
+  btn.addEventListener('click', async () => { switchTab('active-production'); await loadActiveProduction(false); });
+  qs('active-production-refresh').addEventListener('click', () => loadActiveProduction(true));
+  for (const id of ['active-year','active-month','active-from','active-to','active-company','active-expert','active-stage','active-type','active-overdue']) {
+    qs(id).addEventListener('change', applyActiveProductionFilters);
+  }
+  let t=null; qs('active-search').addEventListener('input',()=>{clearTimeout(t);t=setTimeout(applyActiveProductionFilters,160);});
+  qs('active-reset').addEventListener('click',()=>{
+    qs('active-year').value='2026';qs('active-month').value='all';qs('active-from').value='';qs('active-to').value='';
+    qs('active-company').value='all';qs('active-expert').value='all';qs('active-stage').value='all';qs('active-type').value='all';qs('active-overdue').value='all';qs('active-search').value='';applyActiveProductionFilters();
+  });
+  qs('active-production-table').addEventListener('click', activeProductionTableClick);
+}
+
+function populateActiveProductionFilters() {
+  const rows=state.activeProduction.rows;
+  const add=(id,vals,label)=>{const el=qs(id);const old=el.value;el.innerHTML=`<option value="all">${label}</option>`+uniqueSorted(vals).map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');if([...el.options].some(o=>o.value===old))el.value=old;};
+  add('active-company',rows.map(r=>r.companyName),'Все компании');
+  add('active-expert',rows.map(r=>r.expert),'Все эксперты');
+  add('active-stage',rows.map(r=>r.stageName),'Все стадии');
+  add('active-type',rows.map(r=>r.documentType),'Все типы');
+}
+
+function applyActiveProductionFilters() {
+  const rows=state.activeProduction.rows;
+  const f={year:qs('active-year').value,month:qs('active-month').value,from:qs('active-from').value,to:qs('active-to').value,company:qs('active-company').value,expert:qs('active-expert').value,stage:qs('active-stage').value,type:qs('active-type').value,overdue:qs('active-overdue').value,search:qs('active-search').value.trim().toLowerCase()};
+  const from=f.from?new Date(`${f.from}T00:00:00`).getTime():null,to=f.to?new Date(`${f.to}T23:59:59.999`).getTime():null;
+  state.activeProduction.filtered=rows.filter(r=>{
+    const d=r.createdAt?new Date(r.createdAt):null,ms=d&&Number.isFinite(d.getTime())?d.getTime():null;
+    if(f.year!=='all'&&String(r.createdYear||'')!==f.year)return false;
+    if(f.month!=='all'&&String(r.createdMonth||'')!==f.month)return false;
+    if(from!=null&&(ms==null||ms<from))return false;if(to!=null&&(ms==null||ms>to))return false;
+    if(f.company!=='all'&&r.companyName!==f.company)return false;if(f.expert!=='all'&&r.expert!==f.expert)return false;
+    if(f.stage!=='all'&&r.stageName!==f.stage)return false;if(f.type!=='all'&&r.documentType!==f.type)return false;
+    if(f.overdue==='yes'&&!r.overdue)return false;if(f.overdue==='no'&&r.overdue)return false;
+    if(f.search){const hay=`${r.companyName} ${r.title} ${r.expert} ${r.stageName} ${r.productionDealTitle||''} ${r.productionStageName||''} ${r.productionAssignedBy||''}`.toLowerCase();if(!hay.includes(f.search))return false;}
+    return true;
+  });
+  renderActiveProduction();
+}
+
+function renderActiveProduction() {
+  const rows=state.activeProduction.filtered;
+  const companies=new Set(rows.map(r=>r.companyId||r.companyName)).size;
+  const overdue=rows.filter(r=>r.overdue).length;
+  const calls=rows.filter(r=>String(r.stageId)==='1128'||/^звонок$/i.test(r.stageName||'')).length;
+  qs('active-production-kpis').innerHTML=`<div class="mini-kpi"><span>Компаний</span><strong>${fmtNum(companies)}</strong></div><div class="mini-kpi"><span>Невозвращённых документов</span><strong>${fmtNum(rows.length)}</strong></div><div class="mini-kpi"><span>Просрочено</span><strong>${fmtNum(overdue)}</strong></div><div class="mini-kpi"><span>На стадии «Звонок»</span><strong>${fmtNum(calls)}</strong></div>`;
+  const box=qs('active-production-table');
+  if(!rows.length){box.innerHTML='<div class="empty-state">По выбранным фильтрам ничего не найдено</div>';return;}
+  box.innerHTML=`<table class="summary-table active-production-table"><thead><tr><th>Компания</th><th>Эксперт</th><th>Документ</th><th>Стадия</th><th>Дедлайн</th><th>Активная сделка производства</th><th>Стадия производства</th><th>Ответственный</th><th>Комментарий по звонку</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr data-active-task="${r.taskId}"><td><strong>${escapeHtml(r.companyName)}</strong></td><td>${escapeHtml(r.expert||'—')}</td><td class="doc-title">${escapeHtml(r.title)}</td><td><span class="stage-chip">${escapeHtml(r.stageName)}</span></td><td>${fmtDate(r.deadline)}</td><td>${escapeHtml(r.productionDealTitle||'—')}${Number(r.productionDealsCount||0)>1?`<div class="muted-small">Ещё активных сделок: ${Number(r.productionDealsCount)-1}</div>`:''}</td><td>${escapeHtml(r.productionStageName||'—')}</td><td>${escapeHtml(r.productionAssignedBy||'—')}</td><td><textarea class="active-followup-comment" placeholder="Например: Позвонила клиенту, обещал вернуть документы..."></textarea></td><td><div class="sheet-actions"><button class="btn btn-primary btn-small active-followup-save">Сохранить и поставить звонок</button><button class="link-btn open-task" data-url="${escapeHtml(r.taskUrl)}">Открыть задачу</button><div class="active-followup-result"></div></div></td></tr>`).join('')}</tbody></table>`;
+}
+
+async function activeProductionTableClick(event) {
+  const open=event.target.closest('.open-task');if(open)return openTaskUrl(open.dataset.url);
+  const btn=event.target.closest('.active-followup-save');if(!btn)return;
+  const tr=btn.closest('tr[data-active-task]');const taskId=tr.dataset.activeTask;const textarea=tr.querySelector('.active-followup-comment');const result=tr.querySelector('.active-followup-result');const comment=textarea.value.trim();
+  if(!comment){alert('Напиши комментарий по звонку.');return;}
+  btn.disabled=true;result.textContent='Сохраняю…';
+  try{
+    const data=await apiFetch('/api/doc-return-report/active-production/followup',{method:'POST',body:JSON.stringify({taskId,comment})});
+    const r=state.activeProduction.rows.find(x=>String(x.taskId)===String(taskId));if(r&&data.result){r.deadline=data.result.deadline;r.stageId=data.result.stageId;r.stageName=data.result.stageName;r.stageGroup='control';r.overdue=false;r.overdueDays=0;}
+    textarea.value='';result.innerHTML='<span class="active-success">✓ Скопировано в задачу · дедлайн +14 дней · стадия «Звонок»</span>';setTimeout(()=>applyActiveProductionFilters(),1800);
+  }catch(e){result.innerHTML=`<span class="active-error">${escapeHtml(e.message||String(e))}</span>`;}finally{btn.disabled=false;}
+}
+
+async function loadActiveProduction(force=false) {
+  if(state.activeProduction.loading)return;state.activeProduction.loading=true;
+  const status=qs('active-production-status');status.textContent=force?'Обновляю список…':'Загружаю активные сделки Производства…';
+  try{const data=await apiFetch(`/api/doc-return-report/active-production${force?'?force=1':''}`);state.activeProduction.rows=Array.isArray(data.rows)?data.rows:[];state.activeProduction.loaded=true;populateActiveProductionFilters();applyActiveProductionFilters();status.textContent=`Готово: ${fmtNum(state.activeProduction.rows.length)} невозвращённых документов у компаний с активным Производством.`;}catch(e){status.textContent=`Ошибка: ${e.message||e}`;}finally{state.activeProduction.loading=false;}
+}
+
+document.addEventListener('DOMContentLoaded', ensureActiveProductionUi);

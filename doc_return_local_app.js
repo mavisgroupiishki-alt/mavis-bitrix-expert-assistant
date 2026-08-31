@@ -11,7 +11,7 @@ function registerDocReturnLocalApp({
   actsCleanText,
   config,
 }) {
-  const VERSION = 'v119 MAILING_EXACT_INCREMENTAL';
+  const VERSION = 'v121 ACTIVE_PRODUCTION_FOLLOWUP';
   const PROJECT_ID = Number(process.env.DOC_RETURN_REPORT_PROJECT_ID || (config && config.actsProjectId) || 36);
   const PORTAL_DOMAIN = String(process.env.DOC_RETURN_REPORT_PORTAL_DOMAIN || 'mavisgroup.bitrix24.by').toLowerCase().trim();
   const CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CACHE_SECONDS || 300) * 1000);
@@ -123,6 +123,10 @@ function registerDocReturnLocalApp({
   }));
 
   const reportCache = { at: 0, data: null, promise: null };
+  const activeProductionCache = { at: 0, rows: [], promise: null };
+  const ACTIVE_PRODUCTION_CACHE_MS = 5 * 60 * 1000;
+  const PRODUCTION_CATEGORY_ID = Number(process.env.DOC_RETURN_PRODUCTION_CATEGORY_ID || (config && (config.productionCategoryId || config.autopilotCategoryId)) || 28);
+  const CALL_STAGE_ID = String(process.env.DOC_RETURN_CALL_STAGE_ID || STAGES.call || '1128');
   const coreCache = { at: 0, data: null, promise: null };
   const CORE_CACHE_MS = Math.max(60_000, Number(process.env.DOC_RETURN_REPORT_CORE_CACHE_SECONDS || 300) * 1000);
   const authCache = new Map();
@@ -662,6 +666,73 @@ function registerDocReturnLocalApp({
     return { ...core, refreshing:false };
   }
 
+
+
+  async function loadActiveProductionRows(force=false) {
+    if (!force && activeProductionCache.rows.length && Date.now()-activeProductionCache.at < ACTIVE_PRODUCTION_CACHE_MS) return activeProductionCache.rows;
+    if (activeProductionCache.promise) return activeProductionCache.promise;
+    activeProductionCache.promise = (async()=>{
+      const report = reportCache.data || await getReportFast(false);
+      const candidateRows = (report.rows || []).filter((r) => {
+        const id = String(r.stageId || '');
+        return id === STAGES.sent || r.stageGroup === 'control';
+      }).filter((r)=>r.companyId);
+      const companyIds = [...new Set(candidateRows.map(r=>String(r.companyId)).filter(Boolean))];
+      if (!companyIds.length) { activeProductionCache.rows=[]; activeProductionCache.at=Date.now(); return []; }
+
+      // Берём активное Производство одним пагинируемым запросом. Это надёжнее, чем большой @COMPANY_ID,
+      // который на этом портале иногда возвращает пустой массив. Дальше фильтруем по companyIds в памяти.
+      const deals = await bitrixRestList('crm.deal.list', {
+        order:{DATE_MODIFY:'DESC'}, filter:{CATEGORY_ID:PRODUCTION_CATEGORY_ID,CLOSED:'N'},
+        select:['ID','TITLE','COMPANY_ID','STAGE_ID','ASSIGNED_BY_ID','DATE_MODIFY']
+      }, 5000);
+      const prodStagesRaw = await bitrixRestCall('crm.dealcategory.stage.list',{id:PRODUCTION_CATEGORY_ID}).catch(()=>[]);
+      const prodStages = Array.isArray(prodStagesRaw) ? prodStagesRaw : (prodStagesRaw && typeof prodStagesRaw==='object' ? Object.values(prodStagesRaw) : []);
+      const prodStageMap = new Map(prodStages.map(x=>[String(x.STATUS_ID||x.statusId||x.ID||x.id||''), clean(x.NAME||x.name||x.TITLE||x.title||'')]).filter(x=>x[0]));
+      const activeByCompany = new Map();
+      const userIds=[];
+      for (const d of deals || []) {
+        const cid=String(d.COMPANY_ID||d.companyId||''); if(!cid||cid==='0') continue;
+        const item={id:String(d.ID||d.id||''),title:clean(d.TITLE||d.title||''),stageId:String(d.STAGE_ID||d.stageId||''),stageName:prodStageMap.get(String(d.STAGE_ID||d.stageId||''))||String(d.STAGE_ID||d.stageId||''),assignedById:String(d.ASSIGNED_BY_ID||d.assignedById||''),modifiedAt:asIso(d.DATE_MODIFY||d.dateModify||'')};
+        if(item.assignedById)userIds.push(item.assignedById);
+        if(!activeByCompany.has(cid))activeByCompany.set(cid,[]); activeByCompany.get(cid).push(item);
+      }
+      const users=await loadUsers(userIds);
+      const rows=[];
+      for(const r of candidateRows){
+        const active=activeByCompany.get(String(r.companyId))||[]; if(!active.length) continue;
+        const primary=active[0];
+        rows.push({...r,activeDeals:active.map(d=>({...d,assignedBy:users.get(d.assignedById)||`ID ${d.assignedById||'—'}`})),productionDealId:primary.id,productionDealTitle:primary.title,productionStageId:primary.stageId,productionStageName:primary.stageName,productionAssignedBy:users.get(primary.assignedById)||`ID ${primary.assignedById||'—'}`,productionDealsCount:active.length});
+      }
+      activeProductionCache.rows=rows;activeProductionCache.at=Date.now();return rows;
+    })().finally(()=>{activeProductionCache.promise=null;});
+    return activeProductionCache.promise;
+  }
+
+  function plus14CalendarDaysIso() {
+    const d=new Date(); d.setDate(d.getDate()+14); d.setHours(18,0,0,0); return d.toISOString();
+  }
+
+  async function activeProductionFollowup(taskId, comment) {
+    const tid=String(taskId||'').replace(/\D/g,''); const text=clean(comment||'');
+    if(!tid)throw new Error('Не указан ID задачи.');
+    if(!text)throw new Error('Комментарий пустой.');
+    const raw=await bitrixRestCall('tasks.task.get',{taskId:Number(tid),select:['ID','GROUP_ID','TITLE','STAGE_ID']});
+    const task=raw&&raw.task?raw.task:raw; const groupId=String(taskField(task,['groupId','GROUP_ID','group_id'])||'');
+    if(groupId!==String(PROJECT_ID))throw new Error(`Задача ${tid} не относится к проекту «Акты Счета».`);
+    const deadline=plus14CalendarDaysIso();
+    await bitrixRestCall('tasks.task.update',{taskId:Number(tid),fields:{DEADLINE:deadline}});
+    await bitrixRestCall('task.stages.movetask',{id:Number(tid),stageId:Number(CALL_STAGE_ID)});
+    const post=`Скопировано из отчета: ${text}`;
+    await bitrixRestCall('task.commentitem.add',{TASKID:Number(tid),FIELDS:{POST_MESSAGE:post}});
+    activeProductionCache.at=0;
+    // Обновляем локальный снимок, чтобы строка сразу отражала новый дедлайн/стадию.
+    for(const row of (reportCache.data&&reportCache.data.rows)||[]){if(String(row.taskId)===tid){row.deadline=deadline;row.stageId=CALL_STAGE_ID;row.stageName='Звонок';row.stageGroup='control';row.overdue=false;row.overdueDays=0;}}
+    return {taskId:tid,deadline,stageId:CALL_STAGE_ID,stageName:'Звонок',comment:post};
+  }
+
+  app.get('/api/doc-return-report/active-production',async(req,res)=>{try{await authorize(req);const force=['1','true','yes'].includes(String(req.query.force||'').toLowerCase());const rows=await loadActiveProductionRows(force);res.json({ok:true,generatedAt:new Date().toISOString(),categoryId:PRODUCTION_CATEGORY_ID,rows});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
+  app.post('/api/doc-return-report/active-production/followup',async(req,res)=>{try{await authorize(req);const taskId=req.body&&req.body.taskId;const comment=req.body&&req.body.comment;const result=await activeProductionFollowup(taskId,comment);res.json({ok:true,result});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
 
   app.get('/api/doc-return-report/data',async(req,res)=>{try{const auth=await authorize(req);const force=['1','true','yes'].includes(String(req.query.force||'').toLowerCase());const data=await getReportFast(force);res.json({...data,currentUser:auth.user});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
   app.get('/api/doc-return-report/mailing',async(req,res)=>{try{await authorize(req);const report=reportCache.data || await getReportFast(false);const storage=await loadStorageRecords(false);const responses=mergeResponses(storage,report.rows||[]);if(!mailingScanCache.ready&&!mailingScanCache.scanning)buildMailingScan(false).catch(()=>{});res.json({ok:true,responses,categories:CATEGORIES,scan:{ready:mailingScanCache.ready,scanning:mailingScanCache.scanning,error:mailingScanCache.error,events:mailingScanCache.events||[]}});}catch(e){res.status(Number(e.statusCode||500)).json({ok:false,error:e.message||String(e)});}});
