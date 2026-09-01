@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>График платежей</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="https://api.bitrix24.com/api/v1/"></script>
+</head>
+<body class="app-page">
+  <div id="app" data-server-deal-id="{{ deal_id }}">
+    <div class="loading-screen" id="loading-screen">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>Загружаем график платежей…</div>
+    </div>
+
+    <main class="payment-app hidden" id="payment-app">
+      <header class="app-header">
+        <div>
+          <h1>График платежей</h1>
+          <p id="deal-caption">Сделка</p>
+        </div>
+        <div class="header-amount">
+          <span>Сумма сделки</span>
+          <strong id="deal-amount">0,00 руб.</strong>
+        </div>
+      </header>
+
+      <div class="notice notice-error hidden" id="app-error"></div>
+      <div class="notice notice-success hidden" id="app-success"></div>
+
+      <section class="table-card">
+        <div class="table-scroll">
+          <table class="payments-table">
+            <thead>
+              <tr>
+                <th class="col-number">№</th>
+                <th>Дата платежа</th>
+                <th class="money-column">Сумма клиента</th>
+                <th class="contractor-check-column">Подрядчик</th>
+                <th>Кто подрядчик</th>
+                <th class="money-column">Сумма подрядчика</th>
+                <th class="money-column">Наша сумма</th>
+                <th class="col-actions"></th>
+              </tr>
+            </thead>
+            <tbody id="payments-body"></tbody>
+          </table>
+        </div>
+
+        <div class="table-actions">
+          <button type="button" class="button button-secondary" id="add-row-button">+ Добавить платёж</button>
+        </div>
+      </section>
+
+      <section class="summary-grid">
+        <article class="summary-card"><span>Сумма сделки</span><strong id="summary-deal">0,00 руб.</strong></article>
+        <article class="summary-card"><span>Платежи по графику</span><strong id="summary-payments">0,00 руб.</strong></article>
+        <article class="summary-card summary-card-expense"><span>Расход подрядчикам</span><strong id="summary-contractors">0,00 руб.</strong></article>
+        <article class="summary-card summary-card-main"><span>Наша сумма по сделке</span><strong id="summary-ours">0,00 руб.</strong></article>
+      </section>
+
+      <section class="distribution-status" id="distribution-status"></section>
+
+      <footer class="app-footer">
+        <span class="muted" id="save-hint">Изменения ещё не сохранены</span>
+        <button type="button" class="button button-primary" id="save-button">Сохранить</button>
+      </footer>
+    </main>
+
+    <main class="standalone-card hidden" id="no-deal-screen">
+      <div class="brand-mark">M</div>
+      <h1>Откройте приложение из сделки</h1>
+      <p>Перейдите в CRM, откройте карточку сделки и нажмите вкладку «График платежей».</p>
+    </main>
+  </div>
+
+  <template id="payment-row-template">
+    <tr class="payment-row">
+      <td class="row-number"></td>
+      <td><input type="date" class="input payment-date" aria-label="Дата платежа"></td>
+      <td><div class="money-input-wrap"><input type="number" min="0" step="0.01" inputmode="decimal" class="input money-input client-amount" placeholder="0,00" aria-label="Сумма платежа клиента"><span>руб.</span></div></td>
+      <td class="contractor-check-cell"><label class="switch" title="Есть подрядчик"><input type="checkbox" class="has-contractor"><span class="switch-track"></span></label></td>
+      <td>
+        <select class="input contractor-select" aria-label="Подрядчик" disabled>
+          <option value="">Выберите</option><option value="ВИАЛМИ">ВИАЛМИ</option><option value="Рашид">Рашид</option><option value="ОСОС">ОСОС</option><option value="Другой">Другой</option>
+        </select>
+        <input type="text" class="input other-contractor hidden" placeholder="Название подрядчика" aria-label="Другой подрядчик">
+      </td>
+      <td><div class="money-input-wrap contractor-amount-wrap is-disabled"><input type="number" min="0" step="0.01" inputmode="decimal" class="input money-input contractor-amount" placeholder="0,00" aria-label="Сумма подрядчика" disabled><span>руб.</span></div></td>
+      <td><strong class="row-our-amount">0,00 руб.</strong></td>
+      <td><button type="button" class="icon-button delete-row" title="Удалить строку" aria-label="Удалить строку">×</button></td>
+    </tr>
+  </template>
+
+  <script>
+    window.MAVIS_PAYMENT_CONFIG = {
+      serverDealId: {{ deal_id|tojson }},
+      entityCode: "pay_schedule",
+      cleanRevenueField: "UF_CRM_1787226797",
+      fieldXmlIds: {
+        ourAmount: "MPS_OUR_AMOUNT",
+        contractorCost: "MPS_CONTRACTOR_COST",
+        hasContractor: "MPS_HAS_CONTRACTOR",
+        paymentsTotal: "MPS_PAYMENTS_TOTAL",
+        remainder: "MPS_REMAINDER",
+        complete: "MPS_COMPLETE",
+        nextDate: "MPS_NEXT_DATE"
+      }
+    };
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='rnp-payment-bridge.js') }}"></script>
+</body>
+</html>

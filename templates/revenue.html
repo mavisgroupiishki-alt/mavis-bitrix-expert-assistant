@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Чистая выручка</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="https://api.bitrix24.com/api/v1/"></script>
+</head>
+<body class="app-page revenue-page">
+  <div class="loading-screen" id="revenue-loading">
+    <div class="spinner" aria-hidden="true"></div>
+    <div>Считаем наши суммы…</div>
+  </div>
+
+  <main class="revenue-app hidden" id="revenue-app">
+    <header class="revenue-header">
+      <div>
+        <div class="revenue-kicker">Mavis Group</div>
+        <h1>✓ Чистая выручка</h1>
+        <p>Фактическая наша сумма за период = полученные платежи по графику − расходы подрядчикам.</p>
+      </div>
+      <button type="button" class="button button-secondary revenue-refresh" id="revenue-refresh">Обновить</button>
+    </header>
+
+    <div class="notice notice-error hidden" id="revenue-error"></div>
+
+    <section class="revenue-filters">
+      <label><span>Воронка</span><select class="input" id="revenue-category"></select></label>
+      <label><span>Дата с</span><input class="input" type="date" id="revenue-date-from"></label>
+      <label><span>Дата по</span><input class="input" type="date" id="revenue-date-to"></label>
+      <label class="revenue-mode-field">
+        <span>Что считаем</span>
+        <select class="input" id="revenue-mode">
+          <option value="payments_period">Фактически оплачено по графику за период</option>
+          <option value="created_period">Все сделки, созданные за период</option>
+          <option value="closed_period">Успешно закрытые за период</option>
+          <option value="in_period">В периоде — созданы и успешно закрыты в периоде</option>
+          <option value="out_period">Не в периоде — созданы в периоде, закрыты позже</option>
+          <option value="funnel">Вся воронка сейчас — без фильтра по дате</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="revenue-summary-grid">
+      <article class="summary-card"><span>Сделок</span><strong id="revenue-count">0</strong></article>
+      <article class="summary-card"><span id="revenue-gross-label">Сумма сделок</span><strong id="revenue-gross">0,00 руб.</strong></article>
+      <article class="summary-card summary-card-expense"><span>Подрядчики</span><strong id="revenue-contractors">0,00 руб.</strong></article>
+      <article class="summary-card summary-card-main"><span>Наша сумма</span><strong id="revenue-net">0,00 руб.</strong></article>
+    </section>
+
+    <section class="revenue-note hidden" id="revenue-note"></section>
+
+    <section class="table-card revenue-stage-card">
+      <div class="revenue-section-title"><div><h2>По стадиям</h2><p id="revenue-period-caption"></p></div></div>
+      <div class="table-scroll"><table class="revenue-table"><thead><tr><th>Стадия</th><th>Сделок</th><th id="revenue-stage-gross-label">Сумма сделок</th><th>Подрядчики</th><th>Наша сумма</th></tr></thead><tbody id="revenue-stages-body"></tbody></table></div>
+    </section>
+
+    <section class="table-card revenue-deals-card">
+      <div class="revenue-section-title"><div><h2>Сделки</h2><p>Можно проверить, из чего сложилась итоговая сумма.</p></div></div>
+      <div class="table-scroll"><table class="revenue-table revenue-deals-table"><thead><tr><th>Сделка</th><th>Стадия</th><th>Создана</th><th>Закрыта</th><th id="revenue-deal-gross-label">Сумма сделки</th><th id="revenue-deal-paid-label">Оплачено за период</th><th>Подрядчики</th><th>Наша сумма</th></tr></thead><tbody id="revenue-deals-body"></tbody></table></div>
+    </section>
+  </main>
+
+  <script>
+    window.MAVIS_REVENUE_CONFIG = {
+      ourAmountXmlId: "MPS_OUR_AMOUNT",
+      contractorCostXmlId: "MPS_CONTRACTOR_COST",
+      paymentsTotalXmlId: "MPS_PAYMENTS_TOTAL"
+    };
+  </script>
+  <script src="{{ url_for('static', filename='revenue.js') }}"></script>
+  <script src="{{ url_for('static', filename='rnp-payment-bridge.js') }}"></script>
+</body>
+</html>
