@@ -257,6 +257,16 @@ const config = {
   actsIncomingEmailEnabled: String(process.env.ACTS_INCOMING_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
   actsIncomingLeaderId: process.env.ACTS_INCOMING_LEADER_ID || process.env.TANYA_USER_ID || '2182',
 
+  // ACTS_SMART_DIALOG_V129: осмысленные ответы клиента по возврату подписанного акта.
+  // Включено для всех активных контролей актов. Аварийное выключение: ACTS_SMART_DIALOG_ENABLED=false.
+  actsSmartDialogEnabled: String(process.env.ACTS_SMART_DIALOG_ENABLED || 'true').toLowerCase() !== 'false',
+  actsSmartDialogFallbackHoldHours: Number(process.env.ACTS_SMART_DIALOG_FALLBACK_HOLD_HOURS || 24),
+  actsSmartDialogNoDateHoldHours: Number(process.env.ACTS_SMART_DIALOG_NO_DATE_HOLD_HOURS || 72),
+
+  // v129: быстрый тест ТОЛЬКО на Бобике. Не ускоряет реальные push/call таймеры.
+  actsSmartDialogTestDealId: String(process.env.ACTS_SMART_DIALOG_TEST_DEAL_ID || process.env.CJM_TEST_DEAL_ID || '38072'),
+  actsSmartDialogTestImmediateFileReply: String(process.env.ACTS_SMART_DIALOG_TEST_FILE_REPLY || 'true').toLowerCase() !== 'false',
+
   // v78: CJM блоки 3–4 — контроль первого касания/дедлайна документов
   // и автоматический сбор входящих документов по Аттестации + СПК.
   firstCallTestMinutes: Number(process.env.FIRST_CALL_TEST_MINUTES || 0),
@@ -1334,6 +1344,32 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       }
     }
 
+    // ACTS_SMART_DIALOG_V129: текстовые ответы клиента по акту обрабатываем для ВСЕХ
+    // активных контролей актов, независимо от пилотного LIVE_CHAT.
+    if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled && config.actsSmartDialogEnabled) {
+      for (const msg of acceptedMessages) {
+        if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
+        const text = actsCleanText(msg.text || '');
+        if (!text) continue;
+        if (msg.contentUri && ['image','document'].includes(String(msg.type || '').toLowerCase())) continue;
+
+        const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+        if (!phone) continue;
+        const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
+
+        setImmediate(() => actsProcessIncomingClientText({
+          source: channelKey || msg.chatType || 'Wazzup',
+          commType: 'PHONE',
+          commValue: phone,
+          text,
+          channelKey,
+          chatId: msg.chatId || '',
+          phone,
+          externalId: `wazzup_${msg.messageId || ''}`,
+        }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
+      }
+    }
+
     // v78: тот же входящий файл используем для сбора документов по Аттестации/СПК.
     if (config.clientDocsIncomingEnabled && config.clientDocsWazzupEnabled) {
       for (const msg of acceptedMessages) {
@@ -1360,6 +1396,11 @@ app.post('/api/wazzup/webhook', async (req, res) => {
         const contactPhone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
         const testPhone = normalizePhoneDigits(config.liveChatTestPhone);
         if (!testPhone || !contactPhone.endsWith(testPhone.slice(-9))) continue; // пилот — только тестовый номер
+
+        if (config.actsSmartDialogEnabled && config.actsIncomingEnabled) {
+          const waitingActs = await actsFindWaitingStatesByComm('PHONE', contactPhone).catch(() => []);
+          if (waitingActs.length) continue;
+        }
 
         const deal = await findDealForPhone(contactPhone);
         if (!deal) continue;
@@ -1873,8 +1914,25 @@ async function processIncomingEmails() {
             continue;
           }
 
-          // Письма без вложений не обрабатываем
+          // ACTS_SMART_DIALOG_V129: текстовый ответ клиента по акту важен даже БЕЗ вложения.
           if (!attachments.length) {
+            if (config.actsIncomingEnabled && config.actsIncomingEmailEnabled && config.actsSmartDialogEnabled) {
+              const bodyText = actsCleanText(`${subject}\n${parsed.text || ''}`).slice(0, 4000);
+              if (bodyText) {
+                try {
+                  await actsProcessIncomingClientText({
+                    source: 'Email',
+                    commType: 'EMAIL',
+                    commValue: senderEmail,
+                    text: bodyText,
+                    email: senderEmail,
+                    externalId: `email_${actsCleanText(parsed.messageId || uid || '').replace(/\s+/g, '_')}`,
+                  });
+                } catch (dialogErr) {
+                  console.warn(`[acts-dialog] email ${maskEmailForLog(senderEmail)}: ${dialogErr.message || dialogErr}`);
+                }
+              }
+            }
             await client.messageFlagsAdd(uid, ['\\Seen']);
             continue;
           }
@@ -7060,6 +7118,15 @@ const ACTS_SCAN_RECEIVED_MARKER = '[MAVIS_ACTS_SCAN_RECEIVED]';
 const ACTS_CALL_TASK_MARKER = '[MAVIS_ACTS_CALL_TASK_CREATED]';
 const ACTS_PUSH_STATE_MARKER = '[MAVIS_ACTS_PUSH_STATE]';
 const ACTS_FILE_PENDING_MARKER = '[MAVIS_ACTS_FILE_PENDING]';
+
+// ACTS_SMART_DIALOG_V129
+const ACTS_CLIENT_MESSAGE_MARKER = '[MAVIS_ACTS_CLIENT_MESSAGE]';
+const ACTS_DIALOG_REPLY_MARKER = '[MAVIS_ACTS_DIALOG_REPLY]';
+const ACTS_DIALOG_HOLD_MARKER = '[MAVIS_ACTS_DIALOG_HOLD]';
+const ACTS_DIALOG_STOP_MARKER = '[MAVIS_ACTS_DIALOG_STOP]';
+const ACTS_DIALOG_HUMAN_MARKER = '[MAVIS_ACTS_DIALOG_HUMAN]';
+const ACTS_DIALOG_TEST_FILE_MARKER = '[MAVIS_ACTS_DIALOG_TEST_FILE]';
+
 const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
 let actsPushCycleRunning = false;
 
@@ -7141,6 +7208,466 @@ function actsFindLatestMarkerAfterSend(comments, marker, sentAtMs) {
     .filter((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, sentAtMs))
     .sort((a,b) => actsParseTimelineCreated(b) - actsParseTimelineCreated(a))[0] || null;
 }
+
+
+function actsSmartDialogJsonFromComment(comment, marker) {
+  const text = String(comment && comment.COMMENT || '');
+  const idx = text.indexOf(marker);
+  if (idx < 0) return null;
+  const tail = text.slice(idx + marker.length);
+  const line = tail.split(/\r?\n/).map((x) => x.trim()).find((x) => x.startsWith('{') && x.endsWith('}'));
+  if (!line) return null;
+  try { return JSON.parse(line); } catch (_) { return null; }
+}
+
+function actsLatestClientMessageAtMs(state, comments) {
+  const marker = `${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId}`;
+  const rows = (comments || [])
+    .filter((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, state.sentAtMs))
+    .sort((a,b) => actsParseTimelineCreated(b) - actsParseTimelineCreated(a));
+  return rows.length ? actsParseTimelineCreated(rows[0]) : 0;
+}
+
+function actsSmartDialogHistory(state, comments, limit = 12) {
+  return (comments || [])
+    .filter((c) => {
+      if (!actsCommentIsAfterSend(c, state.sentAtMs)) return false;
+      const t = String(c && c.COMMENT || '');
+      return t.includes(`${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId}`)
+        || t.includes(`${ACTS_DIALOG_REPLY_MARKER} task=${state.taskId}`);
+    })
+    .sort((a,b) => actsParseTimelineCreated(a) - actsParseTimelineCreated(b))
+    .slice(-Math.max(1, Number(limit || 12)))
+    .map((c) => String(c.COMMENT || '').replace(/\[[A-Z0-9_]+\][^\n]*/g, '').trim())
+    .filter(Boolean)
+    .join('\n---\n');
+}
+
+async function actsSmartDialogAddComment(dealId, text) {
+  return bitrixRestCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: text },
+  });
+}
+
+async function actsGetSmartDialogControl(state, comments) {
+  if (!config.actsSmartDialogEnabled) return { stop: false, holdUntilMs: 0 };
+
+  const stopMarker = `${ACTS_DIALOG_STOP_MARKER} task=${state.taskId}`;
+  const stop = (comments || []).find((c) =>
+    String(c && c.COMMENT || '').includes(stopMarker) && actsCommentIsAfterSend(c, state.sentAtMs)
+  );
+  if (stop) return { stop: true, holdUntilMs: 0, reason: 'dialog-stop' };
+
+  const holdMarker = `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}`;
+  const latestHold = (comments || [])
+    .filter((c) => String(c && c.COMMENT || '').includes(holdMarker) && actsCommentIsAfterSend(c, state.sentAtMs))
+    .sort((a,b) => actsParseTimelineCreated(b) - actsParseTimelineCreated(a))[0];
+
+  if (!latestHold) return { stop: false, holdUntilMs: 0 };
+
+  const payload = actsSmartDialogJsonFromComment(latestHold, holdMarker) || {};
+  const holdUntilMs = Date.parse(String(payload.holdUntil || payload.hold_until || ''));
+  return {
+    stop: false,
+    holdUntilMs: Number.isFinite(holdUntilMs) ? holdUntilMs : 0,
+    reason: payload.reason || payload.intent || 'client-dialog',
+  };
+}
+
+async function actsSmartDialogNotifyExpert(deal, text) {
+  const userId = Number(deal && deal.ASSIGNED_BY_ID || 0);
+  if (!userId) return;
+  const message = `ИИгорь — акт: ${String(text || '').slice(0, 1500)}`;
+  await bitrixRestCall('im.notify.personal.add', {
+    USER_ID: userId,
+    MESSAGE: message,
+    MESSAGE_OUT: message,
+  }).catch(() => {});
+}
+
+async function actsSmartDialogAnalyse({ state, deal, text, comments }) {
+  const now = new Date();
+  const minskNow = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Minsk',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(now);
+
+  const history = actsSmartDialogHistory(state, comments, 12);
+  const prompt = `
+Ты управляешь ТОЛЬКО коммуникацией по возврату ПОДПИСАННОГО СКАНА АКТА выполненных работ.
+Сейчас по Минску: ${minskNow}. Текущее ISO-время: ${now.toISOString()}.
+Сделка: #${deal.ID}; ${actsCleanText(deal.TITLE || deal.COMPANY_TITLE || '')}.
+
+Нужно понять последнее сообщение клиента и не допустить бессмысленных автоматических напоминаний.
+
+Допустимые action:
+- "wait": клиент назвал срок/дату, сказал что в отпуске/командировке/занят и пришлет позже, либо сообщил "уже отправили/отправлю". На время ожидания пуши и задача на звонок запрещены.
+- "continue": обычное "спасибо", приветствие, нейтральный ответ без обещания срока. Новый пуш допустим позже по стандартному интервалу от сообщения клиента.
+- "human": вопрос по сумме/содержанию/исправлению акта, спор, претензия, юридический/финансовый вопрос, непонятная ситуация. Автопуши временно запрещены; нужен человек.
+- "stop": прямой отказ подписывать/возвращать акт или просьба больше не писать по этому вопросу. Автопуши полностью остановить и сообщить ответственному.
+
+Правила даты:
+- "завтра", "послезавтра", "в пятницу", "после 10 сентября", "до 15-го", "вернусь 7-го" разрешай относительно текущей даты по Минску.
+- hold_until верни ISO 8601 с часовым поясом +03:00.
+- Если обещан конкретный день без времени, ждать минимум до 18:00 этого дня по Минску.
+- Если клиент говорит "позже/после отпуска", но даты нет, action="wait", hold_until=null, а reply вежливо уточняет ориентировочный срок.
+- Если клиент пишет "уже отправили", action="wait", hold_until = примерно +24 часа, reply="Спасибо! Проверим поступление подписанного акта."
+- Если action="continue", обычно reply="" — не нужно отвечать на каждое "спасибо".
+- Если action="human", reply может быть только безопасным подтверждением получения, например: "Спасибо, передам информацию ответственному специалисту. Вернемся к вам по этому вопросу." Не выдумывай ответ по существу.
+- Не обещай то, чего система не знает.
+- Тон: коротко, вежливо, естественно, без канцелярита и без упоминания ИИ/робота.
+
+История сообщений по этому акту:
+${history || '(истории пока нет)'}
+
+Новое сообщение клиента:
+${String(text || '').slice(0, 2500)}
+
+Ответь ТОЛЬКО JSON:
+{
+  "action":"wait|continue|human|stop",
+  "intent":"promised_date|vacation|already_sent|question|problem|refusal|acknowledgement|other",
+  "hold_until":"ISO или null",
+  "reply":"текст ответа или пустая строка",
+  "reason":"коротко",
+  "confidence":0.0
+}`.trim();
+
+  const raw = await callAiChatCompletion({
+    model: config.aiModel,
+    temperature: 0,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  const matched = String(raw || '').match(/\{[\s\S]*\}/);
+  if (!matched) throw new Error('ИИ не вернул JSON');
+  const obj = JSON.parse(matched[0]);
+
+  const action = ['wait','continue','human','stop'].includes(String(obj.action || ''))
+    ? String(obj.action)
+    : 'human';
+
+  return {
+    action,
+    intent: String(obj.intent || 'other'),
+    holdUntil: obj.hold_until || null,
+    reply: actsCleanText(obj.reply || ''),
+    reason: actsCleanText(obj.reason || ''),
+    confidence: Math.max(0, Math.min(1, Number(obj.confidence || 0))),
+  };
+}
+
+async function actsSendSmartDialogReply({ source, state, deal, text, channelKey = '', chatId = '', phone = '', email = '' }) {
+  if (!text) return { ok: true, skipped: true };
+
+  if (String(source || '').toLowerCase() === 'email') {
+    const recipient = await actsResolveRecipientContact(deal, state.contactId || '');
+    if (!recipient.ok) return { ok: false, error: recipient.reason || 'не найден контакт для email-ответа' };
+    const targetEmail = String(email || actsContactEmail(recipient.contact) || '').trim();
+    if (!targetEmail) return { ok: false, error: 'у контакта нет email' };
+    await actsSendReminderEmail(
+      deal,
+      recipient.contactId,
+      targetEmail,
+      text,
+      state.taskId,
+      0,
+      'Акт выполненных работ'
+    );
+    return { ok: true, channel: 'Email' };
+  }
+
+  const key = actsNormalizeChannelKey(channelKey) || actsNormalizeChannelKey(source);
+  if (!key) return { ok: false, error: 'не определён Wazzup-канал для ответа' };
+
+  await sendWazzupMessageInternal({
+    channelKey: key,
+    text,
+    chatId: chatId || undefined,
+    phone: phone || undefined,
+    dealId: deal.ID,
+    ignoreStrictPreferredChannel: true,
+    crmMessageId: `mavis-acts-dialog-${key}-${deal.ID}-${state.taskId}-${Date.now()}`,
+  });
+  return { ok: true, channel: preferredChannelLabel(key) };
+}
+
+async function actsProcessIncomingClientText({
+  source,
+  commType,
+  commValue,
+  text,
+  channelKey = '',
+  chatId = '',
+  phone = '',
+  email = '',
+  externalId = '',
+}) {
+  if (!config.actsIncomingEnabled || !config.actsSmartDialogEnabled) return { ok: true, processed: 0, reason: 'disabled' };
+
+  const cleanText = actsCleanText(text || '');
+  if (!cleanText) return { ok: true, processed: 0, reason: 'empty' };
+
+  const waiting = await actsFindWaitingStatesByComm(commType, commValue);
+  if (!waiting.length) return { ok: true, processed: 0, reason: 'no-active-act' };
+
+  const target = waiting[0];
+  const { state, deal } = target;
+  const comments = await actsLoadTimelineComments(state.dealId, 300).catch(() => []);
+
+  const safeExternal = actsCleanText(externalId || '').replace(/\s+/g, '_').slice(0, 140);
+  if (safeExternal) {
+    const duplicateNeedle = `${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId} external=${safeExternal}`;
+    if (comments.some((c) => String(c && c.COMMENT || '').includes(duplicateNeedle))) {
+      return { ok: true, processed: 0, duplicate: true };
+    }
+  }
+
+  const inboundMarker =
+    `${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId}` +
+    (safeExternal ? ` external=${safeExternal}` : '') +
+    ` source=${actsCleanText(source || '').replace(/\s+/g, '_') || 'unknown'}`;
+
+  await actsSmartDialogAddComment(
+    state.dealId,
+    `${inboundMarker}\nКлиент: ${cleanText.slice(0, 3000)}`
+  );
+
+  let decision;
+  try {
+    decision = await actsSmartDialogAnalyse({ state, deal, text: cleanText, comments });
+  } catch (e) {
+    const fallbackHours = Math.max(1, Number(config.actsSmartDialogFallbackHoldHours || 24));
+    const holdUntil = new Date(Date.now() + fallbackHours * 60 * 60 * 1000).toISOString();
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify({
+        holdUntil,
+        intent: 'ai_error',
+        reason: `ИИ не смог разобрать сообщение: ${String(e.message || e).slice(0, 300)}`,
+      })}\nАвтопуш временно приостановлен, чтобы не отвечать клиенту вслепую.`
+    );
+    console.warn(`[acts-dialog] task=${state.taskId}: AI error -> hold ${fallbackHours}h: ${e.message || e}`);
+    return { ok: true, processed: 1, action: 'wait', fallback: true, holdUntil };
+  }
+
+  if (decision.confidence < 0.70) {
+    const fallbackHours = Math.max(1, Number(config.actsSmartDialogFallbackHoldHours || 24));
+    decision = {
+      ...decision,
+      action: 'wait',
+      holdUntil: new Date(Date.now() + fallbackHours * 60 * 60 * 1000).toISOString(),
+      reply: '',
+      reason: `Низкая уверенность ИИ (${decision.confidence}). ${decision.reason || ''}`.trim(),
+    };
+  }
+
+  let holdUntil = decision.holdUntil;
+  let holdMs = Date.parse(String(holdUntil || ''));
+
+  if ((decision.action === 'wait' || decision.action === 'human') && !Number.isFinite(holdMs)) {
+    const hours = decision.action === 'human'
+      ? Math.max(24, Number(config.actsSmartDialogNoDateHoldHours || 72))
+      : Math.max(1, Number(config.actsSmartDialogNoDateHoldHours || 72));
+    holdUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    holdMs = Date.parse(holdUntil);
+  }
+
+  if (decision.action === 'stop') {
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_STOP_MARKER} task=${state.taskId}\n${JSON.stringify({
+        intent: decision.intent,
+        reason: decision.reason,
+        confidence: decision.confidence,
+      })}\nАвтопуши по этому акту остановлены из-за ответа клиента.`
+    );
+    actsPushStates.delete(String(state.taskId));
+  } else if (decision.action === 'wait' || decision.action === 'human') {
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify({
+        holdUntil,
+        intent: decision.intent,
+        reason: decision.reason,
+        confidence: decision.confidence,
+      })}\nДо указанного срока автопуши и задача на звонок по акту запрещены.`
+    );
+  }
+
+  if (decision.action === 'human') {
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_HUMAN_MARKER} task=${state.taskId}\nКлиенту нужен живой ответ. Причина: ${decision.reason || decision.intent}. Сообщение: ${cleanText.slice(0, 1500)}`
+    );
+    await actsSmartDialogNotifyExpert(
+      deal,
+      `Клиент написал по акту: «${cleanText.slice(0, 800)}». Нужен ваш ответ. Автопуши временно приостановлены.`
+    );
+  } else if (decision.action === 'stop') {
+    await actsSmartDialogNotifyExpert(
+      deal,
+      `Клиент попросил остановить коммуникацию/отказался по акту: «${cleanText.slice(0, 800)}». Автопуши остановлены.`
+    );
+  }
+
+  let sentReply = null;
+  if (decision.reply) {
+    try {
+      sentReply = await actsSendSmartDialogReply({
+        source, state, deal, text: decision.reply, channelKey, chatId, phone, email,
+      });
+      if (sentReply && sentReply.ok) {
+        await actsSmartDialogAddComment(
+          state.dealId,
+          `${ACTS_DIALOG_REPLY_MARKER} task=${state.taskId} source=${actsCleanText(source || '').replace(/\s+/g, '_') || 'unknown'}\nMavis: ${decision.reply}`
+        );
+      }
+    } catch (e) {
+      console.warn(`[acts-dialog] task=${state.taskId}: не смог отправить осмысленный ответ: ${e.message || e}`);
+      sentReply = { ok: false, error: e.message || String(e) };
+    }
+  }
+
+  console.log(
+    `[acts-dialog] task=${state.taskId}, deal=${state.dealId}: action=${decision.action}, intent=${decision.intent}, ` +
+    `hold=${holdUntil || '-'}, confidence=${decision.confidence}, reply=${decision.reply ? 'yes' : 'no'}`
+  );
+
+  return {
+    ok: true,
+    processed: 1,
+    taskId: state.taskId,
+    dealId: state.dealId,
+    action: decision.action,
+    intent: decision.intent,
+    holdUntil: holdUntil || null,
+    confidence: decision.confidence,
+    reply: decision.reply || '',
+    sentReply,
+  };
+}
+
+
+async function actsResolveSmartDialogTestDealByPhone(phoneRaw) {
+  if (!config.actsSmartDialogTestImmediateFileReply) return null;
+
+  const dealId = String(config.actsSmartDialogTestDealId || '');
+  const phone = normalizePhoneDigits(phoneRaw || '');
+  if (!dealId || !phone) return null;
+
+  try {
+    const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+    if (!deal || String(deal.ID || '') !== dealId) return null;
+
+    const tail = phone.slice(-9);
+    const contactIds = await actsGetDealContactIds(deal).catch(() => []);
+    for (const contactId of contactIds) {
+      try {
+        const contact = await actsGetContactProfile(contactId);
+        const phones = Array.isArray(contact && contact.PHONE) ? contact.PHONE : [];
+        if (phones.some((p) => normalizePhoneDigits(p && p.VALUE || '').slice(-9) === tail)) {
+          return { deal, contactId: String(contactId), contact };
+        }
+      } catch (_) {}
+    }
+
+    if (deal.COMPANY_ID) {
+      try {
+        const company = await bitrixRestCall('crm.company.get', { id: deal.COMPANY_ID });
+        const phones = Array.isArray(company && company.PHONE) ? company.PHONE : [];
+        if (phones.some((p) => normalizePhoneDigits(p && p.VALUE || '').slice(-9) === tail)) {
+          return { deal, contactId: '', company };
+        }
+      } catch (_) {}
+    }
+  } catch (e) {
+    console.warn(`[acts-dialog-test] deal=${dealId}: не смог сопоставить тестовый номер: ${e.message || e}`);
+  }
+  return null;
+}
+
+function actsBuildSmartDialogTestFileReply(check, hasActiveControl) {
+  const confidence = String(check && check.confidence || 'low').toLowerCase();
+  const type = actsCleanText(check && check.documentType || '');
+  const reason = actsCleanText(check && check.reason || '');
+
+  if (check && check.isSignedAct) {
+    return 'Спасибо! Файл получили и проверили: это похоже на подписанный акт. Если по нему был активный контроль, дальнейшие автоматические напоминания остановлены.';
+  }
+
+  if (!hasActiveControl) {
+    if (type && type !== 'акт' && confidence !== 'low') {
+      return `Спасибо, файл получили. По проверке это похоже на «${type}», а не на подписанный акт. Это тестовая сделка Бобика, поэтому никаких боевых напоминаний или задач я не запускаю.`;
+    }
+    return 'Спасибо, файл получили. Я проверила его, но сейчас по тестовой сделке Бобика нет активного ожидания подписанного акта. Это только тест — никаких боевых действий не запускаю.';
+  }
+
+  if (type && type !== 'акт' && confidence !== 'low') {
+    return `Спасибо, файл получили. По проверке это похоже на «${type}», а не на подписанный акт. Подписанный акт по-прежнему ждём.`;
+  }
+
+  if (confidence === 'low') {
+    return 'Спасибо, файл получили. Пока не могу уверенно подтвердить, что это подписанный акт, поэтому не буду слать очередное напоминание вслепую — файл поставлен на проверку.';
+  }
+
+  if (reason) {
+    return 'Спасибо, файл получили. Проверка пока не подтвердила, что это подписанный акт. Подписанный акт по-прежнему ждём.';
+  }
+
+  return 'Спасибо, файл получили и учли. Проверим его в контексте возврата подписанного акта.';
+}
+
+async function actsSendSmartDialogTestFileReply({ msg, phone, deal, check, hasActiveControl }) {
+  if (!config.actsSmartDialogTestImmediateFileReply || !deal) return { ok: true, skipped: true };
+
+  const messageId = actsCleanText(msg && msg.messageId || '').replace(/\s+/g, '_').slice(0, 160);
+  const marker = `${ACTS_DIALOG_TEST_FILE_MARKER} deal=${deal.ID}${messageId ? ` message=${messageId}` : ''}`;
+
+  if (messageId) {
+    const comments = await actsLoadTimelineComments(deal.ID, 150).catch(() => []);
+    if (comments.some((c) => String(c && c.COMMENT || '').includes(marker))) {
+      return { ok: true, skipped: true, duplicate: true };
+    }
+  }
+
+  const channelKey =
+    findChannelKeyByChannelId(msg && msg.channelId) ||
+    actsNormalizeChannelKey(msg && msg.chatType || '');
+
+  if (!channelKey) {
+    console.warn(`[acts-dialog-test] deal=${deal.ID}: не смог определить канал для мгновенного ответа на файл.`);
+    return { ok: false, error: 'channel-not-resolved' };
+  }
+
+  const reply = actsBuildSmartDialogTestFileReply(check || {}, hasActiveControl);
+
+  await sendWazzupMessageInternal({
+    channelKey,
+    text: reply,
+    chatId: msg && msg.chatId || undefined,
+    phone: phone || undefined,
+    dealId: deal.ID,
+    ignoreStrictPreferredChannel: true,
+    crmMessageId: `mavis-acts-test-file-${deal.ID}-${messageId || Date.now()}`,
+  });
+
+  await actsSmartDialogAddComment(
+    deal.ID,
+    `${marker}\nТЕСТ БОБИКА: на входящий файл отправлен мгновенный осмысленный ответ.\nКлассификация: ${JSON.stringify({
+      isSignedAct: Boolean(check && check.isSignedAct),
+      confidence: check && check.confidence || 'low',
+      documentType: check && check.documentType || null,
+      reason: check && check.reason || '',
+      activeActControl: Boolean(hasActiveControl),
+    })}`
+  ).catch(() => {});
+
+  console.log(`[acts-dialog-test] deal=${deal.ID}: мгновенный ответ на файл отправлен; active=${Boolean(hasActiveControl)}.`);
+  return { ok: true, reply, channel: channelKey };
+}
+
 
 function actsTrustedScanMarker(comment, sentAtMs) {
   if (!comment || !actsCommentIsAfterSend(comment, sentAtMs)) return false;
@@ -7259,7 +7786,7 @@ function actsPushMessage() {
   return `${actsMinskGreeting()}\n\nРанее направляли вам акт выполненных работ сообщением выше, но пока не получили подписанный скан. Наша бухгалтерия очень просит вернуть подписанный акт. Будем вам очень признательны, если сможете направить его ответным сообщением.`;
 }
 
-async function actsSendReminderEmail(deal, contactId, email, text, taskId, sequence) {
+async function actsSendReminderEmail(deal, contactId, email, text, taskId, sequence, subject = 'Напоминание: подписанный акт выполненных работ') {
   const responsibleId = Number(deal.ASSIGNED_BY_ID || deal.assignedById || 1);
   let staff = null;
   try {
@@ -7274,7 +7801,7 @@ async function actsSendReminderEmail(deal, contactId, email, text, taskId, seque
     RESPONSIBLE_ID: responsibleId,
     TYPE_ID: 4,
     DIRECTION: 2,
-    SUBJECT: 'Напоминание: подписанный акт выполненных работ',
+    SUBJECT: subject,
     DESCRIPTION: text,
     DESCRIPTION_TYPE: 1,
     COMPLETED: 'Y',
@@ -7435,9 +7962,16 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
           actsPushStates.delete(taskId);
           continue;
         }
+        if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_DIALOG_STOP_MARKER} task=${taskId}`) && actsCommentIsAfterSend(c, sentAtMs))) {
+          actsPushStates.delete(taskId);
+          continue;
+        }
+
         const pushComments = comments.filter((c) => String(c.COMMENT || '').includes(`${ACTS_PUSH_SENT_MARKER} task=${taskId}`) && actsCommentIsAfterSend(c, sentAtMs));
         const lastPush = [...pushComments].sort((a,b) => actsParseTimelineCreated(b)-actsParseTimelineCreated(a))[0];
-        const lastMessageAtMs = lastPush ? actsParseTimelineCreated(lastPush) : sentAtMs;
+        let lastMessageAtMs = lastPush ? actsParseTimelineCreated(lastPush) : sentAtMs;
+        const latestClientMessageMs = actsLatestClientMessageAtMs({ taskId, sentAtMs }, comments);
+        if (latestClientMessageMs > lastMessageAtMs) lastMessageAtMs = latestClientMessageMs;
         const channel = actsExtractChannelFromSentComment(sentComment.COMMENT) || await detectPreferredChannelResolved(await bitrixRestCall('crm.deal.get', { id: dealId }));
         const originalMatch = String(sentComment.COMMENT || '').match(/Файл:\s*([^\n]+)/i);
         const contactMatch = String(sentComment.COMMENT || '').match(/\[MAVIS_ACTS_PUSH_STATE\][^\n]*contactId=(\d+)/i);
@@ -7494,9 +8028,25 @@ async function runActsPushCycle() {
           continue;
         }
 
+        const dialogControl = await actsGetSmartDialogControl(state, comments);
+        if (dialogControl.stop) {
+          actsPushStates.delete(String(state.taskId));
+          console.log(`[acts-push] task=${state.taskId}: клиентский STOP — пуши отключены.`);
+          continue;
+        }
+        if (dialogControl.holdUntilMs && now < dialogControl.holdUntilMs) {
+          console.log(`[acts-push] task=${state.taskId}: HOLD до ${new Date(dialogControl.holdUntilMs).toISOString()}; пуш и звонок не создаю.`);
+          continue;
+        }
+
         await actsCreateCallTaskIfNeeded(state, deal, comments);
 
-        const dueAt = actsNextPushDueFrom(state.lastMessageAtMs || state.sentAtMs);
+        const latestClientMessageMs = actsLatestClientMessageAtMs(state, comments);
+        const dueBaseMs = Math.max(
+          Number(state.lastMessageAtMs || state.sentAtMs || 0),
+          Number(latestClientMessageMs || 0)
+        );
+        const dueAt = actsNextPushDueFrom(dueBaseMs);
         if (now < dueAt) continue;
         if (actsIsMinskWeekend(new Date(now))) {
           console.log(`[acts-push] task=${state.taskId}: пуш уже по сроку, но сегодня выходной по Минску — клиенту не пишу.`);
@@ -7832,13 +8382,63 @@ async function actsProcessIncomingWazzupMessage(msg) {
   const fromUrl = actsIncomingFileNameFromUrl(msg.contentUri, '');
   const fallback = fromUrl || `Акт_скан_${phone ? phone.slice(-4) : 'клиент'}_${Date.now()}${fallbackExt}`;
   const downloaded = await actsDownloadIncomingUrl(msg.contentUri, fallback);
+
   console.log(`[acts-incoming] Wazzup ${channel}: inbound ${downloaded.fileName}, phone=***${phone.slice(-4)}, message=${msg.messageId || '?'}`);
-  return actsProcessIncomingAttachments({
+
+  // Сначала выполняется СТАРАЯ боевая логика актов без изменений.
+  const waitingBefore = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
+  const result = await actsProcessIncomingAttachments({
     source: channel === 'viber' ? 'Viber' : channel === 'telegram' ? 'Telegram' : 'Wazzup',
-    commType: 'PHONE', commValue: phone, messageText: msg.text || '',
-    attachments: [downloaded], skipCompanyFolder: false,
+    commType: 'PHONE',
+    commValue: phone,
+    messageText: msg.text || '',
+    attachments: [downloaded],
+    skipCompanyFolder: false,
   });
+
+  // ACTS_SMART_DIALOG_V129_BOBIK:
+  // мгновенный ответ на входящий файл только для тестовой сделки.
+  // Никакие ACTS_PUSH_TEST_MINUTES / ACTS_CALL_TEST_MINUTES не меняются.
+  if (config.actsSmartDialogTestImmediateFileReply) {
+    let testCtx =
+      waitingBefore.find(
+        (x) => String(x && x.state && x.state.dealId || '') === String(config.actsSmartDialogTestDealId || '')
+      ) || null;
+
+    if (!testCtx) {
+      const resolved = await actsResolveSmartDialogTestDealByPhone(phone).catch(() => null);
+      if (resolved) testCtx = { state: null, deal: resolved.deal };
+    }
+
+    if (testCtx && testCtx.deal) {
+      // Отдельная тестовая классификация. Даже если боевой обработчик уже проверил файл,
+      // второй вызов разрешён только для Бобика и нужен для мгновенного видимого ответа.
+      const check = await actsAiCheckSignedAct(
+        downloaded.buffer,
+        downloaded.fileName,
+        downloaded.contentType || '',
+        msg.text || ''
+      ).catch((e) => ({
+        isSignedAct: false,
+        confidence: 'low',
+        documentType: null,
+        reason: `Тестовая AI-проверка не сработала: ${e.message || e}`,
+      }));
+
+      await actsSendSmartDialogTestFileReply({
+        msg,
+        phone,
+        deal: testCtx.deal,
+        check,
+        hasActiveControl: Boolean(testCtx.state),
+      }).catch((e) => console.warn(`[acts-dialog-test] file reply: ${e.message || e}`));
+    }
+  }
+
+  return result;
 }
+
+
 // ======================= /v71: ВХОДЯЩИЕ СКАНЫ АКТОВ =========================
 
 
@@ -12107,7 +12707,7 @@ app.listen(PORT, () => {
     console.log('[doc-return] Автоконтроль выключен: нужен DOC_RETURN_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
