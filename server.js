@@ -1299,6 +1299,79 @@ function wazzupWebhookMessageLogSummary(msg) {
   };
 }
 
+
+// ============================================================================
+// v135: ДИАГНОСТИКА ВХОДЯЩИХ ФАЙЛОВ + НЕБЛОКИРУЮЩИЙ ОТВЕТ БОБИКА
+// ============================================================================
+const ACTS_FILE_PIPELINE_V135 = 'v135-direct-human-first';
+let actsV135FileDiag = {
+  version: ACTS_FILE_PIPELINE_V135,
+  startedAt: new Date().toISOString(),
+  stage: 'startup',
+  at: new Date().toISOString(),
+  messageId: '',
+  type: '',
+  chatType: '',
+  channelKnown: null,
+  phoneTail: '',
+  fileName: '',
+  bobikMatched: null,
+  activeActControl: null,
+  replySent: null,
+  error: '',
+};
+
+function actsV135DiagUpdate(stage, extra = {}) {
+  actsV135FileDiag = {
+    ...actsV135FileDiag,
+    ...extra,
+    version: ACTS_FILE_PIPELINE_V135,
+    stage,
+    at: new Date().toISOString(),
+  };
+}
+
+function actsV135FileMessageSummary(msg) {
+  const phone = normalizePhoneDigits((msg && msg.contact && msg.contact.phone) || (msg && msg.chatId) || '');
+  return {
+    messageId: actsCleanText(msg && msg.messageId || '').slice(0, 120),
+    type: actsCleanText(msg && msg.type || '').slice(0, 60),
+    chatType: actsCleanText(msg && msg.chatType || '').slice(0, 60),
+    channelKnown: !!findChannelKeyByChannelId(msg && msg.channelId),
+    phoneTail: phone ? phone.slice(-4) : '',
+  };
+}
+
+async function actsV135WithTimeout(promise, ms, fallbackValue) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(fallbackValue), ms);
+        if (timer && typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+app.get('/api/acts-smart-dialog/diag', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    ...actsV135FileDiag,
+    config: {
+      actsIncoming: !!config.actsIncomingEnabled,
+      incomingWazzup: !!config.actsIncomingWazzupEnabled,
+      smartDialog: !!config.actsSmartDialogEnabled,
+      testImmediateFileReply: !!config.actsSmartDialogTestImmediateFileReply,
+      testDealId: String(config.actsSmartDialogTestDealId || ''),
+    },
+  });
+});
+
 app.post('/api/wazzup/webhook', async (req, res) => {
   // Wazzup при регистрации вебхука шлёт тестовый POST {test: true} и ждёт 200 немедленно.
   if (req.body && req.body.test) {
@@ -1328,6 +1401,17 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     }
 
     const acceptedMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+
+    for (const msg of acceptedMessages) {
+      if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound' || !msg.contentUri) continue;
+      const v135Summary = actsV135FileMessageSummary(msg);
+      actsV135DiagUpdate('webhook-received', { ...v135Summary, error: '', replySent: null, bobikMatched: null });
+      console.log(
+        `[v135-file] webhook-received message=${v135Summary.messageId || '?'} ` +
+        `type=${v135Summary.type || '-'} chatType=${v135Summary.chatType || '-'} ` +
+        `channelKnown=${v135Summary.channelKnown} phone=***${v135Summary.phoneTail || '----'}`
+      );
+    }
 
     // v71: входящие документы/изображения обрабатываем независимо от LIVE_CHAT_ENABLED.
     // Wazzup ждёт 200 максимум 30 секунд, поэтому тяжёлую работу (скачивание, ИИ, Bitrix Disk)
@@ -7760,7 +7844,7 @@ async function actsSendSmartDialogTestFileReply({ msg, phone, deal, check, hasAc
 
   await actsSmartDialogAddComment(
     deal.ID,
-    `${marker}\nТЕСТ БОБИКА v133: входящий файл обработан по смыслу документа; отправлен естественный ответ.\nКлассификация: ${JSON.stringify({
+    `${marker}\nТЕСТ БОБИКА v135: входящий файл обработан по смыслу документа; ответ отправлен до фоновой проверки акта.\nКлассификация: ${JSON.stringify({
       isSignedAct: Boolean(check && check.isSignedAct),
       confidence: check && check.confidence || 'low',
       documentType: check && check.documentType || null,
@@ -8483,54 +8567,167 @@ async function actsLogWazzupIncomingWebhookStatus() {
 async function actsProcessIncomingWazzupMessage(msg) {
   const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
   const channel = String(msg.chatType || findChannelKeyByChannelId(msg.channelId) || 'messenger').toLowerCase();
+  const summary = actsV135FileMessageSummary(msg);
+
+  actsV135DiagUpdate('handler-start', { ...summary, error: '' });
+  console.log(`[v135-file] handler-start message=${summary.messageId || '?'} phone=***${summary.phoneTail || '----'} channel=${channel}`);
 
   const rawType = String(msg.type || '').toLowerCase();
   const fallbackExt = rawType === 'image' ? '.jpg' : rawType === 'document' ? '.pdf' : '.bin';
   const fromUrl = actsIncomingFileNameFromUrl(msg.contentUri, '');
   const fallback = fromUrl || ('Входящий_файл_' + (phone ? phone.slice(-4) : 'клиент') + '_' + Date.now() + fallbackExt);
-  const downloaded = await actsDownloadIncomingUrl(msg.contentUri, fallback);
 
-  console.log('[acts-incoming] Wazzup ' + channel + ': inbound ' + downloaded.fileName + ', phone=***' + phone.slice(-4) + ', message=' + (msg.messageId || '?') + ', type=' + (rawType || '-'));
+  let downloaded;
+  try {
+    downloaded = await actsDownloadIncomingUrl(msg.contentUri, fallback);
+  } catch (e) {
+    actsV135DiagUpdate('download-error', { ...summary, error: String(e.message || e), replySent: false });
+    console.error(`[v135-file] download-error message=${summary.messageId || '?'}: ${e.message || e}`);
+    throw e;
+  }
 
-  const waitingBefore = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
-  const result = await actsProcessIncomingAttachments({
-    source: channel === 'viber' ? 'Viber' : channel === 'telegram' ? 'Telegram' : 'Wazzup',
-    commType: 'PHONE',
-    commValue: phone,
-    messageText: msg.text || msg.caption || '',
-    attachments: [downloaded],
-    skipCompanyFolder: false
+  actsV135DiagUpdate('downloaded', { ...summary, fileName: downloaded.fileName || '', error: '' });
+  console.log(
+    `[v135-file] downloaded message=${summary.messageId || '?'} file=${downloaded.fileName || '?'} ` +
+    `bytes=${downloaded.buffer ? downloaded.buffer.length : 0} type=${rawType || '-'}`
+  );
+
+  const waitingBefore = await actsFindWaitingStatesByComm('PHONE', phone).catch((e) => {
+    console.warn(`[v135-file] waiting-state-error message=${summary.messageId || '?'}: ${e.message || e}`);
+    return [];
   });
 
-  if (config.actsSmartDialogTestImmediateFileReply) {
-    let testCtx =
-      waitingBefore.find(
-        (x) => String(x && x.state && x.state.dealId || '') === String(config.actsSmartDialogTestDealId || '')
-      ) || null;
+  let testCtx =
+    waitingBefore.find(
+      (x) => String(x && x.state && x.state.dealId || '') === String(config.actsSmartDialogTestDealId || '')
+    ) || null;
 
-    if (!testCtx) {
-      const resolved = await actsResolveSmartDialogTestDealByPhone(phone).catch(() => null);
-      if (resolved) testCtx = { state: null, deal: resolved.deal };
+  let matchedBy = testCtx ? 'active-act' : '';
+
+  if (!testCtx && config.actsSmartDialogTestImmediateFileReply) {
+    const resolved = await actsResolveSmartDialogTestDealByPhone(phone).catch((e) => {
+      console.warn(`[v135-file] bobik-resolve-error message=${summary.messageId || '?'}: ${e.message || e}`);
+      return null;
+    });
+    if (resolved) {
+      testCtx = { state: null, deal: resolved.deal };
+      matchedBy = 'phone';
     }
+  }
 
-    if (testCtx && testCtx.deal) {
-      const check = await actsAiAnalyzeIncomingFileHuman(
+  actsV135DiagUpdate('bobik-resolved', {
+    ...summary,
+    fileName: downloaded.fileName || '',
+    bobikMatched: !!(testCtx && testCtx.deal),
+    activeActControl: !!(testCtx && testCtx.state),
+    error: '',
+  });
+
+  console.log(
+    `[v135-file] bobik-resolved message=${summary.messageId || '?'} matched=${!!(testCtx && testCtx.deal)} ` +
+    `by=${matchedBy || '-'} activeAct=${!!(testCtx && testCtx.state)} waiting=${waitingBefore.length}`
+  );
+
+  // БОБИК: сначала отвечаем клиенту. Старая актовая проверка больше не может задержать этот ответ.
+  if (config.actsSmartDialogTestImmediateFileReply && testCtx && testCtx.deal) {
+    const fallbackCheck = {
+      reply: actsHumanFileFallbackReply(downloaded.fileName || '', msg.text || msg.caption || ''),
+      documentType: 'документ',
+      confidence: 'low',
+      isAct: false,
+      isSignedAct: false,
+      reason: 'v135-timeout-fallback',
+    };
+
+    actsV135DiagUpdate('human-analysis-start', {
+      ...summary,
+      fileName: downloaded.fileName || '',
+      bobikMatched: true,
+      activeActControl: !!testCtx.state,
+    });
+
+    const check = await actsV135WithTimeout(
+      actsAiAnalyzeIncomingFileHuman(
         downloaded.buffer,
         downloaded.fileName,
         downloaded.contentType || '',
         msg.text || msg.caption || '',
         testCtx.deal,
         Boolean(testCtx.state)
-      );
+      ).catch((e) => ({
+        ...fallbackCheck,
+        reason: 'human-analysis-error: ' + String(e.message || e),
+      })),
+      12000,
+      fallbackCheck
+    );
 
-      await actsSendSmartDialogTestFileReply({
-        msg: msg,
-        phone: phone,
-        deal: testCtx.deal,
-        check: check,
-        hasActiveControl: Boolean(testCtx.state)
-      }).catch((e) => console.warn('[acts-dialog-test] v133 file reply: ' + (e.message || e)));
+    console.log(
+      `[v135-file] human-analysis-done message=${summary.messageId || '?'} ` +
+      `documentType=${check && check.documentType || '-'} confidence=${check && check.confidence || '-'}`
+    );
+
+    const sendResult = await actsSendSmartDialogTestFileReply({
+      msg,
+      phone,
+      deal: testCtx.deal,
+      check,
+      hasActiveControl: Boolean(testCtx.state),
+    }).catch((e) => ({ ok: false, error: String(e.message || e) }));
+
+    if (sendResult && sendResult.ok) {
+      actsV135DiagUpdate('reply-sent', {
+        ...summary,
+        fileName: downloaded.fileName || '',
+        bobikMatched: true,
+        activeActControl: !!testCtx.state,
+        replySent: true,
+        error: '',
+      });
+      console.log(`[v135-file] reply-sent deal=${testCtx.deal.ID} message=${summary.messageId || '?'} channel=${sendResult.channel || '-'}`);
+    } else {
+      actsV135DiagUpdate('reply-error', {
+        ...summary,
+        fileName: downloaded.fileName || '',
+        bobikMatched: true,
+        activeActControl: !!testCtx.state,
+        replySent: false,
+        error: String(sendResult && sendResult.error || 'unknown-send-error'),
+      });
+      console.warn(`[v135-file] reply-error deal=${testCtx.deal.ID} message=${summary.messageId || '?'}: ${sendResult && sendResult.error || 'unknown-send-error'}`);
     }
+
+    // После видимого ответа отдельно запускаем старую боевую проверку подписанного акта.
+    setImmediate(() => {
+      actsProcessIncomingAttachments({
+        source: channel === 'viber' ? 'Viber' : channel === 'telegram' ? 'Telegram' : 'Wazzup',
+        commType: 'PHONE',
+        commValue: phone,
+        messageText: msg.text || msg.caption || '',
+        attachments: [downloaded],
+        skipCompanyFolder: false,
+      }).then((result) => {
+        console.log(`[v135-file] background-act-check message=${summary.messageId || '?'} result=${JSON.stringify(result || {})}`);
+      }).catch((e) => {
+        console.warn(`[v135-file] background-act-check-error message=${summary.messageId || '?'}: ${e.message || e}`);
+      });
+    });
+
+    return { ok: true, testReply: sendResult, actCheck: 'background' };
+  }
+
+  // Не Бобик: сохраняем прежнее боевое поведение без изменений.
+  const result = await actsProcessIncomingAttachments({
+    source: channel === 'viber' ? 'Viber' : channel === 'telegram' ? 'Telegram' : 'Wazzup',
+    commType: 'PHONE',
+    commValue: phone,
+    messageText: msg.text || msg.caption || '',
+    attachments: [downloaded],
+    skipCompanyFolder: false,
+  });
+
+  if (!testCtx) {
+    console.log(`[v135-file] not-bobik message=${summary.messageId || '?'}: human test reply skipped.`);
   }
 
   return result;
@@ -12804,6 +13001,7 @@ app.listen(PORT, () => {
     console.log('[doc-return] Автоконтроль выключен: нужен DOC_RETURN_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
+  console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
