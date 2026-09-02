@@ -1375,6 +1375,7 @@ app.get('/api/acts-smart-dialog/diag', (_req, res) => {
 app.post('/api/wazzup/webhook', async (req, res) => {
   // Wazzup при регистрации вебхука шлёт тестовый POST {test: true} и ждёт 200 немедленно.
   if (req.body && req.body.test) {
+    console.log('[v136-wazzup] ✅ test POST от Wazzup получен → 200 OK. Подписка реально достучалась до Render.');
     console.log('[wazzup-webhook] test POST получен → 200 OK.');
     res.status(200).json({ ok: true });
     return;
@@ -8564,6 +8565,72 @@ async function actsLogWazzupIncomingWebhookStatus() {
   }
 }
 
+
+// ============================================================================
+// ACTS_WAZZUP_WEBHOOK_REPAIR_V136
+// После старта сервера принудительно обновляем подписку Wazzup v3.
+// Сохраняем остальные существующие флаги, но messagesAndStatuses включаем всегда.
+// Wazzup после PATCH сам делает тестовый POST {test:true} на наш endpoint.
+// ============================================================================
+async function actsRepairWazzupWebhookV136() {
+  const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
+  if (!apiKey || !config.actsIncomingEnabled || !config.actsIncomingWazzupEnabled) {
+    console.log('[v136-wazzup] repair skipped: Wazzup API key/incoming disabled.');
+    return { ok: false, skipped: true };
+  }
+
+  const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
+  const expected = `${config.actsPublicBaseUrl}/api/wazzup/webhook`.replace(/\/+$/, '');
+
+  try {
+    const getResp = await fetch(`${baseUrl}/webhooks`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const current = await getResp.json().catch(() => ({}));
+
+    if (!getResp.ok) {
+      throw new Error(`GET /webhooks HTTP ${getResp.status}: ${compactWazzupError(current, 'ошибка')}`);
+    }
+
+    const existingSubs = current && typeof current.subscriptions === 'object' && current.subscriptions
+      ? current.subscriptions
+      : {};
+
+    const subscriptions = {
+      ...existingSubs,
+      messagesAndStatuses: true,
+    };
+
+    console.log(
+      `[v136-wazzup] current uri=${String(current.webhooksUri || current.webhookUri || current.uri || '') || '-'}; ` +
+      `messagesAndStatuses=${Boolean(existingSubs.messagesAndStatuses)}; re-register -> ${expected}`
+    );
+
+    const patchResp = await fetch(`${baseUrl}/webhooks`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        webhooksUri: expected,
+        subscriptions,
+      }),
+    });
+
+    const patched = await patchResp.json().catch(() => ({}));
+    if (!patchResp.ok) {
+      throw new Error(`PATCH /webhooks HTTP ${patchResp.status}: ${compactWazzupError(patched, 'ошибка')}`);
+    }
+
+    console.log(`[v136-wazzup] ✅ webhook re-register OK -> ${expected}; Wazzup test POST должен прийти отдельно.`);
+    return { ok: true, expected, subscriptions };
+  } catch (e) {
+    console.warn(`[v136-wazzup] ❌ webhook repair failed: ${e.message || e}`);
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
 async function actsProcessIncomingWazzupMessage(msg) {
   const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
   const channel = String(msg.chatType || findChannelKeyByChannelId(msg.channelId) || 'messenger').toLowerCase();
@@ -13002,10 +13069,13 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
+  console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
+    setTimeout(() => actsRepairWazzupWebhookV136(), 8000);
+    setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 15000);
   }
 
   if (config.bitrixWebhookUrl && config.actsReconAutoEnabled) {
