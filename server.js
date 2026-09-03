@@ -1473,10 +1473,14 @@ app.post('/api/wazzup/webhook', async (req, res) => {
         if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId) === '38072') {
           setImmediate(async () => {
             try {
-              const waiting = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
-              if (waiting.length) return; // активный актовый smart-dialog уже обрабатывает сообщение
+              // v137.2: для тестового Бобика активный актовый контроль не блокирует AI-пилот.
+              // Hard-stop записывается первым обработчиком выше.
               const resolved = await actsResolveSmartDialogTestDealByPhone(phone).catch(() => null);
-              if (!resolved || !resolved.deal || String(resolved.deal.ID) !== '38072') return;
+              if (!resolved || !resolved.deal || String(resolved.deal.ID) !== '38072') {
+                console.log(`[wazzup-ai-v1372] Bobik match failed: phoneTail=${String(phone).slice(-4)} chatId=${String(msg.chatId || '').slice(-12)}`);
+                return;
+              }
+              console.log(`[wazzup-ai-v1372] Bobik matched: deal=38072 channel=${channelKey || msg.chatType || '-'} phoneTail=${String(phone).slice(-4)} chatId=${String(msg.chatId || '').slice(-12)}`);
               await actsProcessBobikInboundText({ msg, phone, channelKey, text });
             } catch (e) {
               console.error(`[wazzup-ai-v137] Bobik fallback error message=${msg.messageId || '?'}: ${e.message || e}`);
@@ -7518,7 +7522,7 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
   }
 
   const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
-  if (!phone) return { ok: true, marked: 0, reason: 'no-phone' };
+  if (!phone) { console.warn(`[acts-client-replied] inbound without phone/chatId message=${msg.messageId || '?'}`); return { ok: true, marked: 0, reason: 'no-phone' }; }
 
   const text = actsCleanText(msg.text || msg.caption || '');
   const external = actsCleanText(msg.messageId || '').replace(/\s+/g, '_').slice(0, 160);
@@ -7889,6 +7893,31 @@ async function actsResolveSmartDialogTestDealByPhone(phoneRaw) {
         }
       } catch (_) {}
     }
+
+    // v137.2: если телефон отсутствует в связанном контакте/компании, ищем его
+    // напрямую в CRM. Для теста это позволяет корректно сопоставить Wazzup chat с Бобиком.
+    try {
+      const contactSearch = await bitrixRestCall('crm.contact.list', {
+        filter: { PHONE: phone },
+        select: ['ID', 'NAME', 'LAST_NAME', 'PHONE'],
+        start: 0,
+      });
+      const contacts = Array.isArray(contactSearch) ? contactSearch : [];
+      if (contacts.length) return { deal, contactId: String(contacts[0].ID || ''), contact: contacts[0] };
+    } catch (_) {}
+
+    try {
+      const companySearch = await bitrixRestCall('crm.company.list', {
+        filter: { PHONE: phone },
+        select: ['ID', 'TITLE', 'PHONE'],
+        start: 0,
+      });
+      const companies = Array.isArray(companySearch) ? companySearch : [];
+      if (companies.length) {
+        const sameCompany = deal.COMPANY_ID && companies.find((c) => String(c.ID) === String(deal.COMPANY_ID));
+        return { deal, contactId: '', company: sameCompany || companies[0] };
+      }
+    } catch (_) {}
   } catch (e) {
     console.warn(`[acts-dialog-test] deal=${dealId}: не смог сопоставить тестовый номер: ${e.message || e}`);
   }
@@ -13304,7 +13333,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V137=ON; hard-client-reply-stop=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V1372=ON; hard-client-reply-stop=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
