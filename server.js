@@ -1449,14 +1449,18 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     // активных контролей актов, независимо от пилотного LIVE_CHAT.
     if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled && config.actsSmartDialogEnabled) {
       for (const msg of acceptedMessages) {
-        if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
+        if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
         const text = actsCleanText(msg.text || '');
-        if (!text) continue;
+        if (!text) {
+          console.log(`[wazzup-inbound-v1373] inbound text empty: message=${msg.messageId || '-'} type=${msg.type || '-'} chatType=${msg.chatType || '-'}`);
+          continue;
+        }
         if (msg.contentUri) continue;
 
         const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
         if (!phone) continue;
         const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
+        console.log(`[wazzup-inbound-v1373] text accepted: message=${msg.messageId || '-'} phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'} textLen=${text.length}`);
 
         setImmediate(() => actsProcessIncomingClientText({
           source: channelKey || msg.chatType || 'Wazzup',
@@ -7862,7 +7866,10 @@ async function actsProcessIncomingClientText({
 
 
 async function actsResolveSmartDialogTestDealByPhone(phoneRaw) {
-  if (!config.actsSmartDialogTestImmediateFileReply) return null;
+  // v137.3: Bobik text AI pilot must not depend on the legacy file-reply flag.
+  // That legacy gate was the reason a real inbound text was accepted by the webhook
+  // but silently stopped before Bobik matching and AI processing.
+  if (!config.wazzupAiTestEnabled) return null;
 
   const dealId = String(config.actsSmartDialogTestDealId || '');
   const phone = normalizePhoneDigits(phoneRaw || '');
@@ -13333,7 +13340,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V1372=ON; hard-client-reply-stop=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V1373=ON; hard-client-reply-stop=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}; bobikMatchGate=wazzupAiTestEnabled`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
