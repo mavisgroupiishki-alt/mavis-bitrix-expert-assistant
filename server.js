@@ -1,12 +1,13 @@
 
-// v143: production act-AI rules.
-// New + historical deals are eligible. Successful deals are never pushed.
-// Any inbound client reply after an act push permanently suppresses future
-// act reminders for that deal. Technical marker strings stay internal.
-const V143_PRODUCTION_RULES = {
+// v149: production act-AI rules.
+// Historical successful deals do NOT receive new act pushes.
+// New deals that reach the successful/closed state DO receive the normal act push.
+// After any inbound client reply, the push timer is stopped for that deal, while
+// the semantic AI dialog remains available for follow-up requests such as resend.
+const V149_PRODUCTION_RULES = {
   allDeals: true,
-  includeHistorical: true,
-  disablePushOnSuccessStage: true,
+  includeHistorical: false,
+  disablePushOnSuccessStage: false,
   stopAfterAnyClientReply: true,
   humanReadableCommentsOnly: true,
 };
@@ -265,6 +266,9 @@ const config = {
   actsPushStateRefreshMinutes: Number(process.env.ACTS_PUSH_STATE_REFRESH_MINUTES || 10),
   // Не обрабатываем исторические задачи «Сделано» до запуска боевого режима актов.
   actsProductionStartIso: process.env.ACTS_PRODUCTION_START_ISO || '2026-08-18T14:56:00+03:00',
+  // v149: only act push states created/sent from this moment are eligible for future pushes.
+  // Existing historical successful deals are therefore never re-pushed after deployment.
+  actsPushNewOnlyAfterIso: process.env.ACTS_PUSH_NEW_ONLY_AFTER_ISO || '2026-09-04T08:00:00+03:00',
   // v71: входящие подписанные сканы актов из Wazzup (Viber/Telegram) и почты.
   // Включено независимо от LIVE_CHAT_ENABLED: документы клиента должны обрабатываться даже если живой чат-бот выключен.
   actsIncomingEnabled: String(process.env.ACTS_INCOMING_ENABLED || 'true').toLowerCase() !== 'false',
@@ -1506,43 +1510,22 @@ __wazzupAck({ ok: true, received: true });
         const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
         console.log(`[wazzup-inbound-v1373] text accepted: message=${msg.messageId || '-'} phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'} textLen=${text.length}`);
 
-        // v146: Bobik pilot is the single owner of Bobik inbound messages.
-        // Do not also run the generic act-dialog worker for the same message:
-        // that created duplicate decisions and could consume/delete the state
-        // before the action (e.g. resend_act) was executed.
-        const isBobikPhoneV145 = String(phone).slice(-4) === String(config.wazzupAiTestPhoneTail || '5898');
-        const bobikPilotV145 = config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072' && isBobikPhoneV145;
-        if (!bobikPilotV145) {
-          setImmediate(() => actsProcessIncomingClientText({
-            source: channelKey || msg.chatType || 'Wazzup',
-            commType: 'PHONE',
-            commValue: phone,
-            text,
-            channelKey,
-            chatId: msg.chatId || '',
-            phone,
-            externalId: `wazzup_${msg.messageId || ''}`,
-          }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
-        } else {
-          console.log(`[wazzup-inbound-v146] Bobik message routed ONLY to Bobik pilot: deal=38072 message=${msg.messageId || '-'}`);
-        }
-        // v141: прямой пилот Бобика. Номер уже получен из Wazzup и проверен по тестовому хвосту.
-        // Больше НЕ вызываем findDealForPhone(): он смотрел только CONTACT_ID и поэтому
-        // возвращал foundDeal=none даже когда сделка 38072 была правильной.
-        const isBobikPhone = String(phone).slice(-4) === String(config.wazzupAiTestPhoneTail || '5898');
-        if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072' && isBobikPhone) {
-          setImmediate(async () => {
-            try {
-              console.log(`[wazzup-ai-v141] Bobik matched by verified test phone: deal=38072 phoneTail=${phone.slice(-4)} message=${msg.messageId || '-'}`);
-              const result = await actsProcessBobikInboundText({ msg, phone, channelKey, text });
-              console.log(`[wazzup-ai-v141] Bobik result: ${JSON.stringify(result).slice(0, 3000)}`);
-            } catch (e) {
-              console.error(`[wazzup-ai-v141] Bobik processing error message=${msg.messageId || '?'}: ${e.message || e}`);
-            }
-          });
-        } else if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072') {
-          console.log(`[wazzup-ai-v141] Bobik NOT matched: incoming phoneTail=${phone.slice(-4)} expectedTail=${config.wazzupAiTestPhoneTail || '5898'}; AI skipped.`);
-        }
+        // v148: единый production-контур для ВСЕХ клиентов.
+        // Больше нет отдельного Bobik-only маршрута: каждое inbound-сообщение
+        // сначала связывается с конкретной сделкой/актовой задачей, а затем
+        // проходит семантический анализ. Это важно и для старых успешных сделок.
+        setImmediate(() => actsProcessIncomingClientText({
+          source: channelKey || msg.chatType || 'Wazzup',
+          commType: 'PHONE',
+          commValue: phone,
+          text,
+          channelKey,
+          chatId: msg.chatId || '',
+          phone,
+          externalId: `wazzup_${msg.messageId || ''}`,
+        }).then((result) => {
+          console.log(`[wazzup-ai-v149] inbound processed message=${msg.messageId || '-'} action=${result && result.action || '-'} deal=${result && result.dealId || '-'} reply=${result && result.sentReply && result.sentReply.ok ? 'yes' : 'no'} reason=${result && result.reason || result && result.reason || '-'}`);
+        }).catch((e) => console.error(`[wazzup-ai-v149] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
 
       }
     }
@@ -7308,6 +7291,16 @@ const ACTS_CLIENT_REPLIED_MARKER = '[MAVIS_ACTS_CLIENT_REPLIED]';
 const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
 // v139: real-time inbound kill switch. Set before expensive Bitrix/AI work.
 const actsRecentClientReplyDeals = new Map(); // dealId -> {at,messageId}
+const actsProcessedInboundMessageIds = new Map(); // Wazzup messageId -> timestamp
+function actsRememberInboundMessage(messageId) {
+  const id = String(messageId || '');
+  if (!id) return false;
+  const now = Date.now();
+  for (const [k, at] of actsProcessedInboundMessageIds.entries()) { if (now - at > 24 * 60 * 60 * 1000) actsProcessedInboundMessageIds.delete(k); }
+  if (actsProcessedInboundMessageIds.has(id)) return true;
+  actsProcessedInboundMessageIds.set(id, now);
+  return false;
+}
 const ACTS_RECENT_REPLY_TTL_MS = 6 * 60 * 60 * 1000;
 function actsSetRecentClientReplyDeal(dealId, messageId = '') {
   if (!dealId) return;
@@ -7613,22 +7606,14 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
     const deal = item && item.deal;
     if (!state || !deal) continue;
     actsSetRecentClientReplyDeal(deal.ID, msg.messageId || '');
-    const marker = `${ACTS_CLIENT_REPLIED_MARKER} task=${state.taskId}`;
     const comments = await actsLoadTimelineComments(state.dealId, 100).catch(() => []);
-    if (comments.some((c) => String(c && c.COMMENT || '').includes(marker))) continue;
-    const payload = {
-      messageId: msg.messageId || '',
-      source,
-      type: msg.type || '',
-      chatType: msg.chatType || '',
-      text: text.slice(0, 3000),
-      receivedAt: new Date().toISOString(),
-    };
+    const alreadyByText = msg.messageId && comments.some((c) => String(c && c.COMMENT || '').includes(`Клиент ответил после отправки акта`) && String(c.COMMENT || '').includes(text.slice(0, 80)));
+    if (alreadyByText) continue;
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
         ENTITY_ID: deal.ID,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${marker}\nКлиент ответил после отправки акта. Автоматические актовые пуши по этому контролю запрещены.\n${JSON.stringify(payload)}`,
+        COMMENT: `Клиент ответил после отправки акта: «${text.slice(0, 3000)}». Дальнейшие автоматические напоминания по акту остановлены.`,
       },
     });
     actsPushStates.delete(String(state.taskId));
@@ -7636,34 +7621,7 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
     console.log(`[acts-client-replied] deal=${deal.ID} task=${state.taskId} source=${source} -> HARD STOP`);
   }
 
-  // Тестовый пилот Бобика: даже если активного контроля акта сейчас нет, сохраняем факт ответа,
-  // чтобы его можно было использовать как состояние живого диалога.
-  if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId) === String(38072)) {
-    try {
-      const deal = await bitrixRestCall('crm.deal.get', { id: config.wazzupAiTestDealId });
-      if (deal) {
-        actsSetRecentClientReplyDeal(deal.ID, msg.messageId || '');
-        const marker = `${ACTS_CLIENT_REPLIED_MARKER} testDeal=${deal.ID}`;
-        const comments = await actsLoadTimelineComments(deal.ID, 100).catch(() => []);
-        const already = external
-          ? comments.some((c) => String(c && c.COMMENT || '').includes(`external=${external}`))
-          : false;
-        if (!already) {
-          await bitrixRestCall('crm.timeline.comment.add', {
-            fields: {
-              ENTITY_ID: deal.ID,
-              ENTITY_TYPE: 'deal',
-              COMMENT: `${marker} external=${external || 'none'}\nКлиент ответил через Wazzup. Канал=${source}; type=${String(msg.type || '')}; text=${text.slice(0, 3000)}`,
-            },
-          });
-          marked++;
-          console.log(`[wazzup-inbound-v137] Bobik deal=${deal.ID}: CLIENT_REPLIED recorded; channel=${source}; message=${external || '-'}`);
-        }
-      }
-    } catch (e) {
-      console.warn(`[wazzup-inbound-v137] Bobik marker error: ${e.message || e}`);
-    }
-  }
+  // v148: legacy Bobik-only marker path removed. The global semantic dialog below owns inbound handling.
 
   return { ok: true, marked };
 }
@@ -7673,7 +7631,11 @@ async function actsHasClientRepliedAfterSend(state, comments = null) {
   if (actsHasRecentClientReplyDeal(state.dealId)) return true;
   const rows = comments || await actsLoadTimelineComments(state.dealId, 150).catch(() => []);
   const marker = `${ACTS_CLIENT_REPLIED_MARKER} task=${state.taskId}`;
-  return rows.some((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, state.sentAtMs));
+  return rows.some((c) => {
+    const t = String(c && c.COMMENT || '');
+    if (!actsCommentIsAfterSend(c, state.sentAtMs)) return false;
+    return t.includes(marker) || t.includes('Клиент ответил после отправки акта') || t.includes('Клиент написал по акту:');
+  });
 }
 
 
@@ -8178,6 +8140,7 @@ async function actsProcessIncomingClientText({
 
   const cleanText = actsCleanText(text || '');
   if (!cleanText) return { ok: true, processed: 0, reason: 'empty' };
+  if (externalId && actsRememberInboundMessage(externalId)) return { ok: true, processed: 0, duplicate: true };
 
   const waiting = await actsFindWaitingStatesByComm(commType, commValue);
   let target = waiting[0] || null;
@@ -8201,14 +8164,9 @@ async function actsProcessIncomingClientText({
     }
   }
 
-  const inboundMarker =
-    `${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId}` +
-    (safeExternal ? ` external=${safeExternal}` : '') +
-    ` source=${actsCleanText(source || '').replace(/\s+/g, '_') || 'unknown'}`;
-
   await actsSmartDialogAddComment(
     state.dealId,
-    `${inboundMarker}\nКлиент: ${cleanText.slice(0, 3000)}`
+    `Клиент написал по акту: ${cleanText.slice(0, 3000)}`
   );
 
   let decision;
@@ -8286,29 +8244,20 @@ async function actsProcessIncomingClientText({
   if (decision.action === 'stop') {
     await actsSmartDialogAddComment(
       state.dealId,
-      `${ACTS_DIALOG_STOP_MARKER} task=${state.taskId}\n${JSON.stringify({
-        intent: decision.intent,
-        reason: decision.reason,
-        confidence: decision.confidence,
-      })}\nАвтопуши по этому акту остановлены из-за ответа клиента.`
+      `Клиент попросил больше не напоминать по акту. Автоматические напоминания остановлены.`
     );
     actsPushStates.delete(String(state.taskId));
   } else if (decision.action === 'wait' || decision.action === 'human') {
     await actsSmartDialogAddComment(
       state.dealId,
-      `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify({
-        holdUntil,
-        intent: decision.intent,
-        reason: decision.reason,
-        confidence: decision.confidence,
-      })}\nДо указанного срока автопуши и задача на звонок по акту запрещены.`
+      `Клиент ответил по акту. Автоматические напоминания приостановлены${holdUntil ? ` до ${holdUntil}` : ''}.`
     );
   }
 
   if (decision.action === 'human') {
     await actsSmartDialogAddComment(
       state.dealId,
-      `${ACTS_DIALOG_HUMAN_MARKER} task=${state.taskId}\nКлиенту нужен живой ответ. Причина: ${decision.reason || decision.intent}. Сообщение: ${cleanText.slice(0, 1500)}`
+      `По акту нужен ответ специалиста. Сообщение клиента: ${cleanText.slice(0, 1500)}`
     );
     await actsSmartDialogNotifyExpert(
       deal,
@@ -8341,7 +8290,7 @@ async function actsProcessIncomingClientText({
       if (sentReply && sentReply.ok) {
         await actsSmartDialogAddComment(
           state.dealId,
-          `${ACTS_DIALOG_REPLY_MARKER}\nMavis: ${v144HumanVisibleComment(decision.reply)}`
+          `Ответ клиенту: ${v144HumanVisibleComment(decision.reply)}`
         );
       }
     } catch (e) {
@@ -8770,18 +8719,9 @@ async function actsSendReminderEmail(deal, contactId, email, text, taskId, seque
 
 async function actsSendPush(state, deal, sequence) {
 
-  // v143: never send act reminders from a successfully closed deal.
-  const __v143SuccessDealId = String(
-    (deal && (deal.ID || deal.id)) ||
-    (state && state.dealId) ||
-    (typeof dealId !== 'undefined' ? dealId : '') ||
-    ''
-  );
-  if (__v143SuccessDealId && await v143IsDealSuccessful(__v143SuccessDealId)) {
-    console.log(`[acts-v143] deal=${__v143SuccessDealId}: SUCCESS stage — ACT PUSH BLOCKED.`);
-    return { ok: false, blocked: true, reason: 'success-stage' };
-  }
-
+  // v149: successful/closed deals may receive the normal push if the act control
+  // belongs to a newly completed deal. Historical states are filtered during recovery.
+  // Do NOT block here by success stage: the act itself is created because the deal closed.
 
 
   // v142: hard stop for ANY client reply, including replies unrelated to the act.
@@ -8790,7 +8730,6 @@ async function actsSendPush(state, deal, sequence) {
     (deal && deal.ID) ||
     (deal && deal.id) ||
     (state && state.dealId) ||
-    dealId ||
     ''
   );
   const __v142SentAtMs = Number(
@@ -8881,6 +8820,11 @@ async function actsCreateCallTaskIfNeeded(state, deal, comments) {
 
 async function actsRegisterPushState({ taskId, dealId, channel, contactId = '', sentAtMs = Date.now(), originalFileName = '' }) {
   if (!config.actsPushEnabled || !taskId || !dealId) return;
+  const pushCutoffMs = Date.parse(String(config.actsPushNewOnlyAfterIso || ''));
+  if (Number.isFinite(pushCutoffMs) && Number(sentAtMs || 0) < pushCutoffMs) {
+    console.log(`[acts-push-v149] task=${taskId}: old sentAt=${new Date(Number(sentAtMs)).toISOString()} < cutoff — recurring pushes disabled.`);
+    return;
+  }
   actsPushStates.set(String(taskId), {
     taskId: String(taskId), dealId: String(dealId), channel: actsNormalizeChannelKey(channel), contactId: String(contactId || ''),
     sentAtMs: Number(sentAtMs || Date.now()), lastMessageAtMs: Number(sentAtMs || Date.now()),
@@ -8946,6 +8890,13 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
           if (parsed) sentAtMs = parsed;
         }
         if (!sentAtMs) { stats.noSentMarker++; continue; }
+        const pushCutoffMs = Date.parse(String(config.actsPushNewOnlyAfterIso || ''));
+        if (Number.isFinite(pushCutoffMs) && sentAtMs < pushCutoffMs) {
+          // Historical successful deal / old act control: keep it available for inbound
+          // semantic replies, but NEVER restore it into the recurring push state.
+          console.log(`[acts-push-v149] task=${taskId}: historical state (${new Date(sentAtMs).toISOString()}) < cutoff ${new Date(pushCutoffMs).toISOString()} — push control not restored.`);
+          continue;
+        }
         if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_SCAN_RECEIVED_MARKER} task=${taskId}`) && actsTrustedScanMarker(c, sentAtMs))) {
           stats.scanReceived++;
           actsPushStates.delete(taskId);
@@ -8992,6 +8943,18 @@ async function actsHasRecentUncertainIncoming(state, comments) {
   if (!latest) return false;
   const createdMs = actsParseTimelineCreated(latest);
   return !!createdMs && Date.now() - createdMs < holdMs;
+}
+
+async function actsShouldSendPushV148(state) {
+  if (!state || !state.dealId) return false;
+  // v149: a newly completed deal is expected to be successful, so success stage
+  // itself is NOT a reason to block the normal act push. Historical states are
+  // excluded when they are recovered, using actsPushNewOnlyAfterIso.
+  if (await actsHasClientRepliedAfterSend(state).catch(() => true)) {
+    console.log(`[acts-push-v149] deal=${state.dealId}: клиент уже ответил, новые актовые пуши запрещены.`);
+    return false;
+  }
+  return true;
 }
 
 async function runActsPushCycle() {
@@ -9063,7 +9026,7 @@ async function runActsPushCycle() {
         await bitrixRestCall('crm.timeline.comment.add', { fields: {
           ENTITY_ID: state.dealId,
           ENTITY_TYPE: 'deal',
-          COMMENT: `${marker}\nАвтопуш #${sequence} по подписанному скану отправлен клиенту через ${result.channel}.`,
+          COMMENT: `Напоминание по акту №${sequence} отправлено клиенту через ${result.channel}.`,
         }});
         state.lastMessageAtMs = Date.now();
         state.pushCount = sequence;
@@ -13877,9 +13840,9 @@ app.listen(PORT, () => {
   } else {
     console.log('[doc-return] Автоконтроль выключен: нужен DOC_RETURN_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
-  console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
-  console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V144=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`MAVIS Bitrix Expert Assistant v149 is running on port ${PORT}`);
+  console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; ACTS_PUSH_V149=NEW_CLOSED_DEALS_ONLY; historical-push-cutoff=${config.actsPushNewOnlyAfterIso}; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V149=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
@@ -13974,7 +13937,9 @@ async function actsHasAnyClientReplyAfterSendV142(dealId, sentAtMs = 0) {
         text.includes('[MAVIS_LIVE_CHAT]') ||
         text.includes('[WAZZUP_INBOUND]') ||
         text.includes('[WAZZUP_INBOUND_MESSAGE]') ||
-        text.includes('[MAVIS_CLIENT_REPLY]');
+        text.includes('[MAVIS_CLIENT_REPLY]') ||
+        text.includes('Клиент ответил после отправки акта') ||
+        text.includes('Клиент написал по акту:');
 
       if (!inbound) return false;
 
@@ -13996,7 +13961,7 @@ async function actsHasAnyClientReplyAfterSendV142(dealId, sentAtMs = 0) {
 async function v143IsDealSuccessful(dealId) {
   if (!dealId || !V143_PRODUCTION_RULES.disablePushOnSuccessStage) return false;
   try {
-    const d = await bitrix('crm.deal.get', { id: String(dealId) });
+    const d = await bitrixRestCall('crm.deal.get', { id: String(dealId) });
     const stage = String(d && (d.STAGE_ID || d.stageId || '')).trim();
     // Production funnel success stage is the standard final successful stage.
     // Also honor any explicitly configured success stage constants already present.
@@ -14008,7 +13973,7 @@ async function v143IsDealSuccessful(dealId) {
         typeof SUCCESS_STAGE !== 'undefined' ? SUCCESS_STAGE : null
       ].filter(Boolean).map(String)
     );
-    return stage === 'C28:SUCCESS' || stage === 'SUCCESS' || configured.has(stage);
+    return stage === 'C28:WON' || stage === 'C28:SUCCESS' || stage === 'SUCCESS' || configured.has(stage);
   } catch (e) {
     console.warn(`[acts-v143] success-stage check failed deal=${dealId}: ${e.message || e}`);
     // Fail closed for client pushes.
