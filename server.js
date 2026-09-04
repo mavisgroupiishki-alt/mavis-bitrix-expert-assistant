@@ -875,7 +875,7 @@ app.get('/api/wazzup/channels', async (_req, res) => {
 // Вынесено в отдельную функцию, чтобы её мог использовать и маршрут /api/wazzup/send (ручная
 // отправка через автопилот), и обработчик вебхука живого бота (автоответ клиенту) — одна и та же
 // проверенная логика (минимальный payload для Telegram, повтор при 500).
-async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId, ignoreStrictPreferredChannel = false, crmMessageId = '' }) {
+async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, username, dealId, ignoreStrictPreferredChannel = false, crmMessageId = '', refMessageId = '' }) {
   const apiKey = process.env.WAZZUP_API_KEY || '';
   const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
   if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
@@ -914,6 +914,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
     crmMessageId: crmMessageId || `mavis-executor-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
     clearUnanswered: false,
   };
+  if (refMessageId) payload.refMessageId = String(refMessageId);
 
   if (configured.chatType === 'telegram') {
     if (cleanChatId) {
@@ -933,6 +934,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
 
   const minimalPayload = { channelId: payload.channelId, chatType: payload.chatType, text: payload.text, crmMessageId: payload.crmMessageId, clearUnanswered: false };
   if (payload.chatId) minimalPayload.chatId = payload.chatId;
+  if (payload.refMessageId) minimalPayload.refMessageId = payload.refMessageId;
   if (payload.phone) minimalPayload.phone = payload.phone;
   if (payload.username) minimalPayload.username = payload.username;
   const payloadToSend = configured.chatType === 'telegram' ? minimalPayload : payload;
@@ -975,7 +977,7 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
 }
 
 
-async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, username, dealId, fileName, crmMessageId = '' }) {
+async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, username, dealId, fileName, crmMessageId = '', refMessageId = '' }) {
   const apiKey = process.env.WAZZUP_API_KEY || '';
   const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
   if (!apiKey) throw new Error('WAZZUP_API_KEY не задан в Render Environment.');
@@ -997,6 +999,7 @@ async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, u
     crmMessageId: crmMessageId || `mavis-acts-file-${configured.key}-${dealId || 'deal'}-${Date.now()}`,
     clearUnanswered: false,
   };
+  if (refMessageId) payload.refMessageId = String(refMessageId);
 
   if (configured.chatType === 'telegram') {
     if (cleanChatId) payload.chatId = cleanChatId;
@@ -1523,9 +1526,10 @@ __wazzupAck({ ok: true, received: true });
           chatId: msg.chatId || '',
           phone,
           externalId: `wazzup_${msg.messageId || ''}`,
+          msg,
         }).then((result) => {
-          console.log(`[wazzup-ai-v149] inbound processed message=${msg.messageId || '-'} action=${result && result.action || '-'} deal=${result && result.dealId || '-'} reply=${result && result.sentReply && result.sentReply.ok ? 'yes' : 'no'} reason=${result && result.reason || result && result.reason || '-'}`);
-        }).catch((e) => console.error(`[wazzup-ai-v149] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
+          console.log(`[wazzup-ai-v150] inbound processed message=${msg.messageId || '-'} action=${result && result.action || '-'} deal=${result && result.dealId || '-'} reply=${result && result.sentReply && result.sentReply.ok ? 'yes' : 'no'} reason=${result && result.reason || result && result.reason || '-'}`);
+        }).catch((e) => console.error(`[wazzup-ai-v150] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
 
       }
     }
@@ -7550,7 +7554,7 @@ ${String(text || '').slice(0, 2500)}
   };
 }
 
-async function actsSendSmartDialogReply({ source, state, deal, text, channelKey = '', chatId = '', phone = '', email = '' }) {
+async function actsSendSmartDialogReply({ source, state, deal, text, channelKey = '', chatId = '', phone = '', email = '', refMessageId = '' }) {
   if (!text) return { ok: true, skipped: true };
 
   if (String(source || '').toLowerCase() === 'email') {
@@ -7581,10 +7585,78 @@ async function actsSendSmartDialogReply({ source, state, deal, text, channelKey 
     dealId: deal.ID,
     ignoreStrictPreferredChannel: true,
     crmMessageId: `mavis-acts-dialog-${key}-${deal.ID}-${state.taskId}-${Date.now()}`,
+    refMessageId: refMessageId || undefined,
   });
   return { ok: true, channel: preferredChannelLabel(key) };
 }
 
+
+
+function actsInboundChatId(msg) {
+  return String((msg && msg.chatId) || (msg && msg.contact && msg.contact.phone) || '').trim();
+}
+
+function actsInboundQuotedMessageIds(msg) {
+  const q = msg && msg.quotedMessage;
+  const rows = Array.isArray(q) ? q : (q ? [q] : []);
+  const ids = [];
+  for (const item of rows) {
+    if (!item) continue;
+    for (const key of ['messageId','message_id','id','ID']) {
+      const v = String(item[key] || '').trim();
+      if (v && !ids.includes(v)) ids.push(v);
+    }
+  }
+  return ids;
+}
+
+function actsStateMatchesInboundExact(state, msg) {
+  if (!state || !msg) return false;
+  const inboundChannelId = String(msg.channelId || '').trim();
+  const inboundChatId = actsInboundChatId(msg);
+  const quotedIds = actsInboundQuotedMessageIds(msg);
+  const stateChannelId = String(state.wazzupChannelId || '').trim();
+  const stateChatId = String(state.wazzupChatId || '').trim();
+  const stateMessageId = String(state.wazzupMessageId || '').trim();
+  const stateFileMessageId = String(state.wazzupFileMessageId || '').trim();
+
+  if (quotedIds.length && (quotedIds.includes(stateMessageId) || quotedIds.includes(stateFileMessageId))) return true;
+  if (stateChannelId && inboundChannelId && stateChannelId !== inboundChannelId) return false;
+  if (stateChatId && inboundChatId && stateChatId === inboundChatId) return true;
+  return false;
+}
+
+async function actsFindExactInboundActTargets(msg) {
+  if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') return [];
+  if (!actsPushStates.size) await actsRecoverPushStatesFromBitrix({ silent: true }).catch(() => {});
+
+  const exact = [];
+  for (const state of actsPushStates.values()) {
+    if (!actsStateMatchesInboundExact(state, msg)) continue;
+    const deal = await bitrixRestCall('crm.deal.get', { id: state.dealId }).catch(() => null);
+    if (deal) exact.push({ state, deal, match: 'wazzup-exact' });
+  }
+  if (exact.length) {
+    const inboundAt = Date.parse(String(msg.dateTime || msg.date || '')) || Date.now();
+    exact.sort((a,b) => {
+      const ad = Math.abs(inboundAt - Number(a.state.sentAtMs || inboundAt));
+      const bd = Math.abs(inboundAt - Number(b.state.sentAtMs || inboundAt));
+      return ad - bd || Number(b.state.sentAtMs || 0) - Number(a.state.sentAtMs || 0);
+    });
+    if (exact.length > 1) console.log(`[acts-inbound-bind-v150] multiple exact Wazzup candidates=${exact.map(x=>`${x.deal.ID}/${x.state.taskId}`).join(',')}; selected=${exact[0].deal.ID}/${exact[0].state.taskId} by closest recent act.`);
+    return [exact[0]];
+  }
+
+  // Safe fallback: phone/contact is allowed only when there is exactly ONE active act.
+  const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+  if (!phone) return [];
+  const waiting = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
+  if (waiting.length === 1) return [{ ...waiting[0], match: 'unique-crm-phone' }];
+  if (waiting.length > 1) {
+    console.warn(`[acts-inbound-bind-v150] AMBIGUOUS inbound: phoneTail=${phone.slice(-4)} candidates=${waiting.map(x => `${x.deal && x.deal.ID}/${x.state && x.state.taskId}`).join(',')}; AI/HARD-STOP skipped.`);
+  }
+  return [];
+}
 
 async function actsMarkClientRepliedForWazzupMessage(msg) {
   if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') {
@@ -7599,9 +7671,11 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
   const source = actsCleanText(findChannelKeyByChannelId(msg.channelId) || msg.chatType || 'Wazzup');
   let marked = 0;
 
-  // Главный путь: все активные актовые контроли, связанные с этим номером.
-  const waiting = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
-  for (const item of waiting) {
+  // v150: никогда не останавливаем несколько сделок по одному номеру.
+  // Сначала используем точную Wazzup-привязку (quoted message / chatId / channelId),
+  // затем разрешаем телефон только если кандидат ровно один.
+  const targets = await actsFindExactInboundActTargets(msg);
+  for (const item of targets) {
     const state = item && item.state;
     const deal = item && item.deal;
     if (!state || !deal) continue;
@@ -7616,9 +7690,8 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
         COMMENT: `Клиент ответил после отправки акта: «${text.slice(0, 3000)}». Дальнейшие автоматические напоминания по акту остановлены.`,
       },
     });
-    actsPushStates.delete(String(state.taskId));
     marked++;
-    console.log(`[acts-client-replied] deal=${deal.ID} task=${state.taskId} source=${source} -> HARD STOP`);
+    console.log(`[acts-client-replied-v150] deal=${deal.ID} task=${state.taskId} source=${source} match=${item.match || '-'} -> HARD STOP`);
   }
 
   // v148: legacy Bobik-only marker path removed. The global semantic dialog below owns inbound handling.
@@ -7949,7 +8022,7 @@ ${history || '(нет)'}
 }
 
 
-async function actsResendLatestActV144({ state, deal, channelKey='', chatId='', phone='', email='', preferredDestination='' }) {
+async function actsResendLatestActV144({ state, deal, channelKey='', chatId='', phone='', email='', preferredDestination='', refMessageId='' }) {
   try {
     const raw = await bitrixRestCall('tasks.task.get', {
       taskId: String(state.taskId),
@@ -7996,7 +8069,8 @@ async function actsResendLatestActV144({ state, deal, channelKey='', chatId='', 
       chatId:chatId || undefined,
       dealId:deal.ID,
       fileName:prepared.fileName || file.name || 'Акт выполненных работ',
-      crmMessageId:`mavis-acts-resend-${key}-${deal.ID}-${state.taskId}-${Date.now()}`
+      crmMessageId:`mavis-acts-resend-${key}-${deal.ID}-${state.taskId}-${Date.now()}`,
+      refMessageId: refMessageId || undefined
     });
     return { ok:true, channel:preferredChannelLabel(key), file:file.name || '' };
   } catch(e) {
@@ -8104,6 +8178,7 @@ async function actsFindLatestSentActByCommV146(commType, commValue) {
     }
   } catch (_) {}
   const seen = new Set();
+  const candidates = [];
   for (const deal of deals) {
     if (!deal || seen.has(String(deal.ID))) continue;
     seen.add(String(deal.ID));
@@ -8120,8 +8195,10 @@ async function actsFindLatestSentActByCommV146(commType, commValue) {
       if (!matched) continue;
     }
     const sent = await actsFindLatestSentActForDealV146(deal.ID);
-    if (sent) return { state:{taskId:sent.taskId,dealId:String(deal.ID),channel:'',contactId:'',sentAtMs:sent.sentAtMs,lastMessageAtMs:sent.sentAtMs,pushCount:0,originalFileName:sent.file.name||''}, deal };
+    if (sent) candidates.push({ state:{taskId:sent.taskId,dealId:String(deal.ID),channel:'',contactId:'',sentAtMs:sent.sentAtMs,lastMessageAtMs:sent.sentAtMs,pushCount:0,originalFileName:sent.file.name||''}, deal });
   }
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) console.warn(`[wazzup-ai-v150] ambiguous historical phone match: candidates=${candidates.map(x=>x.deal.ID).join(',')}; no automatic action.`);
   return null;
 }
 
@@ -8135,6 +8212,7 @@ async function actsProcessIncomingClientText({
   phone = '',
   email = '',
   externalId = '',
+  msg = null,
 }) {
   if (!config.actsIncomingEnabled || !config.actsSmartDialogEnabled) return { ok: true, processed: 0, reason: 'disabled' };
 
@@ -8142,18 +8220,36 @@ async function actsProcessIncomingClientText({
   if (!cleanText) return { ok: true, processed: 0, reason: 'empty' };
   if (externalId && actsRememberInboundMessage(externalId)) return { ok: true, processed: 0, duplicate: true };
 
-  const waiting = await actsFindWaitingStatesByComm(commType, commValue);
-  let target = waiting[0] || null;
+  let target = null;
+  if (msg) {
+    const exactTargets = await actsFindExactInboundActTargets(msg);
+    target = exactTargets[0] || null;
+  } else {
+    const waiting = await actsFindWaitingStatesByComm(commType, commValue);
+    if (waiting.length === 1) target = waiting[0];
+  }
   // v146: a previous client reply intentionally removes the live push state.
   // A later request such as "пришлите акт ещё раз" must still be able to find
   // the last sent act, without restoring the push timer.
-  if (!target && String(commType || '').toUpperCase() === 'PHONE') {
+  if (!target && !msg && String(commType || '').toUpperCase() === 'PHONE') {
     const probe = await actsFindLatestSentActByCommV146('PHONE', commValue).catch(() => null);
     if (probe) target = probe;
   }
-  if (!target) return { ok: true, processed: 0, reason: 'no-act-found' };
+  if (!target) {
+    console.warn(`[wazzup-ai-v150] NO SAFE ACT BINDING: channel=${channelKey || '-'} chatId=${chatId || '-'} phoneTail=${String(phone || commValue || '').slice(-4)} message=${externalId || '-'}; no AI reply and no push-state mutation.`);
+    return { ok: true, processed: 0, reason: 'no-safe-act-binding' };
+  }
 
   const { state, deal } = target;
+  // The inbound reply has already been detected. Freeze recurring pushes now,
+  // but keep the state object available locally so a resend request can still
+  // resolve the exact task/file during this same processing run.
+  actsPushStates.delete(String(state.taskId));
+  if (msg) {
+    const inboundChatId = actsInboundChatId(msg);
+    if (inboundChatId && !state.wazzupChatId) state.wazzupChatId = inboundChatId;
+    if (msg.channelId && !state.wazzupChannelId) state.wazzupChannelId = String(msg.channelId);
+  }
   const comments = await actsLoadTimelineComments(state.dealId, 300).catch(() => []);
 
   const safeExternal = actsCleanText(externalId || '').replace(/\s+/g, '_').slice(0, 140);
@@ -8215,7 +8311,8 @@ async function actsProcessIncomingClientText({
     const destination = decision.action === 'resend_email' ? 'email' : '';
     actionExecution = await actsResendLatestActV144({
       state, deal, channelKey, chatId, phone, email,
-      preferredDestination: destination
+      preferredDestination: destination,
+      refMessageId: msg && msg.messageId || ''
     });
     if (!actionExecution.ok) {
       decision = {
@@ -8285,7 +8382,7 @@ async function actsProcessIncomingClientText({
   if (decision.reply) {
     try {
       sentReply = await actsSendSmartDialogReply({
-        source, state, deal, text: decision.reply, channelKey, chatId, phone, email,
+        source, state, deal, text: decision.reply, channelKey, chatId, phone, email, refMessageId: msg && msg.messageId || '',
       });
       if (sentReply && sentReply.ok) {
         await actsSmartDialogAddComment(
@@ -8818,7 +8915,7 @@ async function actsCreateCallTaskIfNeeded(state, deal, comments) {
   return true;
 }
 
-async function actsRegisterPushState({ taskId, dealId, channel, contactId = '', sentAtMs = Date.now(), originalFileName = '' }) {
+async function actsRegisterPushState({ taskId, dealId, channel, contactId = '', sentAtMs = Date.now(), originalFileName = '', wazzupChatId = '', wazzupChannelId = '', wazzupMessageId = '', wazzupFileMessageId = '' }) {
   if (!config.actsPushEnabled || !taskId || !dealId) return;
   const pushCutoffMs = Date.parse(String(config.actsPushNewOnlyAfterIso || ''));
   if (Number.isFinite(pushCutoffMs) && Number(sentAtMs || 0) < pushCutoffMs) {
@@ -8829,6 +8926,8 @@ async function actsRegisterPushState({ taskId, dealId, channel, contactId = '', 
     taskId: String(taskId), dealId: String(dealId), channel: actsNormalizeChannelKey(channel), contactId: String(contactId || ''),
     sentAtMs: Number(sentAtMs || Date.now()), lastMessageAtMs: Number(sentAtMs || Date.now()),
     pushCount: 0, originalFileName: actsCleanText(originalFileName || ''),
+    wazzupChatId: String(wazzupChatId || ''), wazzupChannelId: String(wazzupChannelId || ''),
+    wazzupMessageId: String(wazzupMessageId || ''), wazzupFileMessageId: String(wazzupFileMessageId || ''),
   });
   console.log(`[acts-push] Зарегистрирован контроль task=${taskId}, deal=${dealId}, channel=${actsNormalizeChannelKey(channel) || channel}, contact=${contactId || 'не сохранён'}, следующий пуш после ${new Date(actsNextPushDueFrom(sentAtMs)).toISOString()}.`);
 }
@@ -8921,8 +9020,16 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
         const channel = actsExtractChannelFromSentComment(sentComment.COMMENT) || await detectPreferredChannelResolved(await bitrixRestCall('crm.deal.get', { id: dealId }));
         const originalMatch = String(sentComment.COMMENT || '').match(/Файл:\s*([^\n]+)/i);
         const contactMatch = String(sentComment.COMMENT || '').match(/\[MAVIS_ACTS_PUSH_STATE\][^\n]*contactId=(\d+)/i);
+        const chatMatch = String(sentComment.COMMENT || '').match(/\bwazzupChatId=([^\s]+)/i);
+        const channelIdMatch = String(sentComment.COMMENT || '').match(/\bwazzupChannelId=([^\s]+)/i);
+        const messageMatch = String(sentComment.COMMENT || '').match(/\bwazzupMessageId=([^\s]+)/i);
+        const fileMessageMatch = String(sentComment.COMMENT || '').match(/\bwazzupFileMessageId=([^\s]+)/i);
         const recoveredContactId = contactMatch ? String(contactMatch[1]) : '';
-        actsPushStates.set(taskId, { taskId, dealId: String(dealId), channel, contactId: recoveredContactId, sentAtMs, lastMessageAtMs, pushCount: pushComments.length, originalFileName: originalMatch ? actsCleanText(originalMatch[1]) : '' });
+        const recoveredChatId = chatMatch ? String(chatMatch[1]) : '';
+        const recoveredChannelId = channelIdMatch ? String(channelIdMatch[1]) : '';
+        const recoveredMessageId = messageMatch ? String(messageMatch[1]) : '';
+        const recoveredFileMessageId = fileMessageMatch ? String(fileMessageMatch[1]) : '';
+        actsPushStates.set(taskId, { taskId, dealId: String(dealId), channel, contactId: recoveredContactId, sentAtMs, lastMessageAtMs, pushCount: pushComments.length, originalFileName: originalMatch ? actsCleanText(originalMatch[1]) : '', wazzupChatId: recoveredChatId, wazzupChannelId: recoveredChannelId, wazzupMessageId: recoveredMessageId, wazzupFileMessageId: recoveredFileMessageId });
         restored++;
       } catch (e) {
         stats.errors++;
@@ -10647,7 +10754,7 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
         crmMessageId: taskId ? `mavis-acts-file-${preferredChannel}-${deal.ID}-${taskId}` : '',
       });
       if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${fileMarker}\nТехнический маркер: файл акта успешно отправлен через ${preferredChannelLabel(preferredChannel)} контакту #${contactId}.` } });
+        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `Файл акта отправлен клиенту через ${preferredChannelLabel(preferredChannel)}.` } });
       }
     }
 
@@ -10662,7 +10769,7 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
         crmMessageId: taskId ? `mavis-acts-text-${preferredChannel}-${deal.ID}-${taskId}` : '',
       });
       if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `${textMarker}\nТехнический маркер: текст сообщения по акту успешно отправлен через ${preferredChannelLabel(preferredChannel)} контакту #${contactId}.` } });
+        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `Сообщение по акту отправлено клиенту через ${preferredChannelLabel(preferredChannel)}.` } });
       }
     }
   } catch (e) {
@@ -10684,6 +10791,10 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     contactLabel: recipient.label,
     recipientSource: recipient.source,
     phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
+    wazzupChannelId: String((textResult && textResult.data && textResult.data.channelId) || (fileResult && fileResult.data && fileResult.data.channelId) || (getConfiguredWazzupChannel(preferredChannel) || {}).channelId || ''),
+    wazzupChatId: String((textResult && textResult.data && textResult.data.chatId) || (fileResult && fileResult.data && fileResult.data.chatId) || phone || ''),
+    wazzupMessageId: String((textResult && textResult.data && textResult.data.messageId) || ''),
+    wazzupFileMessageId: String((fileResult && fileResult.data && fileResult.data.messageId) || ''),
     file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
     partial: { textSent: true, fileSent: true },
   };
@@ -10800,7 +10911,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый канал связи», наличие актуального контакта по последней переписке, телефон/email этого контакта, настройки Wazzup Telegram/Viber и файл акта в задаче.`;
 
     const pushStateLine = sendResult && sendResult.ok
-      ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()}`
+      ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()} wazzupChatId=${sendResult.wazzupChatId || ''} wazzupChannelId=${sendResult.wazzupChannelId || ''} wazzupMessageId=${sendResult.wazzupMessageId || ''} wazzupFileMessageId=${sendResult.wazzupFileMessageId || ''}`
       : '';
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
@@ -10810,7 +10921,7 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       },
     });
     if (sendResult && sendResult.ok) {
-      await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, contactId: sendResult.contactId || '', sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '' });
+      await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, contactId: sendResult.contactId || '', sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '', wazzupChatId: sendResult.wazzupChatId || '', wazzupChannelId: sendResult.wazzupChannelId || '', wazzupMessageId: sendResult.wazzupMessageId || '', wazzupFileMessageId: sendResult.wazzupFileMessageId || '' });
     }
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
   }
@@ -13840,9 +13951,9 @@ app.listen(PORT, () => {
   } else {
     console.log('[doc-return] Автоконтроль выключен: нужен DOC_RETURN_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
-  console.log(`MAVIS Bitrix Expert Assistant v149 is running on port ${PORT}`);
-  console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; ACTS_PUSH_V149=NEW_CLOSED_DEALS_ONLY; historical-push-cutoff=${config.actsPushNewOnlyAfterIso}; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V149=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`MAVIS Bitrix Expert Assistant v150 is running on port ${PORT}`);
+  console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; ACTS_PUSH_V150=NEW_CLOSED_DEALS_ONLY; exact-inbound-binding=quoted-message/chat/channel/unique-fallback; historical-push-cutoff=${config.actsPushNewOnlyAfterIso}; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V150=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
