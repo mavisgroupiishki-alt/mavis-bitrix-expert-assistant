@@ -1,3 +1,16 @@
+
+// v143: production act-AI rules.
+// New + historical deals are eligible. Successful deals are never pushed.
+// Any inbound client reply after an act push permanently suppresses future
+// act reminders for that deal. Technical marker strings stay internal.
+const V143_PRODUCTION_RULES = {
+  allDeals: true,
+  includeHistorical: true,
+  disablePushOnSuccessStage: true,
+  stopAfterAnyClientReply: true,
+  humanReadableCommentsOnly: true,
+};
+
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
@@ -4717,7 +4730,7 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
 
     const clientMsgForComment = `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`;
     const callDoneSuffix = testDeal ? `\n${AUTOPILOT_CALL_DONE_MARKER} activity=${callRecord.activityId}` : '';
-    const commentText = `${AUTOPILOT_MARKER}${callDoneSuffix}${siblingNote}\n\n${sendStatus}\n\n📋 Ход работы / отчёт эксперту:\n${dealComment}${clientMsgForComment}`;
+    const commentText = v143HumanComment(`${AUTOPILOT_MARKER}${callDoneSuffix}${siblingNote}\n\n${sendStatus}\n\n📋 Ход работы / отчёт эксперту:\n${dealComment}${clientMsgForComment}`);
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: commentText },
     });
@@ -7473,10 +7486,15 @@ async function actsSmartDialogAnalyse({ state, deal, text, comments }) {
 Нужно понять последнее сообщение клиента и не допустить бессмысленных автоматических напоминаний.
 
 Допустимые action:
+- "resend_act": клиент просит повторно прислать/переотправить акт. Это ДЕЙСТВИЕ, его нужно выполнить, а затем обязательно ответить клиенту.
+- "resend_email": клиент прямо просит отправить/переотправить акт на почту. Это ДЕЙСТВИЕ, его нужно выполнить, а затем обязательно ответить клиенту.
 - "wait": клиент назвал срок/дату, сказал что в отпуске/командировке/занят и пришлет позже, либо сообщил "уже отправили/отправлю". На время ожидания пуши и задача на звонок запрещены.
 - "continue": обычное "спасибо", приветствие, нейтральный ответ без обещания срока. Новый пуш допустим позже по стандартному интервалу от сообщения клиента.
 - "human": вопрос по сумме/содержанию/исправлению акта, спор, претензия, юридический/финансовый вопрос, непонятная ситуация. Автопуши временно запрещены; нужен человек.
 - "stop": прямой отказ подписывать/возвращать акт или просьба больше не писать по этому вопросу. Автопуши полностью остановить и сообщить ответственному.
+- Если сообщение связано с актом, но клиент ожидает/просит действие, не используй "continue".
+- Для любого action кроме "continue" обязательно сформируй короткий естественный reply клиенту.
+- Для "resend_act"/"resend_email" reply подтверждает выполненную отправку только после успешного выполнения действия.
 
 Правила даты:
 - "завтра", "послезавтра", "в пятницу", "после 10 сентября", "до 15-го", "вернусь 7-го" разрешай относительно текущей даты по Минску.
@@ -7497,7 +7515,7 @@ ${String(text || '').slice(0, 2500)}
 
 Ответь ТОЛЬКО JSON:
 {
-  "action":"wait|continue|human|stop",
+  "action":"resend_act|resend_email|wait|continue|human|stop",
   "intent":"promised_date|vacation|already_sent|question|problem|refusal|acknowledgement|other",
   "hold_until":"ISO или null",
   "reply":"текст ответа или пустая строка",
@@ -7515,7 +7533,7 @@ ${String(text || '').slice(0, 2500)}
   if (!matched) throw new Error('ИИ не вернул JSON');
   const obj = JSON.parse(matched[0]);
 
-  const action = ['wait','continue','human','stop'].includes(String(obj.action || ''))
+  const action = ['resend_act','resend_email','wait','continue','human','stop'].includes(String(obj.action || ''))
     ? String(obj.action)
     : 'human';
 
@@ -7862,6 +7880,62 @@ ${history || '(нет)'}
   return {ok:true,processed:1,action,intent,holdUntil,confidence,reason:decision.reason || ''};
 }
 
+
+async function actsResendLatestActV144({ state, deal, channelKey='', chatId='', phone='', email='', preferredDestination='' }) {
+  try {
+    const raw = await bitrixRestCall('tasks.task.get', {
+      taskId: String(state.taskId),
+      select: ['ID','TITLE','GROUP_ID','STAGE_ID','STATUS','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES']
+    });
+    const task = raw && (raw.task || raw.TASK || raw);
+    if (!task) return { ok:false, error:'Не удалось получить задачу с актом.' };
+
+    const resolution = await actsResolveTaskFiles(task);
+    const files = resolution.files || [];
+    const file = actsPickBestFileForClient(files);
+    if (!file || !file.url) return { ok:false, error:'В задаче не найден файл акта.' };
+
+    const destination = String(preferredDestination || '').toLowerCase();
+    // Explicit request for email -> send the actual file as email attachment.
+    if (destination === 'email' || /почт|email|e-mail|электрон/i.test(String(preferredDestination || ''))) {
+      const recipient = await actsResolveRecipientContact(deal, state.contactId || '');
+      if (!recipient.ok) return { ok:false, error: recipient.reason || 'Не удалось определить контакт.' };
+      const targetEmail = String(email || actsContactEmail(recipient.contact) || '').trim();
+      if (!targetEmail) return { ok:false, error:'У актуального контакта не указан email.' };
+      const storageIds = actsBuildEmailStorageElementIds(file);
+      if (!storageIds.length) return { ok:false, error:'Не удалось получить вложение файла акта для письма.' };
+      await actsDownloadRealFile(file);
+      await sendActEmailThroughBitrix(
+        deal, recipient.contactId, targetEmail,
+        'Повторно направляем акт выполненных работ.',
+        file
+      );
+      return { ok:true, channel:'Email', file:file.name || '' };
+    }
+
+    // Otherwise resend through the channel where the client just wrote.
+    const key = actsNormalizeChannelKey(channelKey) || actsNormalizeChannelKey(preferredDestination);
+    if (!key) return { ok:false, error:'Не определён канал для повторной отправки акта.' };
+    const recipient = await actsResolveRecipientContact(deal, state.contactId || '');
+    if (!recipient.ok) return { ok:false, error: recipient.reason || 'Не удалось определить актуальный контакт.' };
+    const targetPhone = String(phone || actsContactPhone(recipient.contact) || '').trim();
+    if (!targetPhone) return { ok:false, error:'У актуального контакта не указан телефон.' };
+    const prepared = await actsPrepareWazzupFile(file);
+    await sendWazzupFileInternal({
+      channelKey:key,
+      contentUri:prepared.url,
+      phone:targetPhone,
+      chatId:chatId || undefined,
+      dealId:deal.ID,
+      fileName:prepared.fileName || file.name || 'Акт выполненных работ',
+      crmMessageId:`mavis-acts-resend-${key}-${deal.ID}-${state.taskId}-${Date.now()}`
+    });
+    return { ok:true, channel:preferredChannelLabel(key), file:file.name || '' };
+  } catch(e) {
+    return { ok:false, error:e.message || String(e) };
+  }
+}
+
 async function actsProcessIncomingClientText({
   source,
   commType,
@@ -7943,6 +8017,38 @@ async function actsProcessIncomingClientText({
     holdMs = Date.parse(holdUntil);
   }
 
+  // v144: requested act action must actually be executed before we confirm it.
+  let actionExecution = null;
+  if (decision.action === 'resend_act' || decision.action === 'resend_email') {
+    const destination = decision.action === 'resend_email' ? 'email' : '';
+    actionExecution = await actsResendLatestActV144({
+      state, deal, channelKey, chatId, phone, email,
+      preferredDestination: destination
+    });
+    if (!actionExecution.ok) {
+      decision = {
+        ...decision,
+        action: 'human',
+        reply: `Понял, сейчас не удалось автоматически переотправить акт. Передам запрос ответственному специалисту.`,
+        reason: actionExecution.error || 'не удалось переотправить акт',
+      };
+      await actsSmartDialogNotifyExpert(
+        deal,
+        `Клиент просит переотправить акт. Автоматическая отправка не выполнена: ${actionExecution.error || 'неизвестная ошибка'}.`
+      ).catch(()=>{});
+    } else {
+      decision = {
+        ...decision,
+        action: 'wait',
+        holdUntil: new Date(Date.now()+72*60*60*1000).toISOString(),
+        reply: decision.action === 'resend_email'
+          ? 'Конечно, повторно направили акт на почту.'
+          : 'Конечно, повторно направили акт.',
+        reason: 'акт повторно отправлен по просьбе клиента',
+      };
+    }
+  }
+
   if (decision.action === 'stop') {
     await actsSmartDialogAddComment(
       state.dealId,
@@ -7981,6 +8087,17 @@ async function actsProcessIncomingClientText({
     );
   }
 
+  // v144: act-related inbound must receive a human-readable response.
+  if (decision.action !== 'continue' && !String(decision.reply || '').trim()) {
+    if (decision.action === 'wait') {
+      decision.reply = 'Хорошо, договорились. Вернёмся к этому вопросу позже.';
+    } else if (decision.action === 'stop') {
+      decision.reply = 'Хорошо, поняли вас. Больше не будем напоминать по этому вопросу.';
+    } else if (decision.action === 'human') {
+      decision.reply = 'Понял вас. Передам информацию ответственному специалисту.';
+    }
+  }
+
   let sentReply = null;
   if (decision.reply) {
     try {
@@ -7990,7 +8107,7 @@ async function actsProcessIncomingClientText({
       if (sentReply && sentReply.ok) {
         await actsSmartDialogAddComment(
           state.dealId,
-          `${ACTS_DIALOG_REPLY_MARKER} task=${state.taskId} source=${actsCleanText(source || '').replace(/\s+/g, '_') || 'unknown'}\nMavis: ${decision.reply}`
+          `${ACTS_DIALOG_REPLY_MARKER}\nMavis: ${v144HumanVisibleComment(decision.reply)}`
         );
       }
     } catch (e) {
@@ -8418,6 +8535,40 @@ async function actsSendReminderEmail(deal, contactId, email, text, taskId, seque
 }
 
 async function actsSendPush(state, deal, sequence) {
+
+  // v143: never send act reminders from a successfully closed deal.
+  const __v143SuccessDealId = String(
+    (deal && (deal.ID || deal.id)) ||
+    (state && state.dealId) ||
+    (typeof dealId !== 'undefined' ? dealId : '') ||
+    ''
+  );
+  if (__v143SuccessDealId && await v143IsDealSuccessful(__v143SuccessDealId)) {
+    console.log(`[acts-v143] deal=${__v143SuccessDealId}: SUCCESS stage — ACT PUSH BLOCKED.`);
+    return { ok: false, blocked: true, reason: 'success-stage' };
+  }
+
+
+
+  // v142: hard stop for ANY client reply, including replies unrelated to the act.
+  // Applies to historical and newly created act controls.
+  const __v142DealId = String(
+    (deal && deal.ID) ||
+    (deal && deal.id) ||
+    (state && state.dealId) ||
+    dealId ||
+    ''
+  );
+  const __v142SentAtMs = Number(
+    (state && (state.sentAtMs || state.sent_at_ms)) ||
+    0
+  );
+  if (__v142DealId && await actsHasAnyClientReplyAfterSendV142(__v142DealId, __v142SentAtMs)) {
+    console.log(`[acts-global-stop-v142] deal=${__v142DealId}: ANY client reply found — ACT PUSH BLOCKED.`);
+    return { ok: false, blocked: true, reason: 'global-client-reply-stop' };
+  }
+
+
   const channel = actsNormalizeChannelKey(state.channel) || await detectPreferredChannelResolved(deal);
   if (!channel) return { ok: false, error: 'Не удалось определить канал первоначальной отправки акта.' };
   const text = actsPushMessage();
@@ -13494,7 +13645,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V141=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V144=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
@@ -13568,3 +13719,97 @@ app.listen(PORT, () => {
     console.log('[email] Обработка почты выключена. Для включения задай MAIL_IMAP_USER и MAIL_IMAP_PASSWORD в Render.');
   }
 });
+
+
+// v142: GLOBAL ACT PUSH STOP.
+// Any confirmed inbound client reply after an act push stops subsequent act pushes.
+// This is intentionally independent of AI and applies to old + new act states.
+const GLOBAL_ACT_CLIENT_REPLY_STOP_V142 = true;
+
+async function actsHasAnyClientReplyAfterSendV142(dealId, sentAtMs = 0) {
+  if (!GLOBAL_ACT_CLIENT_REPLY_STOP_V142 || !dealId) return false;
+  try {
+    const rows = await actsLoadTimelineComments(String(dealId), 300);
+    return (rows || []).some((c) => {
+      const text = String(c && (c.COMMENT || c.comment || '') || '');
+      if (!text) return false;
+
+      const inbound =
+        text.includes(ACTS_CLIENT_REPLIED_MARKER) ||
+        text.includes('[WAZZUP_AI_INBOUND]') ||
+        text.includes('[MAVIS_LIVE_CHAT]') ||
+        text.includes('[WAZZUP_INBOUND]') ||
+        text.includes('[WAZZUP_INBOUND_MESSAGE]') ||
+        text.includes('[MAVIS_CLIENT_REPLY]');
+
+      if (!inbound) return false;
+
+      const rawDate = c.CREATED || c.DATE_CREATE || c.CREATED_DATE || c.createdAt || c.date;
+      if (!sentAtMs || !rawDate) return true;
+
+      const t = Date.parse(String(rawDate));
+      return !Number.isFinite(t) || t >= Number(sentAtMs);
+    });
+  } catch (e) {
+    console.warn(`[acts-global-stop-v142] deal=${dealId}: reply scan error: ${e.message || e}`);
+    // Fail closed: if we cannot verify that no reply exists, do not send a push.
+    return true;
+  }
+}
+
+
+
+async function v143IsDealSuccessful(dealId) {
+  if (!dealId || !V143_PRODUCTION_RULES.disablePushOnSuccessStage) return false;
+  try {
+    const d = await bitrix('crm.deal.get', { id: String(dealId) });
+    const stage = String(d && (d.STAGE_ID || d.stageId || '')).trim();
+    // Production funnel success stage is the standard final successful stage.
+    // Also honor any explicitly configured success stage constants already present.
+    const configured = new Set(
+      [
+        process.env.ACTS_SUCCESS_STAGE_ID,
+        process.env.PRODUCTION_SUCCESS_STAGE_ID,
+        typeof SUCCESS_STAGE_ID !== 'undefined' ? SUCCESS_STAGE_ID : null,
+        typeof SUCCESS_STAGE !== 'undefined' ? SUCCESS_STAGE : null
+      ].filter(Boolean).map(String)
+    );
+    return stage === 'C28:SUCCESS' || stage === 'SUCCESS' || configured.has(stage);
+  } catch (e) {
+    console.warn(`[acts-v143] success-stage check failed deal=${dealId}: ${e.message || e}`);
+    // Fail closed for client pushes.
+    return true;
+  }
+}
+
+
+
+function v143HumanComment(text) {
+  let t = String(text || '').trim();
+  if (!t) return '';
+  // Never expose internal technical marker names/versions in CRM comments.
+  t = t
+    .replace(/\[WAZZUP_[A-Z0-9_]+\]/gi, '')
+    .replace(/\[MAVIS_[A-Z0-9_]+\]/gi, '')
+    .replace(/\[ACTS_[A-Z0-9_]+\]/gi, '')
+    .replace(/\[COLLECTION_[A-Z0-9_]+\]/gi, '')
+    .replace(/\bv\d{2,4}\b/gi, '')
+    .replace(/\bV\d{2,4}\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return t;
+}
+
+
+
+function v144HumanVisibleComment(text) {
+  return String(text || '')
+    .replace(/\[[A-Z0-9_:-]{3,}\]/g, '')
+    .replace(/\btask=\d+\b/gi, '')
+    .replace(/\bdeal=\d+\b/gi, '')
+    .replace(/\bmessage=[^\s\n]+/gi, '')
+    .replace(/\bsource=[^\s\n]+/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
