@@ -1416,9 +1416,12 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     // Это не зависит от истории Wazzup в Bitrix и не зависит от preferred channel.
     for (const msg of acceptedMessages) {
       if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
-      setImmediate(() => actsMarkClientRepliedForWazzupMessage(msg).catch((e) =>
-        console.error(`[wazzup-inbound-v137] marker error message=${msg.messageId || '?'}: ${e.message || e}`)
-      ));
+      try {
+        await actsMarkClientRepliedForWazzupMessage(msg);
+        console.log(`[wazzup-inbound-v1375] HARD STOP completed: message=${msg.messageId || '-'} phoneTail=${String(normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '')).slice(-4)}`);
+      } catch (e) {
+        console.error(`[wazzup-inbound-v1375] HARD STOP error message=${msg.messageId || '?'}: ${e.message || e}`);
+      }
     }
 
     for (const msg of acceptedMessages) {
@@ -1472,25 +1475,24 @@ app.post('/api/wazzup/webhook', async (req, res) => {
           phone,
           externalId: `wazzup_${msg.messageId || ''}`,
         }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
-        // v137: если у Бобика нет активного актового контроля, всё равно запускаем полноценный AI-диалог.
-        // Для остальных сделок этот fallback НЕ запускается.
-        if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId) === '38072') {
+        // v137.5: прямой пилот Бобика. Не зависит от общего live-chat и
+        // не использует старый gate actsResolveSmartDialogTestDealByPhone.
+        if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072') {
           setImmediate(async () => {
             try {
-              // v137.2: для тестового Бобика активный актовый контроль не блокирует AI-пилот.
-              // Hard-stop записывается первым обработчиком выше.
-              const resolved = await actsResolveSmartDialogTestDealByPhone(phone).catch(() => null);
-              if (!resolved || !resolved.deal || String(resolved.deal.ID) !== '38072') {
-                console.log(`[wazzup-ai-v1372] Bobik match failed: phoneTail=${String(phone).slice(-4)} chatId=${String(msg.chatId || '').slice(-12)}`);
-                return;
-              }
-              console.log(`[wazzup-ai-v1372] Bobik matched: deal=38072 channel=${channelKey || msg.chatType || '-'} phoneTail=${String(phone).slice(-4)} chatId=${String(msg.chatId || '').slice(-12)}`);
-              await actsProcessBobikInboundText({ msg, phone, channelKey, text });
+              const bobikDeal = await findDealForPhone(phone).catch(() => null);
+              console.log(`[wazzup-ai-v1375] Bobik phone lookup: phoneTail=${String(phone).slice(-4)} foundDeal=${bobikDeal ? bobikDeal.ID : 'none'}`);
+              if (!bobikDeal || String(bobikDeal.ID) !== '38072') return;
+
+              console.log(`[wazzup-ai-v1375] Bobik matched: deal=38072 channel=${channelKey || msg.chatType || '-'} message=${msg.messageId || '-'}`);
+              const result = await actsProcessBobikInboundText({ msg, phone, channelKey, text });
+              console.log(`[wazzup-ai-v1375] Bobik result: ${JSON.stringify(result).slice(0, 2000)}`);
             } catch (e) {
-              console.error(`[wazzup-ai-v137] Bobik fallback error message=${msg.messageId || '?'}: ${e.message || e}`);
+              console.error(`[wazzup-ai-v1375] Bobik processing error message=${msg.messageId || '?'}: ${e.message || e}`);
             }
           });
         }
+
       }
     }
 
@@ -13340,7 +13342,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V1373=ON; hard-client-reply-stop=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}; bobikMatchGate=wazzupAiTestEnabled`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V1375=ON; hard-client-reply-stop=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
