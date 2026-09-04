@@ -1376,11 +1376,22 @@ app.get('/api/acts-smart-dialog/diag', (_req, res) => {
 });
 
 app.post('/api/wazzup/webhook', async (req, res) => {
+  // v140: one-response guard for Wazzup webhook.
+  // The webhook MUST never attempt a second HTTP response after immediate ACK.
+  let __wazzupResponded = false;
+  const __wazzupAck = (payload = { ok: true }) => {
+    if (__wazzupResponded || res.headersSent) return false;
+    __wazzupResponded = true;
+    __wazzupAck(payload);
+    return true;
+  };
+  const __wazzupErrorAck = () => __wazzupAck({ ok: true });
+
   // Wazzup при регистрации вебхука шлёт тестовый POST {test: true} и ждёт 200 немедленно.
   if (req.body && req.body.test) {
     console.log('[v136-wazzup] ✅ test POST от Wazzup получен → 200 OK. Подписка реально достучалась до Render.');
     console.log('[wazzup-webhook] test POST получен → 200 OK.');
-    res.status(200).json({ ok: true });
+    __wazzupAck({ ok: true });
     return;
   }
   try {
@@ -1388,6 +1399,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     const auth = String(req.headers.authorization || '');
     const authRequired = !!config.wazzupCrmKey;
     const authMatches = !authRequired || auth === `Bearer ${config.wazzupCrmKey}`;
+__wazzupAck({ ok: true, received: true });
     console.log(`[wazzup-webhook] POST получен: messages=${messages.length}; auth=${auth ? 'present' : 'none'}; authMatches=${authMatches}; summaries=${JSON.stringify(messages.slice(0, 5).map(wazzupWebhookMessageLogSummary))}`);
 
     if (!authMatches) {
@@ -1402,7 +1414,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       });
       if (!safeInbound.length) {
         console.warn('[wazzup-webhook] Authorization не совпал; inbound нашего известного Wazzup-канала не найден → webhook проигнорирован.');
-        res.status(200).json({ ok: true });
+        __wazzupAck({ ok: true });
         return;
       }
       console.warn(`[wazzup-webhook] Authorization не совпал, но найдено inbound-сообщений нашего Wazzup-канала: ${safeInbound.length}. Обрабатываю их.`);
@@ -1413,7 +1425,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     console.log(`[wazzup-inbound-v137] accepted=${acceptedMessages.length}; inbound=${acceptedMessages.filter(m => m && !m.isEcho && String(m.status || '').toLowerCase() === 'inbound').length}; ids=${JSON.stringify(acceptedMessages.filter(m => m && !m.isEcho && String(m.status || '').toLowerCase() === 'inbound').slice(0, 10).map(m => m.messageId || '-'))}`);
 
     // v139: acknowledge Wazzup BEFORE any Bitrix/AI work. The rest of this handler is background work.
-    res.status(200).json({ ok: true, accepted: acceptedMessages.length });
+    __wazzupAck({ ok: true, accepted: acceptedMessages.length });
     console.log('[wazzup-inbound-v139] HTTP 200 sent immediately; background processing continues.');
 
     // v137: железный inbound-catch. Фиксируем ЛЮБОЙ ответ клиента до любой другой логики.
@@ -1607,7 +1619,7 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     return;
   } catch (error) {
     console.error('[live-chat-webhook] общая ошибка:', error.message || error);
-    if (!res.headersSent) res.status(200).json({ ok: true }); // всегда 200, чтобы Wazzup не отключил вебхук из-за наших ошибок
+    if (!res.headersSent) __wazzupAck({ ok: true }); // всегда 200, чтобы Wazzup не отключил вебхук из-за наших ошибок
   }
 });
 
@@ -13476,7 +13488,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V139=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; act-email-resend=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V140=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; act-email-resend=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
