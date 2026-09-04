@@ -1412,35 +1412,125 @@ app.post('/api/wazzup/webhook', async (req, res) => {
     const acceptedMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
     console.log(`[wazzup-inbound-v137] accepted=${acceptedMessages.length}; inbound=${acceptedMessages.filter(m => m && !m.isEcho && String(m.status || '').toLowerCase() === 'inbound').length}; ids=${JSON.stringify(acceptedMessages.filter(m => m && !m.isEcho && String(m.status || '').toLowerCase() === 'inbound').slice(0, 10).map(m => m.messageId || '-'))}`);
 
-    // v137: железный inbound-catch. Фиксируем ЛЮБОЙ ответ клиента до любой другой логики.
-    // Это не зависит от истории Wazzup в Bitrix и не зависит от preferred channel.
-    for (const msg of acceptedMessages) {
-      if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
-      try {
-        await actsMarkClientRepliedForWazzupMessage(msg);
-        console.log(`[wazzup-inbound-v1375] HARD STOP completed: message=${msg.messageId || '-'} phoneTail=${String(normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '')).slice(-4)}`);
-      } catch (e) {
-        console.error(`[wazzup-inbound-v1375] HARD STOP error message=${msg.messageId || '?'}: ${e.message || e}`);
-      }
-    }
+    // v138: отвечаем Wazzup немедленно. Никаких долгих Bitrix/API/AI операций внутри
+    // HTTP request. Раньше await actsMarkClientReplied... мог зависнуть на восстановлении
+    // десятков push-state и webhook оставался на accepted=1, не доходя до Bobik AI.
+    //
+    // Все тяжёлые операции выполняются после 200 OK. Для каждого inbound соблюдаем порядок:
+    // hard-stop -> Bobik AI / общий act-dialog. Ошибка одного сообщения не блокирует остальные.
+    res.status(200).json({ ok: true, accepted: acceptedMessages.length });
+    setImmediate(() => {
+      (async () => {
+        for (const msg of acceptedMessages) {
+          if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
 
-    for (const msg of acceptedMessages) {
-      if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound' || !msg.contentUri) continue;
-      const v135Summary = actsV135FileMessageSummary(msg);
-      actsV135DiagUpdate('webhook-received', { ...v135Summary, error: '', replySent: null, bobikMatched: null });
-      console.log(
-        `[v135-file] webhook-received message=${v135Summary.messageId || '?'} ` +
-        `type=${v135Summary.type || '-'} chatType=${v135Summary.chatType || '-'} ` +
-        `channelKnown=${v135Summary.channelKnown} phone=***${v135Summary.phoneTail || '----'}`
-      );
-    }
+          const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+          const text = actsCleanText(msg.text || msg.caption || '');
+          const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
+          const isBobikPilot =
+            config.wazzupAiTestEnabled &&
+            String(config.wazzupAiTestDealId || '38072') === '38072' &&
+            !!text &&
+            !msg.contentUri;
 
-    // v71: входящие документы/изображения обрабатываем независимо от LIVE_CHAT_ENABLED.
-    // Wazzup ждёт 200 максимум 30 секунд, поэтому тяжёлую работу (скачивание, ИИ, Bitrix Disk)
-    // запускаем асинхронно и не держим webhook-ответ.
+          try {
+            await withTimeout(
+              actsMarkClientRepliedForWazzupMessage(msg),
+              WAZZUP_INBOUND_PROCESS_TIMEOUT_MS,
+              `hard-stop message=${msg.messageId || '-'}`
+            );
+            console.log(
+              `[wazzup-inbound-v138] HARD STOP completed: message=${msg.messageId || '-'} ` +
+              `phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'}`
+            );
+          } catch (e) {
+            console.error(
+              `[wazzup-inbound-v138] HARD STOP error message=${msg.messageId || '?'}: ${e.message || e}`
+            );
+          }
+
+          if (!isBobikPilot || !phone) continue;
+
+          // v138: прямое сопоставление ТОЛЬКО с тестовой сделкой 38072.
+          // Не используем liveChatTestDealId и старый findDealForPhone gate.
+          try {
+            const bobikDeal = await withTimeout(
+              (async () => {
+                const deal = await bitrixRestCall('crm.deal.get', { id: 38072 });
+                if (!deal) return null;
+
+                const candidatePhones = [];
+                const loadPhones = async (method, id) => {
+                  if (!id) return;
+                  try {
+                    const entity = await bitrixRestCall(method, { id });
+                    const arr = Array.isArray(entity && entity.PHONE) ? entity.PHONE : [];
+                    for (const item of arr) {
+                      const digits = normalizePhoneDigits(item && item.VALUE);
+                      if (digits) candidatePhones.push(digits);
+                    }
+                  } catch (_) {}
+                };
+
+                await loadPhones('crm.contact.get', deal.CONTACT_ID);
+                await loadPhones('crm.company.get', deal.COMPANY_ID);
+
+                if (!candidatePhones.length) {
+                  console.warn(`[wazzup-ai-v138] Bobik match: deal=38072 has no phone to verify`);
+                  return null;
+                }
+
+                const matched = candidatePhones.some((p) =>
+                  p.endsWith(phone) || phone.endsWith(p) || p.slice(-9) === phone.slice(-9)
+                );
+                return matched ? deal : null;
+              })(),
+              WAZZUP_INBOUND_PROCESS_TIMEOUT_MS,
+              'Bobik phone match'
+            );
+
+            console.log(
+              `[wazzup-ai-v138] Bobik phone lookup: phoneTail=${String(phone).slice(-4)} ` +
+              `foundDeal=${bobikDeal ? bobikDeal.ID : 'none'}`
+            );
+
+            if (!bobikDeal) continue;
+
+            console.log(
+              `[wazzup-ai-v138] Bobik matched: deal=38072 channel=${channelKey || msg.chatType || '-'} ` +
+              `message=${msg.messageId || '-'}`
+            );
+
+            const result = await withTimeout(
+              actsProcessBobikInboundText({
+                msg,
+                phone,
+                channelKey,
+                text,
+              }),
+              WAZZUP_INBOUND_PROCESS_TIMEOUT_MS,
+              `Bobik AI message=${msg.messageId || '-'}`
+            );
+
+            console.log(`[wazzup-ai-v138] Bobik result: ${JSON.stringify(result).slice(0, 3000)}`);
+          } catch (e) {
+            console.error(
+              `[wazzup-ai-v138] Bobik processing error message=${msg.messageId || '?'}: ${e.message || e}`
+            );
+            await actsSmartDialogAddComment(
+              38072,
+              `[WAZZUP_AI_INBOUND_ERROR] message=${msg.messageId || '-'}\n${String(e.message || e).slice(0, 1200)}`
+            ).catch(() => {});
+          }
+        }
+      })().catch((e) => console.error(`[wazzup-inbound-v138] background error: ${e.message || e}`));
+    });
+
+    // v138: после немедленного 200 ниже остаются только независимые file-pipeline задачи.
+    // Они также запускаются асинхронно.
     if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
       for (const msg of acceptedMessages) {
-        if (!msg || msg.isEcho || msg.status !== 'inbound') continue;
+        if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
         if (!msg.contentUri) continue;
         setImmediate(() => actsProcessIncomingWazzupMessage(msg).catch((e) =>
           console.error(`[acts-incoming] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)
@@ -1448,23 +1538,21 @@ app.post('/api/wazzup/webhook', async (req, res) => {
       }
     }
 
-    // ACTS_SMART_DIALOG_V129: текстовые ответы клиента по акту обрабатываем для ВСЕХ
-    // активных контролей актов, независимо от пилотного LIVE_CHAT.
+    // Для текста Бобика общий act-dialog ниже НЕ запускаем, чтобы не было двух AI-ответов.
+    // Для остальных сделок оставляем прежний smart-dialog.
     if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled && config.actsSmartDialogEnabled) {
       for (const msg of acceptedMessages) {
         if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
         const text = actsCleanText(msg.text || '');
-        if (!text) {
-          console.log(`[wazzup-inbound-v1373] inbound text empty: message=${msg.messageId || '-'} type=${msg.type || '-'} chatType=${msg.chatType || '-'}`);
-          continue;
-        }
-        if (msg.contentUri) continue;
-
+        if (!text || msg.contentUri) continue;
         const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
         if (!phone) continue;
-        const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
-        console.log(`[wazzup-inbound-v1373] text accepted: message=${msg.messageId || '-'} phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'} textLen=${text.length}`);
+        const isBobikPilot =
+          config.wazzupAiTestEnabled &&
+          String(config.wazzupAiTestDealId || '38072') === '38072';
+        if (isBobikPilot) continue;
 
+        const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
         setImmediate(() => actsProcessIncomingClientText({
           source: channelKey || msg.chatType || 'Wazzup',
           commType: 'PHONE',
@@ -1475,24 +1563,6 @@ app.post('/api/wazzup/webhook', async (req, res) => {
           phone,
           externalId: `wazzup_${msg.messageId || ''}`,
         }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
-        // v137.5: прямой пилот Бобика. Не зависит от общего live-chat и
-        // не использует старый gate actsResolveSmartDialogTestDealByPhone.
-        if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072') {
-          setImmediate(async () => {
-            try {
-              const bobikDeal = await findDealForPhone(phone).catch(() => null);
-              console.log(`[wazzup-ai-v1375] Bobik phone lookup: phoneTail=${String(phone).slice(-4)} foundDeal=${bobikDeal ? bobikDeal.ID : 'none'}`);
-              if (!bobikDeal || String(bobikDeal.ID) !== '38072') return;
-
-              console.log(`[wazzup-ai-v1375] Bobik matched: deal=38072 channel=${channelKey || msg.chatType || '-'} message=${msg.messageId || '-'}`);
-              const result = await actsProcessBobikInboundText({ msg, phone, channelKey, text });
-              console.log(`[wazzup-ai-v1375] Bobik result: ${JSON.stringify(result).slice(0, 2000)}`);
-            } catch (e) {
-              console.error(`[wazzup-ai-v1375] Bobik processing error message=${msg.messageId || '?'}: ${e.message || e}`);
-            }
-          });
-        }
-
       }
     }
 
@@ -7254,6 +7324,19 @@ const ACTS_DIALOG_HUMAN_MARKER = '[MAVIS_ACTS_DIALOG_HUMAN]';
 const ACTS_DIALOG_TEST_FILE_MARKER = '[MAVIS_ACTS_DIALOG_TEST_FILE]';
 // v137: железный стоп актовых пушей после ЛЮБОГО входящего сообщения клиента.
 const ACTS_CLIENT_REPLIED_MARKER = '[MAVIS_ACTS_CLIENT_REPLIED]';
+const WAZZUP_INBOUND_PROCESS_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.WAZZUP_INBOUND_PROCESS_TIMEOUT_MS || 25000)
+);
+
+function withTimeout(promise, ms, label = 'operation') {
+  const timeoutMs = Math.max(1000, Number(ms || 10000));
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}: timeout ${timeoutMs}ms`)), timeoutMs)),
+  ]);
+}
+
 
 const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
 let actsPushCycleRunning = false;
@@ -7556,7 +7639,7 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
       fields: {
         ENTITY_ID: deal.ID,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${marker}\nКлиент ответил после отправки акта. Автоматические актовые пуши по этому контролю запрещены.\n${JSON.stringify(payload)}`,
+        COMMENT: `${marker} deal=${deal.ID}\nКлиент ответил после отправки акта. Автоматические актовые пуши по этому контролю запрещены.\n${JSON.stringify(payload)}`,
       },
     });
     actsPushStates.delete(String(state.taskId));
@@ -7599,89 +7682,281 @@ async function actsHasClientRepliedAfterSend(state, comments = null) {
   if (!state || !state.dealId) return false;
   const rows = comments || await actsLoadTimelineComments(state.dealId, 150).catch(() => []);
   const marker = `${ACTS_CLIENT_REPLIED_MARKER} task=${state.taskId}`;
-  return rows.some((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, state.sentAtMs));
+  const taskLevel = rows.some((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, state.sentAtMs));
+  const dealLevel = rows.some((c) =>
+    String(c && c.COMMENT || '').includes(`${ACTS_CLIENT_REPLIED_MARKER} testDeal=${state.dealId}`)
+  );
+  return taskLevel || dealLevel;
 }
 
 async function actsProcessBobikInboundText({ msg, phone, channelKey, text }) {
   if (!config.wazzupAiTestEnabled) return { ok: true, skipped: true, reason: 'disabled' };
-  const dealId = String(config.wazzupAiTestDealId || '38072');
-  let deal = null;
-  try { deal = await bitrixRestCall('crm.deal.get', { id: dealId }); } catch (_) {}
-  if (!deal) return { ok: true, skipped: true, reason: 'deal-not-found' };
+  if (String(config.wazzupAiTestDealId || '38072') !== '38072') {
+    return { ok: true, skipped: true, reason: 'not-bobik-test' };
+  }
+
+  const deal = await bitrixRestCall('crm.deal.get', { id: 38072 });
+  if (!deal) return { ok: false, skipped: true, reason: 'deal-not-found' };
 
   const cleanText = actsCleanText(text || '');
   if (!cleanText) return { ok: true, skipped: true, reason: 'empty' };
 
   const external = actsCleanText(msg && msg.messageId || '').replace(/\s+/g, '_').slice(0, 160);
-  const comments = await actsLoadTimelineComments(deal.ID, 150).catch(() => []);
-  if (external && comments.some((c) => String(c && c.COMMENT || '').includes(`WAZZUP_AI_REPLY deal=${deal.ID} message=${external}`))) {
+  const comments = await actsLoadTimelineComments(deal.ID, 200).catch(() => []);
+
+  // Дубликаты webhook-событий: не отвечаем дважды.
+  if (external && comments.some((c) =>
+    String(c && c.COMMENT || '').includes(`[WAZZUP_AI_INBOUND] message=${external}`)
+  )) {
     return { ok: true, skipped: true, duplicate: true };
   }
 
   const history = comments
-    .filter((c) => String(c && c.COMMENT || '').includes('[MAVIS_LIVE_CHAT]'))
-    .slice(-20)
-    .map((c) => String(c.COMMENT || '').replace('[MAVIS_LIVE_CHAT]', '').trim())
+    .filter((c) => {
+      const x = String(c && c.COMMENT || '');
+      return x.includes('[WAZZUP_AI_INBOUND]') ||
+        x.includes('[WAZZUP_AI_REPLY]') ||
+        x.includes('[MAVIS_LIVE_CHAT]') ||
+        x.includes('[MAVIS_ACTS_CLIENT_REPLIED]');
+    })
+    .slice(-30)
+    .map((c) => String(c.COMMENT || '').slice(0, 3000))
     .join('\n---\n');
 
   const service = String(deal.UF_CRM_1765113071 || 'не указана');
+
+  // Ищем активный актовый контроль Бобика после hard-stop.
+  // Это нужно для реальной операции "переотправить акт на почту".
+  let actTarget = null;
+  try {
+    const waiting = await actsFindWaitingStatesByComm('PHONE', phone);
+    actTarget = waiting.find((x) => x && x.deal && String(x.deal.ID) === '38072') || null;
+  } catch (e) {
+    console.warn(`[wazzup-ai-v138] Bobik waiting-state lookup failed: ${e.message || e}`);
+  }
+
+  const state = actTarget && actTarget.state ? actTarget.state : null;
+  const taskId = state ? String(state.taskId) : '';
+
+  const minskNow = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Minsk',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date());
+
   const prompt = `
-Ты сотрудник MAVIS GROUP и ведёшь обычную рабочую переписку с клиентом.
-Это пилотный реальный диалог по сделке #${deal.ID} (${String(deal.TITLE || '').slice(0, 300)}), услуга: ${service}.
+Ты сотрудник MAVIS GROUP. Ведёшь естественную рабочую переписку с клиентом.
+Сейчас по Минску: ${minskNow}.
+Сделка: #38072, ${String(deal.TITLE || '').slice(0, 300)}.
+Услуга: ${service}.
+Сообщение пришло как ответ клиенту в мессенджере после коммуникации по АКТУ ВЫПОЛНЕННЫХ РАБОТ.
 
-Сообщение клиента:
-${cleanText.slice(0, 3000)}
+Главное правило:
+Автоматически отвечай ТОЛЬКО если сообщение клиента по смыслу относится к акту:
+- получение/подписание/возврат акта;
+- срок подписания;
+- просьба пока не писать / отпуск / командировка / занятость;
+- просьба повторно отправить акт;
+- вопрос непосредственно по акту.
+Если сообщение не связано с актом — action="no_reply".
 
-Контекст предыдущей переписки, если есть:
+Если клиент сообщает срок или просит не писать:
+action="wait".
+hold_until:
+- "завтра", "послезавтра", "в пятницу", "до 14 числа" — вычисли конкретную дату по Минску;
+- если день без времени — минимум 18:00 этого дня;
+- "я в отпуске до 14" — до 14 числа 18:00;
+- если "позже/после отпуска" без даты — hold_until=null и в ответе можно вежливо уточнить ориентир.
+При action=wait ответ должен быть коротким и естественным.
+
+Если клиент просит "пришлите акт на почту / переотправьте на email":
+action="resend_email".
+Система попытается реально найти исходный файл акта и отправить его на email актуального контакта.
+Если файл/email найти невозможно, action после попытки будет заменён на human — не обещай то, что не сделано.
+
+Если вопрос по сумме, содержанию, исправлению, спору, претензии, юридическому/финансовому вопросу или требуется решение эксперта:
+action="human".
+Можно коротко подтвердить получение, но не выдумывать ответ по существу.
+
+"Спасибо", "ок", "понял", "получили" без новой просьбы:
+action="no_reply".
+
+Не упоминай ИИ, робота, автоматизацию, Wazzup, внутренние поля или тест.
+Не говори о классификации сообщения.
+Ответ 1–3 коротких предложения.
+
+История:
 ${history || '(нет)'}
 
-Правила:
-- Отвечай только на то, что действительно следует из сообщения клиента и контекста сделки.
-- Если это простой вопрос по текущей работе, статусу, документам или следующему шагу и ответ можно дать без догадок — ответь.
-- Если вопрос требует экспертного решения, юридической/финансовой оценки, изменения цены/условий, содержит жалобу/конфликт или тебе не хватает данных — action="human" и не выдумывай ответ.
-- Если клиент просто написал «спасибо», «ок», «понял» и т.п., action="no_reply".
-- Не упоминай ИИ, робота, автоматизацию, тест, Wazzup, внутренние процессы или системные поля.
-- Не говори «проверка/классификация сообщения».
-- Пиши естественно, как живой сотрудник, 1–3 коротких предложения.
+Новое сообщение клиента:
+${cleanText.slice(0, 3000)}
 
 Верни ТОЛЬКО JSON:
-{"action":"reply|human|no_reply","reply":"готовый ответ или пусто","reason":"кратко","confidence":0.0}
+{
+  "action":"wait|resend_email|human|no_reply",
+  "intent":"promised_date|vacation|do_not_contact|resend_email|act_question|act_problem|acknowledgement|other",
+  "hold_until":"ISO 8601 +03:00 или null",
+  "reply":"готовый ответ или пустая строка",
+  "reason":"кратко",
+  "confidence":0.0
+}
 `.trim();
 
-  let raw;
+  let decision;
   try {
-    raw = await callAiChatCompletion({
+    const raw = await callAiChatCompletion({
       model: config.aiModel,
-      temperature: 0.2,
+      temperature: 0,
       messages: [{ role: 'user', content: prompt }],
     });
+    const match = String(raw || '').match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('ИИ не вернул JSON');
+    decision = JSON.parse(match[0]);
   } catch (e) {
-    await actsSmartDialogAddComment(deal.ID, `[WAZZUP_AI_INBOUND_ERROR] message=${external || '-'}\n${String(e.message || e).slice(0, 1000)}`).catch(() => {});
-    console.warn(`[wazzup-ai-v137] deal=${deal.ID}: AI error: ${e.message || e}`);
+    await actsSmartDialogAddComment(
+      deal.ID,
+      `[WAZZUP_AI_INBOUND_ERROR] message=${external || '-'}\n${String(e.message || e).slice(0, 1200)}`
+    ).catch(() => {});
+    await actsSmartDialogNotifyExpert(
+      deal,
+      `Клиент написал по акту: «${cleanText.slice(0, 800)}». ИИ не смог обработать сообщение: ${String(e.message || e).slice(0, 500)}`
+    ).catch(() => {});
     return { ok: true, processed: 1, action: 'human', error: String(e.message || e) };
   }
 
-  let decision = { action: 'human', reply: '', reason: 'не удалось разобрать ответ ИИ', confidence: 0 };
-  try {
-    const match = String(raw || '').match(/\{[\s\S]*\}/);
-    if (match) decision = JSON.parse(match[0]);
-  } catch (_) {}
-
-  const action = ['reply', 'human', 'no_reply'].includes(String(decision.action || '')) ? decision.action : 'human';
+  let action = ['wait', 'resend_email', 'human', 'no_reply'].includes(String(decision.action || ''))
+    ? String(decision.action)
+    : 'human';
+  const intent = actsCleanText(decision.intent || 'other');
   const confidence = Math.max(0, Math.min(1, Number(decision.confidence || 0)));
   let reply = actsCleanText(decision.reply || '');
+  let holdUntil = decision.hold_until || null;
+  const reason = actsCleanText(decision.reason || '');
 
-  if (action === 'reply' && (!reply || confidence < 0.70)) {
-    decision.action = 'human';
+  // Для auto-actions нужен уверенный AI. no_reply безопасен при любом confidence.
+  if (action !== 'no_reply' && confidence < 0.70) {
+    action = 'human';
     reply = '';
+    holdUntil = null;
   }
 
+  // Жёсткий стоп уже записан ДО AI. Здесь дополнительно фиксируем решение.
   await actsSmartDialogAddComment(
     deal.ID,
-    `[WAZZUP_AI_INBOUND] message=${external || '-'} channel=${channelKey || '-'}\nКлиент: ${cleanText.slice(0, 3000)}\nРешение: ${JSON.stringify({ action: decision.action, confidence, reason: decision.reason || '' })}`
+    `[WAZZUP_AI_INBOUND] message=${external || '-'} channel=${channelKey || '-'} task=${taskId || '-'}\n` +
+    `Клиент: ${cleanText.slice(0, 3000)}\n` +
+    `Решение: ${JSON.stringify({ action, intent, holdUntil, confidence, reason })}`
   ).catch(() => {});
 
-  if (decision.action === 'reply' && reply) {
+  if (action === 'resend_email') {
+    if (!state) {
+      action = 'human';
+      reply = '';
+      await actsSmartDialogNotifyExpert(
+        deal,
+        `Клиент просит переотправить акт на email: «${cleanText.slice(0, 800)}». Активный актовый контроль не найден.`
+      ).catch(() => {});
+    } else {
+      try {
+        const taskRaw = await bitrixRestCall('tasks.task.get', {
+          taskId: Number(state.taskId),
+          select: ['ID', 'TITLE', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'RESPONSIBLE_ID', 'CHAT_ID', 'UF_TASK_WEBDAV_FILES'],
+        });
+        const task = taskRaw && (taskRaw.task || taskRaw.TASK || taskRaw);
+        if (!task) throw new Error(`Задача ${state.taskId} не найдена`);
+
+        const resolution = await actsResolveTaskFiles(task);
+        const file = actsPickBestFileForClient(resolution.files || []);
+        if (!file || !file.url) throw new Error('Не найден исходный файл акта');
+
+        const recipient = await actsResolveRecipientContact(deal, state.contactId || '');
+        if (!recipient.ok) throw new Error(recipient.reason || 'Не найден контакт клиента');
+
+        const email = actsContactEmail(recipient.contact);
+        if (!email) throw new Error(`У контакта «${recipient.label}» нет email`);
+
+        // crm.activity.add с STORAGE_ELEMENT_IDS прикладывает исходный Disk-файл,
+        // если у него есть attachedId. Если вложение из task-chat не имеет attachedId,
+        // не обещаем клиенту отправку — передаём эксперту.
+        const storageIds = actsBuildEmailStorageElementIds(file);
+        if (!storageIds.length) {
+          throw new Error('У найденного файла нет attachedId Bitrix для вложения в email');
+        }
+
+        await sendActEmailThroughBitrix(
+          deal,
+          recipient.contactId,
+          email,
+          'Как просили, повторно направляем акт во вложении.',
+          file
+        );
+
+        reply = 'Конечно, направили акт на вашу почту.';
+        await actsSmartDialogAddComment(
+          deal.ID,
+          `[WAZZUP_AI_REPLY] task=${state.taskId} action=resend_email\nMavis: ${reply}\nEmail=${maskEmailForLog(email)}\nFile=${file.name}`
+        ).catch(() => {});
+
+        console.log(
+          `[wazzup-ai-v138] Bobik deal=38072: act resent by email; task=${state.taskId}; file=${file.name}`
+        );
+      } catch (e) {
+        action = 'human';
+        reply = '';
+        await actsSmartDialogNotifyExpert(
+          deal,
+          `Клиент просит переотправить акт на email: «${cleanText.slice(0, 800)}». Автоотправка не выполнена: ${String(e.message || e).slice(0, 700)}`
+        ).catch(() => {});
+        console.warn(`[wazzup-ai-v138] Bobik email resend failed: ${e.message || e}`);
+      }
+    }
+  }
+
+  if (action === 'wait') {
+    // Безопасная пауза: если дата не распознана, не возвращаем клиента в обычный push-cycle.
+    // До появления конкретной даты пуши не возобновляем.
+    const payload = {
+      holdUntil: holdUntil || null,
+      intent,
+      reason,
+      confidence,
+    };
+
+    if (state) {
+      await actsSmartDialogAddComment(
+        deal.ID,
+        `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify(payload)}`
+      ).catch(() => {});
+      actsPushStates.delete(String(state.taskId));
+      console.log(
+        `[wazzup-ai-v138] Bobik deal=38072 task=${state.taskId}: WAIT holdUntil=${holdUntil || 'manual'}; push stopped`
+      );
+    } else {
+      console.log(`[wazzup-ai-v138] Bobik deal=38072: WAIT but no active task state`);
+    }
+  }
+
+  if (action === 'human') {
+    await actsSmartDialogAddComment(
+      deal.ID,
+      `${ACTS_DIALOG_HUMAN_MARKER} deal=${deal.ID} task=${taskId || '-'}\n` +
+      `Причина: ${reason || intent}\nСообщение: ${cleanText.slice(0, 1500)}`
+    ).catch(() => {});
+    await actsSmartDialogNotifyExpert(
+      deal,
+      `Клиент написал по акту: «${cleanText.slice(0, 800)}». Автоматический ответ по существу не отправлен.`
+    ).catch(() => {});
+  }
+
+  if (action === 'no_reply') {
+    console.log(
+      `[wazzup-ai-v138] Bobik deal=38072: no_reply; intent=${intent}; confidence=${confidence}`
+    );
+    return { ok: true, processed: 1, action, intent, confidence };
+  }
+
+  if (reply) {
     try {
       await sendWazzupMessageInternal({
         channelKey: channelKey || findChannelKeyByChannelId(msg && msg.channelId),
@@ -7690,24 +7965,32 @@ ${history || '(нет)'}
         phone,
         dealId: deal.ID,
         ignoreStrictPreferredChannel: true,
-        crmMessageId: `mavis-wazzup-ai-${deal.ID}-${external || Date.now()}`,
+        crmMessageId: `mavis-wazzup-ai-v138-${deal.ID}-${external || Date.now()}`,
       });
+
       await actsSmartDialogAddComment(
         deal.ID,
         `[WAZZUP_AI_REPLY deal=${deal.ID} message=${external || '-'}]\nMavis: ${reply}`
       ).catch(() => {});
-      console.log(`[wazzup-ai-v137] Bobik deal=${deal.ID}: reply sent via ${channelKey || '-'}; message=${external || '-'}`);
-      return { ok: true, processed: 1, action: 'reply', reply };
+
+      console.log(
+        `[wazzup-ai-v138] Bobik deal=38072: reply sent via ${channelKey || msg.chatType || '-'}; action=${action}; intent=${intent}`
+      );
+      return { ok: true, processed: 1, action, intent, holdUntil, confidence, reply };
     } catch (e) {
-      await actsSmartDialogAddComment(deal.ID, `[WAZZUP_AI_REPLY_ERROR] message=${external || '-'}\n${String(e.message || e).slice(0, 1000)}`).catch(() => {});
-      console.warn(`[wazzup-ai-v137] Bobik deal=${deal.ID}: reply send error: ${e.message || e}`);
+      await actsSmartDialogAddComment(
+        deal.ID,
+        `[WAZZUP_AI_REPLY_ERROR] message=${external || '-'}\n${String(e.message || e).slice(0, 1200)}`
+      ).catch(() => {});
+      await actsSmartDialogNotifyExpert(
+        deal,
+        `Клиенту нужно было ответить по акту, но автоматическая отправка не выполнена: ${String(e.message || e).slice(0, 600)}`
+      ).catch(() => {});
+      return { ok: true, processed: 1, action: 'human', error: String(e.message || e) };
     }
   }
 
-  if (decision.action === 'human') {
-    await actsSmartDialogNotifyExpert(deal, `Клиент написал: «${cleanText.slice(0, 800)}». Автоматический ответ не отправлен — нужен живой ответ.`).catch(() => {});
-  }
-  return { ok: true, processed: 1, action: decision.action, confidence, reason: decision.reason || '' };
+  return { ok: true, processed: 1, action, intent, holdUntil, confidence };
 }
 
 async function actsProcessIncomingClientText({
@@ -13342,7 +13625,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v125 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V1375=ON; hard-client-reply-stop=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V138=ON; hard-client-reply-stop=ON; act-semantic-dialog=ON; bobikDirectMatch=ON; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
