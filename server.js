@@ -1,5 +1,5 @@
 
-// v145: production act-AI rules — real action execution + global reply stop + strict deal binding.
+// v143: production act-AI rules.
 // New + historical deals are eligible. Successful deals are never pushed.
 // Any inbound client reply after an act push permanently suppresses future
 // act reminders for that deal. Technical marker strings stay internal.
@@ -1447,8 +1447,16 @@ __wazzupAck({ ok: true, received: true });
     // Это не зависит от истории Wazzup в Bitrix и не зависит от preferred channel.
     for (const msg of acceptedMessages) {
       if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') continue;
-      // v145: больше никаких специальных привязок к Bobik/телефонному хвосту.
-      // Сначала CRM-цепочка определяет реальную сделку, затем единый AI-обработчик.
+      const phone = normalizePhoneDigits((msg.contact && msg.contact.phone) || msg.chatId || '');
+      // v141: Bobik hard-stop ставим ТОЛЬКО для подтверждённого тестового номера.
+      // Никаких deal=38072 для чужих клиентов.
+      const isBobikPhone = !!phone && String(phone).slice(-4) === String(config.wazzupAiTestPhoneTail || '5898');
+      if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '') === '38072' && isBobikPhone) {
+        actsSetRecentClientReplyDeal('38072', msg.messageId || '');
+        console.log(`[wazzup-inbound-v141] Bobik FAST HARD STOP: deal=38072 phoneTail=${phone.slice(-4)} message=${msg.messageId || '-'}`);
+      } else if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '') === '38072') {
+        console.log(`[wazzup-inbound-v141] Bobik hard-stop skipped for non-Bobik phoneTail=${phone.slice(-4)}`);
+      }
       // Persist marker asynchronously; never block Wazzup.
       setImmediate(() => actsMarkClientRepliedForWazzupMessage(msg).then((r) => {
         console.log(`[wazzup-inbound-v141] persistent hard-stop done: message=${msg.messageId || '-'} marked=${r && r.marked || 0}`);
@@ -1498,17 +1506,43 @@ __wazzupAck({ ok: true, received: true });
         const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
         console.log(`[wazzup-inbound-v1373] text accepted: message=${msg.messageId || '-'} phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'} textLen=${text.length}`);
 
-        setImmediate(() => actsProcessIncomingClientText({
-          source: channelKey || msg.chatType || 'Wazzup',
-          commType: 'PHONE',
-          commValue: phone,
-          text,
-          channelKey,
-          chatId: msg.chatId || '',
-          phone,
-          externalId: `wazzup_${msg.messageId || ''}`,
-        }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
-        // v145: единый обработчик входящих сообщений для всех сделок; отдельный Bobik-пилот отключён.
+        // v146: Bobik pilot is the single owner of Bobik inbound messages.
+        // Do not also run the generic act-dialog worker for the same message:
+        // that created duplicate decisions and could consume/delete the state
+        // before the action (e.g. resend_act) was executed.
+        const isBobikPhoneV145 = String(phone).slice(-4) === String(config.wazzupAiTestPhoneTail || '5898');
+        const bobikPilotV145 = config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072' && isBobikPhoneV145;
+        if (!bobikPilotV145) {
+          setImmediate(() => actsProcessIncomingClientText({
+            source: channelKey || msg.chatType || 'Wazzup',
+            commType: 'PHONE',
+            commValue: phone,
+            text,
+            channelKey,
+            chatId: msg.chatId || '',
+            phone,
+            externalId: `wazzup_${msg.messageId || ''}`,
+          }).catch((e) => console.error(`[acts-dialog] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
+        } else {
+          console.log(`[wazzup-inbound-v146] Bobik message routed ONLY to Bobik pilot: deal=38072 message=${msg.messageId || '-'}`);
+        }
+        // v141: прямой пилот Бобика. Номер уже получен из Wazzup и проверен по тестовому хвосту.
+        // Больше НЕ вызываем findDealForPhone(): он смотрел только CONTACT_ID и поэтому
+        // возвращал foundDeal=none даже когда сделка 38072 была правильной.
+        const isBobikPhone = String(phone).slice(-4) === String(config.wazzupAiTestPhoneTail || '5898');
+        if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072' && isBobikPhone) {
+          setImmediate(async () => {
+            try {
+              console.log(`[wazzup-ai-v141] Bobik matched by verified test phone: deal=38072 phoneTail=${phone.slice(-4)} message=${msg.messageId || '-'}`);
+              const result = await actsProcessBobikInboundText({ msg, phone, channelKey, text });
+              console.log(`[wazzup-ai-v141] Bobik result: ${JSON.stringify(result).slice(0, 3000)}`);
+            } catch (e) {
+              console.error(`[wazzup-ai-v141] Bobik processing error message=${msg.messageId || '?'}: ${e.message || e}`);
+            }
+          });
+        } else if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId || '38072') === '38072') {
+          console.log(`[wazzup-ai-v141] Bobik NOT matched: incoming phoneTail=${phone.slice(-4)} expectedTail=${config.wazzupAiTestPhoneTail || '5898'}; AI skipped.`);
+        }
 
       }
     }
@@ -7289,7 +7323,6 @@ function actsHasRecentClientReplyDeal(dealId) {
   return true;
 }
 let actsPushCycleRunning = false;
-const actsProcessedInboundMessageIds = new Set();
 
 function actsNormalizeChannelKey(value) {
   const x = actsCleanText(value).toLowerCase();
@@ -7595,15 +7628,42 @@ async function actsMarkClientRepliedForWazzupMessage(msg) {
       fields: {
         ENTITY_ID: deal.ID,
         ENTITY_TYPE: 'deal',
-        COMMENT: `Клиент ответил после отправки акта. Автоматические напоминания по этому акту больше не отправляются.`,
+        COMMENT: `${marker}\nКлиент ответил после отправки акта. Автоматические актовые пуши по этому контролю запрещены.\n${JSON.stringify(payload)}`,
       },
     });
-    // Состояние не удаляем до завершения AI-действия: оно нужно для поиска конкретного акта.
-    // Постоянная отметка ответа уже блокирует следующие актовые пуши.
+    actsPushStates.delete(String(state.taskId));
     marked++;
-    console.log(`[acts-client-replied] deal=${deal.ID} task=${state.taskId} source=${source} -> reply recorded; AI may process action`);
+    console.log(`[acts-client-replied] deal=${deal.ID} task=${state.taskId} source=${source} -> HARD STOP`);
   }
 
+  // Тестовый пилот Бобика: даже если активного контроля акта сейчас нет, сохраняем факт ответа,
+  // чтобы его можно было использовать как состояние живого диалога.
+  if (config.wazzupAiTestEnabled && String(config.wazzupAiTestDealId) === String(38072)) {
+    try {
+      const deal = await bitrixRestCall('crm.deal.get', { id: config.wazzupAiTestDealId });
+      if (deal) {
+        actsSetRecentClientReplyDeal(deal.ID, msg.messageId || '');
+        const marker = `${ACTS_CLIENT_REPLIED_MARKER} testDeal=${deal.ID}`;
+        const comments = await actsLoadTimelineComments(deal.ID, 100).catch(() => []);
+        const already = external
+          ? comments.some((c) => String(c && c.COMMENT || '').includes(`external=${external}`))
+          : false;
+        if (!already) {
+          await bitrixRestCall('crm.timeline.comment.add', {
+            fields: {
+              ENTITY_ID: deal.ID,
+              ENTITY_TYPE: 'deal',
+              COMMENT: `${marker} external=${external || 'none'}\nКлиент ответил через Wazzup. Канал=${source}; type=${String(msg.type || '')}; text=${text.slice(0, 3000)}`,
+            },
+          });
+          marked++;
+          console.log(`[wazzup-inbound-v137] Bobik deal=${deal.ID}: CLIENT_REPLIED recorded; channel=${source}; message=${external || '-'}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[wazzup-inbound-v137] Bobik marker error: ${e.message || e}`);
+    }
+  }
 
   return { ok: true, marked };
 }
@@ -7613,11 +7673,35 @@ async function actsHasClientRepliedAfterSend(state, comments = null) {
   if (actsHasRecentClientReplyDeal(state.dealId)) return true;
   const rows = comments || await actsLoadTimelineComments(state.dealId, 150).catch(() => []);
   const marker = `${ACTS_CLIENT_REPLIED_MARKER} task=${state.taskId}`;
-  return rows.some((c) => {
-    const body = String(c && c.COMMENT || '');
-    return actsCommentIsAfterSend(c, state.sentAtMs) &&
-      (body.includes(marker) || body.includes('Клиент ответил после отправки акта.'));
+  return rows.some((c) => String(c && c.COMMENT || '').includes(marker) && actsCommentIsAfterSend(c, state.sentAtMs));
+}
+
+
+async function actsResendActForClientV145({ state, deal, channelKey, phone, chatId = '' }) {
+  if (!state || !state.taskId) return { ok:false, error:'Не найдена активная задача с актом.' };
+  const raw = await bitrixRestCall('tasks.task.get', {
+    taskId: String(state.taskId),
+    select: ['ID','TITLE','GROUP_ID','STAGE_ID','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES']
   });
+  const task = raw && (raw.task || raw.TASK || raw);
+  if (!task) return { ok:false, error:'Не удалось получить задачу с актом.' };
+  const resolution = await actsResolveTaskFiles(task);
+  const file = actsPickBestFileForClient(resolution.files || []);
+  if (!file || !file.url) return { ok:false, error:'В задаче не найден файл акта.' };
+  const prepared = await actsPrepareWazzupFile(file);
+  const key = actsNormalizeChannelKey(channelKey) || 'viber';
+  const targetPhone = String(phone || '').trim();
+  if (!targetPhone) return { ok:false, error:'Не определён номер клиента.' };
+  const result = await sendWazzupFileInternal({
+    channelKey: key,
+    contentUri: prepared.url,
+    phone: targetPhone,
+    chatId: chatId || undefined,
+    dealId: deal.ID,
+    fileName: prepared.fileName || file.name || 'Акт выполненных работ',
+    crmMessageId:`mavis-bobik-act-resend-${deal.ID}-${state.taskId}-${Date.now()}`,
+  });
+  return { ok:true, channel:key, file:prepared.fileName || file.name || '', result };
 }
 
 async function actsProcessBobikInboundText({ msg, phone, channelKey, text }) {
@@ -7628,7 +7712,7 @@ async function actsProcessBobikInboundText({ msg, phone, channelKey, text }) {
   const dealId = '38072';
   let deal = null;
   try { deal = await bitrixRestCall('crm.deal.get', { id: dealId }); } catch (e) {
-    console.warn(`[wazzup-ai-v139] deal get error: ${e.message || e}`);
+    console.warn(`[wazzup-ai-v147] deal get error: ${e.message || e}`);
   }
   if (!deal) return { ok: true, skipped: true, reason: 'deal-not-found' };
 
@@ -7689,6 +7773,8 @@ async function actsProcessBobikInboundText({ msg, phone, channelKey, text }) {
 action="wait", укажи holdUntil.
 Если клиент просит «пришлите/переотправьте акт на почту»:
 action="resend_email".
+Если клиент просит просто «пришлите/переотправьте акт еще раз» без указания другого канала:
+action="resend_act".
 Если просьба про акт требует действия, которое нельзя безопасно выполнить автоматически:
 action="human".
 Если по смыслу это актовый вопрос, но безопасный ответ невозможен без проверки:
@@ -7699,7 +7785,7 @@ action="human".
 
 Верни ТОЛЬКО JSON:
 {
- "action":"wait|resend_email|human|no_reply",
+ "action":"wait|resend_act|resend_email|human|no_reply",
  "intent":"act_related|promised_signature|do_not_contact|vacation|resend_email|act_question|act_problem|acknowledgement|other",
  "holdUntil":"ISO 8601 +03:00 или null",
  "reply":"готовый ответ или пусто",
@@ -7734,7 +7820,7 @@ ${history || '(нет)'}
     return { ok:true, processed:1, action:'human', error:String(e.message || e) };
   }
 
-  let action = ['wait','resend_email','human','no_reply'].includes(String(decision.action || ''))
+  let action = ['wait','resend_act','resend_email','human','no_reply'].includes(String(decision.action || ''))
     ? String(decision.action) : 'human';
   const confidence = Math.max(0, Math.min(1, Number(decision.confidence || 0)));
   const intent = actsCleanText(decision.intent || 'other');
@@ -7753,39 +7839,107 @@ ${history || '(нет)'}
     `Решение: ${JSON.stringify({action,intent,holdUntil,confidence,reason:decision.reason || ''})}`
   ).catch(()=>{});
 
-  // Не удаляем контроль до завершения действия: он нужен для поиска конкретного акта.
-  // Постоянная отметка ответа клиента уже запрещает дальнейшие актовые пуши.
+  // v146: capture the active act state BEFORE any hard-stop cleanup.
+  // The previous version deleted actsPushStates first and then tried to find the
+  // state again, so resend_email/resend_act could never execute.
+  let bobikTarget = null;
+  try {
+    const waitingNow = await actsFindWaitingStatesByComm('PHONE', phone).catch(() => []);
+    bobikTarget = waitingNow.find((x) => x && x.deal && String(x.deal.ID) === dealId) || null;
+    if (!bobikTarget) {
+      const recovered = await actsFindLatestSentActForDealV146(dealId).catch(() => null);
+      if (recovered) {
+        bobikTarget = {
+          state: { taskId: recovered.taskId, dealId, channel: channelKey, contactId:'', sentAtMs: recovered.sentAtMs, lastMessageAtMs: recovered.sentAtMs, pushCount:0, originalFileName: recovered.file.name || '' },
+          deal,
+        };
+        console.log(`[wazzup-ai-v147] Bobik fallback found last sent act: deal=${dealId} task=${recovered.taskId}`);
+      }
+    }
+  } catch (_) {}
+
+  if (action === 'resend_act') {
+    if (!bobikTarget || !bobikTarget.state) {
+      action = 'human';
+      reply = '';
+      await actsSmartDialogNotifyExpert(deal,
+        `Клиент просит повторно прислать акт: «${cleanText.slice(0,800)}». Не удалось однозначно найти активный акт.`
+      ).catch(()=>{});
+    } else {
+      try {
+        const sentAct = await actsResendActForClientV145({
+          state: bobikTarget.state,
+          deal: bobikTarget.deal,
+          channelKey,
+          phone,
+          chatId: msg && msg.chatId || '',
+        });
+        if (sentAct.ok) {
+          reply = 'Конечно, повторно направили акт.';
+          console.log(`[wazzup-ai-v147] Bobik act resent: deal=${dealId} task=${bobikTarget.state.taskId} channel=${sentAct.channel} file=${sentAct.file}`);
+        } else {
+          action = 'human'; reply = '';
+          await actsSmartDialogNotifyExpert(deal,
+            `Клиент просит повторно прислать акт. Автоотправка не выполнена: ${sentAct.error || 'неизвестная ошибка'}.`
+          ).catch(()=>{});
+        }
+      } catch (e) {
+        action = 'human'; reply = '';
+        await actsSmartDialogNotifyExpert(deal,
+          `Клиент просит повторно прислать акт. Автоотправка не выполнена: ${e.message || e}.`
+        ).catch(()=>{});
+      }
+    }
+  }
+
+  if (action === 'resend_email') {
+    // v146: email resend uses the SAME captured state; never look it up after
+    // deleting it. Reuse the existing safe sender when available.
+    if (!bobikTarget || !bobikTarget.state) {
+      action='human'; reply='';
+      await actsSmartDialogNotifyExpert(deal,
+        `Клиент просит переотправить акт на почту: «${cleanText.slice(0,800)}». Не найден активный контроль акта.`
+      ).catch(()=>{});
+    } else {
+      try {
+        const taskRaw = await bitrixRestCall('tasks.task.get', {
+          taskId: String(bobikTarget.state.taskId),
+          select: ['ID','TITLE','GROUP_ID','STAGE_ID','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES']
+        });
+        const task = taskRaw && (taskRaw.task || taskRaw.TASK || taskRaw);
+        const resolution = await actsResolveTaskFiles(task);
+        const file = actsPickBestFileForClient(resolution.files || []);
+        const recipient = await actsResolveRecipientContact(deal, bobikTarget.state.contactId || '');
+        const targetEmail = recipient.ok ? actsContactEmail(recipient.contact) : '';
+        const storageIds = actsBuildEmailStorageElementIds(file);
+        if (!file || !targetEmail || !storageIds.length) {
+          throw new Error(!targetEmail ? 'у актуального контакта нет email' : 'файл акта нельзя приложить к письму из текущей задачи');
+        }
+        await actsDownloadRealFile(file);
+        await sendActEmailThroughBitrix(deal, recipient.contactId, targetEmail,
+          'Повторно направляем акт выполненных работ.', file);
+        reply='Конечно, повторно направили акт на почту.';
+        console.log(`[wazzup-ai-v147] Bobik act emailed: deal=${dealId} task=${bobikTarget.state.taskId} email=${maskEmailForLog(targetEmail)}`);
+      } catch (e) {
+        action='human'; reply='';
+        await actsSmartDialogNotifyExpert(deal,
+          `Клиент просит переотправить акт на почту. Автоотправка не выполнена: ${e.message || e}.`
+        ).catch(()=>{});
+      }
+    }
+  }
+
+  // Only after the requested action has been executed (or handed to a human),
+  // stop further automated act pushes for this deal.
   if (action !== 'no_reply') {
+    for (const [taskId, st] of actsPushStates.entries()) {
+      if (st && String(st.dealId) === dealId) actsPushStates.delete(taskId);
+    }
     const safeHold = holdUntil || new Date(Date.now()+24*60*60*1000).toISOString();
     await actsSmartDialogAddComment(
       deal.ID,
       `${ACTS_DIALOG_HOLD_MARKER} deal=${deal.ID}\n${JSON.stringify({holdUntil:safeHold,intent,confidence,reason:decision.reason || ''})}\nАктовые пуши приостановлены после ответа клиента.`
     ).catch(()=>{});
-  }
-
-  if (action === 'resend_email') {
-    // Do not claim success until the existing safe act sender reports success.
-    const waiting = await actsFindWaitingStatesByComm('PHONE', phone).catch(()=>[]);
-    const target = waiting.find((x) => x && x.deal && String(x.deal.ID) === dealId);
-    if (!target || !target.state) {
-      action='human'; reply='';
-      await actsSmartDialogNotifyExpert(deal,
-        `Клиент просит переотправить акт на почту: «${cleanText.slice(0,800)}». Не найден однозначный активный контроль акта.`
-      ).catch(()=>{});
-    } else {
-      const sendFn = typeof actsSendActToClientForState === 'function' ? actsSendActToClientForState : null;
-      let sent = null;
-      if (sendFn) sent = await sendFn(target.state, target.deal, { forceChannel:'email', reason:'client-requested-resend' }).catch(e=>({ok:false,error:e.message||String(e)}));
-      else sent = {ok:false,error:'safe act email sender is not available'};
-      if (sent && sent.ok) {
-        reply='Конечно, направили акт на почту.';
-      } else {
-        action='human'; reply='';
-        await actsSmartDialogNotifyExpert(deal,
-          `Клиент просит переотправить акт на почту. Автоотправка не выполнена: ${(sent && sent.error)||'неизвестная ошибка'}.`
-        ).catch(()=>{});
-      }
-    }
   }
 
   if (action === 'human') {
@@ -7800,7 +7954,7 @@ ${history || '(нет)'}
   }
 
   if (action === 'no_reply') {
-    console.log(`[wazzup-ai-v139] Bobik deal=38072: no_reply; intent=${intent}; confidence=${confidence}`);
+    console.log(`[wazzup-ai-v147] Bobik deal=38072: no_reply; intent=${intent}; confidence=${confidence}`);
     return {ok:true,processed:1,action,intent,confidence};
   }
 
@@ -7816,7 +7970,7 @@ ${history || '(нет)'}
       await actsSmartDialogAddComment(
         deal.ID, `[WAZZUP_AI_REPLY deal=${deal.ID} message=${external || '-'}]\nMavis: ${reply}`
       ).catch(()=>{});
-      console.log(`[wazzup-ai-v139] Bobik deal=38072: reply sent; action=${action}; intent=${intent}`);
+      console.log(`[wazzup-ai-v147] Bobik deal=38072: reply sent; action=${action}; intent=${intent}`);
       return {ok:true,processed:1,action,intent,holdUntil,confidence,reply};
     } catch(e) {
       await actsSmartDialogAddComment(deal.ID,
@@ -7888,7 +8042,127 @@ async function actsResendLatestActV144({ state, deal, channelKey='', chatId='', 
   }
 }
 
-// v145: единый production-путь для всех сделок. Bobik больше не обрабатывается отдельным пилотом.
+
+async function actsFindLatestSentActForDealV146(dealId) {
+  const id = String(dealId || '');
+  if (!id) return null;
+
+  // v147: основной источник истины для повторной отправки — сама задача АКТ
+  // в проекте #36, связанная с конкретной сделкой. Не полагаемся только на
+  // сохранённый marker отправки: состояние могло быть очищено после ответа клиента.
+  try {
+    const projectTasks = await bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: config.actsProjectId, UF_CRM_TASK: `D_${id}` },
+      order: { ID: 'DESC' },
+      select: ['ID','TITLE','DESCRIPTION','GROUP_ID','STAGE_ID','STATUS','REAL_STATUS','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES','CREATED_DATE','CHANGED_DATE','CLOSED_DATE'],
+    }, 100);
+
+    const actTasks = (projectTasks || []).filter((task) => {
+      const title = actsCleanText(actsTaskField(task, ['title','TITLE']) || '');
+      const description = actsCleanText(actsTaskField(task, ['description','DESCRIPTION']) || '');
+      const isAct = /^акт(?:\s|№|#|$)/i.test(title) || /акт выполненных работ/i.test(title) || /акт выполненных работ/i.test(description);
+      const taskDeals = actsExtractDealIdsFromTask(task);
+      return isAct && (!taskDeals.length || taskDeals.includes(id));
+    });
+
+    const ranked = actTasks.sort((a,b) => {
+      const aStage = String(actsTaskField(a, ['stageId','STAGE_ID']) || '') === '256' ? 1 : 0;
+      const bStage = String(actsTaskField(b, ['stageId','STAGE_ID']) || '') === '256' ? 1 : 0;
+      if (aStage !== bStage) return bStage - aStage;
+      const ad = Date.parse(String(actsTaskField(a, ['changedDate','CHANGED_DATE','createdDate','CREATED_DATE']) || '')) || 0;
+      const bd = Date.parse(String(actsTaskField(b, ['changedDate','CHANGED_DATE','createdDate','CREATED_DATE']) || '')) || 0;
+      return bd - ad;
+    });
+
+    for (const task of ranked) {
+      try {
+        const resolved = await actsResolveTaskFiles(task);
+        const file = actsPickBestFileForClient(resolved.files || []);
+        if (file && file.url) {
+          const changed = Date.parse(String(actsTaskField(task, ['changedDate','CHANGED_DATE','createdDate','CREATED_DATE']) || '')) || Date.now();
+          console.log(`[wazzup-ai-v147] exact act task found: deal=${id} task=${actsTaskField(task,['id','ID'])} stage=${actsTaskField(task,['stageId','STAGE_ID']) || '-'} file=${file.name || '-'}`);
+          return { taskId:String(actsTaskField(task, ['id','ID'])), task, file, sentAtMs:changed };
+        }
+      } catch (e) {
+        console.warn(`[wazzup-ai-v147] act task file search failed: deal=${id} task=${actsTaskField(task,['id','ID']) || '-'}: ${e.message || e}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[wazzup-ai-v147] project act-task search failed for deal=${id}: ${e.message || e}`);
+  }
+
+  // Fallback для старых сделок, где задача могла уже исчезнуть из текущего списка.
+  const comments = await actsLoadTimelineComments(id, 2000).catch(() => []);
+  const candidates = [];
+  for (const c of comments) {
+    const text = String(c && c.COMMENT || '');
+    const createdMs = actsParseTimelineCreated(c);
+    let m = text.match(/\[MAVIS_ACTS_PUSH_STATE\][^\n]*task=(\d+)/i);
+    if (!m) m = text.match(/\[MAVIS_ACTS_(?:FILE|TEXT)_SENT\]\s*task=(\d+)/i);
+    if (!m) continue;
+    candidates.push({ taskId:String(m[1]), createdMs:Number(createdMs||0), comment:text });
+  }
+  candidates.sort((a,b)=>b.createdMs-a.createdMs);
+  for (const c of candidates) {
+    try {
+      const raw = await bitrixRestCall('tasks.task.get', {
+        taskId:c.taskId,
+        select:['ID','TITLE','GROUP_ID','STAGE_ID','CHAT_ID','UF_CRM_TASK','UF_TASK_WEBDAV_FILES']
+      });
+      const task = raw && (raw.task || raw.TASK || raw);
+      if (!task) continue;
+      const resolved = await actsResolveTaskFiles(task);
+      const file = actsPickBestFileForClient(resolved.files || []);
+      if (file && file.url) return { taskId:c.taskId, task, file, sentAtMs:c.createdMs };
+    } catch (_) {}
+  }
+  return null;
+}
+
+
+async function actsFindLatestSentActByCommV146(commType, commValue) {
+  const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
+  const value = type === 'PHONE' ? normalizePhoneDigits(commValue) : String(commValue || '').trim().toLowerCase();
+  if (!value) return null;
+  // First inspect active states, then recent sent markers from deals. This is action-only fallback.
+  const active = await actsFindWaitingStatesByComm(type, value).catch(() => []);
+  if (active.length) return active[0];
+  let dup = {};
+  try { dup = await bitrixRestCall('crm.duplicate.findbycomm', { type, values:[value] }); } catch (_) {}
+  const contactIds = new Set(actsArrayIds(dup && (dup.CONTACT || dup.contact)).map(String));
+  const companyIds = new Set(actsArrayIds(dup && (dup.COMPANY || dup.company)).map(String));
+  let deals = [];
+  try {
+    const filters = [];
+    if (contactIds.size) filters.push({ CONTACT_ID: [...contactIds][0] });
+    if (companyIds.size) filters.push({ COMPANY_ID: [...companyIds][0] });
+    for (const f of filters) {
+      const rows = await bitrixRestList('crm.deal.list', { filter:f, order:{ID:'DESC'}, select:['ID','TITLE','CONTACT_ID','COMPANY_ID','ASSIGNED_BY_ID'] }, 100);
+      deals.push(...(rows||[]));
+    }
+  } catch (_) {}
+  const seen = new Set();
+  for (const deal of deals) {
+    if (!deal || seen.has(String(deal.ID))) continue;
+    seen.add(String(deal.ID));
+    if (type === 'PHONE') {
+      let matched = false;
+      for (const [method,id] of [['crm.contact.get',deal.CONTACT_ID],['crm.company.get',deal.COMPANY_ID]]) {
+        if (!id) continue;
+        try {
+          const ent = await bitrixRestCall(method,{id});
+          const phones = Array.isArray(ent && ent.PHONE) ? ent.PHONE : [];
+          if (phones.some(x=>normalizePhoneDigits(x && x.VALUE).slice(-9) === value.slice(-9))) { matched=true; break; }
+        } catch (_) {}
+      }
+      if (!matched) continue;
+    }
+    const sent = await actsFindLatestSentActForDealV146(deal.ID);
+    if (sent) return { state:{taskId:sent.taskId,dealId:String(deal.ID),channel:'',contactId:'',sentAtMs:sent.sentAtMs,lastMessageAtMs:sent.sentAtMs,pushCount:0,originalFileName:sent.file.name||''}, deal };
+  }
+  return null;
+}
+
 async function actsProcessIncomingClientText({
   source,
   commType,
@@ -7906,26 +8180,24 @@ async function actsProcessIncomingClientText({
   if (!cleanText) return { ok: true, processed: 0, reason: 'empty' };
 
   const waiting = await actsFindWaitingStatesByComm(commType, commValue);
-  if (!waiting.length) return { ok: true, processed: 0, reason: 'no-active-act' };
+  let target = waiting[0] || null;
+  // v146: a previous client reply intentionally removes the live push state.
+  // A later request such as "пришлите акт ещё раз" must still be able to find
+  // the last sent act, without restoring the push timer.
+  if (!target && String(commType || '').toUpperCase() === 'PHONE') {
+    const probe = await actsFindLatestSentActByCommV146('PHONE', commValue).catch(() => null);
+    if (probe) target = probe;
+  }
+  if (!target) return { ok: true, processed: 0, reason: 'no-act-found' };
 
-  const target = waiting[0];
   const { state, deal } = target;
   const comments = await actsLoadTimelineComments(state.dealId, 300).catch(() => []);
 
   const safeExternal = actsCleanText(externalId || '').replace(/\s+/g, '_').slice(0, 140);
   if (safeExternal) {
-    if (actsProcessedInboundMessageIds.has(safeExternal)) {
-      return { ok: true, processed: 0, duplicate: true };
-    }
     const duplicateNeedle = `${ACTS_CLIENT_MESSAGE_MARKER} task=${state.taskId} external=${safeExternal}`;
     if (comments.some((c) => String(c && c.COMMENT || '').includes(duplicateNeedle))) {
-      actsProcessedInboundMessageIds.add(safeExternal);
       return { ok: true, processed: 0, duplicate: true };
-    }
-    actsProcessedInboundMessageIds.add(safeExternal);
-    if (actsProcessedInboundMessageIds.size > 5000) {
-      const first = actsProcessedInboundMessageIds.values().next().value;
-      if (first) actsProcessedInboundMessageIds.delete(first);
     }
   }
 
@@ -7936,7 +8208,7 @@ async function actsProcessIncomingClientText({
 
   await actsSmartDialogAddComment(
     state.dealId,
-    `Клиент написал через ${source || 'канал связи'}: ${cleanText.slice(0, 3000)}`
+    `${inboundMarker}\nКлиент: ${cleanText.slice(0, 3000)}`
   );
 
   let decision;
@@ -7947,7 +8219,11 @@ async function actsProcessIncomingClientText({
     const holdUntil = new Date(Date.now() + fallbackHours * 60 * 60 * 1000).toISOString();
     await actsSmartDialogAddComment(
       state.dealId,
-      `Клиент написал по акту. Автоматические напоминания остановлены, информацию передали ответственному специалисту.`
+      `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify({
+        holdUntil,
+        intent: 'ai_error',
+        reason: `ИИ не смог разобрать сообщение: ${String(e.message || e).slice(0, 300)}`,
+      })}\nАвтопуш временно приостановлен, чтобы не отвечать клиенту вслепую.`
     );
     console.warn(`[acts-dialog] task=${state.taskId}: AI error -> hold ${fallbackHours}h: ${e.message || e}`);
     return { ok: true, processed: 1, action: 'wait', fallback: true, holdUntil };
@@ -8007,6 +8283,27 @@ async function actsProcessIncomingClientText({
     }
   }
 
+  if (decision.action === 'stop') {
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_STOP_MARKER} task=${state.taskId}\n${JSON.stringify({
+        intent: decision.intent,
+        reason: decision.reason,
+        confidence: decision.confidence,
+      })}\nАвтопуши по этому акту остановлены из-за ответа клиента.`
+    );
+    actsPushStates.delete(String(state.taskId));
+  } else if (decision.action === 'wait' || decision.action === 'human') {
+    await actsSmartDialogAddComment(
+      state.dealId,
+      `${ACTS_DIALOG_HOLD_MARKER} task=${state.taskId}\n${JSON.stringify({
+        holdUntil,
+        intent: decision.intent,
+        reason: decision.reason,
+        confidence: decision.confidence,
+      })}\nДо указанного срока автопуши и задача на звонок по акту запрещены.`
+    );
+  }
 
   if (decision.action === 'human') {
     await actsSmartDialogAddComment(
@@ -8044,7 +8341,7 @@ async function actsProcessIncomingClientText({
       if (sentReply && sentReply.ok) {
         await actsSmartDialogAddComment(
           state.dealId,
-          `${v144HumanVisibleComment(decision.reply)}`
+          `${ACTS_DIALOG_REPLY_MARKER}\nMavis: ${v144HumanVisibleComment(decision.reply)}`
         );
       }
     } catch (e) {
@@ -8628,11 +8925,6 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
     if (!taskId || !dealIds.length) { stats.noDeal++; continue; }
     for (const dealId of dealIds.slice(0,1)) {
       try {
-        const currentDeal = await bitrixRestCall('crm.deal.get', { id: dealId }).catch(() => null);
-        if (currentDeal && await v143IsDealSuccessful(dealId)) {
-          actsPushStates.delete(taskId);
-          continue;
-        }
         let comments = await actsLoadTimelineComments(dealId, 300);
         const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
         let sentComment = comments.find((c) => String(c.COMMENT || '').includes(sentMarker));
@@ -8663,12 +8955,7 @@ async function actsRecoverPushStatesFromBitrix(options = {}) {
           actsPushStates.delete(taskId);
           continue;
         }
-        if (comments.some((c) => {
-          const body = String(c.COMMENT || '');
-          return actsCommentIsAfterSend(c, sentAtMs) &&
-            (body.includes(`${ACTS_CLIENT_REPLIED_MARKER} task=${taskId}`) ||
-             body.includes('Клиент ответил после отправки акта.'));
-        })) {
+        if (comments.some((c) => String(c.COMMENT || '').includes(`${ACTS_CLIENT_REPLIED_MARKER} task=${taskId}`) && actsCommentIsAfterSend(c, sentAtMs))) {
           stats.scanReceived = Number(stats.scanReceived || 0) + 1;
           actsPushStates.delete(taskId);
           console.log(`[acts-push] task=${taskId}: CLIENT_REPLIED marker found during recovery — state not restored.`);
@@ -8729,11 +9016,6 @@ async function runActsPushCycle() {
         const comments = await actsLoadTimelineComments(state.dealId, 100);
         const deal = await bitrixRestCall('crm.deal.get', { id: state.dealId });
         if (!deal) continue;
-        if (await v143IsDealSuccessful(state.dealId)) {
-          actsPushStates.delete(String(state.taskId));
-          console.log(`[acts-push] task=${state.taskId}: SUCCESS stage — state removed, no further pushes.`);
-          continue;
-        }
         if (await actsHasClientRepliedAfterSend(state, comments)) {
           actsPushStates.delete(String(state.taskId));
           console.log(`[acts-push] task=${state.taskId}: CLIENT_REPLIED hard stop — клиент ответил, дальнейшие пуши запрещены.`);
@@ -8879,102 +9161,13 @@ function actsArrayIds(value) {
   return [String(value)];
 }
 
-
-async function actsFindFallbackActStateByComm(commType, commValue) {
-  const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
-  const value = type === 'PHONE' ? normalizePhoneDigits(commValue) : String(commValue || '').trim().toLowerCase();
-  if (!value) return [];
-
-  let dup = {};
-  try {
-    dup = await bitrixRestCall('crm.duplicate.findbycomm', { type, values: [value] });
-  } catch (e) {
-    console.warn(`[acts-incoming] fallback duplicate.findbycomm ${type}: ${e.message || e}`);
-  }
-
-  const contactIds = new Set(actsArrayIds(dup && (dup.CONTACT || dup.contact)).map(String));
-  const companyIds = new Set(actsArrayIds(dup && (dup.COMPANY || dup.company)).map(String));
-  if (!contactIds.size && !companyIds.size) return [];
-
-  const dealMap = new Map();
-  const addDeals = async (filter, priority) => {
-    try {
-      const rows = await bitrixRestList('crm.deal.list', {
-        filter,
-        order: { DATE_MODIFY: 'DESC' },
-        select: ['ID','TITLE','STAGE_ID','CLOSED','CATEGORY_ID','ASSIGNED_BY_ID','CONTACT_ID','COMPANY_ID','DATE_MODIFY','DATE_CREATE'],
-      }, 300);
-      for (const d of rows || []) {
-        const id = String(d.ID || '');
-        if (!id) continue;
-        const exact = (d.CONTACT_ID && contactIds.has(String(d.CONTACT_ID))) ? 2 : 0;
-        const company = (d.COMPANY_ID && companyIds.has(String(d.COMPANY_ID))) ? 1 : 0;
-        const score = Math.max(priority, exact, company);
-        const prev = dealMap.get(id);
-        if (!prev || score > prev.score) dealMap.set(id, { deal: d, score });
-      }
-    } catch (e) {
-      console.warn(`[acts-incoming] fallback deal lookup failed: ${e.message || e}`);
-    }
-  };
-
-  // Exact contact match has priority. Company match is fallback only.
-  if (contactIds.size) await addDeals({ CONTACT_ID: [...contactIds] }, 2);
-  if (companyIds.size) await addDeals({ COMPANY_ID: [...companyIds] }, 1);
-
-  const candidates = [...dealMap.values()]
-    .sort((a, b) => b.score - a.score || String(b.deal.DATE_MODIFY || '').localeCompare(String(a.deal.DATE_MODIFY || '')));
-
-  const result = [];
-  for (const item of candidates.slice(0, 30)) {
-    const deal = item.deal;
-    const task = await actsFindExistingTask(deal.ID);
-    if (!task) continue;
-
-    const taskId = String(actsTaskField(task, ['id','ID']) || '');
-    if (!taskId) continue;
-
-    const createdRaw = actsTaskField(task, ['createdDate','CREATED_DATE','created','DATE_CREATE']) ||
-      deal.DATE_MODIFY || deal.DATE_CREATE || new Date().toISOString();
-    const sentAtMs = actsParseDateMs(createdRaw) || Date.now();
-
-    let contactId = '';
-    if (deal.CONTACT_ID && contactIds.has(String(deal.CONTACT_ID))) contactId = String(deal.CONTACT_ID);
-
-    let channel = '';
-    try { channel = await detectPreferredChannelResolved(deal); } catch (_) {}
-    result.push({
-      state: {
-        taskId,
-        dealId: String(deal.ID),
-        channel: channel || '',
-        contactId,
-        sentAtMs,
-        lastMessageAtMs: sentAtMs,
-        pushCount: 0,
-        originalFileName: '',
-        recoveredFallback: true,
-      },
-      deal,
-      task,
-      score: item.score,
-    });
-
-    // Exact contact match: newest linked act is sufficient.
-    if (item.score >= 2 && result.length >= 1) break;
-  }
-
-  return result;
-}
-
 async function actsFindWaitingStatesByComm(commType, commValue) {
   if (!actsPushStates.size) {
     // После рестарта состояния восстанавливаются из Bitrix; если входящий файл пришёл в первые секунды,
     // попробуем восстановить их прямо сейчас, чтобы не потерять скан.
     await actsRecoverPushStatesFromBitrix().catch(() => {});
   }
-  // Даже если активных in-memory состояний нет, ниже есть fallback-поиск реальной
-  // актовой задачи в проекте #36. Это важно для старых сделок и после рестарта.
+  if (!actsPushStates.size) return [];
   const type = String(commType || '').toUpperCase() === 'EMAIL' ? 'EMAIL' : 'PHONE';
   const value = type === 'PHONE' ? normalizePhoneDigits(commValue) : String(commValue || '').trim().toLowerCase();
   if (!value) return [];
@@ -9023,20 +9216,7 @@ async function actsFindWaitingStatesByComm(commType, commValue) {
       if (matched) matches.push({ state, deal });
     } catch (_) {}
   }
-  const sorted = matches.sort((a,b) => Number(b.state.sentAtMs || 0) - Number(a.state.sentAtMs || 0));
-  if (sorted.length) return sorted;
-
-  // v145: после старого деплоя состояние могло быть удалено из памяти/восстановления
-  // после ответа клиента. Для запроса на действие всё равно находим реальную актовую
-  // задачу в проекте #36 по CRM-привязке D_<dealId>.
-  const fallback = await actsFindFallbackActStateByComm(type, value).catch((e) => {
-    console.warn(`[acts-incoming] fallback act task lookup failed: ${e.message || e}`);
-    return [];
-  });
-  if (fallback.length) {
-    console.log(`[acts-incoming] fallback act task resolved: ${fallback.slice(0,5).map(x => `${x.state.dealId}/${x.state.taskId}`).join(', ')}`);
-  }
-  return fallback;
+  return matches.sort((a,b) => Number(b.state.sentAtMs || 0) - Number(a.state.sentAtMs || 0));
 }
 
 async function actsAiCheckSignedAct(buffer, fileName, contentType, messageText = '') {
@@ -13794,8 +13974,7 @@ async function actsHasAnyClientReplyAfterSendV142(dealId, sentAtMs = 0) {
         text.includes('[MAVIS_LIVE_CHAT]') ||
         text.includes('[WAZZUP_INBOUND]') ||
         text.includes('[WAZZUP_INBOUND_MESSAGE]') ||
-        text.includes('[MAVIS_CLIENT_REPLY]') ||
-       text.includes('Клиент ответил после отправки акта.');
+        text.includes('[MAVIS_CLIENT_REPLY]');
 
       if (!inbound) return false;
 
