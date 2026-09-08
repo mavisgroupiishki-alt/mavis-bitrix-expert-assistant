@@ -284,6 +284,10 @@ const config = {
   actsIncomingWazzupEnabled: String(process.env.ACTS_INCOMING_WAZZUP_ENABLED || 'true').toLowerCase() !== 'false',
   actsIncomingEmailEnabled: String(process.env.ACTS_INCOMING_EMAIL_ENABLED || 'true').toLowerCase() !== 'false',
   actsIncomingLeaderId: process.env.ACTS_INCOMING_LEADER_ID || process.env.TANYA_USER_ID || '2182',
+  // Разовый ретроспективный импорт. Включается только явной переменной среды на один запуск,
+  // читает письма без смены флага Seen и никогда не пишет клиенту.
+  actsHistoricalImportEnabled: String(process.env.ACTS_HISTORICAL_IMPORT_ENABLED || 'false').toLowerCase() === 'true',
+  actsHistoricalImportMonth: process.env.ACTS_HISTORICAL_IMPORT_MONTH || '',
 
   // ACTS_SMART_DIALOG_V129: осмысленные ответы клиента по возврату подписанного акта.
   // Включено для всех активных контролей актов. Аварийное выключение: ACTS_SMART_DIALOG_ENABLED=false.
@@ -9134,14 +9138,14 @@ async function actsMarkFilePending(state, source, fileName = '') {
   }}).catch(() => {});
 }
 
-async function actsMarkScanReceived(state, source, fileName = '') {
+async function actsMarkScanReceived(state, source, fileName = '', fileId = '') {
   const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${state.taskId}`;
   if (!(await fgTimelineHasMarker(state.dealId, marker, 100))) {
     await bitrixRestCall('crm.timeline.comment.add', {
       fields: {
         ENTITY_ID: state.dealId,
         ENTITY_TYPE: 'deal',
-        COMMENT: `${marker}\nПодписанный акт считаю полученным: ${source}${fileName ? ` — ${fileName}` : ''}. Автопуши по этому акту остановлены.`,
+        COMMENT: `Подписанный акт считаю полученным: ${source}${fileName ? ` — ${fileName}` : ''}. Автопуши по этому акту остановлены.\n\n${marker}${fileId ? ` file=${fileId}` : ''}`,
       },
     });
   }
@@ -9588,11 +9592,11 @@ async function runActsPushCycle() {
 }
 // ========================= v71: ВХОДЯЩИЕ СКАНЫ АКТОВ =========================
 const ACTS_EXPERT_FOLDERS = [
-  { surname: 'кананович', first: 'иоланта', folder: 'Кананович Иоланта' },
-  { surname: 'горбатова', first: 'елизавета', folder: 'Горбатова Елизавета' },
-  { surname: 'николаева', first: 'екатерина', folder: 'Николаева Екатерина' },
-  { surname: 'баженова', first: 'мария', folder: 'Баженова Мария' },
-  { surname: 'панькова', first: 'ольга', folder: 'Панькова Ольга' },
+  { surname: 'кананович', first: 'иоланта', folder: 'Иоланта' },
+  { surname: 'горбатова', first: 'елизавета', folder: 'Елизавета' },
+  { surname: 'николаева', first: 'екатерина', folder: 'Екатерина' },
+  { surname: 'баженова', first: 'мария', folder: 'Мария' },
+  { surname: 'панькова', first: 'ольга', folder: 'Ольга' },
 ];
 
 const ACTS_RU_MONTHS = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
@@ -9613,6 +9617,17 @@ function actsResolveExpertFolderName(user) {
   return hit ? hit.folder : '';
 }
 
+function actsFolderPeriod(dateRaw) {
+  const date = dateRaw ? new Date(dateRaw) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Minsk', year: 'numeric', month: '2-digit',
+  }).formatToParts(safeDate);
+  const month = Number(parts.find((p) => p.type === 'month')?.value || safeDate.getMonth() + 1);
+  const year = String(parts.find((p) => p.type === 'year')?.value || safeDate.getFullYear());
+  return { month: ACTS_RU_MONTHS[Math.max(0, Math.min(11, month - 1))], year };
+}
+
 async function actsGetOrCreateChildFolder(parentId, name) {
   const children = await bitrixRestList('disk.folder.getchildren', { id: parentId }, 1000);
   let folder = children.find((c) => String(c.TYPE || c.type).toLowerCase() === 'folder' && actsCleanText(c.NAME || c.name) === name);
@@ -9620,19 +9635,25 @@ async function actsGetOrCreateChildFolder(parentId, name) {
   return String(folder && (folder.ID || folder.id) || '');
 }
 
-async function actsGetExpertActFolder(deal) {
+async function actsGetExpertActFolder(deal, periodDate = '') {
   const userRows = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
   const user = Array.isArray(userRows) ? userRows[0] : userRows;
-  const expertFolder = actsResolveExpertFolderName(user);
-  if (!expertFolder) {
+  const expertFirstName = actsResolveExpertFolderName(user);
+  if (!expertFirstName) {
     const expertHuman = `${user && user.LAST_NAME || ''} ${user && user.NAME || ''}`.trim() || `ID ${deal.ASSIGNED_BY_ID || '?'}`;
     throw new Error(`Ответственный эксперт «${expertHuman}» не сопоставлен с папками актов.`);
   }
   const rootId = await getCommonDriveRootId();
-  const monthFolderName = actsMonthFolderFromDeal(deal);
-  const monthFolderId = await actsGetOrCreateChildFolder(rootId, monthFolderName);
+  const { month, year } = actsFolderPeriod(periodDate || (deal && deal.CLOSEDATE));
+  // Это согласованная с отчётом структура. Раньше код создавал параллельные папки
+  // прямо в корне Общего диска, поэтому августовские сканы не попадали в отчёт.
+  const actsFolderId = await actsGetOrCreateChildFolder(rootId, 'Акты');
+  const yearFolderId = await actsGetOrCreateChildFolder(actsFolderId, year);
+  const monthFolderName = `Акты_${month}`;
+  const monthFolderId = await actsGetOrCreateChildFolder(yearFolderId, monthFolderName);
+  const expertFolder = `Акты ${expertFirstName} ${month} ${year}`;
   const expertFolderId = await actsGetOrCreateChildFolder(monthFolderId, expertFolder);
-  return { expertFolderId, expertFolder, monthFolderName, user };
+  return { expertFolderId, expertFolder, monthFolderName, year, user };
 }
 
 function actsIncomingFileNameFromUrl(urlRaw, fallback = '') {
@@ -9803,12 +9824,13 @@ async function actsNotifyExpertScanReceived(deal, taskId, source, fileName, stor
   }
 }
 
-async function actsSaveIncomingScanForState({ state, deal, source, fileName, buffer, contentType, skipCompanyFolder = false }) {
+async function actsSaveIncomingScanForState({ state, deal, source, fileName, buffer, contentType, skipCompanyFolder = false, periodDate = '', notifyExpert = true }) {
   const taskRaw = await bitrixRestCall('tasks.task.get', { taskId: Number(state.taskId), select: ['ID','TITLE','UF_CRM_TASK'] });
   const task = taskRaw && (taskRaw.task || taskRaw.TASK || taskRaw);
-  const storage = await actsGetExpertActFolder(deal);
+  const storage = await actsGetExpertActFolder(deal, periodDate);
   const savedExpert = await uploadFileToDiskFolder(storage.expertFolderId, fileName, buffer);
   if (!savedExpert) throw new Error('не удалось сохранить скан в папку эксперта');
+  const savedFileId = String(savedExpert.ID || savedExpert.id || '');
 
   if (!skipCompanyFolder) {
     try {
@@ -9820,8 +9842,8 @@ async function actsSaveIncomingScanForState({ state, deal, source, fileName, buf
     }
   }
 
-  await actsMarkScanReceived(state, `${source}; сохранено ${storage.monthFolderName}/${storage.expertFolder}`, fileName);
-  await actsNotifyExpertScanReceived(deal, state.taskId, source, fileName, storage);
+  await actsMarkScanReceived(state, `${source}; сохранено ${storage.monthFolderName}/${storage.expertFolder}`, fileName, savedFileId);
+  if (notifyExpert) await actsNotifyExpertScanReceived(deal, state.taskId, source, fileName, storage);
   console.log(`[acts-incoming] ✅ task=${state.taskId}, deal=${deal.ID}: ${fileName} → ${storage.monthFolderName}/${storage.expertFolder}; пуши остановлены.`);
   return { ok: true, taskId: state.taskId, dealId: deal.ID, fileName, storage };
 }
@@ -9860,6 +9882,174 @@ async function actsProcessIncomingAttachments({ source, commType, commValue, mes
     return actsSaveIncomingScanForState({ state: target.state, deal: target.deal, source, fileName, buffer, contentType: att.contentType || '', skipCompanyFolder });
   }
   return { ok: true, processed: 0, reason: 'no-signed-act-detected' };
+}
+
+// Разовый импорт старых писем нужен отдельно от обычного обработчика: обычный поток
+// намеренно видит только непрочитанные письма и только активные ожидания акта.
+const ACTS_HISTORICAL_EXPERT_NAMES = new Set([
+  'иоланта кананович', 'елизавета горбатова', 'ольга панькова', 'екатерина николаева',
+]);
+
+function actsHistoricalNormalizeName(value) {
+  return actsCleanText(value).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+function actsHistoricalMonthRange(monthRaw) {
+  if (!/^\d{4}-\d{2}$/.test(String(monthRaw || ''))) throw new Error('ACTS_HISTORICAL_IMPORT_MONTH должен быть в формате YYYY-MM');
+  const [year, month] = String(monthRaw).split('-').map(Number);
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 1));
+  return { start, end, startIso: start.toISOString().slice(0, 10), endIso: end.toISOString().slice(0, 10) };
+}
+
+function actsHistoricalTaskCreatorId(task) {
+  return String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'createdById', 'CREATED_BY_ID', 'authorId', 'AUTHOR_ID']) || '');
+}
+
+async function actsHistoricalLoadEmailCandidates(monthRaw) {
+  const range = actsHistoricalMonthRange(monthRaw);
+  const tasks = await bitrixRestList('tasks.task.list', {
+    filter: {
+      GROUP_ID: config.actsProjectId,
+      '>=CREATED_DATE': range.startIso,
+      '<CREATED_DATE': range.endIso,
+    },
+    select: ['ID', 'TITLE', 'CREATED_BY', 'CREATED_BY_ID', 'CREATED_DATE', 'UF_CRM_TASK'],
+    order: { CREATED_DATE: 'ASC' },
+  }, 1000);
+  const userCache = new Map();
+  const entityCache = new Map();
+  const candidates = [];
+
+  for (const task of tasks) {
+    const creatorId = actsHistoricalTaskCreatorId(task);
+    if (!creatorId) continue;
+    if (!userCache.has(creatorId)) {
+      const rows = await bitrixRestCall('user.get', { ID: creatorId }).catch(() => []);
+      const user = Array.isArray(rows) ? rows[0] : rows;
+      userCache.set(creatorId, actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`));
+    }
+    if (!ACTS_HISTORICAL_EXPERT_NAMES.has(userCache.get(creatorId))) continue;
+
+    const dealId = actsExtractDealIdsFromTask(task)[0];
+    if (!dealId) continue;
+    const deal = await bitrixRestCall('crm.deal.get', { id: dealId }).catch(() => null);
+    if (!deal) continue;
+
+    const emails = new Set();
+    const addEntityEmails = async (type, id) => {
+      if (!id) return;
+      const key = `${type}:${id}`;
+      if (!entityCache.has(key)) entityCache.set(key, await bitrixRestCall(`crm.${type}.get`, { id }).catch(() => null));
+      const entity = entityCache.get(key);
+      for (const row of Array.isArray(entity && entity.EMAIL) ? entity.EMAIL : []) {
+        const email = actsCleanText(row && row.VALUE).toLowerCase();
+        if (email) emails.add(email);
+      }
+    };
+    await addEntityEmails('contact', deal.CONTACT_ID);
+    await addEntityEmails('company', deal.COMPANY_ID);
+    if (!emails.size) continue;
+
+    candidates.push({
+      state: {
+        taskId: String(actsTaskField(task, ['id', 'ID'])),
+        dealId: String(dealId),
+        sentAtMs: Date.parse(String(actsTaskField(task, ['createdDate', 'CREATED_DATE']) || '')) || 0,
+        createdDate: actsTaskField(task, ['createdDate', 'CREATED_DATE']) || '',
+      },
+      deal,
+      emails,
+      companyName: deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID).catch(() => '') : '',
+    });
+  }
+  return { range, candidates };
+}
+
+function actsHistoricalPickCandidate(candidates, aiCompany) {
+  if (candidates.length === 1) return candidates[0];
+  const detected = normalizeCompanyNameForMatch(aiCompany || '');
+  if (!detected) return null;
+  const matched = candidates.filter((candidate) => {
+    const company = normalizeCompanyNameForMatch(candidate.companyName || '');
+    return company && (company.includes(detected) || detected.includes(company));
+  });
+  return matched.length === 1 ? matched[0] : null;
+}
+
+async function actsRunHistoricalEmailImport(monthRaw) {
+  const emailUser = process.env.MAIL_IMAP_USER || '';
+  const emailPass = process.env.MAIL_IMAP_PASSWORD || '';
+  if (!emailUser || !emailPass) throw new Error('MAIL_IMAP_USER / MAIL_IMAP_PASSWORD не заданы');
+  const { range, candidates } = await actsHistoricalLoadEmailCandidates(monthRaw);
+  const byEmail = new Map();
+  for (const candidate of candidates) {
+    for (const email of candidate.emails) {
+      const list = byEmail.get(email) || [];
+      list.push(candidate);
+      byEmail.set(email, list);
+    }
+  }
+
+  const result = { month: monthRaw, tasks: candidates.length, letters: 0, filesChecked: 0, saved: [], ambiguous: [], rejected: [], errors: [] };
+  const client = new ImapFlow({
+    host: process.env.MAIL_IMAP_HOST || 'imap.mail.ru',
+    port: Number(process.env.MAIL_IMAP_PORT || 993),
+    secure: String(process.env.MAIL_IMAP_SECURE || 'true').toLowerCase() !== 'false',
+    auth: { user: emailUser, pass: emailPass }, logger: false,
+  });
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      // Конечная дата не ограничивается августом: подписанный августовский акт мог
+      // прийти в сентябре. FetchOne и simpleParser не меняют Seen/прочие флаги письма.
+      const uids = await client.search({ since: range.start, before: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+      for (const uid of uids || []) {
+        const message = await client.fetchOne(uid, { source: true }).catch(() => null);
+        if (!message || !message.source) continue;
+        const parsed = await simpleParser(message.source).catch(() => null);
+        const sender = actsCleanText(parsed && parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address).toLowerCase();
+        const possible = byEmail.get(sender) || [];
+        const attachments = (parsed && parsed.attachments || []).filter((file) => file && file.size > 0);
+        if (!possible.length || !attachments.length) continue;
+        result.letters++;
+        for (const attachment of attachments) {
+          result.filesChecked++;
+          const fileName = actsSafeFileName(attachment.filename || 'attachment');
+          const check = await actsAiCheckSignedAct(attachment.content, fileName, attachment.contentType || '', `${parsed.subject || ''}\n${parsed.text || ''}`.slice(0, 2000));
+          if (!check.isSignedAct) {
+            result.rejected.push({ fileName, reason: check.reason || 'подписанный акт не подтверждён' });
+            continue;
+          }
+          const target = actsHistoricalPickCandidate(possible, check.company);
+          if (!target) {
+            result.ambiguous.push({ fileName, sender, candidates: possible.map((x) => x.state.taskId) });
+            continue;
+          }
+          const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${target.state.taskId}`;
+          if (await fgTimelineHasMarker(target.state.dealId, marker, 200).catch(() => false)) continue;
+          try {
+            const saved = await actsSaveIncomingScanForState({
+              state: target.state, deal: target.deal,
+              source: `исторический email за ${monthRaw}`,
+              fileName, buffer: attachment.content, contentType: attachment.contentType || '',
+              periodDate: target.state.createdDate, skipCompanyFolder: true, notifyExpert: false,
+            });
+            result.saved.push(saved);
+          } catch (e) {
+            result.errors.push({ fileName, taskId: target.state.taskId, error: String(e.message || e) });
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout().catch(() => {});
+  }
+  console.log(`[acts-historical] email import ${monthRaw}: tasks=${result.tasks}; letters=${result.letters}; files=${result.filesChecked}; saved=${result.saved.length}; ambiguous=${result.ambiguous.length}; rejected=${result.rejected.length}; errors=${result.errors.length}`);
+  return result;
 }
 
 async function actsLogWazzupIncomingWebhookStatus() {
@@ -14409,6 +14599,13 @@ app.listen(PORT, () => {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);
     setTimeout(() => actsRepairWazzupWebhookV136(), 8000);
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 15000);
+  }
+
+  if (config.actsHistoricalImportEnabled) {
+    console.log(`[acts-historical] Разовый импорт почты включён для ${config.actsHistoricalImportMonth || 'месяц не задан'}. Клиентам ничего не отправляется.`);
+    setTimeout(() => actsRunHistoricalEmailImport(config.actsHistoricalImportMonth).catch((e) =>
+      console.error(`[acts-historical] import failed: ${e.message || e}`)
+    ), 20 * 1000);
   }
 
   if (config.bitrixWebhookUrl && config.actsReconAutoEnabled) {
