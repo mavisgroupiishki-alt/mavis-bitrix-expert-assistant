@@ -9982,6 +9982,16 @@ function actsHistoricalTaskCreatorId(task) {
   return String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'createdById', 'CREATED_BY_ID', 'authorId', 'AUTHOR_ID']) || '');
 }
 
+function actsHistoricalAwait(promise, label, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Превышено ожидание Bitrix: ${label}`)), timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 async function actsHistoricalLoadEmailCandidates(monthRaw) {
   const range = actsHistoricalMonthRange(monthRaw);
   console.log(`[acts-historical] Подбираю задачи проекта #${config.actsProjectId} за ${monthRaw}.`);
@@ -9998,7 +10008,10 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
   // Не запрашиваем user.get для каждой из 152 задач по очереди: это задерживает
   // разовый импорт и может упереться в очередь Bitrix. Одним запросом строим
   // справочник сотрудников, затем обращаемся к CRM только по нужным экспертам.
-  const users = await bitrixRestCall('user.get', { FILTER: { ACTIVE: 'Y' } }).catch(() => []);
+  const users = await actsHistoricalAwait(
+    bitrixRestCall('user.get', { FILTER: { ACTIVE: 'Y' } }),
+    'справочник сотрудников',
+  ).catch(() => []);
   const userCache = new Map((Array.isArray(users) ? users : []).map((user) => [
     String(user && user.ID || ''),
     actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`),
@@ -10008,20 +10021,27 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
   const candidates = [];
 
   for (const [index, task] of tasks.entries()) {
+    if ((index + 1) % 10 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
     const creatorId = actsHistoricalTaskCreatorId(task);
     if (!creatorId) continue;
     if (!ACTS_HISTORICAL_EXPERT_NAMES.has(userCache.get(creatorId))) continue;
 
     const dealId = actsExtractDealIdsFromTask(task)[0];
     if (!dealId) continue;
-    const deal = await bitrixRestCall('crm.deal.get', { id: dealId }).catch(() => null);
+    const deal = await actsHistoricalAwait(
+      bitrixRestCall('crm.deal.get', { id: dealId }),
+      `сделка ${dealId}`,
+    ).catch(() => null);
     if (!deal) continue;
 
     const emails = new Set();
     const addEntityEmails = async (type, id) => {
       if (!id) return;
       const key = `${type}:${id}`;
-      if (!entityCache.has(key)) entityCache.set(key, await bitrixRestCall(`crm.${type}.get`, { id }).catch(() => null));
+      if (!entityCache.has(key)) entityCache.set(key, await actsHistoricalAwait(
+        bitrixRestCall(`crm.${type}.get`, { id }),
+        `${type} ${id}`,
+      ).catch(() => null));
       const entity = entityCache.get(key);
       for (const row of Array.isArray(entity && entity.EMAIL) ? entity.EMAIL : []) {
         const email = actsCleanText(row && row.VALUE).toLowerCase();
@@ -10041,9 +10061,11 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       },
       deal,
       emails,
-      companyName: deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID).catch(() => '') : '',
+      companyName: deal.COMPANY_ID ? await actsHistoricalAwait(
+        getCompanyName(deal.COMPANY_ID),
+        `название компании ${deal.COMPANY_ID}`,
+      ).catch(() => '') : '',
     });
-    if ((index + 1) % 10 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
   }
   console.log(`[acts-historical] Кандидатов с почтой: ${candidates.length}.`);
   return { range, candidates };
