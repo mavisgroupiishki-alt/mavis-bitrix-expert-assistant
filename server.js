@@ -10527,10 +10527,26 @@ async function actsRunHistoricalEmailImport(monthRaw) {
           console.log(`[acts-historical] Почта: проверено адресов ${index + 1}/${emailList.length}; найдено писем ${uidSet.size}.`);
         }
       }
-      for (const uid of uidSet) {
-        const message = await client.fetchOne(uid, { source: true }).catch(() => null);
+      const uids = [...uidSet];
+      for (const [index, uid] of uids.entries()) {
+        const message = await actsHistoricalAwait(
+          client.fetchOne(uid, { source: true }),
+          `письмо UID ${uid}`,
+          30000,
+        ).catch((error) => {
+          result.errors.push(`письмо UID ${uid}: ${error.message || error}`);
+          return null;
+        });
         if (!message || !message.source) continue;
-        const parsed = await simpleParser(message.source).catch(() => null);
+        const parsed = await actsHistoricalAwait(
+          simpleParser(message.source),
+          `разбор письма UID ${uid}`,
+          30000,
+        ).catch((error) => {
+          result.errors.push(`разбор UID ${uid}: ${error.message || error}`);
+          return null;
+        });
+        if (!parsed) continue;
         const sender = actsCleanText(parsed && parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address).toLowerCase();
         const possible = byEmail.get(sender) || [];
         const attachments = (parsed && parsed.attachments || []).filter((file) => file && file.size > 0);
@@ -10539,7 +10555,15 @@ async function actsRunHistoricalEmailImport(monthRaw) {
         for (const attachment of attachments) {
           result.filesChecked++;
           const fileName = actsSafeFileName(attachment.filename || 'attachment');
-          const check = await actsAiCheckSignedAct(attachment.content, fileName, attachment.contentType || '', `${parsed.subject || ''}\n${parsed.text || ''}`.slice(0, 2000));
+          const check = await actsHistoricalAwait(
+            actsAiCheckSignedAct(attachment.content, fileName, attachment.contentType || '', `${parsed.subject || ''}\n${parsed.text || ''}`.slice(0, 2000)),
+            `проверка вложения ${fileName}`,
+            45000,
+          ).catch((error) => {
+            result.errors.push({ fileName, error: String(error.message || error) });
+            return null;
+          });
+          if (!check) continue;
           if (!check.isSignedAct) {
             result.rejected.push({ fileName, reason: check.reason || 'подписанный акт не подтверждён' });
             continue;
@@ -10563,6 +10587,9 @@ async function actsRunHistoricalEmailImport(monthRaw) {
           } catch (e) {
             result.errors.push({ fileName, taskId: target.state.taskId, error: String(e.message || e) });
           }
+        }
+        if ((index + 1) % 10 === 0 || index + 1 === uids.length) {
+          console.log(`[acts-historical] Почта: обработано писем ${index + 1}/${uids.length}; проверено файлов ${result.filesChecked}; сохранено ${result.saved.length}; ошибок ${result.errors.length}.`);
         }
       }
     } finally {
