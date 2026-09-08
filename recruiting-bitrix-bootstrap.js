@@ -11,19 +11,24 @@ const APPLY = process.argv.includes('--apply');
 const WEBHOOK = String(process.env.BITRIX_WEBHOOK_URL || '').replace(/\/+$/, '');
 const CATEGORY_NAME = 'Найм';
 
-const stages = [
-  ['HR_NEW', 'Новый отклик', 100, ''],
-  ['HR_RECRUITER_REVIEW', 'Проверка рекрутером', 200, ''],
-  ['HR_NEEDS_CLARIFICATION', 'Нужно уточнение', 300, ''],
-  ['HR_INTERVIEW_SCHEDULE', 'Запись на интервью', 400, ''],
-  ['HR_INTERVIEW_DONE', 'Интервью проведено', 500, ''],
-  ['HR_DECISION', 'Решение руководителя', 600, ''],
-  ['HR_OFFER', 'Оффер', 700, ''],
-  ['HR_RESERVE', 'Резерв', 800, ''],
-  ['HR_HIRED', 'Нанят', 900, 'S'],
-  ['HR_REJECTED', 'Не выбран', 1000, 'F'],
-  ['HR_CANDIDATE_DECLINED', 'Кандидат отказался', 1100, 'F'],
-  ['HR_NO_RESPONSE', 'Нет связи', 1200, 'F'],
+// Bitrix создаёт эти стадии автоматически. Их нельзя ставить после «Успеха»,
+// поэтому они переименовываются, а не дублируются.
+const defaultStageNames = [
+  ['NEW', 'Новый отклик', '#4A90E2'],
+  ['PREPARATION', 'Проверка рекрутером', '#4A90E2'],
+  ['PREPAYMENT_INVOIC', 'Нужно уточнение', '#4A90E2'],
+  ['EXECUTING', 'Запись на интервью', '#4A90E2'],
+  ['FINAL_INVOICE', 'Интервью проведено', '#4A90E2'],
+  ['WON', 'Нанят', '#7BD500'],
+  ['LOSE', 'Не выбран', '#FF5752'],
+  ['APOLOGY', 'Кандидат отказался', '#FF5752'],
+];
+
+const addedStages = [
+  ['HR_DECISION', 'Решение руководителя', 51, ''],
+  ['HR_OFFER', 'Оффер', 52, ''],
+  ['HR_RESERVE', 'Резерв', 53, ''],
+  ['HR_NO_RESPONSE', 'Нет связи', 90, 'F'],
 ];
 
 const fields = [
@@ -99,7 +104,7 @@ async function main() {
 
   console.log(`[recruiting] mode=${APPLY ? 'apply' : 'dry-run'}; category=${category ? `existing:${category.id}` : 'missing'}; fields=${fieldList.length}`);
   if (!APPLY) {
-    console.log(`[recruiting] would create category=${!category}; missing_fields=${fields.filter(([code]) => !fieldExists(fieldList, code)).length}; stages=${stages.length}`);
+    console.log(`[recruiting] would create category=${!category}; missing_fields=${fields.filter(([code]) => !fieldExists(fieldList, code)).length}; stages=${defaultStageNames.length + addedStages.length}`);
     return;
   }
 
@@ -113,9 +118,17 @@ async function main() {
   const stageEntityId = `DEAL_STAGE_${category.id}`;
   const currentStages = await call('crm.status.list', { filter: { ENTITY_ID: stageEntityId }, order: { SORT: 'ASC' } });
   const stageList = Array.isArray(currentStages) ? currentStages : [];
-  for (const [statusId, name, sort, semantics] of stages) {
-    if (stageList.some((item) => String(item.STATUS_ID || '').includes(statusId))) continue;
-    await call('crm.status.add', { fields: { ENTITY_ID: stageEntityId, STATUS_ID: statusId, NAME: name, SORT: sort, SEMANTICS: semantics, COLOR: '#4A90E2' } });
+  for (const [suffix, name, color] of defaultStageNames) {
+    const stage = stageList.find((item) => String(item.STATUS_ID || '').endsWith(`:${suffix}`));
+    if (!stage) fail(`Не найдена стандартная стадия ${suffix} в воронке ${category.id}.`);
+    if (String(stage.NAME || '') !== name || String(stage.COLOR || '') !== color) {
+      await call('crm.status.update', { id: Number(stage.ID), fields: { NAME: name, COLOR: color } });
+      console.log(`[recruiting] configured stage=${suffix}`);
+    }
+  }
+  for (const [statusId, name, sort, semantics] of addedStages) {
+    if (stageList.some((item) => String(item.STATUS_ID || '').endsWith(`:${statusId}`))) continue;
+    await call('crm.status.add', { fields: { ENTITY_ID: stageEntityId, STATUS_ID: `C${category.id}:${statusId}`, NAME: name, SORT: sort, SEMANTICS: semantics, COLOR: '#4A90E2' } });
     console.log(`[recruiting] created stage=${statusId}`);
   }
 
