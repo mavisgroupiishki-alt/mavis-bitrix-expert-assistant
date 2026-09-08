@@ -302,6 +302,10 @@ const config = {
   // читает письма без смены флага Seen и никогда не пишет клиенту.
   actsHistoricalImportEnabled: String(process.env.ACTS_HISTORICAL_IMPORT_ENABLED || 'false').toLowerCase() === 'true',
   actsHistoricalImportMonth: process.env.ACTS_HISTORICAL_IMPORT_MONTH || '',
+  // Разовый ретроспективный импорт вложений из истории Wazzup. Отдельен от почты:
+  // выгрузка сообщений создаётся только при явном включении переменной среды.
+  actsHistoricalWazzupImportEnabled: String(process.env.ACTS_HISTORICAL_WAZZUP_IMPORT_ENABLED || 'false').toLowerCase() === 'true',
+  actsHistoricalWazzupImportMonth: process.env.ACTS_HISTORICAL_WAZZUP_IMPORT_MONTH || process.env.ACTS_HISTORICAL_IMPORT_MONTH || '',
 
   // ACTS_SMART_DIALOG_V129: осмысленные ответы клиента по возврату подписанного акта.
   // Включено для всех активных контролей актов. Аварийное выключение: ACTS_SMART_DIALOG_ENABLED=false.
@@ -9806,10 +9810,14 @@ async function actsGetOrCreateChildFolder(parentId, name) {
   return String(folder && (folder.ID || folder.id) || '');
 }
 
-async function actsGetExpertActFolder(deal, periodDate = '') {
-  const userRows = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
-  const user = Array.isArray(userRows) ? userRows[0] : userRows;
-  const expertFirstName = actsResolveExpertFolderName(user);
+async function actsGetExpertActFolder(deal, periodDate = '', expertFolderOverride = '') {
+  let user = null;
+  let expertFirstName = actsCleanText(expertFolderOverride);
+  if (!expertFirstName) {
+    const userRows = await bitrixRestCall('user.get', { ID: deal.ASSIGNED_BY_ID });
+    user = Array.isArray(userRows) ? userRows[0] : userRows;
+    expertFirstName = actsResolveExpertFolderName(user);
+  }
   if (!expertFirstName) {
     const expertHuman = `${user && user.LAST_NAME || ''} ${user && user.NAME || ''}`.trim() || `ID ${deal.ASSIGNED_BY_ID || '?'}`;
     throw new Error(`Ответственный эксперт «${expertHuman}» не сопоставлен с папками актов.`);
@@ -9995,10 +10003,10 @@ async function actsNotifyExpertScanReceived(deal, taskId, source, fileName, stor
   }
 }
 
-async function actsSaveIncomingScanForState({ state, deal, source, fileName, buffer, contentType, skipCompanyFolder = false, periodDate = '', notifyExpert = true }) {
+async function actsSaveIncomingScanForState({ state, deal, source, fileName, buffer, contentType, skipCompanyFolder = false, periodDate = '', expertFolderOverride = '', notifyExpert = true }) {
   const taskRaw = await bitrixRestCall('tasks.task.get', { taskId: Number(state.taskId), select: ['ID','TITLE','UF_CRM_TASK'] });
   const task = taskRaw && (taskRaw.task || taskRaw.TASK || taskRaw);
-  const storage = await actsGetExpertActFolder(deal, periodDate);
+  const storage = await actsGetExpertActFolder(deal, periodDate, expertFolderOverride);
   const savedExpert = await uploadFileToDiskFolder(storage.expertFolderId, fileName, buffer);
   if (!savedExpert) throw new Error('не удалось сохранить скан в папку эксперта');
   const savedFileId = String(savedExpert.ID || savedExpert.id || '');
@@ -10111,6 +10119,10 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     String(user && user.ID || ''),
     actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`),
   ]));
+  const expertFolderByUserId = new Map((Array.isArray(users) ? users : []).map((user) => [
+    String(user && user.ID || ''),
+    actsResolveExpertFolderName(user),
+  ]));
   console.log(`[acts-historical] Загружен справочник сотрудников: ${userCache.size}.`);
   const entityCache = new Map();
   const candidates = [];
@@ -10120,6 +10132,8 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     const creatorId = actsHistoricalTaskCreatorId(task);
     if (!creatorId) continue;
     if (!ACTS_HISTORICAL_EXPERT_NAMES.has(userCache.get(creatorId))) continue;
+    const expertFolder = expertFolderByUserId.get(creatorId);
+    if (!expertFolder) continue;
 
     const dealId = actsExtractDealIdsFromTask(task)[0];
     if (!dealId) continue;
@@ -10130,7 +10144,8 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     if (!deal) continue;
 
     const emails = new Set();
-    const addEntityEmails = async (type, id) => {
+    const phones = new Set();
+    const addEntityContacts = async (type, id) => {
       if (!id) return;
       const key = `${type}:${id}`;
       if (!entityCache.has(key)) entityCache.set(key, await actsHistoricalAwait(
@@ -10142,10 +10157,14 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
         const email = actsCleanText(row && row.VALUE).toLowerCase();
         if (email) emails.add(email);
       }
+      for (const row of Array.isArray(entity && entity.PHONE) ? entity.PHONE : []) {
+        const phone = normalizePhoneDigits(row && row.VALUE);
+        if (phone) phones.add(phone);
+      }
     };
-    await addEntityEmails('contact', deal.CONTACT_ID);
-    await addEntityEmails('company', deal.COMPANY_ID);
-    if (!emails.size) continue;
+    await addEntityContacts('contact', deal.CONTACT_ID);
+    await addEntityContacts('company', deal.COMPANY_ID);
+    if (!emails.size && !phones.size) continue;
 
     candidates.push({
       state: {
@@ -10156,13 +10175,15 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       },
       deal,
       emails,
+      phones,
+      expertFolder,
       companyName: deal.COMPANY_ID ? await actsHistoricalAwait(
         getCompanyName(deal.COMPANY_ID),
         `название компании ${deal.COMPANY_ID}`,
       ).catch(() => '') : '',
     });
   }
-  console.log(`[acts-historical] Кандидатов с почтой: ${candidates.length}.`);
+  console.log(`[acts-historical] Кандидатов с контактами: ${candidates.length}; с почтой: ${candidates.filter((x) => x.emails.size).length}; с телефоном: ${candidates.filter((x) => x.phones.size).length}.`);
   return { range, candidates };
 }
 
@@ -10182,7 +10203,8 @@ async function actsRunHistoricalEmailImport(monthRaw) {
   const emailPass = process.env.MAIL_IMAP_PASSWORD || '';
   if (!emailUser || !emailPass) throw new Error('MAIL_IMAP_USER / MAIL_IMAP_PASSWORD не заданы');
   console.log(`[acts-historical] Старт импорта почты за ${monthRaw}.`);
-  const { range, candidates } = await actsHistoricalLoadEmailCandidates(monthRaw);
+  const { range, candidates: allCandidates } = await actsHistoricalLoadEmailCandidates(monthRaw);
+  const candidates = allCandidates.filter((candidate) => candidate.emails.size);
   const byEmail = new Map();
   for (const candidate of candidates) {
     for (const email of candidate.emails) {
@@ -10206,8 +10228,27 @@ async function actsRunHistoricalEmailImport(monthRaw) {
     try {
       // Конечная дата не ограничивается августом: подписанный августовский акт мог
       // прийти в сентябре. FetchOne и simpleParser не меняют Seen/прочие флаги письма.
-      const uids = await client.search({ since: range.start, before: new Date(Date.now() + 24 * 60 * 60 * 1000) });
-      for (const uid of uids || []) {
+      // Не выгружаем весь ящик за период: в нём могут быть десятки тысяч
+      // нерелевантных писем. IMAP отбирает только адреса, привязанные к
+      // августовским задачам, а одинаковые UID из нескольких контактов
+      // объединяются до скачивания содержимого.
+      const uidSet = new Set();
+      const emailList = [...byEmail.keys()];
+      for (const [index, email] of emailList.entries()) {
+        const matchedUids = await client.search({
+          since: range.start,
+          before: new Date(Date.now() + 24 * 60 * 60 * 1000),
+          from: email,
+        }).catch((error) => {
+          result.errors.push(`поиск ${email}: ${error.message || error}`);
+          return [];
+        });
+        for (const uid of matchedUids || []) uidSet.add(uid);
+        if ((index + 1) % 10 === 0 || index + 1 === emailList.length) {
+          console.log(`[acts-historical] Почта: проверено адресов ${index + 1}/${emailList.length}; найдено писем ${uidSet.size}.`);
+        }
+      }
+      for (const uid of uidSet) {
         const message = await client.fetchOne(uid, { source: true }).catch(() => null);
         if (!message || !message.source) continue;
         const parsed = await simpleParser(message.source).catch(() => null);
@@ -10236,7 +10277,8 @@ async function actsRunHistoricalEmailImport(monthRaw) {
               state: target.state, deal: target.deal,
               source: `исторический email за ${monthRaw}`,
               fileName, buffer: attachment.content, contentType: attachment.contentType || '',
-              periodDate: target.state.createdDate, skipCompanyFolder: true, notifyExpert: false,
+              periodDate: target.state.createdDate, expertFolderOverride: target.expertFolder,
+              skipCompanyFolder: true, notifyExpert: false,
             });
             result.saved.push(saved);
           } catch (e) {
@@ -10251,6 +10293,156 @@ async function actsRunHistoricalEmailImport(monthRaw) {
     await client.logout().catch(() => {});
   }
   console.log(`[acts-historical] email import ${monthRaw}: tasks=${result.tasks}; letters=${result.letters}; files=${result.filesChecked}; saved=${result.saved.length}; ambiguous=${result.ambiguous.length}; rejected=${result.rejected.length}; errors=${result.errors.length}`);
+  return result;
+}
+
+function actsHistoricalCsvParse(text) {
+  const source = String(text || '').replace(/^\uFEFF/, '');
+  // Wazzup currently returns comma-separated CSV. The parser also accepts ;/TAB,
+  // which keeps the importer compatible with locale-specific exports.
+  const rawLines = source.split(/\r?\n/).filter((line) => line.trim());
+  if (!rawLines.length) return { headers: [], rows: [] };
+  const delimiter = [',', ';', '\t'].reduce((best, candidate) => {
+    const count = rawLines[0].split(candidate).length - 1;
+    return count > best.count ? { candidate, count } : best;
+  }, { candidate: ',', count: -1 }).candidate;
+  const records = [];
+  let record = [];
+  let value = '';
+  let inQuotes = false;
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index];
+    if (char === '"') {
+      if (inQuotes && source[index + 1] === '"') { value += '"'; index++; }
+      else inQuotes = !inQuotes;
+    } else if (!inQuotes && char === delimiter) { record.push(value); value = ''; }
+    else if (!inQuotes && (char === '\n' || char === '\r')) {
+      if (char === '\r' && source[index + 1] === '\n') index++;
+      record.push(value); value = '';
+      if (record.some((cell) => String(cell).trim())) records.push(record);
+      record = [];
+    } else value += char;
+  }
+  record.push(value);
+  if (record.some((cell) => String(cell).trim())) records.push(record);
+  const headers = (records.shift() || []).map((header) => String(header).trim().toLowerCase().replace(/[^a-z0-9а-я]+/gi, '_').replace(/^_+|_+$/g, ''));
+  const rows = records.map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
+  return { headers, rows };
+}
+
+function actsHistoricalRowValue(row, keys) {
+  for (const key of keys) {
+    const value = row && row[key];
+    if (actsCleanText(value)) return actsCleanText(value);
+  }
+  return '';
+}
+
+function actsHistoricalWazzupInbound(row) {
+  const direction = actsHistoricalRowValue(row, [
+    'direction', 'status', 'message_status', 'message_direction', 'sender_type', 'from_type',
+  ]).toLowerCase();
+  return /(^|[^a-z])(inbound|incoming|received)([^a-z]|$)|входящ/.test(direction);
+}
+
+function actsHistoricalWazzupAttachment(row) {
+  const explicitUrl = actsHistoricalRowValue(row, [
+    'content_uri', 'contenturl', 'content_url', 'attachment_url', 'file_url', 'media_url', 'document_url',
+  ]);
+  const type = actsHistoricalRowValue(row, ['type', 'message_type', 'content_type', 'attachment_type']).toLowerCase();
+  const genericUrl = actsHistoricalRowValue(row, ['url', 'uri']);
+  const url = explicitUrl || (/file|document|image|photo|pdf|media|attachment/.test(type) ? genericUrl : '');
+  if (!/^https?:\/\//i.test(url)) return null;
+  return {
+    url,
+    fileName: actsHistoricalRowValue(row, ['file_name', 'filename', 'attachment_name', 'content_name', 'name']),
+    contentType: actsHistoricalRowValue(row, ['mime_type', 'mimetype', 'content_type']),
+  };
+}
+
+async function actsHistoricalFetchWazzupDump(monthRaw) {
+  const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
+  if (!apiKey) throw new Error('WAZZUP_API_KEY / WAZZUP_SIDECAR_KEY не задан');
+  const range = actsHistoricalMonthRange(monthRaw);
+  // Конец не ограничиваем августом: клиент мог вернуть августовский акт в первые дни сентября.
+  const endAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const baseUrl = (process.env.WAZZUP_TECH_BASE_URL || 'https://tech.wazzup24.com').replace(/\/$/, '');
+  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+  const created = await fetch(`${baseUrl}/v2/messages/messages_dump`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ start_at: `${range.startIso}T00:00:00.000Z`, end_at: endAt }),
+  });
+  const createdBody = await created.json().catch(() => ({}));
+  if (!created.ok) throw new Error(`Wazzup export: HTTP ${created.status}`);
+  const exportId = actsCleanText(createdBody && createdBody.data && createdBody.data.export_id);
+  if (!exportId) throw new Error('Wazzup export не вернул export_id');
+  console.log(`[acts-historical-wazzup] Запрошена выгрузка ${monthRaw}; job=${exportId.slice(0, 8)}…`);
+
+  let exportUrl = '';
+  for (let attempt = 1; attempt <= 30; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+    const statusResponse = await fetch(`${baseUrl}/v2/messages/messages_dump/${encodeURIComponent(exportId)}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    const statusBody = await statusResponse.json().catch(() => ({}));
+    if (!statusResponse.ok) throw new Error(`Wazzup export status: HTTP ${statusResponse.status}`);
+    const status = actsCleanText(statusBody && statusBody.data && statusBody.data.status).toLowerCase();
+    exportUrl = actsCleanText(statusBody && statusBody.data && statusBody.data.url);
+    if (exportUrl && (status === 'done' || status === 'webhook_failed')) break;
+    if (attempt % 6 === 0) console.log(`[acts-historical-wazzup] Выгрузка ещё готовится: попытка ${attempt}/30.`);
+  }
+  if (!exportUrl) throw new Error('Wazzup export не подготовил ссылку за 5 минут');
+  const csvResponse = await fetch(exportUrl, { headers: { Accept: 'text/csv,*/*' } });
+  if (!csvResponse.ok) throw new Error(`не удалось скачать CSV Wazzup: HTTP ${csvResponse.status}`);
+  return { exportId, range, csv: await csvResponse.text() };
+}
+
+async function actsRunHistoricalWazzupImport(monthRaw) {
+  console.log(`[acts-historical-wazzup] Старт импорта вложений Wazzup за ${monthRaw}. Клиентам ничего не отправляется.`);
+  const [{ candidates }, dump] = await Promise.all([
+    actsHistoricalLoadEmailCandidates(monthRaw),
+    actsHistoricalFetchWazzupDump(monthRaw),
+  ]);
+  const byPhone = new Map();
+  for (const candidate of candidates) {
+    for (const phone of candidate.phones) {
+      const list = byPhone.get(phone) || [];
+      list.push(candidate);
+      byPhone.set(phone, list);
+    }
+  }
+  const parsed = actsHistoricalCsvParse(dump.csv);
+  const result = { month: monthRaw, candidates: candidates.length, rows: parsed.rows.length, attachments: 0, saved: 0, ambiguous: 0, rejected: 0, skipped: 0, errors: 0 };
+  console.log(`[acts-historical-wazzup] CSV: строк=${parsed.rows.length}; поля=${parsed.headers.join(',') || 'нет'}.`);
+
+  for (const row of parsed.rows) {
+    if (!actsHistoricalWazzupInbound(row)) { result.skipped++; continue; }
+    const attachment = actsHistoricalWazzupAttachment(row);
+    if (!attachment) continue;
+    result.attachments++;
+    const phone = normalizePhoneDigits(actsHistoricalRowValue(row, ['chat_id', 'chatid', 'phone', 'contact_phone', 'recipient_phone', 'recipient']));
+    const possible = byPhone.get(phone) || [];
+    if (possible.length !== 1) { result.ambiguous++; continue; }
+    const target = possible[0];
+    const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${target.state.taskId}`;
+    if (await fgTimelineHasMarker(target.state.dealId, marker, 200).catch(() => false)) { result.skipped++; continue; }
+    try {
+      const downloaded = await actsDownloadIncomingUrl(attachment.url, attachment.fileName || `Входящий_акт_${phone.slice(-4) || 'клиент'}.bin`);
+      const check = await actsAiCheckSignedAct(downloaded.buffer, downloaded.fileName, attachment.contentType || downloaded.contentType, 'Историческое входящее сообщение Wazzup');
+      if (!check.isSignedAct) { result.rejected++; continue; }
+      await actsSaveIncomingScanForState({
+        state: target.state, deal: target.deal,
+        source: `исторический Wazzup за ${monthRaw}`,
+        fileName: downloaded.fileName, buffer: downloaded.buffer,
+        contentType: attachment.contentType || downloaded.contentType,
+        periodDate: target.state.createdDate, expertFolderOverride: target.expertFolder,
+        skipCompanyFolder: true, notifyExpert: false,
+      });
+      result.saved++;
+    } catch (error) {
+      result.errors++;
+      console.warn(`[acts-historical-wazzup] task=${target.state.taskId}: ${String(error && error.message || error).slice(0, 300)}`);
+    }
+  }
+  console.log(`[acts-historical-wazzup] import ${monthRaw}: candidates=${result.candidates}; rows=${result.rows}; attachments=${result.attachments}; saved=${result.saved}; ambiguous=${result.ambiguous}; rejected=${result.rejected}; skipped=${result.skipped}; errors=${result.errors}`);
   return result;
 }
 
@@ -14808,6 +15000,13 @@ app.listen(PORT, () => {
     setTimeout(() => actsRunHistoricalEmailImport(config.actsHistoricalImportMonth).catch((e) =>
       console.error(`[acts-historical] import failed: ${e.message || e}`)
     ), 20 * 1000);
+  }
+
+  if (config.actsHistoricalWazzupImportEnabled) {
+    console.log(`[acts-historical-wazzup] Разовый импорт Wazzup включён для ${config.actsHistoricalWazzupImportMonth || 'месяц не задан'}. Клиентам ничего не отправляется.`);
+    setTimeout(() => actsRunHistoricalWazzupImport(config.actsHistoricalWazzupImportMonth).catch((e) =>
+      console.error(`[acts-historical-wazzup] import failed: ${e.message || e}`)
+    ), 45 * 1000);
   }
 
   if (config.bitrixWebhookUrl && config.actsReconAutoEnabled) {
