@@ -22,8 +22,10 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 const AdmZip = require('adm-zip');
 const { intakeKey, intakeTitle, normalizeRecruitingIntake } = require('./recruiting-intake');
-const { createRabotaByClient, rabotaResponseToIntake } = require('./rabota-by');
+const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = require('./rabota-by');
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
+const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
+const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -157,10 +159,17 @@ const config = {
   recruitingTasksEnabled: String(process.env.RECRUITING_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
   recruitingStageTasksEnabled: String(process.env.RECRUITING_STAGE_TASKS_ENABLED || 'false').toLowerCase() === 'true',
   recruitingStageTasksIntervalMinutes: boundedPositiveInteger(process.env.RECRUITING_STAGE_TASKS_INTERVAL_MINUTES, 5, 60),
-  // Источник откликов менеджеров и экспертов. Токен только в секретах Render; импорт запускается вручную.
+  // Источник откликов менеджеров и экспертов. Токен только в секретах Render.
   rabotaByAccessToken: process.env.RABOTA_BY_ACCESS_TOKEN || '',
   rabotaByUserAgent: process.env.RABOTA_BY_USER_AGENT || '',
   rabotaBySyncLimit: boundedPositiveInteger(process.env.RABOTA_BY_SYNC_LIMIT, 50, 100),
+  // AI-триаж отключён по умолчанию. Внешние сообщения и отказы требуют отдельного флага,
+  // чтобы не включиться только от появления OAuth-токена.
+  rabotaByAiTriageEnabled: String(process.env.RABOTA_BY_AI_TRIAGE_ENABLED || 'false').toLowerCase() === 'true',
+  rabotaByExternalActionsEnabled: String(process.env.RABOTA_BY_EXTERNAL_ACTIONS_ENABLED || 'false').toLowerCase() === 'true',
+  rabotaByAiTriageIntervalMinutes: boundedPositiveInteger(process.env.RABOTA_BY_AI_TRIAGE_INTERVAL_MINUTES, 1, 60),
+  rabotaByAiTriageVacancies: (() => { try { return JSON.parse(process.env.RABOTA_BY_AI_TRIAGE_VACANCIES_JSON || '[]'); } catch (_) { return []; } })(),
+  rabotaByWebhookToken: process.env.RABOTA_BY_WEBHOOK_TOKEN || '',
   // Только этот номер телефона обрабатывается живым ботом — пилотная сделка 34946.
   liveChatTestPhone: process.env.LIVE_CHAT_TEST_PHONE || '',
   liveChatTestDealId: process.env.LIVE_CHAT_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || '',
@@ -426,6 +435,12 @@ function recruitingBearerMatches(header) {
   return expected.length > 0 && expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
+function rabotaByWebhookMatches(value) {
+  const expected = Buffer.from(String(config.rabotaByWebhookToken || ''));
+  const actual = Buffer.from(String(value || ''));
+  return expected.length > 0 && expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
 function recruitingEnumValue(field, label) {
   const values = Array.isArray(field && field.LIST) ? field.LIST : Object.values(field && field.LIST || {});
   const match = values.find((item) => String(item && item.VALUE || '') === label);
@@ -435,7 +450,7 @@ function recruitingEnumValue(field, label) {
 async function loadRecruitingFieldMap() {
   const fields = await bitrixRestCall('crm.deal.userfield.list');
   const byXmlId = new Map((Array.isArray(fields) ? fields : []).map((field) => [String(field.XML_ID || ''), field]));
-  const required = ['HR_ROLE', 'HR_SOURCE', 'HR_SOURCE_APPLICATION_ID', 'HR_SOURCE_VACANCY_ID', 'HR_SOURCE_URL', 'HR_RECEIVED_AT', 'HR_DEDUP_KEY', 'HR_CANDIDATE_FULL_NAME', 'HR_CANDIDATE_PHONE', 'HR_CANDIDATE_EMAIL', 'HR_RESUME_URL', 'HR_CONDITIONS', 'HR_DECISION_OWNER', 'HR_AUTOMATION_STATUS', 'HR_CORRELATION_ID', 'HR_LAST_SYNC_AT'];
+  const required = ['HR_ROLE', 'HR_SOURCE', 'HR_SOURCE_APPLICATION_ID', 'HR_SOURCE_VACANCY_ID', 'HR_SOURCE_URL', 'HR_RECEIVED_AT', 'HR_DEDUP_KEY', 'HR_CANDIDATE_FULL_NAME', 'HR_CANDIDATE_PHONE', 'HR_CANDIDATE_EMAIL', 'HR_RESUME_URL', 'HR_CONDITIONS', 'HR_SCORE_VERSION', 'HR_TOTAL_SCORE', 'HR_B2B_SCORE', 'HR_COLD_SCORE', 'HR_DISCOVERY_SCORE', 'HR_CRM_SCORE', 'HR_COMPLEX_SCORE', 'HR_METRICS_SCORE', 'HR_LEARNING_SCORE', 'HR_EVIDENCE', 'HR_STRENGTHS', 'HR_RISKS', 'HR_MISSING_INFO', 'HR_RECOMMENDATION', 'HR_DECISION_OWNER', 'HR_AUTOMATION_STATUS', 'HR_CORRELATION_ID', 'HR_LAST_SYNC_AT', 'HR_SYNC_ERROR'];
   const map = {};
   for (const code of required) {
     const field = byXmlId.get(code);
@@ -446,6 +461,7 @@ async function loadRecruitingFieldMap() {
     HR_ROLE: ['Менеджер по продажам', 'Эксперт', 'Прораб'],
     HR_SOURCE: ['rabota.by', 'Kufar', 'Ручной'],
     HR_AUTOMATION_STATUS: ['Включена', 'На паузе', 'Только вручную'],
+    HR_RECOMMENDATION: ['Ручная проверка', 'Уточнить', 'Рекомендовать интервью'],
   })) {
     for (const label of labels) {
       const value = recruitingEnumValue(map[code].field, label);
@@ -488,10 +504,29 @@ function recruitingDealFields(intake, fieldMap, correlationId, isNew) {
   return fields;
 }
 
-async function createRecruitingTask(dealId, intake) {
+function recruitingScoreFields(analysis, fieldMap) {
+  return {
+    [fieldMap.HR_SCORE_VERSION.fieldName]: analysis.version,
+    [fieldMap.HR_TOTAL_SCORE.fieldName]: analysis.total,
+    [fieldMap.HR_B2B_SCORE.fieldName]: analysis.scores.b2b,
+    [fieldMap.HR_COLD_SCORE.fieldName]: analysis.scores.cold,
+    [fieldMap.HR_DISCOVERY_SCORE.fieldName]: analysis.scores.discovery,
+    [fieldMap.HR_CRM_SCORE.fieldName]: analysis.scores.crm,
+    [fieldMap.HR_COMPLEX_SCORE.fieldName]: analysis.scores.complex,
+    [fieldMap.HR_METRICS_SCORE.fieldName]: analysis.scores.metrics,
+    [fieldMap.HR_LEARNING_SCORE.fieldName]: analysis.scores.learning,
+    [fieldMap.HR_EVIDENCE.fieldName]: analysis.evidence.join('\n'),
+    [fieldMap.HR_STRENGTHS.fieldName]: analysis.strengths.join('\n'),
+    [fieldMap.HR_RISKS.fieldName]: analysis.risks.join('\n'),
+    [fieldMap.HR_MISSING_INFO.fieldName]: analysis.missing.join('\n'),
+    [fieldMap.HR_RECOMMENDATION.fieldName]: fieldMap.HR_RECOMMENDATION[analysis.recommendation],
+  };
+}
+
+async function createRecruitingTask(dealId, intake, description = '') {
   return bitrixRestCall('tasks.task.add', { fields: {
     TITLE: `НАЙМ: проверить новый отклик — ${intake.role}`,
-    DESCRIPTION: `Новый отклик из ${intake.source}. Проверьте карточку кандидата и назначьте следующий шаг.\n\nВнешние сообщения и изменение статуса на площадке не выполнялись автоматически.`,
+    DESCRIPTION: description || `Новый отклик из ${intake.source}. Проверьте карточку кандидата и назначьте следующий шаг.\n\nВнешние сообщения и изменение статуса на площадке не выполнялись автоматически.`,
     RESPONSIBLE_ID: config.recruitingRecruiterId,
     UF_CRM_TASK: [`D_${dealId}`],
     PRIORITY: 1,
@@ -589,7 +624,7 @@ function recruitingServiceUnavailableError() {
   return null;
 }
 
-async function processRecruitingIntake(payload) {
+async function processRecruitingIntake(payload, options = {}) {
   const intake = normalizeRecruitingIntake(payload);
   const fieldMap = await loadRecruitingFieldMap();
   const sourceValue = fieldMap.HR_SOURCE[intake.source];
@@ -609,11 +644,14 @@ async function processRecruitingIntake(payload) {
 
   const correlationId = crypto.randomUUID();
   if (current) {
-    await bitrixRestCall('crm.deal.update', { id: current.ID, fields: recruitingDealFields(intake, fieldMap, correlationId, false) });
+    const fields = recruitingDealFields(intake, fieldMap, correlationId, false);
+    await bitrixRestCall('crm.deal.update', { id: current.ID, fields });
     return { ok: true, action: 'updated', dealId: String(current.ID), externalActions: false };
   }
 
-  const created = await bitrixRestCall('crm.deal.add', { fields: recruitingDealFields(intake, fieldMap, correlationId, true) });
+  const fields = recruitingDealFields(intake, fieldMap, correlationId, true);
+  if (options.stageId) fields.STAGE_ID = options.stageId;
+  const created = await bitrixRestCall('crm.deal.add', { fields });
   const dealId = String(created && (created.id || created.ID) || created || '');
   if (!dealId) throw new Error('Bitrix24 не вернул ID созданной сделки найма.');
   const createdDeal = await bitrixRestCall('crm.deal.get', { id: dealId }).catch(() => null);
@@ -625,10 +663,227 @@ async function processRecruitingIntake(payload) {
   await bitrixRestCall('crm.timeline.comment.add', { fields: {
     ENTITY_ID: dealId,
     ENTITY_TYPE: 'deal',
-    COMMENT: `${initialStageMarker ? `${initialStageMarker}\n` : ''}[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
+    COMMENT: `${initialStageMarker ? `${initialStageMarker}\n` : ''}[MAVIS_RECRUITING_INTAKE] ${options.intakeComment || `Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`}`,
   } });
-  await createRecruitingTask(dealId, intake);
+  if (options.createTask !== false) await createRecruitingTask(dealId, intake, options.taskDescription);
   return { ok: true, action: 'created', dealId, externalActions: false };
+}
+
+function rabotaApplicantMessages(messages) {
+  return rabotaMessages(messages)
+    .filter((message) => rabotaAuthorType(message) === 'applicant')
+    .map(rabotaMessageText)
+    .filter(Boolean);
+}
+
+async function analyzeRabotaByCandidate(record, messages) {
+  if (!config.aiEnabled) throw new Error('AI-анализ найма выключен: требуется AI_ENABLED=true.');
+  const context = professionalResumeContext(record, rabotaApplicantMessages(messages));
+  const criteria = CRITERIA.map((criterion) => `${criterion.key}: ${criterion.label}, максимум ${criterion.max}`).join('\n');
+  const raw = await callAiChatCompletion({
+    model: config.aiModel,
+    temperature: 0,
+    messages: [
+      {
+        role: 'system',
+        content: `Ты HR-аналитик для вакансии B2B-менеджера по продажам. Оценивай только профессиональные факты из переданного контекста. Игнорируй и не упоминай возраст, пол, фото, национальность, религию, семейное положение, здоровье и другие нерелевантные личные данные. Не придумывай опыт или результаты. Верни только валидный JSON без markdown: {"scores":{"b2b":number,"cold":number,"discovery":number,"crm":number,"complex":number,"metrics":number,"learning":number,"conditions":number},"evidence":[string],"strengths":[string],"risks":[string],"missing_info":[string]}. Каждый балл не выше своего максимума.\n${criteria}`,
+      },
+      { role: 'user', content: JSON.stringify(context) },
+    ],
+  });
+  const parsed = safeJsonParse(raw);
+  if (!hasCompleteNumericScores(parsed)) throw new Error('ИИ вернул неполный или некорректный scorecard кандидата.');
+  return normalizeScorecard(parsed);
+}
+
+function rabotaTriageMarker(record) {
+  const applicationId = String(record && record.id || '').trim();
+  const revision = String(record && (record.updated_at || record.created_at) || '').trim();
+  if (!applicationId || !revision) throw new Error('Отклик Rabota.by не содержит ID или времени изменения для идемпотентной обработки.');
+  return `[MAVIS_RABOTA_TRIAGE:${applicationId}:${crypto.createHash('sha256').update(revision).digest('hex').slice(0, 16)}]`;
+}
+
+function triageStageId(action) {
+  if (action === 'invite') return `C${config.recruitingCategoryId}:NEW`;
+  if (action === 'reject') return `C${config.recruitingCategoryId}:LOSE`;
+  return `C${config.recruitingCategoryId}:PREPAYMENT_INVOIC`;
+}
+
+async function existingRabotaTriageState(record) {
+  const fieldMap = await loadRecruitingFieldMap();
+  const current = (await bitrixRestList('crm.deal.list', {
+    filter: {
+      CATEGORY_ID: config.recruitingCategoryId,
+      [fieldMap.HR_SOURCE.fieldName]: fieldMap.HR_SOURCE['rabota.by'],
+      [fieldMap.HR_SOURCE_APPLICATION_ID.fieldName]: String(record.id || ''),
+    },
+    select: ['ID', fieldMap.HR_AUTOMATION_STATUS.fieldName],
+    order: { ID: 'ASC' },
+  }, 2))[0];
+  if (!current) return { fieldMap, current: null, alreadyProcessed: false };
+  if (isRecruitingAutomationPaused(
+    current[fieldMap.HR_AUTOMATION_STATUS.fieldName],
+    fieldMap.HR_AUTOMATION_STATUS['На паузе'],
+    fieldMap.HR_AUTOMATION_STATUS['Только вручную'],
+  )) return { fieldMap, current, alreadyProcessed: true, reason: 'paused' };
+  const marker = rabotaTriageMarker(record);
+  return { fieldMap, current, alreadyProcessed: await recruitingStageTaskAlreadyCreated(current.ID, marker), marker };
+}
+
+async function saveRabotaTriageAudit(record, vacancyId, analysis, correlationId) {
+  const marker = rabotaTriageMarker(record);
+  const intake = rabotaResponseToIntake(record, { vacancyId, role: 'Менеджер по продажам' });
+  const result = await processRecruitingIntake(intake, {
+    stageId: triageStageId(analysis.action),
+    createTask: analysis.action === 'invite',
+    intakeComment: 'Отклик Rabota.by передан в AI-триаж. Все дальнейшие действия фиксируются в таймлайне.',
+    taskDescription: 'Кандидат рекомендован ИИ к интервью. Проверьте scorecard и назначьте следующий ручной шаг.',
+  });
+  if (result.action === 'paused') return { ...result, alreadyProcessed: true };
+  const fieldMap = await loadRecruitingFieldMap();
+  if (await recruitingStageTaskAlreadyCreated(result.dealId, marker)) return { ...result, alreadyProcessed: true };
+  await bitrixRestCall('crm.deal.update', { id: result.dealId, fields: recruitingScoreFields(analysis, fieldMap) });
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: result.dealId,
+    ENTITY_TYPE: 'deal',
+    COMMENT: `${marker}\n[MAVIS_RABOTA_TRIAGE] Решение ${analysis.action}; correlation=${correlationId}. Внешнее действие будет выполнено только после этой аудиторской записи.\n\n${analysisComment(analysis)}`,
+  } });
+  return result;
+}
+
+async function markRabotaTriageError(dealId, marker, error) {
+  const fieldMap = await loadRecruitingFieldMap();
+  const message = String(error && error.message || error || 'неизвестная ошибка').replace(/[\r\n]+/g, ' ').slice(0, 800);
+  await bitrixRestCall('crm.deal.update', { id: dealId, fields: { [fieldMap.HR_SYNC_ERROR.fieldName]: message } });
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: dealId,
+    ENTITY_TYPE: 'deal',
+    COMMENT: `${marker}\n[MAVIS_RABOTA_TRIAGE_ERROR] Внешнее действие не выполнено; требуется ручная проверка. Причина: ${message}`,
+  } });
+}
+
+async function saveRabotaTriageFailure(record, vacancyId, error) {
+  const marker = rabotaTriageMarker(record);
+  const intake = rabotaResponseToIntake(record, { vacancyId, role: 'Менеджер по продажам' });
+  const result = await processRecruitingIntake(intake, {
+    stageId: `C${config.recruitingCategoryId}:PREPAYMENT_INVOIC`,
+    createTask: true,
+    intakeComment: 'AI-триаж Rabota.by остановлен: требуется ручная проверка.',
+    taskDescription: 'AI-триаж Rabota.by не получил полный безопасный контекст. Проверьте отклик вручную.',
+  });
+  if (result.action !== 'paused') await markRabotaTriageError(result.dealId, marker, error);
+  return result;
+}
+
+async function triageRabotaByResponse({ client, record, vacancyId, externalActions }) {
+  const correlationId = crypto.randomUUID();
+  const existing = await existingRabotaTriageState(record);
+  if (existing.alreadyProcessed) return { action: 'skipped', externalAction: existing.reason || 'already-processed', correlationId };
+
+  let messages;
+  let fullResume;
+  try {
+    messages = await client.getMessages(record);
+    fullResume = await client.getResume(record);
+  } catch (error) {
+    const saved = await saveRabotaTriageFailure(record, vacancyId, error);
+    return { action: 'needs-human', externalAction: 'context-unavailable', dealId: saved.dealId, correlationId };
+  }
+  const scoringRecord = fullResume && typeof fullResume === 'object'
+    ? { ...record, resume: { ...(record.resume || {}), ...fullResume } }
+    : record;
+  let analysis;
+  try {
+    analysis = await analyzeRabotaByCandidate(scoringRecord, messages);
+  } catch (error) {
+    const saved = await saveRabotaTriageFailure(record, vacancyId, error);
+    return { action: 'needs-human', externalAction: 'analysis-unavailable', dealId: saved.dealId, correlationId };
+  }
+  const audit = await saveRabotaTriageAudit(record, vacancyId, analysis, correlationId);
+  if (audit.alreadyProcessed) return { action: 'skipped', externalAction: 'already-processed', dealId: audit.dealId, correlationId };
+
+  if (analysis.action === 'invite' || !externalActions) {
+    console.log(`[rabota-by-triage] action=${analysis.action} application=${record.id} deal=${audit.dealId} score=${analysis.total} correlation=${correlationId}; external=${externalActions}.`);
+    return { action: analysis.action, score: analysis.total, dealId: audit.dealId, externalAction: externalActions ? 'not-required' : 'disabled', correlationId };
+  }
+
+  try {
+    if (analysis.action === 'clarify') {
+      const message = clarificationMessage(analysis.questions);
+      if (!message || rabotaClarificationCount(messages) >= 2) throw new Error('Лимит уточнений исчерпан; требуется ручная проверка.');
+      if (rabotaAwaitingApplicantReply(messages)) return { action: 'clarify', score: analysis.total, dealId: audit.dealId, externalAction: 'waiting-reply', correlationId };
+      await client.sendMessage(record, message);
+      console.log(`[rabota-by-triage] clarification sent application=${record.id} deal=${audit.dealId} score=${analysis.total} correlation=${correlationId}.`);
+      return { action: 'clarify', score: analysis.total, dealId: audit.dealId, externalAction: 'sent', correlationId };
+    }
+    const rejectAction = availableRejectAction(record);
+    if (!rejectAction) throw new Error('Rabota.by не вернула разрешённое действие отказа.');
+    await client.performAvailableAction(rejectAction, rejectionMessage());
+    console.log(`[rabota-by-triage] rejection sent application=${record.id} deal=${audit.dealId} score=${analysis.total} correlation=${correlationId}.`);
+    return { action: 'reject', score: analysis.total, dealId: audit.dealId, externalAction: 'discarded', correlationId };
+  } catch (error) {
+    await markRabotaTriageError(audit.dealId, '[MAVIS_RABOTA_TRIAGE_EXTERNAL_ERROR]', error);
+    return { action: 'needs-human', externalAction: 'failed-closed', dealId: audit.dealId, correlationId };
+  }
+}
+
+let rabotaByAiTriageRunning = false;
+
+function configuredRabotaByTriageVacancies() {
+  return (Array.isArray(config.rabotaByAiTriageVacancies) ? config.rabotaByAiTriageVacancies : [])
+    .map((item) => ({ vacancyId: String(item && (item.vacancyId || item.vacancy_id) || '').trim(), role: String(item && item.role || '').trim() }))
+    .filter((item) => item.vacancyId && item.role === 'Менеджер по продажам');
+}
+
+async function runRabotaByAiTriageCycle(trigger = 'interval', requested = null) {
+  if (rabotaByAiTriageRunning) return { ok: true, skipped: 'already-running' };
+  if (!config.rabotaByAiTriageEnabled || !config.rabotaByAccessToken || !config.rabotaByUserAgent || !config.aiEnabled) return { ok: true, skipped: 'disabled-or-not-configured' };
+  const vacancies = requested ? [requested] : configuredRabotaByTriageVacancies();
+  if (!vacancies.length) return { ok: true, skipped: 'no-manager-vacancy-configured' };
+
+  rabotaByAiTriageRunning = true;
+  try {
+    const client = createRabotaByClient({ accessToken: config.rabotaByAccessToken, userAgent: config.rabotaByUserAgent });
+    const totals = { listed: 0, processed: 0, skipped: 0, invite: 0, clarify: 0, reject: 0, needsHuman: 0, errors: 0 };
+    for (const vacancy of vacancies) {
+      const collections = await client.listCollections(vacancy.vacancyId);
+      const collection = (Array.isArray(collections.collections) ? collections.collections : []).find((item) => item && item.id === 'response' && item.url);
+      if (!collection) throw new Error(`Rabota.by не вернула коллекцию откликов для вакансии ${vacancy.vacancyId}.`);
+      let page = 0;
+      let pages = 1;
+      while (page < pages && totals.processed < config.rabotaBySyncLimit) {
+        const responses = await client.listResponsePage(collection.url, { page, perPage: 20 });
+        pages = Math.max(1, Number(responses && responses.pages) || 1);
+        for (const item of (Array.isArray(responses && responses.items) ? responses.items : [])) {
+          totals.listed++;
+          try {
+            const record = item && item.url ? await client.getResponse(item.url) : item;
+            const result = await triageRabotaByResponse({ client, record, vacancyId: vacancy.vacancyId, externalActions: config.rabotaByExternalActionsEnabled });
+            if (result.action === 'skipped') {
+              totals.skipped++;
+              continue;
+            }
+            totals.processed++;
+            if (result.action === 'needs-human') totals.needsHuman++;
+            else if (Object.hasOwn(totals, result.action)) totals[result.action]++;
+            if (totals.processed >= config.rabotaBySyncLimit) break;
+          } catch (error) {
+            totals.errors++;
+            totals.processed++;
+            console.error(`[rabota-by-triage] ${trigger}: application=${item && item.id || 'unknown'} ${error.message || String(error)}`);
+            if (totals.processed >= config.rabotaBySyncLimit) break;
+          }
+        }
+        page++;
+      }
+    }
+    return { ok: true, trigger, externalActions: config.rabotaByExternalActionsEnabled, totals };
+  } catch (error) {
+    console.error(`[rabota-by-triage] ${trigger}: ${error.message || String(error)}`);
+    return { ok: false, error: 'cycle-failed' };
+  } finally {
+    rabotaByAiTriageRunning = false;
+  }
 }
 
 app.get('/api/recruiting/status', (req, res) => {
@@ -664,7 +919,10 @@ app.get('/api/recruiting/rabota/status', (req, res) => {
     intakeEnabled: config.recruitingIntakeEnabled,
     maxPerRun: config.rabotaBySyncLimit,
     roles: ['Менеджер по продажам', 'Эксперт'],
-    externalActions: false,
+    aiTriageEnabled: config.rabotaByAiTriageEnabled,
+    externalActions: config.rabotaByAiTriageEnabled && config.rabotaByExternalActionsEnabled,
+    configuredManagerVacancies: configuredRabotaByTriageVacancies().map((item) => item.vacancyId),
+    webhookConfigured: Boolean(config.rabotaByWebhookToken),
   });
 });
 
@@ -710,6 +968,27 @@ app.post('/api/recruiting/rabota/sync', async (req, res) => {
     console.error(`[rabota-by-sync] ${error.message || String(error)}`);
     return res.status(502).json({ ok: false, error: 'Не удалось получить отклики из Rabota.by. Проверьте подключение источника.' });
   }
+});
+
+app.post('/api/recruiting/rabota/triage', async (req, res) => {
+  if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const vacancyId = String(body.vacancy_id || '').trim().slice(0, 200);
+  const role = String(body.role || 'Менеджер по продажам').trim();
+  if (role !== 'Менеджер по продажам') return res.status(400).json({ ok: false, error: 'AI-триаж пока согласован только для роли «Менеджер по продажам». ' });
+  if (!vacancyId) return res.status(400).json({ ok: false, error: 'vacancy_id обязателен.' });
+  const result = await runRabotaByAiTriageCycle('manual', { vacancyId, role });
+  return res.status(result.ok ? 200 : 502).json(result);
+});
+
+app.post('/api/recruiting/rabota/webhook/:token', async (req, res) => {
+  if (!rabotaByWebhookMatches(req.params.token)) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  const payload = req.body && typeof req.body === 'object' ? req.body : {};
+  const vacancyId = String(payload && payload.payload && payload.payload.vacancy_id || '').trim();
+  const vacancy = configuredRabotaByTriageVacancies().find((item) => item.vacancyId === vacancyId);
+  if (!vacancy) return res.status(202).json({ ok: true, skipped: 'vacancy-not-configured' });
+  const result = await runRabotaByAiTriageCycle('webhook', vacancy);
+  return res.status(result.ok ? 200 : 502).json(result);
 });
 
 app.get('/health', (_req, res) => {
@@ -15035,6 +15314,15 @@ app.listen(PORT, () => {
     setInterval(() => runRecruitingStageTaskCycle('interval'), recruitingStageTasksMs);
   } else {
     console.log('[recruiting-stage-tasks] Выключено. Для включения нужны RECRUITING_STAGE_TASKS_ENABLED=true, RECRUITING_TASKS_ENABLED=true и BITRIX_WEBHOOK_URL.');
+  }
+
+  if (config.rabotaByAiTriageEnabled && config.rabotaByAccessToken && config.rabotaByUserAgent && config.aiEnabled && configuredRabotaByTriageVacancies().length) {
+    const rabotaByTriageMs = config.rabotaByAiTriageIntervalMinutes * 60 * 1000;
+    console.log(`[rabota-by-triage] Включён монитор откликов менеджеров: каждые ${config.rabotaByAiTriageIntervalMinutes} мин; внешние действия=${config.rabotaByExternalActionsEnabled}.`);
+    setTimeout(() => runRabotaByAiTriageCycle('startup'), 8000);
+    setInterval(() => runRabotaByAiTriageCycle('interval'), rabotaByTriageMs);
+  } else {
+    console.log('[rabota-by-triage] Выключен. Нужны RABOTA_BY_AI_TRIAGE_ENABLED=true, OAuth, AI_ENABLED=true и менеджерская вакансия в RABOTA_BY_AI_TRIAGE_VACANCIES_JSON.');
   }
 
   if (config.bitrixWebhookUrl && config.actsTasksEnabled && config.actsSendToClientEnabled && config.actsDonePollEnabled) {

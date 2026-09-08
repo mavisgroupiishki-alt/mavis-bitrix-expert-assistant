@@ -2,13 +2,13 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { apiUrl, createRabotaByClient, rabotaResponseToIntake } = require('../rabota-by');
+const { apiUrl, availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = require('../rabota-by');
 
 function jsonResponse(body) {
   return { ok: true, status: 200, json: async () => body };
 }
 
-test('uses only GET requests to the official Rabota.by API', async () => {
+test('uses GET requests to the official Rabota.by API for reading responses', async () => {
   const calls = [];
   const client = createRabotaByClient({
     accessToken: 'test-token',
@@ -31,6 +31,32 @@ test('uses only GET requests to the official Rabota.by API', async () => {
     assert.equal(call.options.headers.Authorization, 'Bearer test-token');
     assert.equal(call.options.headers['HH-User-Agent'], 'MAVIS Recruiting/1.0 (hr@example.test)');
   }
+});
+
+test('sends messages and rejection only through the official action URL returned by Rabota.by', async () => {
+  const calls = [];
+  const client = createRabotaByClient({
+    accessToken: 'test-token',
+    userAgent: 'MAVIS Recruiting/1.0 (hr@example.test)',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ ok: true });
+    },
+  });
+  const response = { id: '42', actions: [{ id: 'discard_by_employer', method: 'PUT', enabled: true, arguments: [{ id: 'message' }], url: 'https://api.hh.ru/negotiations/discard_by_employer/42' }] };
+
+  await client.sendMessage(response, 'Спасибо за отклик.');
+  await client.performAvailableAction(availableRejectAction(response), 'Спасибо за отклик.');
+
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].url, /^https:\/\/api\.hh\.ru\/negotiations\/42\/messages\?host=rabota\.by$/);
+  assert.equal(calls[0].options.method, 'POST');
+  assert.equal(calls[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.match(calls[1].url, /^https:\/\/api\.hh\.ru\/negotiations\/discard_by_employer\/42\?host=rabota\.by$/);
+  assert.equal(calls[1].options.method, 'PUT');
+  assert.equal(calls[1].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  await assert.rejects(client.performAvailableAction({ id: 'discard_by_employer', method: 'PUT', enabled: true, arguments: [{ id: 'message' }], url: 'https://example.test/evil' }, 'Отказ'), /api\.hh\.ru/);
+  assert.equal(availableRejectAction({ actions: [{ id: 'discard_by_employer', method: 'PUT', enabled: false, arguments: [{ id: 'message' }], url: 'https://api.hh.ru/negotiations/discard_by_employer/42' }] }), null);
 });
 
 test('rejects URLs outside the official API origin', () => {
