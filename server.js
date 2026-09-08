@@ -9995,18 +9995,21 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     order: { CREATED_DATE: 'ASC' },
   }, 1000);
   console.log(`[acts-historical] Задач за ${monthRaw}: ${tasks.length}. Проверяю экспертов и CRM-связи.`);
-  const userCache = new Map();
+  // Не запрашиваем user.get для каждой из 152 задач по очереди: это задерживает
+  // разовый импорт и может упереться в очередь Bitrix. Одним запросом строим
+  // справочник сотрудников, затем обращаемся к CRM только по нужным экспертам.
+  const users = await bitrixRestCall('user.get', { FILTER: { ACTIVE: 'Y' } }).catch(() => []);
+  const userCache = new Map((Array.isArray(users) ? users : []).map((user) => [
+    String(user && user.ID || ''),
+    actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`),
+  ]));
+  console.log(`[acts-historical] Загружен справочник сотрудников: ${userCache.size}.`);
   const entityCache = new Map();
   const candidates = [];
 
   for (const [index, task] of tasks.entries()) {
     const creatorId = actsHistoricalTaskCreatorId(task);
     if (!creatorId) continue;
-    if (!userCache.has(creatorId)) {
-      const rows = await bitrixRestCall('user.get', { ID: creatorId }).catch(() => []);
-      const user = Array.isArray(rows) ? rows[0] : rows;
-      userCache.set(creatorId, actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`));
-    }
     if (!ACTS_HISTORICAL_EXPERT_NAMES.has(userCache.get(creatorId))) continue;
 
     const dealId = actsExtractDealIdsFromTask(task)[0];
@@ -10040,7 +10043,7 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       emails,
       companyName: deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID).catch(() => '') : '',
     });
-    if ((index + 1) % 25 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
+    if ((index + 1) % 10 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
   }
   console.log(`[acts-historical] Кандидатов с почтой: ${candidates.length}.`);
   return { range, candidates };
