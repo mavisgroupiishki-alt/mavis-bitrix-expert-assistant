@@ -9908,6 +9908,7 @@ function actsHistoricalTaskCreatorId(task) {
 
 async function actsHistoricalLoadEmailCandidates(monthRaw) {
   const range = actsHistoricalMonthRange(monthRaw);
+  console.log(`[acts-historical] Подбираю задачи проекта #${config.actsProjectId} за ${monthRaw}.`);
   const tasks = await bitrixRestList('tasks.task.list', {
     filter: {
       GROUP_ID: config.actsProjectId,
@@ -9917,11 +9918,12 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     select: ['ID', 'TITLE', 'CREATED_BY', 'CREATED_BY_ID', 'CREATED_DATE', 'UF_CRM_TASK'],
     order: { CREATED_DATE: 'ASC' },
   }, 1000);
+  console.log(`[acts-historical] Задач за ${monthRaw}: ${tasks.length}. Проверяю экспертов и CRM-связи.`);
   const userCache = new Map();
   const entityCache = new Map();
   const candidates = [];
 
-  for (const task of tasks) {
+  for (const [index, task] of tasks.entries()) {
     const creatorId = actsHistoricalTaskCreatorId(task);
     if (!creatorId) continue;
     if (!userCache.has(creatorId)) {
@@ -9962,7 +9964,9 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       emails,
       companyName: deal.COMPANY_ID ? await getCompanyName(deal.COMPANY_ID).catch(() => '') : '',
     });
+    if ((index + 1) % 25 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
   }
+  console.log(`[acts-historical] Кандидатов с почтой: ${candidates.length}.`);
   return { range, candidates };
 }
 
@@ -9981,6 +9985,7 @@ async function actsRunHistoricalEmailImport(monthRaw) {
   const emailUser = process.env.MAIL_IMAP_USER || '';
   const emailPass = process.env.MAIL_IMAP_PASSWORD || '';
   if (!emailUser || !emailPass) throw new Error('MAIL_IMAP_USER / MAIL_IMAP_PASSWORD не заданы');
+  console.log(`[acts-historical] Старт импорта почты за ${monthRaw}.`);
   const { range, candidates } = await actsHistoricalLoadEmailCandidates(monthRaw);
   const byEmail = new Map();
   for (const candidate of candidates) {
@@ -10000,6 +10005,7 @@ async function actsRunHistoricalEmailImport(monthRaw) {
   });
   try {
     await client.connect();
+    console.log(`[acts-historical] Почта подключена; кандидатов: ${candidates.length}. Ищу письма с ${range.startIso}.`);
     const lock = await client.getMailboxLock('INBOX');
     try {
       // Конечная дата не ограничивается августом: подписанный августовский акт мог
