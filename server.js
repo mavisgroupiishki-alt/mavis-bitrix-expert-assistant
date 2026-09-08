@@ -288,6 +288,9 @@ const config = {
   // v137: реальный inbound AI-пилот ТОЛЬКО на Бобике. Для остальных сделок AI-ответ не запускается.
   wazzupAiTestEnabled: String(process.env.WAZZUP_AI_TEST_ENABLED || 'true').toLowerCase() !== 'false',
   wazzupAiTestDealId: String(process.env.WAZZUP_AI_TEST_DEAL_ID || '38072'),
+  // Isolated sales-dialog pilot. It can only handle the verified test phone ending 5898.
+  // Set WAZZUP_SALES_PILOT_ENABLED=false for an immediate rollback without redeploy.
+  wazzupSalesPilotEnabled: String(process.env.WAZZUP_SALES_PILOT_ENABLED || 'true').toLowerCase() !== 'false',
 
   // v78: CJM блоки 3–4 — контроль первого касания/дедлайна документов
   // и автоматический сбор входящих документов по Аттестации + СПК.
@@ -1397,6 +1400,91 @@ app.get('/api/acts-smart-dialog/diag', (_req, res) => {
   });
 });
 
+async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
+  if (!config.wazzupSalesPilotEnabled) return { handled: false, reason: 'disabled' };
+  if (String(phone || '').slice(-4) !== String(config.wazzupAiTestPhoneTail || '5898')) {
+    return { handled: false, reason: 'outside-test-phone' };
+  }
+
+  const binding = await actsResolveSmartDialogTestDealByPhone(phone).catch(() => null);
+  if (!binding || String(binding.deal && binding.deal.ID || '') !== String(config.wazzupAiTestDealId || '38072')) {
+    return { handled: false, reason: 'crm-binding-failed' };
+  }
+
+  const cleanText = actsCleanText(text || '');
+  if (!cleanText) return { handled: true, action: 'no_reply', reason: 'empty' };
+  const external = actsCleanText(msg && msg.messageId || '').replace(/\s+/g, '_').slice(0, 160);
+  const comments = await actsLoadTimelineComments(binding.deal.ID, 100).catch(() => []);
+  const marker = `[WAZZUP_SALES_PILOT] message=${external}`;
+  if (external && comments.some((c) => String(c && c.COMMENT || '').includes(marker))) {
+    return { handled: true, action: 'no_reply', reason: 'duplicate' };
+  }
+
+  const commercialRisk = /(цен|стоимост|скидк|дешев|срок|когда готов|гарант|договор|оплат|предоплат|рассроч|возврат|претенз|жалоб|суд|юрист)/iu.test(cleanText);
+  let decision = { action: 'human', reply: '', confidence: 1, reason: 'commercial_or_risk_request' };
+
+  if (!commercialRisk) {
+    try {
+      const raw = await callAiChatCompletion({
+        model: config.aiModel,
+        temperature: 0,
+        messages: [{ role: 'user', content: `Ты AI-помощник отдела продаж MAVIS GROUP в тесте только для одного клиента. Проанализируй сообщение клиента и верни только JSON: {"action":"reply|human|no_reply","reply":"...","confidence":0..1,"reason":"..."}.\nАвтоответ допустим только для безопасного общего вопроса: уточнить вид услуги, объект, город, контакты или следующий шаг. Любая цена, срок, скидка, гарантия, оплата, договор, претензия, юридический вопрос, неизвестный факт или неоднозначность — action human и пустой reply. Не выдумывай факты и не называй цену/срок.\nСообщение: ${cleanText.slice(0, 3000)}` }],
+      });
+      const match = String(raw || '').match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('AI returned no JSON');
+      const parsed = JSON.parse(match[0]);
+      decision = {
+        action: ['reply', 'human', 'no_reply'].includes(String(parsed.action)) ? String(parsed.action) : 'human',
+        reply: actsCleanText(parsed.reply || ''),
+        confidence: Math.max(0, Math.min(1, Number(parsed.confidence || 0))),
+        reason: actsCleanText(parsed.reason || 'ai_classification'),
+      };
+    } catch (e) {
+      decision = { action: 'human', reply: '', confidence: 0, reason: `ai_error:${String(e.message || e).slice(0, 160)}` };
+    }
+  }
+
+  if (decision.confidence < 0.75 || /(цен|стоимост|скидк|срок|гарант|оплат|договор)/iu.test(decision.reply || '')) {
+    decision = { ...decision, action: 'human', reply: '', reason: 'unsafe_or_low_confidence' };
+  }
+
+  await actsSmartDialogAddComment(binding.deal.ID,
+    `${marker} channel=${channelKey || msg.chatType || '-'}\nКлиент: ${cleanText.slice(0, 3000)}\nРешение: ${JSON.stringify({ action: decision.action, confidence: decision.confidence, reason: decision.reason })}`
+  ).catch(() => {});
+
+  if (decision.action === 'human') {
+    await actsSmartDialogNotifyExpert(binding.deal,
+      `Тестовый клиент написал: «${cleanText.slice(0, 800)}». Нужен ответ специалиста; автоответ не отправлен.`
+    ).catch(() => {});
+    return { handled: true, action: 'human', reason: decision.reason };
+  }
+
+  if (decision.action !== 'reply' || !decision.reply) {
+    return { handled: true, action: 'no_reply', reason: decision.reason };
+  }
+
+  try {
+    await sendWazzupMessageInternal({
+      channelKey: channelKey || findChannelKeyByChannelId(msg && msg.channelId),
+      text: decision.reply,
+      chatId: msg && msg.chatId || undefined,
+      phone,
+      dealId: binding.deal.ID,
+      ignoreStrictPreferredChannel: true,
+      crmMessageId: `mavis-sales-pilot-${binding.deal.ID}-${external || Date.now()}`,
+    });
+    await actsSmartDialogAddComment(binding.deal.ID,
+      `[WAZZUP_SALES_PILOT_REPLY] message=${external || '-'}\nMavis: ${decision.reply}`
+    ).catch(() => {});
+    return { handled: true, action: 'reply', reason: decision.reason };
+  } catch (e) {
+    await actsSmartDialogNotifyExpert(binding.deal,
+      `Тестовый клиент написал: «${cleanText.slice(0, 800)}». Автоответ не отправлен: ${String(e.message || e).slice(0, 300)}.`
+    ).catch(() => {});
+    return { handled: true, action: 'human', reason: 'send_error' };
+  }
+}
+
 app.post('/api/wazzup/webhook', async (req, res) => {
   // v140: one-response guard for Wazzup webhook.
   // The webhook MUST never attempt a second HTTP response after immediate ACK.
@@ -1512,6 +1600,30 @@ __wazzupAck({ ok: true, received: true });
         if (!phone) continue;
         const channelKey = findChannelKeyByChannelId(msg.channelId) || actsNormalizeChannelKey(msg.chatType || '');
         console.log(`[wazzup-inbound-v1373] text accepted: message=${msg.messageId || '-'} phoneTail=${String(phone).slice(-4)} channel=${channelKey || msg.chatType || '-'} textLen=${text.length}`);
+
+        // Separate live sales pilot: only the CRM-verified Bobik test contact can enter it.
+        // A handled test message must not fall through into the production act-dialog route.
+        setImmediate(() => runBobikSalesPilotInbound({ msg, phone, channelKey, text }).then((pilot) => {
+          if (pilot && pilot.handled) {
+            console.log(`[wazzup-sales-pilot] message=${msg.messageId || '-'} action=${pilot.action || '-'} reason=${pilot.reason || '-'}`);
+            return;
+          }
+          return actsProcessIncomingClientText({
+            source: channelKey || msg.chatType || 'Wazzup',
+            commType: 'PHONE',
+            commValue: phone,
+            text,
+            channelKey,
+            chatId: msg.chatId || '',
+            phone,
+            externalId: `wazzup_${msg.messageId || ''}`,
+            msg,
+          }).then((result) => {
+            console.log(`[wazzup-ai-v150] inbound processed message=${msg.messageId || '-'} action=${result && result.action || '-'} deal=${result && result.dealId || '-'} reply=${result && result.sentReply && result.sentReply.ok ? 'yes' : 'no'} reason=${result && result.reason || result && result.reason || '-'}`);
+          });
+        }).catch((e) => console.error(`[wazzup-sales-pilot] Wazzup message=${msg.messageId || '?'}: ${e.message || e}`)));
+
+        continue;
 
         // v148: единый production-контур для ВСЕХ клиентов.
         // Больше нет отдельного Bobik-only маршрута: каждое inbound-сообщение
@@ -13953,7 +14065,7 @@ app.listen(PORT, () => {
   }
   console.log(`MAVIS Bitrix Expert Assistant v150 is running on port ${PORT}`);
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; ACTS_PUSH_V150=NEW_CLOSED_DEALS_ONLY; exact-inbound-binding=quoted-message/chat/channel/unique-fallback; historical-push-cutoff=${config.actsPushNewOnlyAfterIso}; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
-  console.log(`[startup] WAZZUP_INBOUND_AI_V150=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}`);
+  console.log(`[startup] WAZZUP_INBOUND_AI_V150=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}; salesPilot=${config.wazzupSalesPilotEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
   console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
@@ -14122,4 +14234,3 @@ function v144HumanVisibleComment(text) {
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
-
