@@ -10690,7 +10690,10 @@ async function clientDocsProcessIncomingAttachments({ source, commType, commValu
         fields: {
           ENTITY_ID: deal.ID,
           ENTITY_TYPE: 'deal',
-          COMMENT: `${CLIENT_DOCS_RECEIVED_MARKER}\n${JSON.stringify(receivedPayload)}\n\n📨 ИИгорь получил документы через ${source} и сохранил их в папку компании.\n${receivedText}\n\nНе хватает:\n${missingText}${actionsText}${warningsText}\n\n${CLIENT_DOCS_STATE_MARKER}\n${JSON.stringify(statePayload)}`,
+          // Человеческое резюме должно быть первым: Bitrix показывает начало комментария
+          // в ленте. Технические данные оставляем в конце, так как они нужны для
+          // восстановления состояния после перезапуска и защиты от лишнего напоминания.
+          COMMENT: `📨 ИИгорь получил документы через ${source} и сохранил их в папку компании.\n${receivedText}\n\nНе хватает:\n${missingText}${actionsText}${warningsText}\n\n${CLIENT_DOCS_RECEIVED_MARKER}\n${JSON.stringify(receivedPayload)}\n${CLIENT_DOCS_STATE_MARKER}\n${JSON.stringify(statePayload)}`,
         },
       });
 
