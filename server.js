@@ -1405,7 +1405,47 @@ function salesPilotUserName(user) {
   return actsCleanText(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`).toLocaleLowerCase('ru-RU');
 }
 
-function salesPilotConversationHistory(comments, limit = 12) { const turns = []; for (const item of comments || []) { const comment = String(item && item.COMMENT || ''); if (!comment.includes('[WAZZUP_SALES_PILOT]') && !comment.includes('[WAZZUP_SALES_PILOT_REPLY]')) continue; const clientPart = comment.split('Клиент: ')[1]; const mavisPart = comment.split('Mavis: ')[1]; if (clientPart) turns.push(`Клиент: ${actsCleanText(clientPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`); if (mavisPart) turns.push(`MAVIS: ${actsCleanText(mavisPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`); } return turns.reverse().slice(-limit); } function salesPilotHasUnseenService(reply, conversation) { const normalizedReply = actsCleanText(reply).toLocaleLowerCase('ru-RU'); const normalizedConversation = actsCleanText(conversation).toLocaleLowerCase('ru-RU'); const serviceWords = ['аттестац', 'генподряд', 'проектирован', 'лицензи', 'сертификат']; return serviceWords.some((word) => normalizedReply.includes(word) && !normalizedConversation.includes(word) && !(word === 'аттестац' && normalizedConversation.includes('генподряд'))); } function salesPilotAsksKnownPhone(reply) { return /(контактн\w*\s+(?:номер|телефон)|ваш\s+(?:номер|телефон)|номер\s+телефон|телефон\s+для\s+связ|(?:подскажите|укажите|оставьте).{0,50}(?:номер|телефон))/iu.test(String(reply || '')); } async function salesPilotResolveRop() {
+const salesPilotInboundIds = new Map();
+
+function salesPilotRememberInbound(externalId) {
+  const id = String(externalId || '').trim();
+  if (!id) return false;
+  const now = Date.now();
+  for (const [key, seenAt] of salesPilotInboundIds.entries()) {
+    if (now - seenAt > 24 * 60 * 60 * 1000) salesPilotInboundIds.delete(key);
+  }
+  if (salesPilotInboundIds.has(id)) return true;
+  salesPilotInboundIds.set(id, now);
+  return false;
+}
+
+function salesPilotVisibleComment({ clientText, reply = '', status = '' }) {
+  const lines = ['ИИгорь: диалог с клиентом обработан.'];
+  if (clientText) lines.push(`Клиент: ${actsCleanText(clientText).slice(0, 3000)}`);
+  if (reply) lines.push(`MAVIS: ${actsCleanText(reply).slice(0, 3000)}`);
+  if (status) lines.push(status);
+  return lines.join('\n');
+}
+
+function salesPilotConversationHistory(comments, limit = 12) {
+  const turns = [];
+  // actsLoadTimelineComments returns newest first; restore chronological order
+  // before keeping the client/MAVIS turns together.
+  for (const item of (comments || []).slice().reverse()) {
+    const comment = String(item && item.COMMENT || '');
+    // Старые служебные записи читаем для обратной совместимости; новые пишем человеческим текстом.
+    if (!comment.includes('[WAZZUP_SALES_PILOT]') && !comment.includes('[WAZZUP_SALES_PILOT_REPLY]') && !comment.startsWith('ИИгорь: диалог с клиентом обработан.')) continue;
+    const clientPart = comment.split('Клиент: ')[1];
+    const mavisPart = comment.split('Mavis: ')[1] || comment.split('MAVIS: ')[1];
+    if (clientPart) turns.push(`Клиент: ${actsCleanText(clientPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`);
+    if (mavisPart) turns.push(`MAVIS: ${actsCleanText(mavisPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`);
+  }
+  return turns.slice(-limit);
+}
+
+function salesPilotHasUnseenService(reply, conversation) { const normalizedReply = actsCleanText(reply).toLocaleLowerCase('ru-RU'); const normalizedConversation = actsCleanText(conversation).toLocaleLowerCase('ru-RU'); const serviceWords = ['аттестац', 'генподряд', 'проектирован', 'лицензи', 'сертификат']; return serviceWords.some((word) => normalizedReply.includes(word) && !normalizedConversation.includes(word) && !(word === 'аттестац' && normalizedConversation.includes('генподряд'))); }
+function salesPilotAsksKnownPhone(reply) { return /(контактн\w*\s+(?:номер|телефон)|ваш\s+(?:номер|телефон)|номер\s+телефон|телефон\s+для\s+связ|(?:подскажите|укажите|оставьте).{0,50}(?:номер|телефон))/iu.test(String(reply || '')); }
+async function salesPilotResolveRop() {
   const users = await bitrixRestList('user.get', { FILTER: { ACTIVE: 'Y' } }, 500);
   const matches = users.filter((u) => salesPilotUserName(u) === 'александра вербицкая');
   if (matches.length !== 1 || !matches[0].ID) {
@@ -1459,7 +1499,7 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
   const external = actsCleanText(msg && msg.messageId || '').replace(/\s+/g, '_').slice(0, 160);
   const comments = await actsLoadTimelineComments(binding.deal.ID, 100).catch(() => []);
   const marker = `[WAZZUP_SALES_PILOT] message=${external}`;
-  if (external && comments.some((c) => String(c && c.COMMENT || '').includes(marker))) {
+  if (external && (salesPilotRememberInbound(external) || comments.some((c) => String(c && c.COMMENT || '').includes(marker)))) {
     return { handled: true, action: 'no_reply', reason: 'duplicate' };
   }
 
@@ -1490,16 +1530,13 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
     decision = { ...decision, action: 'human', reply: '', reason: 'unsafe_or_low_confidence' };
   }
 
-  await actsSmartDialogAddComment(binding.deal.ID,
-    `${marker} channel=${channelKey || msg.chatType || '-'}\nКлиент: ${cleanText.slice(0, 3000)}\nРешение: ${JSON.stringify({ action: decision.action, confidence: decision.confidence, reason: decision.reason })}`
-  ).catch(() => {});
-
   if (decision.intent === 'new_purchase' && decision.confidence >= 0.999) {
     try {
       const created = await salesPilotCreateLead({ binding, phone, channelKey, text: cleanText, external, decision });
-      await actsSmartDialogAddComment(binding.deal.ID,
-        `[WAZZUP_SALES_PILOT_LEAD_CREATED] message=${external} lead=${created.leadId} rop=${created.rop.ID}`
-      ).catch(() => {});
+      await actsSmartDialogAddComment(binding.deal.ID, salesPilotVisibleComment({
+        clientText: cleanText,
+        status: `По обращению создан тестовый лид #${created.leadId}; ответственный РОП уведомлён.`,
+      })).catch(() => {});
       return { handled: true, action: 'lead_created', leadId: created.leadId, reason: decision.reason };
     } catch (e) {
       decision = { ...decision, action: 'human', reply: '', reason: `lead_creation_failed:${String(e.message || e).slice(0, 180)}` };
@@ -1507,6 +1544,10 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
   }
 
   if (decision.action === 'human') {
+    await actsSmartDialogAddComment(binding.deal.ID, salesPilotVisibleComment({
+      clientText: cleanText,
+      status: 'Автоответ не отправлен: обращение передано ответственному сотруднику.',
+    })).catch(() => {});
     await actsSmartDialogNotifyExpert(binding.deal,
       `Тестовый клиент написал: «${cleanText.slice(0, 800)}». Нужен ответ специалиста; автоответ не отправлен.`
     ).catch(() => {});
@@ -1527,11 +1568,16 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
       ignoreStrictPreferredChannel: true,
       crmMessageId: `mavis-sales-pilot-${binding.deal.ID}-${external || Date.now()}`,
     });
-    await actsSmartDialogAddComment(binding.deal.ID,
-      `[WAZZUP_SALES_PILOT_REPLY] message=${external || '-'}\nMavis: ${decision.reply}`
-    ).catch(() => {});
+    await actsSmartDialogAddComment(binding.deal.ID, salesPilotVisibleComment({
+      clientText: cleanText,
+      reply: decision.reply,
+    })).catch(() => {});
     return { handled: true, action: 'reply', reason: decision.reason };
   } catch (e) {
+    await actsSmartDialogAddComment(binding.deal.ID, salesPilotVisibleComment({
+      clientText: cleanText,
+      status: 'Автоответ не отправлен: обращение передано ответственному сотруднику.',
+    })).catch(() => {});
     await actsSmartDialogNotifyExpert(binding.deal,
       `Тестовый клиент написал: «${cleanText.slice(0, 800)}». Автоответ не отправлен: ${String(e.message || e).slice(0, 300)}.`
     ).catch(() => {});
@@ -4166,6 +4212,18 @@ function preferredChannelLabel(channel) {
   return { telegram: 'Telegram', viber: 'Viber', email: 'Email' }[channel] || 'не определён';
 }
 
+function actsDeliveryChannelPlan(preferredChannel) {
+  const all = ['telegram', 'viber', 'email'];
+  if (preferredChannel === 'email') return ['email'];
+  if (preferredChannel === 'telegram' || preferredChannel === 'viber') {
+    // Почта идёт сразу после выбранного мессенджера как дополнительная доставка.
+    // Второй мессенджер нужен только если предыдущие способы не доставили сам акт.
+    return [preferredChannel, 'email', ...all.filter((x) => x !== preferredChannel && x !== 'email')];
+  }
+  // Неизвестное/пустое значение поля не должно оставлять клиента без акта.
+  return all;
+}
+
 // v84: для актов при нескольких контактах НЕ используем CONTACT_ID наугад/по умолчанию.
 // Выбираем контакт, с которым в этой сделке была последняя переписка (email/чат/мессенджер).
 // Если контактов несколько, а переписку однозначно определить не удалось — автоотправку блокируем.
@@ -4308,6 +4366,76 @@ async function actsResolveRecipientContact(deal, preferredContactId = '') {
     reason: `В сделке ${contactIds.length} контакта(ов), но не удалось однозначно определить контакт по последней переписке. Автоотправка акта заблокирована, чтобы не написать неактуальному человеку.`,
     contactIds,
   };
+}
+
+// Для первичной отправки акта допустим управляемый fallback: сначала контакт с
+// последней перепиской, затем основной контакт сделки, остальные привязанные
+// контакты и в самом конце компания. Это отличается от actsResolveRecipientContact:
+// последняя остаётся строгой для повторных пушей, где нельзя менять адресата.
+async function actsResolveDeliveryRecipients(deal) {
+  const result = [];
+  const used = new Set();
+  const add = (candidate) => {
+    if (!candidate || !candidate.entity || !candidate.entityId) return;
+    const key = `${candidate.entityTypeId}:${candidate.entityId}`;
+    if (used.has(key)) return;
+    used.add(key);
+    result.push(candidate);
+  };
+
+  const strict = await actsResolveRecipientContact(deal).catch(() => null);
+  if (strict && strict.ok) {
+    add({
+      entityId: String(strict.contactId),
+      entityTypeId: 3,
+      entity: strict.contact,
+      label: strict.label,
+      source: strict.source,
+    });
+  }
+
+  const contactIds = await actsGetDealContactIds(deal);
+  for (const contactId of contactIds) {
+    const contact = await actsGetContactProfile(contactId);
+    if (!contact) continue;
+    add({
+      entityId: String(contactId),
+      entityTypeId: 3,
+      entity: contact,
+      label: actsContactLabel(contact, contactId),
+      source: String(deal && deal.CONTACT_ID) === String(contactId) ? 'primary-contact' : 'linked-contact',
+    });
+  }
+
+  if (deal && deal.COMPANY_ID) {
+    try {
+      const company = await bitrixRestCall('crm.company.get', { id: deal.COMPANY_ID });
+      if (company) {
+        add({
+          entityId: String(deal.COMPANY_ID),
+          entityTypeId: 4,
+          entity: company,
+          label: actsCleanText(company.TITLE || company.COMPANY_TITLE || '') || `компания ${deal.COMPANY_ID}`,
+          source: 'company',
+        });
+      }
+    } catch (e) {
+      console.warn(`[acts-recipient] deal=${deal && deal.ID}: не смог получить компанию для fallback: ${e.message || e}`);
+    }
+  }
+
+  if (!result.length) {
+    return { ok: false, reason: 'В сделке нет доступного контакта или компании для доставки акта.' };
+  }
+  return { ok: true, recipients: result };
+}
+
+function actsEntityPhone(candidate) {
+  return actsContactPhone(candidate && candidate.entity);
+}
+
+function actsEntityEmail(candidate) {
+  return actsContactEmail(candidate && candidate.entity);
 }
 
 async function getContactPhone(deal) {
@@ -10775,7 +10903,7 @@ app.get('/api/acts/file/:token/:filename', (req, res) => {
   return res.status(200).send(item.buffer);
 });
 
-async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file) {
+async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file, recipientEntityType = 3) {
   const dealId = deal.ID;
   const responsibleId = deal.ASSIGNED_BY_ID || 1;
   let staff = null;
@@ -10798,7 +10926,7 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file) {
     COMPLETED: 'Y',
     START_TIME: new Date().toISOString(),
     END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: Number(recipientEntityType || 3), TYPE: 'EMAIL' }],
   };
 
   if (staff && staff.EMAIL) {
@@ -10827,143 +10955,145 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     return { ok: false, skipped: true, message: 'В задаче не найден файл акта. Автоотправка полностью заблокирована: пустое сообщение клиенту не отправляю.' };
   }
 
-  const preferredChannel = await detectPreferredChannelResolved(deal);
-  if (!preferredChannel) {
-    const pref = preferredRawValue(deal);
-    return { ok: false, skipped: true, message: `В сделке не распознано поле «Предпочитаемый канал связи» (поле ${pref.code || 'не найдено'}, значение ${String(pref.raw || 'пусто')}). Нужно выбрать Email / Telegram / Viber.` };
-  }
-
-  // v84: при нескольких контактах выбираем того, с кем была последняя переписка.
-  const recipient = await actsResolveRecipientContact(deal);
-  if (!recipient.ok) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), message: recipient.reason || 'Не удалось определить актуальный контакт для отправки.' };
-  }
-
   const text = actsBuildClientMessage(deal, task, file);
   const taskId = String(actsTaskField(task, ['id','ID']) || '');
-  const contactId = String(recipient.contactId || '');
+  const preferredChannel = await detectPreferredChannelResolved(deal);
+  const recipientsResult = await actsResolveDeliveryRecipients(deal);
+  if (!recipientsResult.ok) {
+    return { ok: false, skipped: true, message: recipientsResult.reason };
+  }
 
-  if (preferredChannel === 'email') {
-    const email = actsContactEmail(recipient.contact);
-    if (!email) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: `Выбран актуальный контакт «${recipient.label}», но у него нет email. На email компании/другого контакта автоматически НЕ переключаюсь.` };
-    }
+  const attempts = [];
+  let primary = null;
+  let emailCopy = null;
+  let preparedWazzupFile = null;
+  let emailValidated = false;
 
-    // Для email требуем именно прикрепляемый Bitrix-файл, а не просто ссылку.
+  const tryEmail = async () => {
+    if (emailCopy) return emailCopy;
     const storageIds = actsBuildEmailStorageElementIds(file);
     if (!storageIds.length) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: 'Файл найден, но Bitrix не дал attachment-id для вложения в письмо. Пустое письмо без акта не отправляю.' };
+      attempts.push({ channel: 'email', error: 'Bitrix не дал attachment-id для вложения' });
+      return null;
     }
-    try {
-      await actsDownloadRealFile(file); // валидация: URL реально отдаёт бинарный файл, а не HTML/PHP-заглушку
-    } catch (e) {
-      return { ok: false, skipped: true, channel: 'Email', contactId, message: `Файл акта не удалось скачать/проверить (${e.message || e}). Письмо без файла не отправляю.` };
-    }
-
-    await sendActEmailThroughBitrix(deal, contactId, email, text, file);
-    return {
-      ok: true,
-      channel: 'Email',
-      contactId,
-      contactLabel: recipient.label,
-      recipientSource: recipient.source,
-      email: maskEmailForLog(email),
-      file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
-      note: `Письмо отправлено через Bitrix (COMPLETED=Y) контакту «${recipient.label}».`,
-    };
-  }
-
-  const phone = actsContactPhone(recipient.contact);
-  if (!phone) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), contactId, message: `Выбран актуальный контакт «${recipient.label}», но у него нет телефона. На другого контакта автоматически НЕ переключаюсь.` };
-  }
-
-  const ch = getConfiguredWazzupChannel(preferredChannel);
-  if (!ch || !ch.channelId || ch.key !== preferredChannel) {
-    return { ok: false, skipped: true, channel: preferredChannelLabel(preferredChannel), contactId, message: `В сделке выбран ${preferredChannelLabel(preferredChannel)}, но именно этот Wazzup-канал не настроен в Render. На другой канал автоматически НЕ переключаюсь.` };
-  }
-
-  const textMarker = `[MAVIS_ACTS_TEXT_SENT] task=${taskId}`;
-  const fileMarker = `[MAVIS_ACTS_FILE_SENT] task=${taskId}`;
-  const textAlreadySent = taskId ? await fgTimelineHasMarker(deal.ID, textMarker, 50) : false;
-  const fileAlreadySent = taskId ? await fgTimelineHasMarker(deal.ID, fileMarker, 50) : false;
-
-  let textResult = null;
-  let fileResult = null;
-  let preparedFile = null;
-
-  // v84: сначала убеждаемся, что реальный файл можно скачать и подготовить.
-  // Только после успешной проверки разрешаем вообще отправлять клиенту что-либо.
-  if (!fileAlreadySent) {
-    try {
-      preparedFile = await actsPrepareWazzupFile(file);
-    } catch (e) {
-      return {
-        ok: false,
-        skipped: true,
-        channel: preferredChannelLabel(preferredChannel),
-        contactId,
-        message: `Не удалось подготовить реальный файл акта (${e.message || e}). Сообщение без файла клиенту НЕ отправлено.`,
-      };
-    }
-  }
-
-  try {
-    // Сначала отправляем файл. Если Wazzup отверг файл — текст не уйдёт и не будет "пустого" сообщения.
-    if (!fileAlreadySent) {
-      fileResult = await sendWazzupFileInternal({
-        channelKey: preferredChannel,
-        contentUri: preparedFile.url,
-        phone,
-        dealId: deal.ID,
-        fileName: preparedFile.fileName,
-        crmMessageId: taskId ? `mavis-acts-file-${preferredChannel}-${deal.ID}-${taskId}` : '',
-      });
-      if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `Файл акта отправлен клиенту через ${preferredChannelLabel(preferredChannel)}.` } });
+    if (!emailValidated) {
+      try {
+        await actsDownloadRealFile(file);
+        emailValidated = true;
+      } catch (e) {
+        attempts.push({ channel: 'email', error: `файл не прошёл проверку: ${e.message || e}` });
+        return null;
       }
     }
-
-    // Текст отправляем только если файл уже был отправлен раньше или только что успешно ушёл.
-    if (!textAlreadySent) {
-      textResult = await sendWazzupMessageInternal({
-        channelKey: preferredChannel,
-        text,
-        phone,
-        dealId: deal.ID,
-        ignoreStrictPreferredChannel: true,
-        crmMessageId: taskId ? `mavis-acts-text-${preferredChannel}-${deal.ID}-${taskId}` : '',
-      });
-      if (taskId) {
-        await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal', COMMENT: `Сообщение по акту отправлено клиенту через ${preferredChannelLabel(preferredChannel)}.` } });
+    for (const recipient of recipientsResult.recipients) {
+      const email = actsEntityEmail(recipient);
+      if (!email) continue;
+      try {
+        await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId);
+        emailCopy = {
+          ok: true, channel: 'Email', contactId: recipient.entityId, contactLabel: recipient.label,
+          recipientSource: recipient.source, email: maskEmailForLog(email), recipientEntityType: recipient.entityTypeId,
+        };
+        return emailCopy;
+      } catch (e) {
+        attempts.push({ channel: 'email', recipient: recipient.label, error: e.message || String(e) });
       }
     }
-  } catch (e) {
+    attempts.push({ channel: 'email', error: 'нет доступного адреса у контактов и компании' });
+    return null;
+  };
+
+  const tryWazzup = async (channel) => {
+    const configured = getConfiguredWazzupChannel(channel);
+    if (!configured || !configured.channelId || configured.key !== channel) {
+      attempts.push({ channel, error: `${preferredChannelLabel(channel)} не настроен` });
+      return null;
+    }
+    if (!preparedWazzupFile) {
+      try {
+        preparedWazzupFile = await actsPrepareWazzupFile(file);
+      } catch (e) {
+        attempts.push({ channel, error: `файл не подготовлен: ${e.message || e}` });
+        return null;
+      }
+    }
+    for (const recipient of recipientsResult.recipients) {
+      const phone = actsEntityPhone(recipient);
+      if (!phone) continue;
+      try {
+        // Файл — обязательный результат доставки. Текст отправляем после файла; его ошибка
+        // не запускает повторную отправку самого файла и не создаёт технический комментарий.
+        const fileResult = await sendWazzupFileInternal({
+          channelKey: channel, contentUri: preparedWazzupFile.url, phone, dealId: deal.ID,
+          fileName: preparedWazzupFile.fileName,
+          crmMessageId: taskId ? `mavis-acts-file-${channel}-${deal.ID}-${taskId}` : '',
+        });
+        let textResult = null;
+        let textError = '';
+        try {
+          textResult = await sendWazzupMessageInternal({
+            channelKey: channel, text, phone, dealId: deal.ID, ignoreStrictPreferredChannel: true,
+            crmMessageId: taskId ? `mavis-acts-text-${channel}-${deal.ID}-${taskId}` : '',
+          });
+        } catch (e) {
+          textError = e.message || String(e);
+          attempts.push({ channel, recipient: recipient.label, error: `текст после файла не отправлен: ${textError}` });
+        }
+        return {
+          ok: true, channel: preferredChannelLabel(channel), channelKey: channel,
+          contactId: recipient.entityId, contactLabel: recipient.label, recipientSource: recipient.source,
+          phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
+          wazzupChannelId: String((textResult && textResult.data && textResult.data.channelId) || (fileResult && fileResult.data && fileResult.data.channelId) || configured.channelId || ''),
+          wazzupChatId: String((textResult && textResult.data && textResult.data.chatId) || (fileResult && fileResult.data && fileResult.data.chatId) || phone || ''),
+          wazzupMessageId: String((textResult && textResult.data && textResult.data.messageId) || ''),
+          wazzupFileMessageId: String((fileResult && fileResult.data && fileResult.data.messageId) || ''),
+          file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
+          partial: { fileSent: true, textSent: Boolean(textResult), textError },
+        };
+      } catch (e) {
+        attempts.push({ channel, recipient: recipient.label, error: e.message || String(e), possiblyDelivered: Boolean(e.possiblyDelivered) });
+      }
+    }
+    attempts.push({ channel, error: 'нет доступного телефона у контактов и компании' });
+    return null;
+  };
+
+  for (const channel of actsDeliveryChannelPlan(preferredChannel)) {
+    if (channel === 'email') {
+      const sent = await tryEmail();
+      if (sent && !primary) primary = sent;
+      // После успеха в мессенджере email — дополнительная копия; его ошибка не отменяет доставку.
+      if (primary && (preferredChannel === 'email' || primary.channel !== 'Email')) break;
+      continue;
+    }
+    if (primary) continue;
+    const sent = await tryWazzup(channel);
+    if (sent) primary = sent;
+  }
+
+  if (!primary) {
     return {
       ok: false,
-      channel: preferredChannelLabel(preferredChannel),
-      contactId,
-      contactLabel: recipient.label,
-      error: e.message || String(e),
-      possiblyDelivered: Boolean(e.possiblyDelivered),
-      partial: { textSent: textAlreadySent || Boolean(textResult), fileSent: fileAlreadySent || Boolean(fileResult) },
+      skipped: true,
+      channel: preferredChannel ? preferredChannelLabel(preferredChannel) : 'fallback',
+      message: 'Не удалось доставить акт ни по одному доступному каналу. ' +
+        attempts.map((x) => `${preferredChannelLabel(x.channel)}${x.recipient ? ` / ${x.recipient}` : ''}: ${x.error}`).join('; '),
+      attempts,
     };
   }
 
-  return {
+  const result = {
+    ...primary,
     ok: true,
-    channel: (fileResult && fileResult.channel && fileResult.channel.label) || (textResult && textResult.channel && textResult.channel.label) || preferredChannelLabel(preferredChannel),
-    contactId,
-    contactLabel: recipient.label,
-    recipientSource: recipient.source,
-    phone: phone.replace(/(\d{3})\d+(\d{3})$/, '$1***$2'),
-    wazzupChannelId: String((textResult && textResult.data && textResult.data.channelId) || (fileResult && fileResult.data && fileResult.data.channelId) || (getConfiguredWazzupChannel(preferredChannel) || {}).channelId || ''),
-    wazzupChatId: String((textResult && textResult.data && textResult.data.chatId) || (fileResult && fileResult.data && fileResult.data.chatId) || phone || ''),
-    wazzupMessageId: String((textResult && textResult.data && textResult.data.messageId) || ''),
-    wazzupFileMessageId: String((fileResult && fileResult.data && fileResult.data.messageId) || ''),
-    file: { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
-    partial: { textSent: true, fileSent: true },
+    file: primary.file || { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
+    attempts,
   };
+  if (emailCopy && primary.channel !== 'Email') {
+    result.emailCopy = emailCopy;
+    result.channel = `${primary.channel} + Email`;
+    result.email = emailCopy.email;
+  }
+  return result;
 }
 
 
@@ -11079,13 +11209,18 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
     const pushStateLine = sendResult && sendResult.ok
       ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()} wazzupChatId=${sendResult.wazzupChatId || ''} wazzupChannelId=${sendResult.wazzupChannelId || ''} wazzupMessageId=${sendResult.wazzupMessageId || ''} wazzupFileMessageId=${sendResult.wazzupFileMessageId || ''}`
       : '';
-    await bitrixRestCall('crm.timeline.comment.add', {
-      fields: {
-        ENTITY_ID: dealId,
-        ENTITY_TYPE: 'deal',
-        COMMENT: `${sendResult && sendResult.ok ? sentMarker : failedMarker}\n${doneMarker}${pushStateLine}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
-      },
-    });
+    // Одна итоговая запись на исход задачи. Повтор polling-а после ошибки не должен
+    // каждый раз плодить одинаковые технические комментарии в сделке.
+    const outcomeMarker = sendResult && sendResult.ok ? sentMarker : failedMarker;
+    if (!await fgTimelineHasMarker(dealId, outcomeMarker, 100)) {
+      await bitrixRestCall('crm.timeline.comment.add', {
+        fields: {
+          ENTITY_ID: dealId,
+          ENTITY_TYPE: 'deal',
+          COMMENT: `${outcomeMarker}\n${doneMarker}${pushStateLine}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
+        },
+      });
+    }
     if (sendResult && sendResult.ok) {
       await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, contactId: sendResult.contactId || '', sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '', wazzupChatId: sendResult.wazzupChatId || '', wazzupChannelId: sendResult.wazzupChannelId || '', wazzupMessageId: sendResult.wazzupMessageId || '', wazzupFileMessageId: sendResult.wazzupFileMessageId || '' });
     }
