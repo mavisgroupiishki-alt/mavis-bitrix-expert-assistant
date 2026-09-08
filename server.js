@@ -1404,7 +1404,7 @@ function salesPilotUserName(user) {
   return actsCleanText(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`).toLocaleLowerCase('ru-RU');
 }
 
-async function salesPilotResolveRop() {
+function salesPilotConversationHistory(comments, limit = 12) { const turns = []; for (const item of comments || []) { const comment = String(item && item.COMMENT || ''); if (!comment.includes('[WAZZUP_SALES_PILOT]') && !comment.includes('[WAZZUP_SALES_PILOT_REPLY]')) continue; const clientPart = comment.split('Клиент: ')[1]; const mavisPart = comment.split('Mavis: ')[1]; if (clientPart) turns.push(`Клиент: ${actsCleanText(clientPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`); if (mavisPart) turns.push(`MAVIS: ${actsCleanText(mavisPart.split(String.fromCharCode(10))[0]).slice(0, 600)}`); } return turns.reverse().slice(-limit); } function salesPilotHasUnseenService(reply, conversation) { const normalizedReply = actsCleanText(reply).toLocaleLowerCase('ru-RU'); const normalizedConversation = actsCleanText(conversation).toLocaleLowerCase('ru-RU'); const serviceWords = ['аттестац', 'генподряд', 'проектирован', 'лицензи', 'сертификат']; return serviceWords.some((word) => normalizedReply.includes(word) && !normalizedConversation.includes(word)); } function salesPilotAsksKnownPhone(reply) { return /(контактн\w*\s+(?:номер|телефон)|ваш\s+(?:номер|телефон)|номер\s+телефон|телефон\s+для\s+связ|(?:подскажите|укажите|оставьте).{0,50}(?:номер|телефон))/iu.test(String(reply || '')); } async function salesPilotResolveRop() {
   const users = await bitrixRestList('user.get', { FILTER: { ACTIVE: 'Y' } }, 500);
   const matches = users.filter((u) => salesPilotUserName(u) === 'александра вербицкая');
   if (matches.length !== 1 || !matches[0].ID) {
@@ -1462,14 +1462,14 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
     return { handled: true, action: 'no_reply', reason: 'duplicate' };
   }
 
-  const commercialRisk = /(цен|стоимост|скидк|дешев|срок|когда готов|гарант|договор|оплат|предоплат|рассроч|возврат|претенз|жалоб|суд|юрист)/iu.test(cleanText);
+  const history = salesPilotConversationHistory(comments); const conversation = [...history, `Клиент: ${cleanText}`].join(String.fromCharCode(10)); const commercialRisk = /(цен|стоимост|скидк|дешев|срок|когда готов|гарант|договор|оплат|предоплат|рассроч|возврат|претенз|жалоб|суд|юрист)/iu.test(cleanText);
   let decision = { action: 'human', intent: 'unclear', reply: '', confidence: 0, reason: 'not_classified' };
 
   try {
       const raw = await callAiChatCompletion({
         model: config.aiModel,
         temperature: 0,
-        messages: [{ role: 'user', content: `Ты AI-помощник отдела продаж MAVIS GROUP в тесте одного клиента. Верни только JSON: {"action":"reply|human|no_reply","intent":"new_purchase|current_deal|general|unclear","reply":"...","confidence":0..1,"reason":"..."}.\nnew_purchase ставь ТОЛЬКО если клиент недвусмысленно хочет купить новую, отдельную услугу; вопрос по уже купленной/оплаченной/производственной сделке — current_deal. Любая цена, срок, скидка, гарантия, оплата, договор, претензия, юридический вопрос или неоднозначность — action human и пустой reply. Автоответ допустим только для безопасного общего вопроса. Не выдумывай факты и не называй цену/срок.\nСообщение: ${cleanText.slice(0, 3000)}` }],
+        messages: [{ role: 'user', content: `Ты AI-помощник отдела продаж MAVIS GROUP в тесте одного клиента. Верни только JSON: {"action":"reply|human|no_reply","intent":"new_purchase|current_deal|general|unclear","reply":"...","confidence":0..1,"reason":"..."}. new_purchase ставь ТОЛЬКО если клиент недвусмысленно хочет купить новую, отдельную услугу; вопрос по уже купленной или производственной сделке — current_deal. Любая цена, срок, скидка, гарантия, оплата, договор, претензия, юридический вопрос или неоднозначность — action human и пустой reply. Автоответ допустим только для безопасного общего вопроса. Не выдумывай факты и не называй цену или срок. Номер клиента уже получен из Wazzup: НИКОГДА не проси телефон, контактный номер, e-mail или иной способ связи. Называй услугу только если клиент прямо назвал её ниже; не подменяй и не угадывай услугу. Продолжай текущий диалог без нового приветствия и не повторяй уже полученные сведения. Если клиент уже назвал услугу и город, безопасный следующий вопрос — про объект и планируемые работы. История диалога: ${history.length ? history.join(String.fromCharCode(10)) : 'Истории пока нет.'} Новое сообщение клиента: ${cleanText.slice(0, 3000)}` }],
       });
       const match = String(raw || '').match(/\{[\s\S]*\}/);
       if (!match) throw new Error('AI returned no JSON');
@@ -1485,7 +1485,7 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
     decision = { action: 'human', intent: 'unclear', reply: '', confidence: 0, reason: `ai_error:${String(e.message || e).slice(0, 160)}` };
   }
 
-  if (commercialRisk || decision.confidence < 0.75 || /(цен|стоимост|скидк|срок|гарант|оплат|договор)/iu.test(decision.reply || '')) {
+  if (commercialRisk || decision.confidence < 0.75 || /(цен|стоимост|скидк|срок|гарант|оплат|договор)/iu.test(decision.reply || '') || salesPilotAsksKnownPhone(decision.reply) || salesPilotHasUnseenService(decision.reply, conversation)) {
     decision = { ...decision, action: 'human', reply: '', reason: 'unsafe_or_low_confidence' };
   }
 
