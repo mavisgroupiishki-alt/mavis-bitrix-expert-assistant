@@ -22,6 +22,7 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 const AdmZip = require('adm-zip');
 const { intakeKey, intakeTitle, normalizeRecruitingIntake } = require('./recruiting-intake');
+const { createRabotaByClient, rabotaResponseToIntake } = require('./rabota-by');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +62,12 @@ function parseIdList(value) {
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+function boundedPositiveInteger(value, fallback, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(Math.floor(parsed), maximum);
 }
 
 const config = {
@@ -147,6 +154,10 @@ const config = {
   recruitingCategoryId: Number(process.env.RECRUITING_CATEGORY_ID || 34),
   recruitingRecruiterId: process.env.RECRUITING_RECRUITER_ID || '',
   recruitingTasksEnabled: String(process.env.RECRUITING_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
+  // Источник откликов менеджеров и экспертов. Токен только в секретах Render; импорт запускается вручную.
+  rabotaByAccessToken: process.env.RABOTA_BY_ACCESS_TOKEN || '',
+  rabotaByUserAgent: process.env.RABOTA_BY_USER_AGENT || '',
+  rabotaBySyncLimit: boundedPositiveInteger(process.env.RABOTA_BY_SYNC_LIMIT, 50, 100),
   // Только этот номер телефона обрабатывается живым ботом — пилотная сделка 34946.
   liveChatTestPhone: process.env.LIVE_CHAT_TEST_PHONE || '',
   liveChatTestDealId: process.env.LIVE_CHAT_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || '',
@@ -480,6 +491,48 @@ async function createRecruitingTask(dealId, intake) {
   } });
 }
 
+function recruitingServiceUnavailableError() {
+  if (!config.recruitingIntakeEnabled) return new Error('Приём откликов выключен.');
+  if (!config.recruitingRecruiterId || !config.recruitingCategoryId) return new Error('Не задан ответственный рекрутер или воронка найма.');
+  return null;
+}
+
+async function processRecruitingIntake(payload) {
+  const intake = normalizeRecruitingIntake(payload);
+  const fieldMap = await loadRecruitingFieldMap();
+  const sourceValue = fieldMap.HR_SOURCE[intake.source];
+  const existing = await bitrixRestList('crm.deal.list', {
+    filter: {
+      CATEGORY_ID: config.recruitingCategoryId,
+      [fieldMap.HR_SOURCE.fieldName]: sourceValue,
+      [fieldMap.HR_SOURCE_APPLICATION_ID.fieldName]: intake.applicationId,
+    },
+    select: ['ID', fieldMap.HR_AUTOMATION_STATUS.fieldName],
+    order: { ID: 'ASC' },
+  }, 2);
+  const current = existing[0];
+  if (current && [fieldMap.HR_AUTOMATION_STATUS['На паузе'], fieldMap.HR_AUTOMATION_STATUS['Только вручную']].includes(current[fieldMap.HR_AUTOMATION_STATUS.fieldName])) {
+    return { ok: true, action: 'paused', dealId: String(current.ID), externalActions: false };
+  }
+
+  const correlationId = crypto.randomUUID();
+  if (current) {
+    await bitrixRestCall('crm.deal.update', { id: current.ID, fields: recruitingDealFields(intake, fieldMap, correlationId, false) });
+    return { ok: true, action: 'updated', dealId: String(current.ID), externalActions: false };
+  }
+
+  const created = await bitrixRestCall('crm.deal.add', { fields: recruitingDealFields(intake, fieldMap, correlationId, true) });
+  const dealId = String(created && (created.id || created.ID) || created || '');
+  if (!dealId) throw new Error('Bitrix24 не вернул ID созданной сделки найма.');
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: dealId,
+    ENTITY_TYPE: 'deal',
+    COMMENT: `[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
+  } });
+  await createRecruitingTask(dealId, intake);
+  return { ok: true, action: 'created', dealId, externalActions: false };
+}
+
 app.get('/api/recruiting/status', (req, res) => {
   if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
   res.json({
@@ -493,47 +546,70 @@ app.get('/api/recruiting/status', (req, res) => {
 
 app.post('/api/recruiting/intake', async (req, res) => {
   if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
-  if (!config.recruitingIntakeEnabled) return res.status(503).json({ ok: false, error: 'Приём откликов выключен.' });
-  if (!config.recruitingRecruiterId || !config.recruitingCategoryId) {
-    return res.status(503).json({ ok: false, error: 'Не задан ответственный рекрутер или воронка найма.' });
-  }
+  const unavailable = recruitingServiceUnavailableError();
+  if (unavailable) return res.status(503).json({ ok: false, error: unavailable.message });
   try {
-    const intake = normalizeRecruitingIntake(req.body);
-    const fieldMap = await loadRecruitingFieldMap();
-    const sourceValue = fieldMap.HR_SOURCE[intake.source];
-    const existing = await bitrixRestList('crm.deal.list', {
-      filter: {
-        CATEGORY_ID: config.recruitingCategoryId,
-        [fieldMap.HR_SOURCE.fieldName]: sourceValue,
-        [fieldMap.HR_SOURCE_APPLICATION_ID.fieldName]: intake.applicationId,
-      },
-      select: ['ID', fieldMap.HR_AUTOMATION_STATUS.fieldName],
-      order: { ID: 'ASC' },
-    }, 2);
-    const current = existing[0];
-    if (current && [fieldMap.HR_AUTOMATION_STATUS['На паузе'], fieldMap.HR_AUTOMATION_STATUS['Только вручную']].includes(current[fieldMap.HR_AUTOMATION_STATUS.fieldName])) {
-      return res.status(202).json({ ok: true, action: 'paused', dealId: String(current.ID), externalActions: false });
-    }
-
-    const correlationId = crypto.randomUUID();
-    if (current) {
-      await bitrixRestCall('crm.deal.update', { id: current.ID, fields: recruitingDealFields(intake, fieldMap, correlationId, false) });
-      return res.json({ ok: true, action: 'updated', dealId: String(current.ID), externalActions: false });
-    }
-
-    const created = await bitrixRestCall('crm.deal.add', { fields: recruitingDealFields(intake, fieldMap, correlationId, true) });
-    const dealId = String(created && (created.id || created.ID) || created || '');
-    if (!dealId) throw new Error('Bitrix24 не вернул ID созданной сделки найма.');
-    await bitrixRestCall('crm.timeline.comment.add', { fields: {
-      ENTITY_ID: dealId,
-      ENTITY_TYPE: 'deal',
-      COMMENT: `[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
-    } });
-    await createRecruitingTask(dealId, intake);
-    return res.status(201).json({ ok: true, action: 'created', dealId, externalActions: false });
+    const result = await processRecruitingIntake(req.body);
+    return res.status(result.action === 'created' ? 201 : result.action === 'paused' ? 202 : 200).json(result);
   } catch (error) {
     console.error(`[recruiting-intake] ${error.message || String(error)}`);
     return res.status(400).json({ ok: false, error: error.message || 'Не удалось обработать отклик.' });
+  }
+});
+
+app.get('/api/recruiting/rabota/status', (req, res) => {
+  if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  res.json({
+    ok: true,
+    configured: Boolean(config.rabotaByAccessToken && config.rabotaByUserAgent),
+    intakeEnabled: config.recruitingIntakeEnabled,
+    maxPerRun: config.rabotaBySyncLimit,
+    roles: ['Менеджер по продажам', 'Эксперт'],
+    externalActions: false,
+  });
+});
+
+app.post('/api/recruiting/rabota/sync', async (req, res) => {
+  if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const vacancyId = String(body.vacancy_id || '').trim().slice(0, 200);
+  const role = String(body.role || '').trim();
+  const dryRun = body.dry_run !== false;
+  const limit = boundedPositiveInteger(body.limit, config.rabotaBySyncLimit, config.rabotaBySyncLimit);
+  if (!vacancyId) return res.status(400).json({ ok: false, error: 'vacancy_id обязателен.' });
+  if (!['Менеджер по продажам', 'Эксперт'].includes(role)) return res.status(400).json({ ok: false, error: 'Для Rabota.by поддерживаются только роли «Менеджер по продажам» и «Эксперт».' });
+  if (!dryRun) {
+    const unavailable = recruitingServiceUnavailableError();
+    if (unavailable) return res.status(503).json({ ok: false, error: unavailable.message });
+  }
+
+  try {
+    const client = createRabotaByClient({ accessToken: config.rabotaByAccessToken, userAgent: config.rabotaByUserAgent });
+    const collectionList = await client.listCollections(vacancyId);
+    const collection = (Array.isArray(collectionList.collections) ? collectionList.collections : []).find((item) => item && item.id === 'response' && item.url);
+    if (!collection) return res.status(404).json({ ok: false, error: 'Rabota.by не вернула коллекцию откликов для этой вакансии.' });
+    const responseList = await client.listResponses(collection.url);
+    const items = (Array.isArray(responseList.items) ? responseList.items : []).slice(0, limit);
+    const counts = { listed: items.length, mapped: 0, created: 0, updated: 0, paused: 0, errors: 0 };
+
+    for (const item of items) {
+      try {
+        const record = item && item.url ? await client.getResponse(item.url) : item;
+        const intakePayload = rabotaResponseToIntake(record, { vacancyId, role });
+        if (!intakePayload.application_id) throw new Error('Отклик не содержит ID.');
+        counts.mapped++;
+        if (!dryRun) {
+          const result = await processRecruitingIntake(intakePayload);
+          if (Object.hasOwn(counts, result.action)) counts[result.action]++;
+        }
+      } catch (_) {
+        counts.errors++;
+      }
+    }
+    return res.json({ ok: true, source: 'rabota.by', vacancyId, role, dryRun, counts, externalActions: false });
+  } catch (error) {
+    console.error(`[rabota-by-sync] ${error.message || String(error)}`);
+    return res.status(502).json({ ok: false, error: 'Не удалось получить отклики из Rabota.by. Проверьте подключение источника.' });
   }
 });
 
