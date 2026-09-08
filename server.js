@@ -23,6 +23,7 @@ const nodemailer = require('nodemailer');
 const AdmZip = require('adm-zip');
 const { intakeKey, intakeTitle, normalizeRecruitingIntake } = require('./recruiting-intake');
 const { createRabotaByClient, rabotaResponseToIntake } = require('./rabota-by');
+const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -154,6 +155,8 @@ const config = {
   recruitingCategoryId: Number(process.env.RECRUITING_CATEGORY_ID || 34),
   recruitingRecruiterId: process.env.RECRUITING_RECRUITER_ID || '',
   recruitingTasksEnabled: String(process.env.RECRUITING_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
+  recruitingStageTasksEnabled: String(process.env.RECRUITING_STAGE_TASKS_ENABLED || 'false').toLowerCase() === 'true',
+  recruitingStageTasksIntervalMinutes: boundedPositiveInteger(process.env.RECRUITING_STAGE_TASKS_INTERVAL_MINUTES, 5, 60),
   // Источник откликов менеджеров и экспертов. Токен только в секретах Render; импорт запускается вручную.
   rabotaByAccessToken: process.env.RABOTA_BY_ACCESS_TOKEN || '',
   rabotaByUserAgent: process.env.RABOTA_BY_USER_AGENT || '',
@@ -428,7 +431,7 @@ function recruitingEnumValue(field, label) {
 async function loadRecruitingFieldMap() {
   const fields = await bitrixRestCall('crm.deal.userfield.list');
   const byXmlId = new Map((Array.isArray(fields) ? fields : []).map((field) => [String(field.XML_ID || ''), field]));
-  const required = ['HR_ROLE', 'HR_SOURCE', 'HR_SOURCE_APPLICATION_ID', 'HR_SOURCE_VACANCY_ID', 'HR_SOURCE_URL', 'HR_RECEIVED_AT', 'HR_DEDUP_KEY', 'HR_CANDIDATE_FULL_NAME', 'HR_CANDIDATE_PHONE', 'HR_CANDIDATE_EMAIL', 'HR_RESUME_URL', 'HR_CONDITIONS', 'HR_AUTOMATION_STATUS', 'HR_CORRELATION_ID', 'HR_LAST_SYNC_AT'];
+  const required = ['HR_ROLE', 'HR_SOURCE', 'HR_SOURCE_APPLICATION_ID', 'HR_SOURCE_VACANCY_ID', 'HR_SOURCE_URL', 'HR_RECEIVED_AT', 'HR_DEDUP_KEY', 'HR_CANDIDATE_FULL_NAME', 'HR_CANDIDATE_PHONE', 'HR_CANDIDATE_EMAIL', 'HR_RESUME_URL', 'HR_CONDITIONS', 'HR_DECISION_OWNER', 'HR_AUTOMATION_STATUS', 'HR_CORRELATION_ID', 'HR_LAST_SYNC_AT'];
   const map = {};
   for (const code of required) {
     const field = byXmlId.get(code);
@@ -491,6 +494,91 @@ async function createRecruitingTask(dealId, intake) {
   } });
 }
 
+function recruitingEnumLabel(field, value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const values = Array.isArray(field && field.LIST) ? field.LIST : Object.values(field && field.LIST || {});
+  const match = values.find((item) => String(item && (item.ID || item.VALUE_ID || item.VALUE) || '') === String(raw || ''));
+  return String(match && match.VALUE || raw || '').trim();
+}
+
+function recruitingTaskDeadline() {
+  const deadline = addWorkingDays(new Date(), 1);
+  deadline.setHours(18, 0, 0, 0);
+  return deadline.toISOString();
+}
+
+async function recruitingStageTaskAlreadyCreated(dealId, marker) {
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT'],
+    order: { ID: 'DESC' },
+  }, 100);
+  return comments.some((comment) => String(comment && comment.COMMENT || '').includes(marker));
+}
+
+let recruitingStageTasksRunning = false;
+
+async function runRecruitingStageTaskCycle(trigger = 'interval') {
+  if (recruitingStageTasksRunning) return { ok: true, skipped: 'already-running' };
+  if (!config.recruitingStageTasksEnabled || !config.recruitingTasksEnabled || !config.bitrixWebhookUrl) return { ok: true, skipped: 'disabled-or-no-webhook' };
+  if (!config.recruitingRecruiterId || !config.recruitingCategoryId) return { ok: false, skipped: 'missing-recruiter-or-category' };
+
+  recruitingStageTasksRunning = true;
+  try {
+    const fieldMap = await loadRecruitingFieldMap();
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: config.recruitingCategoryId },
+      select: [
+        'ID', 'STAGE_ID', 'MOVED_TIME',
+        fieldMap.HR_ROLE.fieldName,
+        fieldMap.HR_DECISION_OWNER.fieldName,
+        fieldMap.HR_AUTOMATION_STATUS.fieldName,
+      ],
+      order: { ID: 'ASC' },
+    }, 200);
+    let created = 0;
+    for (const deal of deals) {
+      const stageId = String(deal.STAGE_ID || '');
+      const marker = recruitingStageTaskMarker({ dealId: deal.ID, stageId, movedTime: deal.MOVED_TIME });
+      if (!marker) continue;
+      if (isRecruitingAutomationPaused(
+        deal[fieldMap.HR_AUTOMATION_STATUS.fieldName],
+        fieldMap.HR_AUTOMATION_STATUS['На паузе'],
+        fieldMap.HR_AUTOMATION_STATUS['Только вручную'],
+      )) continue;
+      const role = recruitingEnumLabel(fieldMap.HR_ROLE.field, deal[fieldMap.HR_ROLE.fieldName]);
+      const plan = recruitingStageTaskPlan({
+        stageId,
+        role,
+        decisionOwner: deal[fieldMap.HR_DECISION_OWNER.fieldName],
+        recruiterId: config.recruitingRecruiterId,
+      });
+      if (!plan || await recruitingStageTaskAlreadyCreated(deal.ID, marker)) continue;
+      await bitrixRestCall('tasks.task.add', { fields: {
+        TITLE: `НАЙМ: ${plan.title}`,
+        DESCRIPTION: `${plan.description}\n\nЭто внутренняя задача по сделке найма. Внешние сообщения, отказы и действия на площадках не выполнялись автоматически.`,
+        RESPONSIBLE_ID: plan.responsibleId,
+        DEADLINE: recruitingTaskDeadline(),
+        UF_CRM_TASK: [`D_${deal.ID}`],
+        PRIORITY: 1,
+      } });
+      await bitrixRestCall('crm.timeline.comment.add', { fields: {
+        ENTITY_ID: deal.ID,
+        ENTITY_TYPE: 'deal',
+        COMMENT: `${marker}\nАвтоматизация найма: создана внутренняя задача по текущему этапу. Внешние действия выключены.`,
+      } });
+      created++;
+      console.log(`[recruiting-stage-tasks] ${trigger}: task created for deal=${deal.ID}, stage=${stageId}.`);
+    }
+    return { ok: true, deals: deals.length, created };
+  } catch (error) {
+    console.error(`[recruiting-stage-tasks] ${trigger}: ${error.message || String(error)}`);
+    return { ok: false, error: 'cycle-failed' };
+  } finally {
+    recruitingStageTasksRunning = false;
+  }
+}
+
 function recruitingServiceUnavailableError() {
   if (!config.recruitingIntakeEnabled) return new Error('Приём откликов выключен.');
   if (!config.recruitingRecruiterId || !config.recruitingCategoryId) return new Error('Не задан ответственный рекрутер или воронка найма.');
@@ -524,10 +612,16 @@ async function processRecruitingIntake(payload) {
   const created = await bitrixRestCall('crm.deal.add', { fields: recruitingDealFields(intake, fieldMap, correlationId, true) });
   const dealId = String(created && (created.id || created.ID) || created || '');
   if (!dealId) throw new Error('Bitrix24 не вернул ID созданной сделки найма.');
+  const createdDeal = await bitrixRestCall('crm.deal.get', { id: dealId }).catch(() => null);
+  const initialStageMarker = recruitingStageTaskMarker({
+    dealId,
+    stageId: createdDeal && createdDeal.STAGE_ID,
+    movedTime: createdDeal && createdDeal.MOVED_TIME,
+  });
   await bitrixRestCall('crm.timeline.comment.add', { fields: {
     ENTITY_ID: dealId,
     ENTITY_TYPE: 'deal',
-    COMMENT: `[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
+    COMMENT: `${initialStageMarker ? `${initialStageMarker}\n` : ''}[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
   } });
   await createRecruitingTask(dealId, intake);
   return { ok: true, action: 'created', dealId, externalActions: false };
@@ -540,6 +634,7 @@ app.get('/api/recruiting/status', (req, res) => {
     enabled: config.recruitingIntakeEnabled,
     ready: Boolean(config.recruitingIntakeEnabled && config.recruitingIntakeToken && config.recruitingRecruiterId && config.recruitingCategoryId),
     categoryId: config.recruitingCategoryId,
+    stageTasksEnabled: config.recruitingStageTasksEnabled,
     externalActions: false,
   });
 });
@@ -14732,6 +14827,15 @@ app.listen(PORT, () => {
     setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
+  }
+
+  if (config.bitrixWebhookUrl && config.recruitingStageTasksEnabled && config.recruitingTasksEnabled) {
+    const recruitingStageTasksMs = config.recruitingStageTasksIntervalMinutes * 60 * 1000;
+    console.log(`[recruiting-stage-tasks] Включено: проверка этапов «Найм» каждые ${config.recruitingStageTasksIntervalMinutes} мин; этапы сделок не меняются.`);
+    setTimeout(() => runRecruitingStageTaskCycle('startup'), 5000);
+    setInterval(() => runRecruitingStageTaskCycle('interval'), recruitingStageTasksMs);
+  } else {
+    console.log('[recruiting-stage-tasks] Выключено. Для включения нужны RECRUITING_STAGE_TASKS_ENABLED=true, RECRUITING_TASKS_ENABLED=true и BITRIX_WEBHOOK_URL.');
   }
 
   if (config.bitrixWebhookUrl && config.actsTasksEnabled && config.actsSendToClientEnabled && config.actsDonePollEnabled) {
