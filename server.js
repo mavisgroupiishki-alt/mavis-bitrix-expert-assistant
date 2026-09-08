@@ -1400,6 +1400,48 @@ app.get('/api/acts-smart-dialog/diag', (_req, res) => {
   });
 });
 
+function salesPilotUserName(user) {
+  return actsCleanText(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`).toLocaleLowerCase('ru-RU');
+}
+
+async function salesPilotResolveRop() {
+  const users = await bitrixRestList('user.get', { FILTER: { ACTIVE: 'Y' } }, 500);
+  const matches = users.filter((u) => salesPilotUserName(u) === 'александра вербицкая');
+  if (matches.length !== 1 || !matches[0].ID) {
+    throw new Error(`РОП «Александра Вербицкая» не найден однозначно (matches=${matches.length})`);
+  }
+  return matches[0];
+}
+
+async function salesPilotCreateLead({ binding, phone, channelKey, text, external, decision }) {
+  const rop = await salesPilotResolveRop();
+  const marker = `[WAZZUP_SALES_PILOT_LEAD] message=${external}`;
+  const context = [
+    marker,
+    `Источник: Wazzup / ${channelKey || 'не определён'}.`,
+    `Клиент: ${actsCleanText(binding.contact && `${binding.contact.NAME || ''} ${binding.contact.LAST_NAME || ''}`) || 'контакт из тестовой сделки'}.`,
+    `Сообщение: ${text.slice(0, 3000)}`,
+    `Вывод ИИ: новая покупка; уверенность ${(Number(decision.confidence || 0) * 100).toFixed(1)}%; причина: ${decision.reason || '-'}.`,
+    `Клиент уже есть в CRM; исходная тестовая сделка: #${binding.deal.ID} «${actsCleanText(binding.deal.TITLE || '')}».`,
+    'ТЕСТОВЫЙ ЛИД: требуется проверить потребность и создать новую сделку только после квалификации.',
+  ].join('\n');
+  const leadId = await bitrixRestCall('crm.lead.add', { fields: {
+    TITLE: `ТЕСТ AI — новая покупка — ${actsCleanText(binding.deal.TITLE || 'клиент')}`.slice(0, 250),
+    NAME: binding.contact && binding.contact.NAME || '',
+    LAST_NAME: binding.contact && binding.contact.LAST_NAME || '',
+    PHONE: [{ VALUE: phone, VALUE_TYPE: 'WORK' }],
+    ASSIGNED_BY_ID: Number(rop.ID),
+    COMMENTS: context,
+  }});
+  if (!leadId) throw new Error('Bitrix не вернул ID созданного лида');
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: leadId, ENTITY_TYPE: 'lead', COMMENT: context,
+  }}).catch(() => {});
+  const notify = `ИИгорь: создан тестовый лид #${leadId} по новой покупке. Источник ${channelKey || 'Wazzup'}; сообщение: «${text.slice(0, 800)}».`;
+  await bitrixRestCall('im.notify.personal.add', { USER_ID: Number(rop.ID), MESSAGE: notify, MESSAGE_OUT: notify });
+  return { leadId: String(leadId), rop };
+}
+
 async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
   if (!config.wazzupSalesPilotEnabled) return { handled: false, reason: 'disabled' };
   if (String(phone || '').slice(-4) !== String(config.wazzupAiTestPhoneTail || '5898')) {
@@ -1421,36 +1463,47 @@ async function runBobikSalesPilotInbound({ msg, phone, channelKey, text }) {
   }
 
   const commercialRisk = /(цен|стоимост|скидк|дешев|срок|когда готов|гарант|договор|оплат|предоплат|рассроч|возврат|претенз|жалоб|суд|юрист)/iu.test(cleanText);
-  let decision = { action: 'human', reply: '', confidence: 1, reason: 'commercial_or_risk_request' };
+  let decision = { action: 'human', intent: 'unclear', reply: '', confidence: 0, reason: 'not_classified' };
 
-  if (!commercialRisk) {
-    try {
+  try {
       const raw = await callAiChatCompletion({
         model: config.aiModel,
         temperature: 0,
-        messages: [{ role: 'user', content: `Ты AI-помощник отдела продаж MAVIS GROUP в тесте только для одного клиента. Проанализируй сообщение клиента и верни только JSON: {"action":"reply|human|no_reply","reply":"...","confidence":0..1,"reason":"..."}.\nАвтоответ допустим только для безопасного общего вопроса: уточнить вид услуги, объект, город, контакты или следующий шаг. Любая цена, срок, скидка, гарантия, оплата, договор, претензия, юридический вопрос, неизвестный факт или неоднозначность — action human и пустой reply. Не выдумывай факты и не называй цену/срок.\nСообщение: ${cleanText.slice(0, 3000)}` }],
+        messages: [{ role: 'user', content: `Ты AI-помощник отдела продаж MAVIS GROUP в тесте одного клиента. Верни только JSON: {"action":"reply|human|no_reply","intent":"new_purchase|current_deal|general|unclear","reply":"...","confidence":0..1,"reason":"..."}.\nnew_purchase ставь ТОЛЬКО если клиент недвусмысленно хочет купить новую, отдельную услугу; вопрос по уже купленной/оплаченной/производственной сделке — current_deal. Любая цена, срок, скидка, гарантия, оплата, договор, претензия, юридический вопрос или неоднозначность — action human и пустой reply. Автоответ допустим только для безопасного общего вопроса. Не выдумывай факты и не называй цену/срок.\nСообщение: ${cleanText.slice(0, 3000)}` }],
       });
       const match = String(raw || '').match(/\{[\s\S]*\}/);
       if (!match) throw new Error('AI returned no JSON');
       const parsed = JSON.parse(match[0]);
       decision = {
         action: ['reply', 'human', 'no_reply'].includes(String(parsed.action)) ? String(parsed.action) : 'human',
+        intent: ['new_purchase', 'current_deal', 'general', 'unclear'].includes(String(parsed.intent)) ? String(parsed.intent) : 'unclear',
         reply: actsCleanText(parsed.reply || ''),
         confidence: Math.max(0, Math.min(1, Number(parsed.confidence || 0))),
         reason: actsCleanText(parsed.reason || 'ai_classification'),
       };
-    } catch (e) {
-      decision = { action: 'human', reply: '', confidence: 0, reason: `ai_error:${String(e.message || e).slice(0, 160)}` };
-    }
+  } catch (e) {
+    decision = { action: 'human', intent: 'unclear', reply: '', confidence: 0, reason: `ai_error:${String(e.message || e).slice(0, 160)}` };
   }
 
-  if (decision.confidence < 0.75 || /(цен|стоимост|скидк|срок|гарант|оплат|договор)/iu.test(decision.reply || '')) {
+  if (commercialRisk || decision.confidence < 0.75 || /(цен|стоимост|скидк|срок|гарант|оплат|договор)/iu.test(decision.reply || '')) {
     decision = { ...decision, action: 'human', reply: '', reason: 'unsafe_or_low_confidence' };
   }
 
   await actsSmartDialogAddComment(binding.deal.ID,
     `${marker} channel=${channelKey || msg.chatType || '-'}\nКлиент: ${cleanText.slice(0, 3000)}\nРешение: ${JSON.stringify({ action: decision.action, confidence: decision.confidence, reason: decision.reason })}`
   ).catch(() => {});
+
+  if (decision.intent === 'new_purchase' && decision.confidence >= 0.999) {
+    try {
+      const created = await salesPilotCreateLead({ binding, phone, channelKey, text: cleanText, external, decision });
+      await actsSmartDialogAddComment(binding.deal.ID,
+        `[WAZZUP_SALES_PILOT_LEAD_CREATED] message=${external} lead=${created.leadId} rop=${created.rop.ID}`
+      ).catch(() => {});
+      return { handled: true, action: 'lead_created', leadId: created.leadId, reason: decision.reason };
+    } catch (e) {
+      decision = { ...decision, action: 'human', reply: '', reason: `lead_creation_failed:${String(e.message || e).slice(0, 180)}` };
+    }
+  }
 
   if (decision.action === 'human') {
     await actsSmartDialogNotifyExpert(binding.deal,
