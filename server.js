@@ -21,6 +21,7 @@ const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 const AdmZip = require('adm-zip');
+const { intakeKey, intakeTitle, normalizeRecruitingIntake } = require('./recruiting-intake');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -139,6 +140,13 @@ const config = {
   // разделе "Разработчикам" → "Входящий вебхук"), нужен серверу для работы с Bitrix без открытого
   // браузера (вебхук от Wazzup может прийти в любой момент, когда никто не открыл Bitrix).
   bitrixWebhookUrl: (process.env.BITRIX_WEBHOOK_URL || '').replace(/\/+$/, ''),
+  // Приём откликов в изолированную воронку «Найм». По умолчанию выключен, пока не заданы
+  // секрет интеграции и конкретный рекрутер. Сообщения кандидатам и действия на площадках не выполняются.
+  recruitingIntakeEnabled: String(process.env.RECRUITING_INTAKE_ENABLED || 'false').toLowerCase() === 'true',
+  recruitingIntakeToken: process.env.RECRUITING_INTAKE_TOKEN || '',
+  recruitingCategoryId: Number(process.env.RECRUITING_CATEGORY_ID || 34),
+  recruitingRecruiterId: process.env.RECRUITING_RECRUITER_ID || '',
+  recruitingTasksEnabled: String(process.env.RECRUITING_TASKS_ENABLED || 'true').toLowerCase() !== 'false',
   // Только этот номер телефона обрабатывается живым ботом — пилотная сделка 34946.
   liveChatTestPhone: process.env.LIVE_CHAT_TEST_PHONE || '',
   liveChatTestDealId: process.env.LIVE_CHAT_TEST_DEAL_ID || process.env.EXECUTOR_TEST_DEAL_ID || '',
@@ -336,11 +344,12 @@ async function bitrixRestCall(method, params = {}) {
       || /позвони клиенту.*4\+.*час/i.test(title)
       || /я отправил ход работы клиенту/i.test(title)
       || /не смог отправить ход работы клиенту/i.test(title);
-    if (!isForemanTask && !isActsTask && !isCoreAssistantTask) {
+    const isRecruitingTask = /^НАЙМ:/i.test(title) && config.recruitingTasksEnabled;
+    if (!isForemanTask && !isActsTask && !isCoreAssistantTask && !isRecruitingTask) {
       console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
       return { task: { id: null, blocked: true } };
     }
-    const kind = isActsTask ? 'acts' : (isForemanTask ? 'foreman' : 'core-assistant');
+    const kind = isActsTask ? 'acts' : (isForemanTask ? 'foreman' : (isRecruitingTask ? 'recruiting' : 'core-assistant'));
     console.log(`[tasks] allowed as ${kind} task: ${title || 'без названия'}`);
   }
   if (!config.bitrixWebhookUrl) throw new Error('BITRIX_WEBHOOK_URL не задан в Render Environment — без него сервер не может сам обращаться к Bitrix.');
@@ -388,6 +397,141 @@ async function bitrixRestList(method, params = {}, limit = 200) {
   }
   return out.slice(0, limit);
 }
+
+function recruitingBearerMatches(header) {
+  const expected = Buffer.from(String(config.recruitingIntakeToken || ''));
+  const actual = Buffer.from(String(header || '').replace(/^Bearer\s+/i, ''));
+  return expected.length > 0 && expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function recruitingEnumValue(field, label) {
+  const values = Array.isArray(field && field.LIST) ? field.LIST : Object.values(field && field.LIST || {});
+  const match = values.find((item) => String(item && item.VALUE || '') === label);
+  return match && (match.ID || match.VALUE_ID || match.VALUE);
+}
+
+async function loadRecruitingFieldMap() {
+  const fields = await bitrixRestCall('crm.deal.userfield.list');
+  const byXmlId = new Map((Array.isArray(fields) ? fields : []).map((field) => [String(field.XML_ID || ''), field]));
+  const required = ['HR_ROLE', 'HR_SOURCE', 'HR_SOURCE_APPLICATION_ID', 'HR_SOURCE_VACANCY_ID', 'HR_SOURCE_URL', 'HR_RECEIVED_AT', 'HR_DEDUP_KEY', 'HR_CANDIDATE_FULL_NAME', 'HR_CANDIDATE_PHONE', 'HR_CANDIDATE_EMAIL', 'HR_RESUME_URL', 'HR_CONDITIONS', 'HR_AUTOMATION_STATUS', 'HR_CORRELATION_ID', 'HR_LAST_SYNC_AT'];
+  const map = {};
+  for (const code of required) {
+    const field = byXmlId.get(code);
+    if (!field || !field.FIELD_NAME) throw new Error(`В Bitrix24 отсутствует поле найма ${code}. Сначала запустите recruiting-bitrix-bootstrap.js --apply.`);
+    map[code] = { fieldName: field.FIELD_NAME, field };
+  }
+  for (const [code, labels] of Object.entries({
+    HR_ROLE: ['Менеджер по продажам', 'Эксперт', 'Прораб'],
+    HR_SOURCE: ['rabota.by', 'Kufar', 'Ручной'],
+    HR_AUTOMATION_STATUS: ['Включена', 'На паузе', 'Только вручную'],
+  })) {
+    for (const label of labels) {
+      const value = recruitingEnumValue(map[code].field, label);
+      if (!value) throw new Error(`В Bitrix24 отсутствует значение «${label}» поля ${code}.`);
+      map[code][label] = value;
+    }
+  }
+  return map;
+}
+
+function recruitingDealFields(intake, fieldMap, correlationId, isNew) {
+  const fields = {
+    [fieldMap.HR_SOURCE_APPLICATION_ID.fieldName]: intake.applicationId,
+    [fieldMap.HR_RECEIVED_AT.fieldName]: intake.receivedAt,
+    [fieldMap.HR_DEDUP_KEY.fieldName]: intakeKey(intake),
+    [fieldMap.HR_LAST_SYNC_AT.fieldName]: new Date().toISOString(),
+    [fieldMap.HR_CORRELATION_ID.fieldName]: correlationId,
+  };
+  if (isNew) {
+    Object.assign(fields, {
+      TITLE: intakeTitle(intake),
+      CATEGORY_ID: config.recruitingCategoryId,
+      STAGE_ID: `C${config.recruitingCategoryId}:NEW`,
+      ASSIGNED_BY_ID: config.recruitingRecruiterId,
+      [fieldMap.HR_ROLE.fieldName]: fieldMap.HR_ROLE[intake.role],
+      [fieldMap.HR_SOURCE.fieldName]: fieldMap.HR_SOURCE[intake.source],
+      [fieldMap.HR_AUTOMATION_STATUS.fieldName]: fieldMap.HR_AUTOMATION_STATUS['Включена'],
+    });
+  }
+  const optional = [
+    ['HR_SOURCE_VACANCY_ID', intake.vacancyId],
+    ['HR_SOURCE_URL', intake.sourceUrl],
+    ['HR_CANDIDATE_FULL_NAME', intake.candidate.fullName],
+    ['HR_CANDIDATE_PHONE', intake.candidate.phone],
+    ['HR_CANDIDATE_EMAIL', intake.candidate.email],
+    ['HR_RESUME_URL', intake.candidate.resumeUrl],
+    ['HR_CONDITIONS', intake.conditions],
+  ];
+  for (const [code, value] of optional) if (value) fields[fieldMap[code].fieldName] = value;
+  return fields;
+}
+
+async function createRecruitingTask(dealId, intake) {
+  return bitrixRestCall('tasks.task.add', { fields: {
+    TITLE: `НАЙМ: проверить новый отклик — ${intake.role}`,
+    DESCRIPTION: `Новый отклик из ${intake.source}. Проверьте карточку кандидата и назначьте следующий шаг.\n\nВнешние сообщения и изменение статуса на площадке не выполнялись автоматически.`,
+    RESPONSIBLE_ID: config.recruitingRecruiterId,
+    UF_CRM_TASK: [`D_${dealId}`],
+    PRIORITY: 1,
+  } });
+}
+
+app.get('/api/recruiting/status', (req, res) => {
+  if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  res.json({
+    ok: true,
+    enabled: config.recruitingIntakeEnabled,
+    ready: Boolean(config.recruitingIntakeEnabled && config.recruitingIntakeToken && config.recruitingRecruiterId && config.recruitingCategoryId),
+    categoryId: config.recruitingCategoryId,
+    externalActions: false,
+  });
+});
+
+app.post('/api/recruiting/intake', async (req, res) => {
+  if (!recruitingBearerMatches(req.get('authorization'))) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
+  if (!config.recruitingIntakeEnabled) return res.status(503).json({ ok: false, error: 'Приём откликов выключен.' });
+  if (!config.recruitingRecruiterId || !config.recruitingCategoryId) {
+    return res.status(503).json({ ok: false, error: 'Не задан ответственный рекрутер или воронка найма.' });
+  }
+  try {
+    const intake = normalizeRecruitingIntake(req.body);
+    const fieldMap = await loadRecruitingFieldMap();
+    const sourceValue = fieldMap.HR_SOURCE[intake.source];
+    const existing = await bitrixRestList('crm.deal.list', {
+      filter: {
+        CATEGORY_ID: config.recruitingCategoryId,
+        [fieldMap.HR_SOURCE.fieldName]: sourceValue,
+        [fieldMap.HR_SOURCE_APPLICATION_ID.fieldName]: intake.applicationId,
+      },
+      select: ['ID', fieldMap.HR_AUTOMATION_STATUS.fieldName],
+      order: { ID: 'ASC' },
+    }, 2);
+    const current = existing[0];
+    if (current && [fieldMap.HR_AUTOMATION_STATUS['На паузе'], fieldMap.HR_AUTOMATION_STATUS['Только вручную']].includes(current[fieldMap.HR_AUTOMATION_STATUS.fieldName])) {
+      return res.status(202).json({ ok: true, action: 'paused', dealId: String(current.ID), externalActions: false });
+    }
+
+    const correlationId = crypto.randomUUID();
+    if (current) {
+      await bitrixRestCall('crm.deal.update', { id: current.ID, fields: recruitingDealFields(intake, fieldMap, correlationId, false) });
+      return res.json({ ok: true, action: 'updated', dealId: String(current.ID), externalActions: false });
+    }
+
+    const created = await bitrixRestCall('crm.deal.add', { fields: recruitingDealFields(intake, fieldMap, correlationId, true) });
+    const dealId = String(created && (created.id || created.ID) || created || '');
+    if (!dealId) throw new Error('Bitrix24 не вернул ID созданной сделки найма.');
+    await bitrixRestCall('crm.timeline.comment.add', { fields: {
+      ENTITY_ID: dealId,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `[MAVIS_RECRUITING_INTAKE] Новый отклик получен из ${intake.source}. Автоматические сообщения, отказы и действия на площадке выключены.`,
+    } });
+    await createRecruitingTask(dealId, intake);
+    return res.status(201).json({ ok: true, action: 'created', dealId, externalActions: false });
+  } catch (error) {
+    console.error(`[recruiting-intake] ${error.message || String(error)}`);
+    return res.status(400).json({ ok: false, error: error.message || 'Не удалось обработать отклик.' });
+  }
+});
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'mavis-bitrix-expert-assistant' });
