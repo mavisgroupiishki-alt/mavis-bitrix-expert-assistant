@@ -10670,9 +10670,8 @@ async function actsHistoricalFetchWazzupDump(monthRaw) {
   const apiKeys = [...new Set([
     process.env.WAZZUP_API_KEY,
     process.env.WAZZUP_SIDECAR_KEY,
-    process.env.WAZZUP_CRM_KEY,
   ].map((value) => actsCleanText(value)).filter(Boolean))];
-  if (!apiKeys.length) throw new Error('WAZZUP_API_KEY / WAZZUP_SIDECAR_KEY / WAZZUP_CRM_KEY не задан');
+  if (!apiKeys.length) throw new Error('WAZZUP_API_KEY / WAZZUP_SIDECAR_KEY не задан');
   const range = actsHistoricalMonthRange(monthRaw);
   // Конец не ограничиваем августом: клиент мог вернуть августовский акт в первые дни сентября.
   const endAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
