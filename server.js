@@ -10667,33 +10667,24 @@ function actsHistoricalWazzupAttachment(row) {
 }
 
 async function actsHistoricalFetchWazzupDump(monthRaw) {
-  const apiKeys = [...new Set([
-    process.env.WAZZUP_API_KEY,
-    process.env.WAZZUP_SIDECAR_KEY,
-  ].map((value) => actsCleanText(value)).filter(Boolean))];
-  if (!apiKeys.length) throw new Error('WAZZUP_API_KEY / WAZZUP_SIDECAR_KEY не задан');
+  // messages_dump относится к partner API v2: обычный API/Sidecar ключ Wazzup
+  // (который используется для отправок и вебхуков) для него не подходит.
+  const accessToken = actsCleanText(process.env.WAZZUP_CLIENT_ACCESS_TOKEN);
+  if (!accessToken) {
+    throw new Error('WAZZUP_CLIENT_ACCESS_TOKEN не задан: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
+  }
   const range = actsHistoricalMonthRange(monthRaw);
   // Конец не ограничиваем августом: клиент мог вернуть августовский акт в первые дни сентября.
   const endAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const baseUrl = (process.env.WAZZUP_TECH_BASE_URL || 'https://tech.wazzup24.com').replace(/\/$/, '');
-  let apiKey = '';
   let createdBody = {};
-  let lastStatus = 0;
-  for (const candidateKey of apiKeys) {
-    const created = await fetch(`${baseUrl}/v2/messages/messages_dump`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${candidateKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ start_at: `${range.startIso}T00:00:00.000Z`, end_at: endAt }),
-    });
-    createdBody = await created.json().catch(() => ({}));
-    if (created.ok) {
-      apiKey = candidateKey;
-      break;
-    }
-    lastStatus = created.status;
-    if (created.status !== 401 && created.status !== 403) break;
-  }
-  if (!apiKey) throw new Error(`Wazzup export: HTTP ${lastStatus || 'unknown'}`);
+  const created = await fetch(`${baseUrl}/v2/messages/messages_dump`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ start_at: `${range.startIso}T00:00:00.000Z`, end_at: endAt }),
+  });
+  createdBody = await created.json().catch(() => ({}));
+  if (!created.ok) throw new Error(`Wazzup export: HTTP ${created.status}`);
   const exportId = actsCleanText(createdBody && createdBody.data && createdBody.data.export_id);
   if (!exportId) throw new Error('Wazzup export не вернул export_id');
   console.log(`[acts-historical-wazzup] Запрошена выгрузка ${monthRaw}; job=${exportId.slice(0, 8)}…`);
@@ -10701,7 +10692,7 @@ async function actsHistoricalFetchWazzupDump(monthRaw) {
   let exportUrl = '';
   for (let attempt = 1; attempt <= 30; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 10_000));
-    const statusResponse = await fetch(`${baseUrl}/v2/messages/messages_dump/${encodeURIComponent(exportId)}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    const statusResponse = await fetch(`${baseUrl}/v2/messages/messages_dump/${encodeURIComponent(exportId)}`, { headers: { Authorization: `Bearer ${accessToken}` } });
     const statusBody = await statusResponse.json().catch(() => ({}));
     if (!statusResponse.ok) throw new Error(`Wazzup export status: HTTP ${statusResponse.status}`);
     const status = actsCleanText(statusBody && statusBody.data && statusBody.data.status).toLowerCase();
