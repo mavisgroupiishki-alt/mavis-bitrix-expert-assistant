@@ -23,10 +23,37 @@
 В Render Environment добавить:
 ```
 MAIL_IMAP_USER=mavis.group@mail.ru
-MAIL_IMAP_PASSWORD=srAe0UetFAWY5EweM29P
+MAIL_IMAP_PASSWORD=пароль_приложения_из_секретов_Render
 MAIL_IMAP_HOST=imap.mail.ru
 MAIL_IMAP_PORT=993
 ```
+
+Для предварительного просмотра и безопасной очистки уже созданных технических комментариев
+в воронке Производства задай отдельный `ACTS_MAINTENANCE_TOKEN`. Затем выполни защищённый
+`POST /api/maintenance/production-comment-cleanup` с `Authorization: Bearer <token>` без
+`execute` — ответ вернёт только список кандидатов. Удаление выполняется исключительно при
+`{"execute":true}` после проверки этого списка.
+
+## Секреты служебных маршрутов
+
+В Render должны быть заданы разные длинные случайные значения для:
+```
+MAVIS_ADMIN_TOKEN=...
+ACTS_ROBOT_TOKEN=...
+ACTS_MAINTENANCE_TOKEN=...
+ACTS_RECON_TOKEN=...
+FOREMAN_ROBOT_TOKEN=...
+WAZZUP_CRM_KEY=...
+```
+
+`MAVIS_ADMIN_TOKEN`, `ACTS_MAINTENANCE_TOKEN`, `ACTS_RECON_TOKEN` и `WAZZUP_CRM_KEY`
+передавай только в заголовке `Authorization: Bearer <token>`. `ACTS_RECON_TOKEN` нужен
+даже для отчёта-сверки; его отправка разрешена только через POST. Для роботов Bitrix
+`ACTS_ROBOT_TOKEN` и `FOREMAN_ROBOT_TOKEN` можно передать как поле `token` в POST-теле,
+если робот не умеет задать HTTP-заголовок. Если Bitrix при скачивании файлов перенаправляет
+на отдельный доверенный домен, добавь его в
+`BITRIX_FILE_DOWNLOAD_HOSTS` через запятую.
+
 Пароль — это специальный "пароль для внешнего приложения", созданный в настройках безопасности Mail.ru (раздел "Безопасность" → "Внешние сервисы"), не обычный пароль от ящика.
 
 ## Ограничения текущей версии

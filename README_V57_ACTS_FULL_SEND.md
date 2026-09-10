@@ -27,14 +27,14 @@ WAZZUP_VIBER_CHAT_TYPE=viber
 
 ## Хендлер робота в проекте «Акты счета» на стадии «Сделано»
 
-```text
-https://mavis-bitrix-expert-assistant.onrender.com/api/acts/task-done?task_id={{ID}}
-```
+Настрой исходящий вебхук как `POST` на `https://mavis-bitrix-expert-assistant.onrender.com/api/acts/task-done`
+с полями `task_id={{ID}}` и `token=<ACTS_ROBOT_TOKEN>`. GET-ссылка больше не подходит:
+она отклоняется, чтобы исключить случайный повтор отправки акта.
 
 ## Ручная проверка
 
 ```text
-https://mavis-bitrix-expert-assistant.onrender.com/api/acts/task-done?task_id=ID_ЗАДАЧИ_АКТА
+POST /api/acts/task-done  (task_id=ID_ЗАДАЧИ_АКТА, token=<ACTS_ROBOT_TOKEN>)
 ```
 
 ## Важно

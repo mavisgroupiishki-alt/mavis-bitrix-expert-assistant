@@ -26,6 +26,8 @@ const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = 
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
+const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('./acts-delivery');
+const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -245,7 +247,8 @@ const config = {
   foremanSuggestionScanEnabled: String(process.env.FOREMAN_SUGGESTION_SCAN_ENABLED || 'true').toLowerCase() !== 'false',
   foremanMaxProductionDeals: Number(process.env.FOREMAN_MAX_PRODUCTION_DEALS || 300),
   // v51: Роботы Bitrix запускают ИИгоря сразу при привязке/закрытии сделки.
-  // Если задан FOREMAN_ROBOT_TOKEN, его нужно передавать в body/query робота как token.
+  // Если задан FOREMAN_ROBOT_TOKEN, передай его в POST-теле робота как token
+  // (или в Authorization: Bearer, если робот умеет выставлять заголовки).
   foremanRobotToken: process.env.FOREMAN_ROBOT_TOKEN || '',
   foremanPropagateToCompanyDeals: String(process.env.FOREMAN_PROPAGATE_TO_COMPANY_DEALS || 'true').toLowerCase() !== 'false',
   // v53: антидубль для бизнес-процессов Bitrix. Когда сервер сам проставляет прораба
@@ -433,6 +436,14 @@ function recruitingBearerMatches(header) {
   const expected = Buffer.from(String(config.recruitingIntakeToken || ''));
   const actual = Buffer.from(String(header || '').replace(/^Bearer\s+/i, ''));
   return expected.length > 0 && expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function mavisAdminAuthorized(req) {
+  return authorizationMatchesToken(req, process.env.MAVIS_ADMIN_TOKEN);
+}
+
+function actsRobotAuthorized(req) {
+  return requestMatchesToken(req, process.env.ACTS_ROBOT_TOKEN);
 }
 
 function rabotaByWebhookMatches(value) {
@@ -1302,6 +1313,7 @@ async function callAiChatCompletion({ model, temperature, messages }) {
 }
 
 app.post('/api/ai/analyze-deal', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     if (!config.aiEnabled) {
       res.status(400).json({ ok: false, error: 'ИИ пока выключен. Добавь AI_ENABLED=true и AI_API_KEY в Render Environment.' });
@@ -1432,6 +1444,7 @@ function findChannelKeyByChannelId(channelId) {
 
 
 app.get('/api/wazzup/channels', async (_req, res) => {
+  if (!mavisAdminAuthorized(_req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     const apiKey = process.env.WAZZUP_API_KEY || '';
     const baseUrl = (process.env.WAZZUP_BASE_URL || 'https://api.wazzup24.com/v3').replace(/\/$/, '');
@@ -1636,6 +1649,7 @@ async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, u
 }
 
 app.post('/api/wazzup/send', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     const body = req.body || {};
     const result = await sendWazzupMessageInternal({
@@ -1653,6 +1667,7 @@ app.post('/api/wazzup/send', async (req, res) => {
 });
 
 app.get('/api/wazzup/webhook-status', async (_req, res) => {
+  if (!mavisAdminAuthorized(_req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     // Проверяем статус через тот же ключ, которым регистрировали — Sidecar если задан.
     const apiKey = process.env.WAZZUP_SIDECAR_KEY || process.env.WAZZUP_API_KEY || '';
@@ -1678,6 +1693,7 @@ app.get('/api/wazzup/webhook-status', async (_req, res) => {
 });
 
 app.get('/api/debug/deal-activities/:dealId', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     const dealId = req.params.dealId;
     const acts = await bitrixRestList('crm.activity.list', {
@@ -1705,6 +1721,7 @@ app.get('/api/debug/deal-activities/:dealId', async (req, res) => {
 });
 
 app.post('/api/autopilot/reset/:dealId', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   // Сбрасывает маркер автопилота для конкретной сделки — нужно если автопилот упал с ошибкой
   // и пометил сделку как обработанную, хотя реально ничего не сделал.
   try {
@@ -1738,6 +1755,7 @@ app.post('/api/autopilot/reset/:dealId', async (req, res) => {
 });
 
 app.post('/api/deals/siblings', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   // Находим другие сделки той же компании на той же стадии "Эксперт назначен".
   // Вызывается ручным автопилотом перед формированием контекста — чтобы объединить
   // все услуги одной компании в один общий ход работы и одно сообщение клиенту.
@@ -1765,6 +1783,7 @@ app.post('/api/deals/siblings', async (req, res) => {
 });
 
 app.post('/api/wazzup/register-webhook', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     // Для регистрации вебхука используем Sidecar API key (если задан) — именно он связан
     // с нативной Bitrix24-интеграцией Wazzup, и вебхуки в этом режиме приходят только
@@ -1989,6 +2008,7 @@ async function actsV135WithTimeout(promise, ms, fallbackValue) {
 }
 
 app.get('/api/acts-smart-dialog/diag', (_req, res) => {
+  if (!mavisAdminAuthorized(_req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     ok: true,
@@ -2209,28 +2229,13 @@ app.post('/api/wazzup/webhook', async (req, res) => {
   try {
     const messages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
     const auth = String(req.headers.authorization || '');
-    const authRequired = !!config.wazzupCrmKey;
-    const authMatches = !authRequired || auth === `Bearer ${config.wazzupCrmKey}`;
+    const authMatches = authorizationMatchesToken(req, config.wazzupCrmKey);
 __wazzupAck({ ok: true, received: true });
     console.log(`[wazzup-webhook] POST получен: messages=${messages.length}; auth=${auth ? 'present' : 'none'}; authMatches=${authMatches}; summaries=${JSON.stringify(messages.slice(0, 5).map(wazzupWebhookMessageLogSummary))}`);
 
     if (!authMatches) {
-      // v137.1: Wazzup на некоторых подключениях присылает реальные webhook-события
-      // без Authorization, даже если в Render остался старый WAZZUP_CRM_KEY.
-      // Раньше в этом случае мы принимали только inbound-файлы. Из-за этого ТЕКСТОВЫЙ
-      // ответ клиента отбрасывался до hard-stop и AI.
-      // Безопасно принимаем только реальные inbound-сообщения нашего известного channelId.
-      const safeInbound = messages.filter((msg) => {
-        if (!msg || msg.isEcho || String(msg.status || '').toLowerCase() !== 'inbound') return false;
-        return wazzupWebhookKnownChannel(msg);
-      });
-      if (!safeInbound.length) {
-        console.warn('[wazzup-webhook] Authorization не совпал; inbound нашего известного Wazzup-канала не найден → webhook проигнорирован.');
-        __wazzupAck({ ok: true });
-        return;
-      }
-      console.warn(`[wazzup-webhook] Authorization не совпал, но найдено inbound-сообщений нашего Wazzup-канала: ${safeInbound.length}. Обрабатываю их.`);
-      req.body = { ...req.body, messages: safeInbound };
+      console.warn('[wazzup-webhook] Authorization не совпал или WAZZUP_CRM_KEY не задан → webhook проигнорирован.');
+      return;
     }
 
     const acceptedMessages = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
@@ -2468,6 +2473,7 @@ function resolveTranscribeProvider() {
 }
 
 app.post('/api/ai/transcribe-url', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     if (!config.callTranscriptionEnabled) {
       res.status(400).json({ ok: false, error: 'Расшифровка звонков выключена. Добавь CALL_TRANSCRIPTION_ENABLED=true в Render.' });
@@ -2478,15 +2484,28 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
       res.status(400).json({ ok: false, error: 'Не передан URL аудиозаписи.' });
       return;
     }
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch (_) {
+      return res.status(400).json({ ok: false, error: 'Некорректный URL аудиозаписи.' });
+    }
+    const bitrixHost = (() => {
+      try { return new URL(config.bitrixWebhookUrl).hostname; } catch (_) { return ''; }
+    })();
+    if (parsedUrl.protocol !== 'https:' || !bitrixHost || parsedUrl.hostname !== bitrixHost) {
+      return res.status(400).json({ ok: false, error: 'Аудиозапись должна быть HTTPS-ссылкой из подключённого портала Bitrix24.' });
+    }
     const ai = resolveTranscribeProvider();
     if (!ai.apiKey) {
       res.status(400).json({ ok: false, error: 'Не задан ключ для расшифровки. Добавь TRANSCRIBE_API_KEY или AI_API_KEY.' });
       return;
     }
 
-    const audioResp = await fetch(url);
+    const audioResp = await fetch(url, { redirect: 'error' });
     if (!audioResp.ok) throw new Error(`Не удалось скачать аудио: HTTP ${audioResp.status}`);
+    const declaredSize = Number(audioResp.headers.get('content-length') || 0);
+    if (declaredSize > 25 * 1024 * 1024) throw new Error('Аудиозапись больше 25 МБ.');
     const arrayBuffer = await audioResp.arrayBuffer();
+    if (arrayBuffer.byteLength > 25 * 1024 * 1024) throw new Error('Аудиозапись больше 25 МБ.');
     const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
     const fileName = String(req.body.fileName || 'call-record.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call-record.mp3';
 
@@ -3961,9 +3980,13 @@ async function dealAlreadyProcessed(dealId) {
       filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
       select: ['ID', 'COMMENT'],
       order: { ID: 'DESC' },
-    }, 30);
-    // v77: только успешный DONE блокирует повторную обработку; ERROR не должен навсегда выключать сделку.
-    const done = comments.some((c) => String(c.COMMENT || '').includes(AUTOPILOT_MARKER));
+    }, 300);
+    // Старый marker мог быть удалён sanitizer-ом до записи комментария. Человеческий
+    // заголовок итогового отчёта остаётся устойчивым признаком завершённого автопилота.
+    const done = comments.some((c) => {
+      const comment = String(c.COMMENT || '');
+      return comment.includes(AUTOPILOT_MARKER) || comment.includes('📋 Ход работы / отчёт эксперту:');
+    });
     if (done) autopilotProcessed.add(String(dealId));
     return done;
   } catch (_) {
@@ -4069,9 +4092,13 @@ async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
 async function transcribeAudioUrl(audioUrl, fileName) {
   const ai = resolveTranscribeProvider();
   if (!ai.apiKey) throw new Error('Не задан ключ для расшифровки (TRANSCRIBE_API_KEY / AI_API_KEY).');
-  const audioResp = await fetch(audioUrl);
+  if (!actsTrustedFileUrl(audioUrl)) throw new Error('Аудиозапись должна быть HTTPS-ссылкой из подключённого Bitrix24 или доверенного домена загрузки.');
+  const audioResp = await fetch(audioUrl, { redirect: 'error' });
   if (!audioResp.ok) throw new Error(`Не удалось скачать аудио: HTTP ${audioResp.status}`);
+  const declaredSize = Number(audioResp.headers.get('content-length') || 0);
+  if (declaredSize > 25 * 1024 * 1024) throw new Error('Аудиозапись больше 25 МБ.');
   const arrayBuffer = await audioResp.arrayBuffer();
+  if (arrayBuffer.byteLength > 25 * 1024 * 1024) throw new Error('Аудиозапись больше 25 МБ.');
   const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
   const safeFileName = String(fileName || 'call.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call.mp3';
   const configuredModel = config.transcribeModel || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
@@ -4657,24 +4684,20 @@ async function getLastTaskCreatedTime(dealId, titlePattern) {
 
 // ✅ НОВАЯ ФУНКЦИЯ: Создавать задачу только если прошло 4+ часа
 async function shouldCreateTaskAgain(dealId, titlePattern, hoursDelay = 4) {
-  const lastTime = await getLastTaskCreatedTime(dealId, titlePattern);
-  if (!lastTime) {
-    // Нет предыдущей задачи - создаём
-    return true;
-  }
-  
-  const now = new Date();
-  const hoursPassed = (now - lastTime) / (1000 * 60 * 60);
-  
-  if (hoursPassed >= hoursDelay) {
-    // Прошло достаточно времени - создаём новую
-    console.log(`[tasks] ${hoursPassed.toFixed(1)} часов с последней задачи для сделки ${dealId} — создаю новую.`);
-    return true;
-  } else {
-    // Слишком мало времени - пропускаем
-    console.log(`[tasks] Последняя задача для сделки ${dealId} была ${hoursPassed.toFixed(1)} часов назад (нужно 4 часа), пропускаю.`);
+  const tasks = await bitrixRestList('tasks.task.list', {
+    filter: { 'UF_CRM_TASK': `D_${dealId}` },
+    select: ['ID', 'TITLE', 'STATUS', 'REAL_STATUS'],
+    order: { ID: 'DESC' },
+  }, 50).catch(() => []);
+  const hasOpenDuplicate = tasks.some((task) => {
+    if (!String(task.TITLE || '').includes(String(titlePattern || '').slice(0, 30))) return false;
+    return String(task.REAL_STATUS || task.STATUS || '') !== '5'; // Bitrix status 5 = completed.
+  });
+  if (hasOpenDuplicate) {
+    console.log(`[tasks] В сделке ${dealId} уже есть открытая задача «${titlePattern}» — новую не создаю.`);
     return false;
   }
+  return true;
 }
 
 function detectServiceFromDeal(deal) {
@@ -4815,20 +4838,14 @@ function preferredChannelLabel(channel) {
 }
 
 function actsDeliveryChannelPlan(preferredChannel) {
-  const all = ['telegram', 'viber', 'email'];
-  if (preferredChannel === 'email') return ['email'];
-  if (preferredChannel === 'telegram' || preferredChannel === 'viber') {
-    // Почта идёт сразу после выбранного мессенджера как дополнительная доставка.
-    // Второй мессенджер нужен только если предыдущие способы не доставили сам акт.
-    return [preferredChannel, 'email', ...all.filter((x) => x !== preferredChannel && x !== 'email')];
-  }
-  // Неизвестное/пустое значение поля не должно оставлять клиента без акта.
-  return all;
+  // Следующий канал — только fallback после подтверждённой неудачи предыдущего.
+  // Дополнительная email-копия отключена: она и была источником дублей.
+  return deliveryChannelPlan(preferredChannel);
 }
 
-// v84: для актов при нескольких контактах НЕ используем CONTACT_ID наугад/по умолчанию.
-// Выбираем контакт, с которым в этой сделке была последняя переписка (email/чат/мессенджер).
-// Если контактов несколько, а переписку однозначно определить не удалось — автоотправку блокируем.
+// Приоритет адресата: последняя Wazzup-переписка, затем последняя CRM-переписка.
+// Если их нельзя определить, отправка акта не останавливается: actsResolveDeliveryRecipients
+// перебирает основной контакт, остальные контакты сделки и компанию.
 async function actsGetDealContactIds(deal) {
   const ids = [];
   const add = (v) => {
@@ -4907,6 +4924,15 @@ function actsActivityLooksLikeCorrespondence(a) {
   });
 }
 
+function actsActivityLooksLikeWazzup(a) {
+  if (!a || actsActivityIsCall(a)) return false;
+  const text = [a.PROVIDER_ID, a.PROVIDER_TYPE_ID, a.SUBJECT, a.DESCRIPTION]
+    .map((x) => String(x || '').toLowerCase()).join(' ');
+  if (/wazzup|whatsapp|telegram|viber/.test(text)) return true;
+  const comm = Array.isArray(a.COMMUNICATIONS) ? a.COMMUNICATIONS : [];
+  return comm.some((c) => /^(im|chat|telegram|viber|whatsapp)$/i.test(String(c && (c.TYPE || c.TYPE_ID || ''))));
+}
+
 function actsActivityContactIds(a, allowedIds) {
   const allowed = new Set((allowedIds || []).map(String));
   const out = [];
@@ -4953,46 +4979,56 @@ async function actsResolveRecipientContact(deal, preferredContactId = '') {
 
   activities = (activities || []).slice().sort((a,b) => actsActivityTimeMs(b) - actsActivityTimeMs(a));
   for (const activity of activities) {
+    if (!actsActivityLooksLikeWazzup(activity)) continue;
+    const ids = actsActivityContactIds(activity, contactIds);
+    if (ids.length !== 1) continue;
+    const contact = await actsGetContactProfile(ids[0]);
+    if (!contact) continue;
+    console.log(`[acts-recipient] deal=${deal.ID}: выбран ${actsContactLabel(contact, ids[0])} (#${ids[0]}) — последняя Wazzup-переписка activity=${activity.ID}.`);
+    return { ok: true, contactId: ids[0], contact, source: 'last-wazzup', activityId: String(activity.ID || ''), label: actsContactLabel(contact, ids[0]) };
+  }
+
+  for (const activity of activities) {
     if (!actsActivityLooksLikeCorrespondence(activity)) continue;
     const ids = actsActivityContactIds(activity, contactIds);
-    if (!ids.length) continue;
+    if (ids.length !== 1) continue;
     const contact = await actsGetContactProfile(ids[0]);
     if (!contact) continue;
     console.log(`[acts-recipient] deal=${deal.ID}: из ${contactIds.length} контактов выбран ${actsContactLabel(contact, ids[0])} (#${ids[0]}) — последняя переписка activity=${activity.ID}.`);
     return { ok: true, contactId: ids[0], contact, source: 'last-correspondence', activityId: String(activity.ID || ''), label: actsContactLabel(contact, ids[0]) };
   }
 
-  // ВАЖНО: при нескольких контактах не берём основной CONTACT_ID как случайный fallback.
+  // Для повторного пуша адресата не угадываем: такой сценарий должен получить сохранённый
+  // контакт предыдущей отправки. Первичная доставка ниже обязана продолжить с fallback.
   return {
     ok: false,
-    reason: `В сделке ${contactIds.length} контакта(ов), но не удалось однозначно определить контакт по последней переписке. Автоотправка акта заблокирована, чтобы не написать неактуальному человеку.`,
+    reason: `В сделке ${contactIds.length} контакта(ов), но не удалось определить последнюю переписку.`,
     contactIds,
   };
 }
 
-// Для первичной отправки акта допустим управляемый fallback: сначала контакт с
-// последней перепиской, затем основной контакт сделки, остальные привязанные
-// контакты и в самом конце компания. Это отличается от actsResolveRecipientContact:
-// последняя остаётся строгой для повторных пушей, где нельзя менять адресата.
+// Для первичной отправки акт никогда не блокируется из-за нескольких контактов:
+// после лучшего кандидата пробуем основной контакт, остальные контакты и компанию.
+// Первый успешный адресат завершает отправку — один акт, без дублей.
 async function actsResolveDeliveryRecipients(deal) {
-  const result = [];
+  const recipients = [];
   const used = new Set();
   const add = (candidate) => {
     if (!candidate || !candidate.entity || !candidate.entityId) return;
     const key = `${candidate.entityTypeId}:${candidate.entityId}`;
     if (used.has(key)) return;
     used.add(key);
-    result.push(candidate);
+    recipients.push(candidate);
   };
 
-  const strict = await actsResolveRecipientContact(deal).catch(() => null);
-  if (strict && strict.ok) {
+  const preferred = await actsResolveRecipientContact(deal).catch(() => null);
+  if (preferred && preferred.ok) {
     add({
-      entityId: String(strict.contactId),
+      entityId: String(preferred.contactId),
       entityTypeId: 3,
-      entity: strict.contact,
-      label: strict.label,
-      source: strict.source,
+      entity: preferred.contact,
+      label: preferred.label,
+      source: preferred.source,
     });
   }
 
@@ -5026,10 +5062,10 @@ async function actsResolveDeliveryRecipients(deal) {
     }
   }
 
-  if (!result.length) {
+  if (!recipients.length) {
     return { ok: false, reason: 'В сделке нет доступного контакта или компании для доставки акта.' };
   }
-  return { ok: true, recipients: result };
+  return { ok: true, recipients };
 }
 
 function actsEntityPhone(candidate) {
@@ -5610,13 +5646,8 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
           }
         } catch (_) {}
       }
-      try {
-        await addAutopilotCommentOnce(
-          dealId,
-          AUTOPILOT_SEND_PENDING_MARKER,
-          `${sendStatus}\n\n${dealComment}${clientMessageWithEmail ? `\n\nПодготовлено клиенту:\n${clientMessageWithEmail}` : ''}`
-        );
-      } catch (_) {}
+      // Ошибка доставки уже передана эксперту одной открытой задачей. В таймлайн
+      // не добавляем транспортный шум и не создаём повторяющиеся комментарии.
       console.warn(`${logPrefix} ${sendStatus}`);
       return;
     }
@@ -6097,15 +6128,21 @@ async function runDocsReminderForDeal(dealId, trackInfo) {
       if (sent) console.log(`${logPrefix} Напоминание отправлено через ${sentResult.channel}.`);
       else console.warn(`${logPrefix} Напоминание не отправлено: ${sentResult.error || 'неизвестная ошибка'}.`);
 
+      // Ошибки транспорта не пишем в сделку и не повторяем на следующем polling-цикле.
+      // Сохраняем контролируемую паузу, чтобы клиент не получил серию одинаковых попыток.
+      if (!sent) {
+        const retryAt = Date.now() + 4 * 60 * 60 * 1000;
+        pendingDocsCheck.set(String(dealId), { ...trackInfo, nextRetryAt: retryAt });
+        console.warn(`${logPrefix} Повтор отложен до ${new Date(retryAt).toISOString()}.`);
+        return;
+      }
       // Эскалация эксперту/руководителю относится к следующему блоку CJM.
       await bitrixRestCall('crm.timeline.comment.add', {
         fields: {
           ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-          COMMENT: `${sent ? DOCS_REMINDER_MARKER : DOCS_REMINDER_ERROR_MARKER}\nat=${new Date().toISOString()}\ndue=${new Date(trackInfo.dueAt || Date.now()).toISOString()}\nИгорь: ${sent ? 'отправил первое напоминание клиенту про документы' : `не удалось отправить первое напоминание клиенту: ${sentResult.error || 'ошибка канала'}`} (${analysis.situation})`,
+          COMMENT: `${DOCS_REMINDER_MARKER}\nИгорь: отправил первое напоминание клиенту про документы.`,
         },
       });
-      // Если канал временно не сработал — оставляем сделку в pending и повторим в следующем цикле.
-      if (!sent) return;
 
     } else if (analysis.action === 'send_specialist_task') {
       // Если ИИ видит, что вопрос не в документах, а в отсутствии специалистов,
@@ -6147,6 +6184,7 @@ async function runDocsReminderForDeal(dealId, trackInfo) {
 
 async function checkPendingDocsReminders() {
   for (const [dealId, trackInfo] of pendingDocsCheck.entries()) {
+    if (Number(trackInfo.nextRetryAt || 0) > Date.now()) continue;
     // Проверяем уже установленные маркеры (защита от повторного запуска).
     try {
       const comments = await bitrixRestList('crm.timeline.comment.list', {
@@ -6755,7 +6793,7 @@ async function checkWonStage() {
       const congMarker = '[MAVIS_WON_CONGRATS]';
       const alreadyCongrats = await isStageEventProcessed(deal.ID, 'won_congrats', congMarker);
       if (!alreadyCongrats) {
-        const serviceNames = companyDeals.map((d) => getShortServiceName(detectServiceFromDeal(d))).filter(Boolean);
+        const serviceNames = [deal].map((d) => getShortServiceName(detectServiceFromDeal(d))).filter(Boolean);
         const serviceLabel = [...new Set(serviceNames)].join(' и ') || 'услуги';
         const msg = `${clientName ? clientName + ', п' : 'П'}оздравляем с успешным получением ${serviceLabel}! 🎉\n\nРады, что смогли помочь. Для закрытия с нашей стороны нам нужен скан подписанного акта выполненных работ.\n\nПришлите, пожалуйста, на почту: mavis.group@mail.ru`;
         const channel = detectPreferredChannel(deal);
@@ -7531,9 +7569,7 @@ function fgReqDealId(req) {
 }
 
 function fgCheckRobotToken(req) {
-  if (!config.foremanRobotToken) return true;
-  const token = String((req.query && req.query.token) || (req.body && req.body.token) || '').trim();
-  return token && token === config.foremanRobotToken;
+  return requestMatchesToken(req, config.foremanRobotToken);
 }
 
 function fgDealUrl(dealId) {
@@ -7844,6 +7880,7 @@ async function actsCreateCollectionTaskForDeal(dealId, source = 'robot') {
 }
 
 app.post('/api/acts/robot-closed', async (req, res) => {
+  if (!actsRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'ACTS_ROBOT_TOKEN is required.' });
   try {
     const dealId = fgReqDealId(req);
     if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
@@ -7856,15 +7893,7 @@ app.post('/api/acts/robot-closed', async (req, res) => {
 });
 
 app.get('/api/acts/robot-closed', async (req, res) => {
-  try {
-    const dealId = fgReqDealId(req);
-    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
-    const result = await actsCreateCollectionTaskForDeal(dealId, 'robot-closed-get');
-    res.status(result.ok ? 200 : 422).json(result);
-  } catch (e) {
-    console.error('[acts-robot-closed-get]', e.message || e);
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
+  res.status(405).json({ ok: false, error: 'Используйте POST с ACTS_ROBOT_TOKEN.' });
 });
 
 
@@ -8189,6 +8218,7 @@ const ACTS_DIALOG_TEST_FILE_MARKER = '[MAVIS_ACTS_DIALOG_TEST_FILE]';
 const ACTS_CLIENT_REPLIED_MARKER = '[MAVIS_ACTS_CLIENT_REPLIED]';
 
 const actsPushStates = new Map(); // taskId -> durable state rebuilt from Bitrix timeline
+const actsDeliveryLock = createInFlightLock(); // taskId:dealId -> one in-flight delivery per server instance
 // v139: real-time inbound kill switch. Set before expensive Bitrix/AI work.
 const actsRecentClientReplyDeals = new Map(); // dealId -> {at,messageId}
 const actsProcessedInboundMessageIds = new Map(); // Wazzup messageId -> timestamp
@@ -11842,11 +11872,26 @@ function actsAbsoluteBitrixFileUrl(rawUrl) {
   try { return new URL(value, `${actsBitrixOrigin()}/`).toString(); } catch (_) { return value; }
 }
 
+function actsTrustedFileUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const portalHost = new URL(actsBitrixOrigin()).hostname.toLowerCase();
+    const additionalHosts = String(process.env.BITRIX_FILE_DOWNLOAD_HOSTS || '')
+      .split(',')
+      .map((host) => host.trim().toLowerCase())
+      .filter(Boolean);
+    return parsed.protocol === 'https:' && new Set([portalHost, ...additionalHosts]).has(parsed.hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
 async function actsFetchBinaryFromUrl(sourceUrl, fileName) {
   const origin = actsBitrixOrigin();
-  const response = await fetch(sourceUrl, {
+  if (!actsTrustedFileUrl(sourceUrl)) throw new Error('неразрешённый URL скачивания файла');
+  const requestOptions = {
     method: 'GET',
-    redirect: 'follow',
+    redirect: 'manual',
     headers: {
       // Bitrix рекомендует browser-like User-Agent/Accept/Referer при скачивании DOWNLOAD_URL.
       'User-Agent': 'Mozilla/5.0 (compatible; MAVIS-Expert-Assistant/1.0; +https://mavisgroup.by)',
@@ -11854,9 +11899,22 @@ async function actsFetchBinaryFromUrl(sourceUrl, fileName) {
       'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.7',
       'Referer': `${origin}/`,
     },
-  });
+  };
+  let nextUrl = sourceUrl;
+  let response = null;
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    response = await fetch(nextUrl, requestOptions);
+    if (response.status < 300 || response.status >= 400) break;
+    const location = response.headers.get('location');
+    if (!location) throw new Error(`редирект HTTP ${response.status} без Location`);
+    if (redirects === 3) throw new Error('слишком много редиректов при скачивании файла');
+    nextUrl = new URL(location, nextUrl).toString();
+    if (!actsTrustedFileUrl(nextUrl)) throw new Error('редирект на неразрешённый URL скачивания файла');
+  }
 
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const declaredSize = Number(response.headers.get('content-length') || 0);
+  if (declaredSize > 10 * 1024 * 1024) throw new Error('файл больше 10 МБ');
   const buffer = Buffer.from(await response.arrayBuffer());
   if (!buffer.length) throw new Error('пустой ответ');
   if (buffer.length > 10 * 1024 * 1024) throw new Error('файл больше 10 МБ');
@@ -12007,12 +12065,11 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
 
   const attempts = [];
   let primary = null;
-  let emailCopy = null;
   let preparedWazzupFile = null;
   let emailValidated = false;
+  let uncertainDelivery = null;
 
   const tryEmail = async () => {
-    if (emailCopy) return emailCopy;
     const storageIds = actsBuildEmailStorageElementIds(file);
     if (!storageIds.length) {
       attempts.push({ channel: 'email', error: 'Bitrix не дал attachment-id для вложения' });
@@ -12032,11 +12089,10 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
       if (!email) continue;
       try {
         await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId);
-        emailCopy = {
+        return {
           ok: true, channel: 'Email', contactId: recipient.entityId, contactLabel: recipient.label,
           recipientSource: recipient.source, email: maskEmailForLog(email), recipientEntityType: recipient.entityTypeId,
         };
-        return emailCopy;
       } catch (e) {
         attempts.push({ channel: 'email', recipient: recipient.label, error: e.message || String(e) });
       }
@@ -12094,6 +12150,14 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
         };
       } catch (e) {
         attempts.push({ channel, recipient: recipient.label, error: e.message || String(e), possiblyDelivered: Boolean(e.possiblyDelivered) });
+        if (e.possiblyDelivered) {
+          uncertainDelivery = {
+            channel,
+            recipient: recipient.label,
+            message: `${preferredChannelLabel(channel)} вернул неопределённый статус. Автоматический fallback и повтор отключены, чтобы не отправить акт дважды.`,
+          };
+          return null;
+        }
       }
     }
     attempts.push({ channel, error: 'нет доступного телефона у контактов и компании' });
@@ -12101,16 +12165,25 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   };
 
   for (const channel of actsDeliveryChannelPlan(preferredChannel)) {
+    if (uncertainDelivery || primary) break;
     if (channel === 'email') {
       const sent = await tryEmail();
-      if (sent && !primary) primary = sent;
-      // После успеха в мессенджере email — дополнительная копия; его ошибка не отменяет доставку.
-      if (primary && (preferredChannel === 'email' || primary.channel !== 'Email')) break;
+      if (sent) primary = sent;
       continue;
     }
-    if (primary) continue;
     const sent = await tryWazzup(channel);
     if (sent) primary = sent;
+  }
+
+  if (uncertainDelivery) {
+    return {
+      ok: false,
+      skipped: true,
+      possiblyDelivered: true,
+      channel: preferredChannelLabel(uncertainDelivery.channel),
+      message: uncertainDelivery.message,
+      attempts,
+    };
   }
 
   if (!primary) {
@@ -12130,11 +12203,6 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     file: primary.file || { name: file.name, id: file.id || '', attachedId: file.attachedId || '' },
     attempts,
   };
-  if (emailCopy && primary.channel !== 'Email') {
-    result.emailCopy = emailCopy;
-    result.channel = `${primary.channel} + Email`;
-    result.email = emailCopy.email;
-  }
   return result;
 }
 
@@ -12212,6 +12280,13 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       continue;
     }
 
+    const releaseDeliveryLock = actsDeliveryLock.acquire(`${taskId}:${dealId}`);
+    if (!releaseDeliveryLock) {
+      results.push({ dealId: String(dealId), duplicate: true, inFlight: true, message: 'Отправка этого акта уже выполняется другим обработчиком. Повторно клиенту не отправляю.' });
+      continue;
+    }
+
+    try {
     let deal = null;
     try {
       deal = await bitrixRestCall('crm.deal.get', { id: dealId });
@@ -12267,12 +12342,16 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       await actsRegisterPushState({ taskId, dealId, channel: sendResult.channel, contactId: sendResult.contactId || '', sentAtMs: Date.now(), originalFileName: fileForClient && fileForClient.name || '', wazzupChatId: sendResult.wazzupChatId || '', wazzupChannelId: sendResult.wazzupChannelId || '', wazzupMessageId: sendResult.wazzupMessageId || '', wazzupFileMessageId: sendResult.wazzupFileMessageId || '' });
     }
     results.push({ dealId: String(dealId), commentAdded: true, sent: sendResult });
+    } finally {
+      releaseDeliveryLock();
+    }
   }
 
   return { ok: true, event: 'acts_task_done_processed_and_sent_by_preferred_channel', source, taskId: String(taskId), title, dealIds: allowedDealIds.map(String), files, fileForClient, results };
 }
 
 app.post('/api/acts/task-done', async (req, res) => {
+  if (!actsRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'ACTS_ROBOT_TOKEN is required.' });
   try {
     const taskId = actsReqTaskId(req);
     console.log(`[acts-task-done] POST вызван${taskId ? `, task=${taskId}` : ', но task_id не найден'}.`);
@@ -12287,16 +12366,78 @@ app.post('/api/acts/task-done', async (req, res) => {
 });
 
 app.get('/api/acts/task-done', async (req, res) => {
+  res.status(405).json({ ok: false, error: 'Используйте POST с ACTS_ROBOT_TOKEN.' });
+});
+
+function actsMaintenanceTokenMatches(req) {
+  return authorizationMatchesToken(req, process.env.ACTS_MAINTENANCE_TOKEN);
+}
+
+async function actsFindTechnicalProductionComments(commentLimit = 1000) {
+  const deals = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: Number(config.productionCategoryId || config.autopilotCategoryId || 28) },
+    order: { ID: 'ASC' },
+    select: ['ID', 'TITLE'],
+  }, 5000);
+  const candidates = [];
+
+  for (const deal of deals) {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+      select: ['ID', 'COMMENT', 'CREATED', 'DATE_CREATE'],
+    }, commentLimit);
+    for (const comment of comments) {
+      if (!isTechnicalProductionComment(comment && comment.COMMENT)) continue;
+      candidates.push({
+        dealId: String(deal.ID),
+        dealTitle: String(deal.TITLE || ''),
+        commentId: String(comment.ID || ''),
+        created: String(comment.CREATED || comment.DATE_CREATE || ''),
+        preview: String(comment.COMMENT || '').replace(/\s+/g, ' ').slice(0, 300),
+      });
+    }
+  }
+  return { scannedDeals: deals.length, candidates };
+}
+
+// Историческая очистка технического шума в воронке Производства. По умолчанию
+// только показывает кандидатов: удаление потребует отдельный секрет и execute=true.
+app.post('/api/maintenance/production-comment-cleanup', async (req, res) => {
+  if (!actsMaintenanceTokenMatches(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
+  }
+
+  const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+  const requestedLimit = Number(req.body && req.body.commentLimit);
+  const commentLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(Math.floor(requestedLimit), 5000)) : 1000;
+
   try {
-    const taskId = actsReqTaskId(req);
-    console.log(`[acts-task-done] GET вызван${taskId ? `, task=${taskId}` : ', но task_id не найден'}.`);
-    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
-    const result = await actsHandleTaskDone(taskId, 'task-done-get');
-    console.log(`[acts-task-done] task=${taskId}: ${JSON.stringify({ ok: result.ok, event: result.event, dealIds: result.dealIds, results: result.results && result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) })}`);
-    res.status(result.ok ? 200 : 422).json(result);
-  } catch (e) {
-    console.error('[acts-task-done-get]', e.message || e);
-    res.status(500).json({ ok: false, error: e.message || String(e) });
+    const report = await actsFindTechnicalProductionComments(commentLimit);
+    if (!execute) {
+      return res.status(200).json({ ok: true, dryRun: true, ...report });
+    }
+
+    const deleted = [];
+    const errors = [];
+    for (const candidate of report.candidates) {
+      try {
+        await bitrixRestCall('crm.timeline.comment.delete', { id: candidate.commentId });
+        deleted.push(candidate);
+      } catch (error) {
+        errors.push({ ...candidate, error: error.message || String(error) });
+      }
+    }
+    return res.status(errors.length ? 207 : 200).json({
+      ok: errors.length === 0,
+      dryRun: false,
+      scannedDeals: report.scannedDeals,
+      deleted,
+      errors,
+    });
+  } catch (error) {
+    console.error('[acts-cleanup] ', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
   }
 });
 
@@ -12839,11 +12980,7 @@ async function actsBuildMonthlyOriginalsReconciliation(monthRaw) {
 
 
 function actsReconRequestAuthorized(req) {
-  const expected = String(config.actsReconToken || '');
-  if (!expected) return false;
-  const supplied = String((req.query && req.query.token) || (req.body && req.body.token) || '').trim();
-  if (!supplied || supplied.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+  return authorizationMatchesToken(req, config.actsReconToken);
 }
 
 function actsReconReportTitleForMonth(monthRaw) {
@@ -12930,7 +13067,7 @@ async function runActsReconAutoCycle() {
   }
 }
 
-async function actsReconEndpoint(req, res) {
+async function actsReconEndpoint(req, res, { allowSend = false } = {}) {
   try {
     if (!config.actsReconToken) {
       return res.status(503).json({ ok: false, error: 'В Render не задан ACTS_RECON_TOKEN. Добавь секретную строку и повтори запрос.' });
@@ -12939,6 +13076,7 @@ async function actsReconEndpoint(req, res) {
     const rawMonth = String((req.query && req.query.month) || (req.body && req.body.month) || '').trim();
     const sendRaw = String((req.query && req.query.send) || (req.body && req.body.send) || '0').toLowerCase();
     const send = ['1','true','yes','y'].includes(sendRaw);
+    if (send && !allowSend) return res.status(405).json({ ok: false, error: 'Отправка отчёта разрешена только POST-запросом.' });
     const report = await actsBuildMonthlyOriginalsReconciliation(rawMonth);
     let sent = null;
     if (send) sent = await actsReconSendToLeader(report);
@@ -12950,8 +13088,8 @@ async function actsReconEndpoint(req, res) {
   }
 }
 
-app.get('/api/acts/reconcile', actsReconEndpoint);
-app.post('/api/acts/reconcile', actsReconEndpoint);
+app.get('/api/acts/reconcile', (req, res) => actsReconEndpoint(req, res));
+app.post('/api/acts/reconcile', (req, res) => actsReconEndpoint(req, res, { allowSend: true }));
 
 app.post('/api/foreman/robot-linked', async (req, res) => {
   try {
@@ -12967,16 +13105,7 @@ app.post('/api/foreman/robot-linked', async (req, res) => {
 });
 
 app.get('/api/foreman/robot-linked', async (req, res) => {
-  try {
-    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
-    const dealId = fgReqDealId(req);
-    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
-    const result = await fgHandleForemanLinked(dealId, 'robot-linked-get');
-    res.status(result.ok ? 200 : 422).json(result);
-  } catch (e) {
-    console.error('[foreman-robot-linked-get]', e.message || e);
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
+  res.status(405).json({ ok: false, error: 'Используйте POST с FOREMAN_ROBOT_TOKEN.' });
 });
 
 app.post('/api/foreman/robot-closed', async (req, res) => {
@@ -12993,32 +13122,24 @@ app.post('/api/foreman/robot-closed', async (req, res) => {
 });
 
 app.get('/api/foreman/robot-closed', async (req, res) => {
-  try {
-    if (!fgCheckRobotToken(req)) return res.status(403).json({ ok: false, error: 'bad token' });
-    const dealId = fgReqDealId(req);
-    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
-    const result = await fgHandleProductionClosed(dealId, 'robot-closed-get');
-    res.json(result);
-  } catch (e) {
-    console.error('[foreman-robot-closed-get]', e.message || e);
-    res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
+  res.status(405).json({ ok: false, error: 'Используйте POST с FOREMAN_ROBOT_TOKEN.' });
 });
 
 app.post('/api/foreman/auto-sync', async (_req, res) => {
+  if (!mavisAdminAuthorized(_req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   const result = await runForemanAutomationCycle('manual-api');
   res.status(result.ok ? 200 : 500).json(result);
 });
 
 app.get('/api/foreman/auto-sync', async (_req, res) => {
-  const result = await runForemanAutomationCycle('manual-api');
-  res.status(result.ok ? 200 : 500).json(result);
+  res.status(405).json({ ok: false, error: 'Используйте POST с MAVIS_ADMIN_TOKEN.' });
 });
 
 // Запуск polling после старта сервера.
 
 // ✅ ЭНДПОИНТ: Получить все поля сделки
 app.get('/api/get-deal-fields', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   try {
     const dealId = req.query.dealId;
     if (!dealId) return res.status(400).json({ error: 'dealId не указан' });
@@ -15216,6 +15337,7 @@ async function docReturnDryRun(taskId) {
 
 // GET — безопасная диагностика.
 app.get('/api/doc-return-reminder', async (req, res) => {
+  if (!mavisAdminAuthorized(req)) return res.status(403).json({ ok: false, error: 'MAVIS_ADMIN_TOKEN is required.' });
   const taskId = docReturnReqTaskId(req) || DOC_RETURN_TEST_TASK_ID;
   try {
     const result = await docReturnDryRun(taskId);
@@ -15229,6 +15351,7 @@ app.get('/api/doc-return-reminder', async (req, res) => {
 // Текущий тестовый робот Bitrix может продолжать вызывать task_id=47208.
 // В бою серверный polling не зависит от этого робота.
 app.post('/api/doc-return-reminder', async (req, res) => {
+  if (!actsRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'ACTS_ROBOT_TOKEN is required.' });
   const taskId = docReturnReqTaskId(req);
   if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
 

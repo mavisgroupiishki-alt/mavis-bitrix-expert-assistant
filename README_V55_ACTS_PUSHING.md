@@ -40,18 +40,20 @@ ACTS_AUDITOR_IDS=2110,14
 - Сделка закрыта = Да
 - желательно стадия = Успешно
 
-Исходящий вебхук / хендлер:
+Исходящий вебхук / хендлер: `POST` с полями `deal_id={{ID}}` и
+`token=<ACTS_ROBOT_TOKEN>`. Не используй GET: сервер отклоняет его, чтобы ссылку нельзя
+было случайно открыть и повторно создать задачу.
 
 ```text
-https://mavis-bitrix-expert-assistant.onrender.com/api/acts/robot-closed?deal_id={{ID}}
+https://mavis-bitrix-expert-assistant.onrender.com/api/acts/robot-closed
 ```
 
 ## Проверка вручную
 
-Открыть в браузере, подставив ID закрытой сделки:
+Отправить POST (например, через Postman) с `deal_id=12345` и `token=<ACTS_ROBOT_TOKEN>`.
 
 ```text
-https://mavis-bitrix-expert-assistant.onrender.com/api/acts/robot-closed?deal_id=12345
+POST /api/acts/robot-closed
 ```
 
 Успешный ответ:
