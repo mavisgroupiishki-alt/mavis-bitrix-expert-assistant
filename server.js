@@ -27,6 +27,7 @@ const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStage
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
 const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('./acts-delivery');
+const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 
 const app = express();
@@ -2862,8 +2863,9 @@ async function processIncomingEmails() {
     await client.connect();
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Ищем непрочитанные письма.
-      const uids = await client.search({ seen: false });
+      // Ищем непрочитанные письма, которые ещё не обработал MAVIS. Статус «прочитано»
+      // не используем как служебную отметку: письмо должно оставаться заметным экспертам.
+      const uids = await client.search(unreadUnprocessedMailSearch());
       if (!uids || !uids.length) {
         console.log('[email] Новых писем нет.');
         return;
@@ -2929,7 +2931,7 @@ async function processIncomingEmails() {
                 }
               }
             }
-            await client.messageFlagsAdd(uid, ['\\Seen']);
+            await markMailProcessedAndUnread(client, uid);
             continue;
           }
 
@@ -2948,7 +2950,7 @@ async function processIncomingEmails() {
                 })),
               });
               if (clientDocsResult && Number(clientDocsResult.processed || 0) > 0) {
-                await client.messageFlagsAdd(uid, ['\\Seen']);
+                await markMailProcessedAndUnread(client, uid);
                 console.log(`[client-docs] Email ${maskEmailForLog(senderEmail)} обработан новой логикой; старую ветку пропускаю.`);
                 continue;
               }
@@ -3006,8 +3008,7 @@ async function processIncomingEmails() {
                   }
                 }
                 
-                // Помечаем прочитанным
-                await client.messageFlagsAdd(uid, ['\\Seen']);
+                await markMailProcessedAndUnread(client, uid);
                 console.log(`[email] ✅ Загружено ${savedFiles.length} файлов в "Неопределённые"`);
               } catch (e) {
                 console.warn(`[email] Ошибка загрузки в "Неопределённые": ${e.message}`);
@@ -3097,7 +3098,7 @@ async function processIncomingEmails() {
             }
           }
 
-          await client.messageFlagsAdd(uid, ['\\Seen']);
+          await markMailProcessedAndUnread(client, uid);
         } catch (msgErr) {
           console.error(`[email] Ошибка обработки письма uid=${uid}: ${msgErr.message}`);
         }

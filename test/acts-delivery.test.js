@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('../acts-delivery');
+const { MAIL_PROCESSED_KEYWORD, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
 test('uses the preferred channel first and falls back only after it', () => {
@@ -39,4 +40,37 @@ test('requires an exact non-empty token for protected routes', () => {
   assert.equal(authorizationMatchesToken({ body: { token: 'secret' }, get: () => '' }, 'secret'), false);
   assert.equal(tokenMatches('', ''), false);
   assert.equal(tokenMatches('secret', 'wrong'), false);
+});
+
+test('keeps processed client emails unread while persisting a separate processing marker', async () => {
+  const calls = [];
+  const client = {
+    async messageFlagsAdd(uid, flags) { calls.push(['add', uid, flags]); },
+    async messageFlagsRemove(uid, flags) { calls.push(['remove', uid, flags]); },
+  };
+
+  assert.deepEqual(unreadUnprocessedMailSearch(), { seen: false, unKeyword: MAIL_PROCESSED_KEYWORD });
+  await markMailProcessedAndUnread(client, 125);
+  assert.deepEqual(calls, [
+    ['add', 125, [MAIL_PROCESSED_KEYWORD]],
+    ['remove', 125, ['\\Seen']],
+  ]);
+});
+
+test('falls back to seen when an IMAP server rejects custom processing markers', async () => {
+  const calls = [];
+  const client = {
+    async messageFlagsAdd(uid, flags) {
+      calls.push(['add', uid, flags]);
+      if (flags.includes(MAIL_PROCESSED_KEYWORD)) throw new Error('keywords unsupported');
+    },
+    async messageFlagsRemove() { throw new Error('must not remove seen'); },
+  };
+
+  const result = await markMailProcessedAndUnread(client, 126);
+  assert.equal(result.keptUnread, false);
+  assert.deepEqual(calls, [
+    ['add', 126, [MAIL_PROCESSED_KEYWORD]],
+    ['add', 126, ['\\Seen']],
+  ]);
 });
