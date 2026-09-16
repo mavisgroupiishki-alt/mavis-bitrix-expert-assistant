@@ -2881,6 +2881,11 @@ async function processIncomingEmails() {
           const senderEmail = parsed.from && parsed.from.value && parsed.from.value[0] ? parsed.from.value[0].address : '';
           const subject = parsed.subject || '';
           const attachments = (parsed.attachments || []).filter((a) => a.size > 0);
+          // Message-ID стабилен между IMAP-проверками и хранится только в служебном
+          // payload уже существующего комментария сделки.
+          const externalId = parsed.messageId
+            ? `email:${String(parsed.messageId).trim().toLowerCase()}`
+            : '';
 
           console.log(`[email] Письмо от ${senderEmail}, тема: "${subject}", вложений: ${attachments.length}`);
 
@@ -2948,9 +2953,12 @@ async function processIncomingEmails() {
                   contentType: a.contentType || '',
                   buffer: a.content,
                 })),
+                externalId,
               });
-              if (clientDocsResult && Number(clientDocsResult.processed || 0) > 0) {
-                await markMailProcessedAndUnread(client, uid);
+              if (clientDocsResult && (Number(clientDocsResult.processed || 0) > 0 || clientDocsResult.duplicate)) {
+                await markMailProcessedAndUnread(client, uid, {
+                  durableProcessedMarker: !!clientDocsResult.durableProcessedMarker,
+                });
                 console.log(`[client-docs] Email ${maskEmailForLog(senderEmail)} обработан новой логикой; старую ветку пропускаю.`);
                 continue;
               }
@@ -11574,6 +11582,26 @@ async function clientDocsLoadState(dealId) {
   return { docs: [] };
 }
 
+async function clientDocsHasProcessedExternalId(deals, externalId) {
+  if (!externalId) return false;
+  for (const deal of deals || []) {
+    try {
+      const comments = await bitrixRestList('crm.timeline.comment.list', {
+        filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+        select: ['COMMENT'],
+        order: { ID: 'DESC' },
+      }, 120);
+      if (comments.some((comment) => {
+        const payload = clientDocsParseMarkerJson(String(comment && comment.COMMENT || ''), CLIENT_DOCS_RECEIVED_MARKER);
+        return payload && String(payload.externalId || '') === externalId;
+      })) return true;
+    } catch (e) {
+      console.warn(`[client-docs] deal=${deal && deal.ID || '?'}: не смог проверить CRM-маркер письма: ${e.message || e}`);
+    }
+  }
+  return false;
+}
+
 function clientDocsMergeDocs(oldDocs, newDocs) {
   const result = [];
   const seen = new Set();
@@ -11686,7 +11714,7 @@ async function clientDocsNotifyExpert(deal, source, analyzedDocs, completeness) 
   } catch (_) {}
 }
 
-async function clientDocsProcessIncomingAttachments({ source, commType, commValue, messageText = '', attachments = [] }) {
+async function clientDocsProcessIncomingAttachments({ source, commType, commValue, messageText = '', attachments = [], externalId = '' }) {
   if (!config.clientDocsIncomingEnabled || !attachments.length) return { ok: true, processed: 0 };
   const match = await clientDocsFindDealsByComm(commType, commValue);
   if (!match.deals.length) {
@@ -11695,6 +11723,10 @@ async function clientDocsProcessIncomingAttachments({ source, commType, commValu
   }
 
   const deals = match.deals;
+  if (await clientDocsHasProcessedExternalId(deals, externalId)) {
+    console.log(`[client-docs] ${source}: письмо уже обработано, повторный импорт пропущен.`);
+    return { ok: true, processed: 0, duplicate: true, durableProcessedMarker: true, reason: 'external-id-already-processed' };
+  }
   const primary = deals[0];
   const companyName = primary.COMPANY_ID ? await getCompanyName(primary.COMPANY_ID) : (primary.TITLE || `Сделка ${primary.ID}`);
   const folderId = await getOrCreateCompanyFolder(companyName || `Сделка ${primary.ID}`);
@@ -11741,6 +11773,7 @@ async function clientDocsProcessIncomingAttachments({ source, commType, commValu
         at: nowIso,
         source,
         files: savedNames,
+        externalId: String(externalId || ''),
       };
 
       const receivedText = analyzedDocs.map((d) =>
@@ -11787,7 +11820,12 @@ async function clientDocsProcessIncomingAttachments({ source, commType, commValu
     }).catch(() => {});
   }
 
-  return { ok: true, processed: savedNames.length || analyzedDocs.length, deals: resultPerDeal.map((x) => x.deal.ID) };
+  return {
+    ok: true,
+    processed: savedNames.length || analyzedDocs.length,
+    deals: resultPerDeal.map((x) => x.deal.ID),
+    durableProcessedMarker: Boolean(externalId && resultPerDeal.length),
+  };
 }
 
 async function clientDocsProcessIncomingWazzupMessage(msg) {

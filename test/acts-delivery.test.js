@@ -74,3 +74,21 @@ test('falls back to seen when an IMAP server rejects custom processing markers',
     ['add', 126, ['\\Seen']],
   ]);
 });
+
+test('keeps an email unread when CRM already has a durable processing marker', async () => {
+  const calls = [];
+  const client = {
+    async messageFlagsAdd(uid, flags) {
+      calls.push(['add', uid, flags]);
+      if (flags.includes(MAIL_PROCESSED_KEYWORD)) throw new Error('keywords unsupported');
+    },
+    async messageFlagsRemove(uid, flags) { calls.push(['remove', uid, flags]); },
+  };
+
+  const result = await markMailProcessedAndUnread(client, 127, { durableProcessedMarker: true });
+  assert.equal(result.keptUnread, true);
+  assert.deepEqual(calls, [
+    ['add', 127, [MAIL_PROCESSED_KEYWORD]],
+    ['remove', 127, ['\\Seen']],
+  ]);
+});
