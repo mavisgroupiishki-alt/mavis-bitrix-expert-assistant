@@ -12480,6 +12480,107 @@ app.post('/api/maintenance/production-comment-cleanup', async (req, res) => {
   }
 });
 
+// Одноразовое выравнивание уже созданных сделок после изменения БП #936
+// «Сделка. Инициализация маршрута Производства». В UI этот БП стартует только
+// при создании сделки, поэтому для исторических сделок запускаем его явно.
+// Список услуг намеренно фиксирован: эндпоинт не может быть использован для
+// произвольного массового запуска БП.
+const PRODUCTION_ROUTE_BACKFILL_TEMPLATE_ID = 936;
+const PRODUCTION_ROUTE_BACKFILL_SERVICES = ['ИК СПК', 'ИК ИСО', 'ИК СУОТ', 'Периодика СПК'];
+
+function productionRouteBackfillEnumItems(field) {
+  const list = Array.isArray(field && field.LIST) ? field.LIST : Object.values(field && field.LIST || {});
+  const byLabel = new Map();
+  for (const item of list) {
+    const id = String(item && (item.ID || item.id || item.VALUE_ID || item.valueId) || '').trim();
+    const label = String(item && (item.VALUE || item.value) || '').trim();
+    if (id && label) byLabel.set(normalizeControlValue(label), { id, label });
+  }
+  return byLabel;
+}
+
+async function productionRouteBackfillReport() {
+  const productionCategoryId = Number(config.productionCategoryId || config.autopilotCategoryId || 28);
+  const serviceFieldCode = config.serviceFieldCode || 'UF_CRM_1765113071';
+  const fields = await bitrixRestList('crm.deal.userfield.list', { filter: { FIELD_NAME: serviceFieldCode } }, 20);
+  const serviceField = fields.find((field) => String(field && (field.FIELD_NAME || field.fieldName) || '') === serviceFieldCode) || fields[0];
+  if (!serviceField) throw new Error(`Не найдено поле услуги ${serviceFieldCode}.`);
+
+  const enumItems = productionRouteBackfillEnumItems(serviceField);
+  const missingServices = PRODUCTION_ROUTE_BACKFILL_SERVICES.filter((service) => !enumItems.has(normalizeControlValue(service)));
+  if (missingServices.length) {
+    throw new Error(`В поле «Услуга» не найдены значения: ${missingServices.join(', ')}. Запуск не выполнен.`);
+  }
+
+  const dealsById = new Map();
+  for (const requestedService of PRODUCTION_ROUTE_BACKFILL_SERVICES) {
+    const enumItem = enumItems.get(normalizeControlValue(requestedService));
+    const rows = await bitrixRestList('crm.deal.list', {
+      filter: { CATEGORY_ID: productionCategoryId, [serviceFieldCode]: enumItem.id },
+      order: { ID: 'ASC' },
+      select: ['ID', 'TITLE', 'CATEGORY_ID', serviceFieldCode],
+    }, 5000);
+    for (const deal of rows) {
+      if (String(deal && deal.CATEGORY_ID) !== String(productionCategoryId)) continue;
+      const rawService = deal && deal[serviceFieldCode];
+      const rawValues = (Array.isArray(rawService) ? rawService : [rawService]).map(String);
+      if (!rawValues.includes(String(enumItem.id))) continue;
+      dealsById.set(String(deal.ID), {
+        dealId: String(deal.ID),
+        title: String(deal.TITLE || ''),
+        service: enumItem.label,
+      });
+    }
+  }
+
+  return {
+    templateId: PRODUCTION_ROUTE_BACKFILL_TEMPLATE_ID,
+    productionCategoryId,
+    serviceFieldCode,
+    services: PRODUCTION_ROUTE_BACKFILL_SERVICES,
+    deals: [...dealsById.values()].sort((a, b) => Number(a.dealId) - Number(b.dealId)),
+  };
+}
+
+// По умолчанию возвращает только состав. Реальный запуск требует execute=true
+// и уже существующий секрет обслуживания актов.
+app.post('/api/maintenance/production-route-backfill', async (req, res) => {
+  if (!actsMaintenanceTokenMatches(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
+  }
+
+  const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+  try {
+    const report = await productionRouteBackfillReport();
+    if (!execute) return res.status(200).json({ ok: true, dryRun: true, ...report });
+
+    const started = [];
+    const errors = [];
+    for (const deal of report.deals) {
+      try {
+        const workflowId = await bitrixRestCall('bizproc.workflow.start', {
+          TEMPLATE_ID: report.templateId,
+          DOCUMENT_ID: ['crm', 'CCrmDocumentDeal', `DEAL_${deal.dealId}`],
+        });
+        started.push({ ...deal, workflowId: String(workflowId || '') });
+      } catch (error) {
+        errors.push({ ...deal, error: error.message || String(error) });
+      }
+    }
+    console.log(`[production-route-backfill] template=${report.templateId}; found=${report.deals.length}; started=${started.length}; errors=${errors.length}.`);
+    return res.status(errors.length ? 207 : 200).json({
+      ok: errors.length === 0,
+      dryRun: false,
+      ...report,
+      started,
+      errors,
+    });
+  } catch (error) {
+    console.error('[production-route-backfill]', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
 // v60: резервный серверный контроль стадии «Сделано/Сделаны» в проекте «Акты счета».
 // Он нужен, потому что робот Bitrix может не вызвать URL, а пользователь ожидает отправку
 // именно по факту перемещения задачи в нужную Kanban-стадию.
