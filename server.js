@@ -12501,28 +12501,37 @@ function productionRouteBackfillEnumItems(field) {
 
 async function productionRouteBackfillReport() {
   const productionCategoryId = Number(config.productionCategoryId || config.autopilotCategoryId || 28);
-  const serviceFieldCode = config.serviceFieldCode || 'UF_CRM_1765113071';
-  const fields = await bitrixRestList('crm.deal.userfield.list', { filter: { FIELD_NAME: serviceFieldCode } }, 20);
-  const serviceField = fields.find((field) => String(field && (field.FIELD_NAME || field.fieldName) || '') === serviceFieldCode) || fields[0];
-  if (!serviceField) throw new Error(`Не найдено поле услуги ${serviceFieldCode}.`);
+  const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
+  const serviceEnums = new Map();
+  for (const field of fields) {
+    const fieldCode = String(field && (field.FIELD_NAME || field.fieldName) || '').trim();
+    if (!fieldCode) continue;
+    for (const [normalizedLabel, enumItem] of productionRouteBackfillEnumItems(field)) {
+      if (!PRODUCTION_ROUTE_BACKFILL_SERVICES.some((service) => normalizeControlValue(service) === normalizedLabel)) continue;
+      const previous = serviceEnums.get(normalizedLabel);
+      if (previous && (previous.fieldCode !== fieldCode || previous.id !== enumItem.id)) {
+        throw new Error(`Значение услуги «${enumItem.label}» найдено в нескольких полях сделки. Запуск не выполнен.`);
+      }
+      serviceEnums.set(normalizedLabel, { ...enumItem, fieldCode });
+    }
+  }
 
-  const enumItems = productionRouteBackfillEnumItems(serviceField);
-  const missingServices = PRODUCTION_ROUTE_BACKFILL_SERVICES.filter((service) => !enumItems.has(normalizeControlValue(service)));
+  const missingServices = PRODUCTION_ROUTE_BACKFILL_SERVICES.filter((service) => !serviceEnums.has(normalizeControlValue(service)));
   if (missingServices.length) {
-    throw new Error(`В поле «Услуга» не найдены значения: ${missingServices.join(', ')}. Запуск не выполнен.`);
+    throw new Error(`В справочниках сделки не найдены значения: ${missingServices.join(', ')}. Запуск не выполнен.`);
   }
 
   const dealsById = new Map();
   for (const requestedService of PRODUCTION_ROUTE_BACKFILL_SERVICES) {
-    const enumItem = enumItems.get(normalizeControlValue(requestedService));
+    const enumItem = serviceEnums.get(normalizeControlValue(requestedService));
     const rows = await bitrixRestList('crm.deal.list', {
-      filter: { CATEGORY_ID: productionCategoryId, [serviceFieldCode]: enumItem.id },
+      filter: { CATEGORY_ID: productionCategoryId, [enumItem.fieldCode]: enumItem.id },
       order: { ID: 'ASC' },
-      select: ['ID', 'TITLE', 'CATEGORY_ID', serviceFieldCode],
+      select: ['ID', 'TITLE', 'CATEGORY_ID', enumItem.fieldCode],
     }, 5000);
     for (const deal of rows) {
       if (String(deal && deal.CATEGORY_ID) !== String(productionCategoryId)) continue;
-      const rawService = deal && deal[serviceFieldCode];
+      const rawService = deal && deal[enumItem.fieldCode];
       const rawValues = (Array.isArray(rawService) ? rawService : [rawService]).map(String);
       if (!rawValues.includes(String(enumItem.id))) continue;
       dealsById.set(String(deal.ID), {
@@ -12536,8 +12545,11 @@ async function productionRouteBackfillReport() {
   return {
     templateId: PRODUCTION_ROUTE_BACKFILL_TEMPLATE_ID,
     productionCategoryId,
-    serviceFieldCode,
     services: PRODUCTION_ROUTE_BACKFILL_SERVICES,
+    serviceFields: Object.fromEntries(PRODUCTION_ROUTE_BACKFILL_SERVICES.map((service) => {
+      const item = serviceEnums.get(normalizeControlValue(service));
+      return [service, item.fieldCode];
+    })),
     deals: [...dealsById.values()].sort((a, b) => Number(a.dealId) - Number(b.dealId)),
   };
 }
