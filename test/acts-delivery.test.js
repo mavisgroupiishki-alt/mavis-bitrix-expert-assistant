@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('../acts-delivery');
-const { MAIL_PROCESSED_KEYWORD, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
+const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
 test('uses the preferred channel first and falls back only after it', () => {
@@ -49,20 +49,20 @@ test('keeps processed client emails unread while persisting a separate processin
     async messageFlagsRemove(uid, flags) { calls.push(['remove', uid, flags]); },
   };
 
-  assert.deepEqual(unreadUnprocessedMailSearch(), { seen: false, unKeyword: MAIL_PROCESSED_KEYWORD });
+  assert.deepEqual(unreadUnprocessedMailSearch(), { seen: false, answered: false });
   await markMailProcessedAndUnread(client, 125);
   assert.deepEqual(calls, [
-    ['add', 125, [MAIL_PROCESSED_KEYWORD]],
+    ['add', 125, [MAIL_PROCESSED_FLAG]],
     ['remove', 125, ['\\Seen']],
   ]);
 });
 
-test('falls back to seen when an IMAP server rejects custom processing markers', async () => {
+test('falls back to seen when an IMAP server rejects the standard processing flag', async () => {
   const calls = [];
   const client = {
     async messageFlagsAdd(uid, flags) {
       calls.push(['add', uid, flags]);
-      if (flags.includes(MAIL_PROCESSED_KEYWORD)) throw new Error('keywords unsupported');
+      if (flags.includes(MAIL_PROCESSED_FLAG)) throw new Error('flag unsupported');
     },
     async messageFlagsRemove() { throw new Error('must not remove seen'); },
   };
@@ -70,7 +70,7 @@ test('falls back to seen when an IMAP server rejects custom processing markers',
   const result = await markMailProcessedAndUnread(client, 126);
   assert.equal(result.keptUnread, false);
   assert.deepEqual(calls, [
-    ['add', 126, [MAIL_PROCESSED_KEYWORD]],
+    ['add', 126, [MAIL_PROCESSED_FLAG]],
     ['add', 126, ['\\Seen']],
   ]);
 });
@@ -80,7 +80,7 @@ test('keeps an email unread when CRM already has a durable processing marker', a
   const client = {
     async messageFlagsAdd(uid, flags) {
       calls.push(['add', uid, flags]);
-      if (flags.includes(MAIL_PROCESSED_KEYWORD)) throw new Error('keywords unsupported');
+      if (flags.includes(MAIL_PROCESSED_FLAG)) throw new Error('flag unsupported');
     },
     async messageFlagsRemove(uid, flags) { calls.push(['remove', uid, flags]); },
   };
@@ -88,7 +88,7 @@ test('keeps an email unread when CRM already has a durable processing marker', a
   const result = await markMailProcessedAndUnread(client, 127, { durableProcessedMarker: true });
   assert.equal(result.keptUnread, true);
   assert.deepEqual(calls, [
-    ['add', 127, [MAIL_PROCESSED_KEYWORD]],
+    ['add', 127, [MAIL_PROCESSED_FLAG]],
     ['remove', 127, ['\\Seen']],
   ]);
 });
