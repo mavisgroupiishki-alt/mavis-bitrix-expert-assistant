@@ -62,19 +62,33 @@ test('historical candidate loader starts with an empty closed-deal result', asyn
 
 test('historical Wazzup importer fails before starting an extra email candidate scan without OAuth', async () => {
   const run = historicalWazzupImporter();
-  await assert.rejects(run('2026-09'), /Не задан ключ Wazzup/);
+  await assert.rejects(run('2026-09'), /Не задан WAZZUP_CLIENT_ACCESS_TOKEN/);
 });
 
-test('historical Wazzup importer accepts the configured sidecar key', () => {
+test('historical Wazzup importer only accepts the child-account OAuth token', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   const start = source.indexOf('function actsHistoricalWazzupAccessToken() {');
   const end = source.indexOf('\nasync function actsHistoricalFetchWazzupDump(', start);
   const context = {
-    process: { env: { WAZZUP_SIDECAR_KEY: 'sidecar-key' } },
+    process: { env: { WAZZUP_SIDECAR_KEY: 'sidecar-key', WAZZUP_CLIENT_ACCESS_TOKEN: 'oauth-token' } },
     actsCleanText: (value) => String(value || '').trim(),
   };
   vm.runInNewContext(`${source.slice(start, end)}; globalThis.getToken = actsHistoricalWazzupAccessToken;`, context);
   const result = context.getToken();
-  assert.equal(result.token, 'sidecar-key');
-  assert.equal(result.source, 'sidecar_api_key');
+  assert.equal(result.token, 'oauth-token');
+  assert.equal(result.source, 'client_access_token');
+});
+
+test('historical Wazzup importer rejects API keys as a substitute for OAuth', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('function actsHistoricalWazzupAccessToken() {');
+  const end = source.indexOf('\nasync function actsHistoricalFetchWazzupDump(', start);
+  const context = {
+    process: { env: { WAZZUP_SIDECAR_KEY: 'sidecar-key', WAZZUP_API_KEY: 'api-key' } },
+    actsCleanText: (value) => String(value || '').trim(),
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.getToken = actsHistoricalWazzupAccessToken;`, context);
+  const result = context.getToken();
+  assert.equal(result.token, '');
+  assert.equal(result.source, '');
 });

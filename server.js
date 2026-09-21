@@ -10736,22 +10736,14 @@ function actsHistoricalWazzupAttachment(row) {
 }
 
 function actsHistoricalWazzupAccessToken() {
-  const candidates = [
-    ['client_access_token', process.env.WAZZUP_CLIENT_ACCESS_TOKEN],
-    ['sidecar_api_key', process.env.WAZZUP_SIDECAR_KEY],
-    ['api_key', process.env.WAZZUP_API_KEY],
-  ];
-  for (const [source, value] of candidates) {
-    const token = actsCleanText(value);
-    if (token) return { token, source };
-  }
-  return { token: '', source: '' };
+  const token = actsCleanText(process.env.WAZZUP_CLIENT_ACCESS_TOKEN);
+  return { token, source: token ? 'client_access_token' : '' };
 }
 
 async function actsHistoricalFetchWazzupDump(monthRaw) {
   const { token: accessToken, source: tokenSource } = actsHistoricalWazzupAccessToken();
   if (!accessToken) {
-    throw new Error('Не задан ключ Wazzup для messages_dump: нужен client_access_token, WAZZUP_SIDECAR_KEY или WAZZUP_API_KEY');
+    throw new Error('Не задан WAZZUP_CLIENT_ACCESS_TOKEN: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
   }
   const range = actsHistoricalMonthRange(monthRaw);
   // Конец не ограничиваем августом: клиент мог вернуть августовский акт в первые дни сентября.
@@ -10790,7 +10782,7 @@ async function actsHistoricalFetchWazzupDump(monthRaw) {
 async function actsRunHistoricalWazzupImport(monthRaw) {
   console.log(`[acts-historical-wazzup] Старт импорта вложений Wazzup за ${monthRaw}. Клиентам ничего не отправляется.`);
   if (!actsHistoricalWazzupAccessToken().token) {
-    throw new Error('Не задан ключ Wazzup для messages_dump: нужен client_access_token, WAZZUP_SIDECAR_KEY или WAZZUP_API_KEY');
+    throw new Error('Не задан WAZZUP_CLIENT_ACCESS_TOKEN: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
   }
   const [{ candidates }, dump] = await Promise.all([
     actsHistoricalLoadEmailCandidates(monthRaw),
