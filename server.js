@@ -10777,6 +10777,9 @@ async function actsHistoricalFetchWazzupDump(monthRaw) {
 
 async function actsRunHistoricalWazzupImport(monthRaw) {
   console.log(`[acts-historical-wazzup] Старт импорта вложений Wazzup за ${monthRaw}. Клиентам ничего не отправляется.`);
+  if (!actsCleanText(process.env.WAZZUP_CLIENT_ACCESS_TOKEN)) {
+    throw new Error('WAZZUP_CLIENT_ACCESS_TOKEN не задан: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
+  }
   const [{ candidates }, dump] = await Promise.all([
     actsHistoricalLoadEmailCandidates(monthRaw),
     actsHistoricalFetchWazzupDump(monthRaw),
