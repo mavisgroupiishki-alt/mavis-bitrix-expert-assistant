@@ -35,7 +35,7 @@ function historicalCandidateLoader() {
 
 function historicalWazzupImporter(environment = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  const start = source.indexOf('async function actsRunHistoricalWazzupImport(monthRaw) {');
+  const start = source.indexOf('function actsHistoricalWazzupAccessToken() {');
   const end = source.indexOf('\nasync function actsLogWazzupIncomingWebhookStatus()', start);
   assert.ok(start >= 0 && end > start, 'historical Wazzup importer must be present in server.js');
 
@@ -62,5 +62,19 @@ test('historical candidate loader starts with an empty closed-deal result', asyn
 
 test('historical Wazzup importer fails before starting an extra email candidate scan without OAuth', async () => {
   const run = historicalWazzupImporter();
-  await assert.rejects(run('2026-09'), /WAZZUP_CLIENT_ACCESS_TOKEN не задан/);
+  await assert.rejects(run('2026-09'), /Не задан ключ Wazzup/);
+});
+
+test('historical Wazzup importer accepts the configured sidecar key', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('function actsHistoricalWazzupAccessToken() {');
+  const end = source.indexOf('\nasync function actsHistoricalFetchWazzupDump(', start);
+  const context = {
+    process: { env: { WAZZUP_SIDECAR_KEY: 'sidecar-key' } },
+    actsCleanText: (value) => String(value || '').trim(),
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.getToken = actsHistoricalWazzupAccessToken;`, context);
+  const result = context.getToken();
+  assert.equal(result.token, 'sidecar-key');
+  assert.equal(result.source, 'sidecar_api_key');
 });

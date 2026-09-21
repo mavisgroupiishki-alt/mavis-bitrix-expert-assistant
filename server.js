@@ -10735,18 +10735,30 @@ function actsHistoricalWazzupAttachment(row) {
   };
 }
 
+function actsHistoricalWazzupAccessToken() {
+  const candidates = [
+    ['client_access_token', process.env.WAZZUP_CLIENT_ACCESS_TOKEN],
+    ['sidecar_api_key', process.env.WAZZUP_SIDECAR_KEY],
+    ['api_key', process.env.WAZZUP_API_KEY],
+  ];
+  for (const [source, value] of candidates) {
+    const token = actsCleanText(value);
+    if (token) return { token, source };
+  }
+  return { token: '', source: '' };
+}
+
 async function actsHistoricalFetchWazzupDump(monthRaw) {
-  // messages_dump относится к partner API v2: обычный API/Sidecar ключ Wazzup
-  // (который используется для отправок и вебхуков) для него не подходит.
-  const accessToken = actsCleanText(process.env.WAZZUP_CLIENT_ACCESS_TOKEN);
+  const { token: accessToken, source: tokenSource } = actsHistoricalWazzupAccessToken();
   if (!accessToken) {
-    throw new Error('WAZZUP_CLIENT_ACCESS_TOKEN не задан: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
+    throw new Error('Не задан ключ Wazzup для messages_dump: нужен client_access_token, WAZZUP_SIDECAR_KEY или WAZZUP_API_KEY');
   }
   const range = actsHistoricalMonthRange(monthRaw);
   // Конец не ограничиваем августом: клиент мог вернуть августовский акт в первые дни сентября.
   const endAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   const baseUrl = (process.env.WAZZUP_TECH_BASE_URL || 'https://tech.wazzup24.com').replace(/\/$/, '');
   let createdBody = {};
+  console.log(`[acts-historical-wazzup] Пробую выгрузку с ключом ${tokenSource}.`);
   const created = await fetch(`${baseUrl}/v2/messages/messages_dump`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -10777,8 +10789,8 @@ async function actsHistoricalFetchWazzupDump(monthRaw) {
 
 async function actsRunHistoricalWazzupImport(monthRaw) {
   console.log(`[acts-historical-wazzup] Старт импорта вложений Wazzup за ${monthRaw}. Клиентам ничего не отправляется.`);
-  if (!actsCleanText(process.env.WAZZUP_CLIENT_ACCESS_TOKEN)) {
-    throw new Error('WAZZUP_CLIENT_ACCESS_TOKEN не задан: для messages_dump нужен OAuth-токен дочернего аккаунта Wazzup');
+  if (!actsHistoricalWazzupAccessToken().token) {
+    throw new Error('Не задан ключ Wazzup для messages_dump: нужен client_access_token, WAZZUP_SIDECAR_KEY или WAZZUP_API_KEY');
   }
   const [{ candidates }, dump] = await Promise.all([
     actsHistoricalLoadEmailCandidates(monthRaw),
