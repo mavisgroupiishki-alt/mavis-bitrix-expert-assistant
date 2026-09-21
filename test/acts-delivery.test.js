@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('../acts-delivery');
+const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('../acts-delivery');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
@@ -20,6 +20,12 @@ test('treats a repeated Wazzup crmMessageId as an accepted idempotent delivery',
   assert.equal(isWazzupRepeatedCrmMessageError({ error: 'REPEATED_CRM_MESSAGE_ID' }), true);
   assert.equal(isWazzupRepeatedCrmMessageError({}, 'Wazzup: REPEATED_CRM_MESSAGE_ID'), true);
   assert.equal(isWazzupRepeatedCrmMessageError({ error: 'POST_MESSAGE_ERROR' }), false);
+});
+
+test('uses Email after a confirmed Wazzup failure, but never after an uncertain delivery', () => {
+  assert.equal(canUseEmailFallbackAfterWazzupError({ possiblyDelivered: false }), true);
+  assert.equal(canUseEmailFallbackAfterWazzupError(new Error('POST_MESSAGE_ERROR')), true);
+  assert.equal(canUseEmailFallbackAfterWazzupError({ possiblyDelivered: true }), false);
 });
 
 test('allows only one concurrent delivery for the same task and deal', () => {

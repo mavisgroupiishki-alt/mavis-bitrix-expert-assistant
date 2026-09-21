@@ -24,6 +24,10 @@ function isWazzupRepeatedCrmMessageError(data, fallback = '') {
   return values.some((value) => /REPEATED_CRM_MESSAGE_ID/i.test(String(value || '')));
 }
 
+function canUseEmailFallbackAfterWazzupError(error) {
+  return !Boolean(error && error.possiblyDelivered);
+}
+
 function createInFlightLock() {
   const keys = new Set();
 
@@ -55,4 +59,4 @@ function isTechnicalProductionComment(value) {
   );
 }
 
-module.exports = { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError };
+module.exports = { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError };

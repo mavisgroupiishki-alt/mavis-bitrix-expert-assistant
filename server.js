@@ -26,7 +26,7 @@ const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = 
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
-const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('./acts-delivery');
+const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('./acts-delivery');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 
@@ -5611,7 +5611,21 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
             sent = true;
             sentChannel = preferredChannel;
           } catch (sendErr) {
-            console.warn(`${logPrefix} ${preferredChannel} не сработал: ${sendErr.message}. Запасные каналы не используем.`);
+            console.warn(`${logPrefix} ${preferredChannel} не сработал: ${sendErr.message}.`);
+            if (canUseEmailFallbackAfterWazzupError(sendErr) && email) {
+              try {
+                await sendEmailThroughBitrix(dealId, deal.ASSIGNED_BY_ID, deal.CONTACT_ID, email, deal.TITLE, clientMessageWithEmail);
+                console.log(`${logPrefix} После подтверждённой ошибки ${preferredChannel} сообщение отправлено через Email: ${email}.`);
+                sent = true;
+                sentChannel = 'email';
+              } catch (emailErr) {
+                console.error(`${logPrefix} Email fallback после ошибки ${preferredChannel} не сработал: ${emailErr.message}`);
+              }
+            } else if (canUseEmailFallbackAfterWazzupError(sendErr)) {
+              console.warn(`${logPrefix} ${preferredChannel} не сработал, но email клиента не найден.`);
+            } else {
+              console.warn(`${logPrefix} Ответ ${preferredChannel} неопределённый: Email fallback не использую, чтобы не создать дубль.`);
+            }
           }
         }
       } else {
