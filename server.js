@@ -10474,7 +10474,7 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     String(user && user.ID || ''),
     actsResolveExpertFolderName(user),
   ]));
-  console.log(`[acts-historical] Загружен справочник сотрудников: ${userCache.size}.`);
+  console.log(`[acts-historical] Загружен справочник сотрудников: ${users.length}.`);
   const entityCache = new Map();
   const candidates = [];
 

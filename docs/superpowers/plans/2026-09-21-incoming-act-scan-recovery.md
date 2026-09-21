@@ -156,6 +156,43 @@ Expected: no whitespace errors; no unrelated changes.
 
 Verify Render starts successfully and logs the corrected candidate counts. Do not enable a month import that writes Bitrix files until the dry report identifies the exact candidates.
 
+### Task 5: Prevent the historical candidate loader from failing before its first deal
+
+**Files:**
+- Modify: `server.js:10460-10490`
+- Create: `test/acts-historical-import.test.js`
+
+**Interfaces:**
+- Consumes: `actsHistoricalLoadEmailCandidates(monthRaw)` with mocked empty CRM and employee responses.
+- Produces: an empty candidate array without throwing when no deals exist for the requested month.
+
+- [ ] **Step 1: Write the failing regression test.**
+
+```js
+const result = await loadHistoricalCandidates('2026-09');
+assert.deepEqual(result.candidates, []);
+```
+
+The harness extracts this one loader from `server.js` and replaces Bitrix calls with empty successful responses. Before the fix, the startup log references the removed `userCache` variable and throws a `ReferenceError`.
+
+- [ ] **Step 2: Run the focused test.**
+
+Run: `node --test test/acts-historical-import.test.js`
+
+Expected: FAIL with `userCache is not defined`.
+
+- [ ] **Step 3: Apply the single-variable fix.**
+
+```js
+console.log(`[acts-historical] Загружен справочник сотрудников: ${users.length}.`);
+```
+
+- [ ] **Step 4: Run the focused and complete test suite.**
+
+Run: `node --test test/acts-historical-import.test.js && node --check server.js && node --test`
+
+Expected: all commands exit 0.
+
 ## Self-Review
 
 - **Spec coverage:** Task 1 prevents DOC/DOCX false negatives; Task 2 fixes the close-month selection error; Task 3 makes uncertainty inspectable; Task 4 verifies code and deployment without sending clients anything.
