@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('../acts-delivery');
+const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('../acts-delivery');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
@@ -11,6 +11,15 @@ test('uses the preferred channel first and falls back only after it', () => {
   assert.deepEqual(deliveryChannelPlan('viber'), ['viber', 'telegram', 'email']);
   assert.deepEqual(deliveryChannelPlan('email'), ['email', 'telegram', 'viber']);
   assert.deepEqual(deliveryChannelPlan(''), ['telegram', 'viber', 'email']);
+  assert.deepEqual(deliveryChannelPlan('telegram', { telegramEnabled: false }), ['viber', 'email']);
+  assert.deepEqual(deliveryChannelPlan('viber', { telegramEnabled: false }), ['viber', 'email']);
+  assert.deepEqual(deliveryChannelPlan('email', { telegramEnabled: false }), ['email', 'viber']);
+});
+
+test('treats a repeated Wazzup crmMessageId as an accepted idempotent delivery', () => {
+  assert.equal(isWazzupRepeatedCrmMessageError({ error: 'REPEATED_CRM_MESSAGE_ID' }), true);
+  assert.equal(isWazzupRepeatedCrmMessageError({}, 'Wazzup: REPEATED_CRM_MESSAGE_ID'), true);
+  assert.equal(isWazzupRepeatedCrmMessageError({ error: 'POST_MESSAGE_ERROR' }), false);
 });
 
 test('allows only one concurrent delivery for the same task and deal', () => {

@@ -26,7 +26,7 @@ const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = 
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
-const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment } = require('./acts-delivery');
+const { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('./acts-delivery');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 
@@ -273,6 +273,9 @@ const config = {
   // Email -> письмо, Telegram -> Wazzup Telegram, Viber -> Wazzup Viber.
   // ACTS_SEND_CHANNEL оставлен только как legacy/fallback для старых ручных тестов, в основной логике не используется.
   actsSendChannel: process.env.ACTS_SEND_CHANNEL || '',
+  // Telegram для актов временно отключён: приоритетный Telegram пропускаем в пользу Viber, затем Email.
+  // Включать обратно только явным ACTS_TELEGRAM_ENABLED=true после восстановления канала.
+  actsTelegramEnabled: String(process.env.ACTS_TELEGRAM_ENABLED || 'false').toLowerCase() === 'true',
   actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
   actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
   // v60: резервный polling стадии «Сделано/Сделаны», чтобы отправка акта не зависела
@@ -1578,6 +1581,10 @@ async function sendWazzupMessageInternal({ channelKey, text, phone, chatId, user
   // Telegram, хотя сообщение уже дошло). Теперь при ошибке сразу поднимаем исключение — пусть
   // вызывающий код (с Viber-фоллбеком) решает, что делать, без повтора внутри одного канала.
   const { resp: response, text: responseText, json: data } = await attemptSend(payloadToSend);
+  if (isWazzupRepeatedCrmMessageError(data, responseText)) {
+    console.warn(`[acts-idempotency] Wazzup ${configured.label}: crmMessageId уже был принят; повтор не отправляю.`);
+    return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data, alreadyAccepted: true };
+  }
   if (!response.ok) {
     const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${response.status} без тела ответа`);
     const err = new Error(`Wazzup ${configured.label}: ${message}`);
@@ -1639,6 +1646,10 @@ async function sendWazzupFileInternal({ channelKey, contentUri, phone, chatId, u
   });
   const responseText = await resp.text();
   const data = (() => { try { return JSON.parse(responseText); } catch (_) { return {}; } })();
+  if (isWazzupRepeatedCrmMessageError(data, responseText)) {
+    console.warn(`[acts-idempotency] Wazzup ${configured.label}: файл с crmMessageId уже был принят; повтор не отправляю.`);
+    return { channel: { key: configured.key, label: configured.label, chatType: configured.chatType }, data, alreadyAccepted: true };
+  }
   if (!resp.ok || (data && data.error)) {
     const message = compactWazzupError(data, responseText ? responseText.slice(0, 300) : `HTTP ${resp.status} без тела ответа`);
     const err = new Error(`Wazzup ${configured.label} файл ${fileName || ''}: ${message}`);
@@ -4849,7 +4860,7 @@ function preferredChannelLabel(channel) {
 function actsDeliveryChannelPlan(preferredChannel) {
   // Следующий канал — только fallback после подтверждённой неудачи предыдущего.
   // Дополнительная email-копия отключена: она и была источником дублей.
-  return deliveryChannelPlan(preferredChannel);
+  return deliveryChannelPlan(preferredChannel, { telegramEnabled: config.actsTelegramEnabled });
 }
 
 // Приоритет адресата: последняя Wazzup-переписка, затем последняя CRM-переписка.
@@ -9776,6 +9787,10 @@ async function actsSendPush(state, deal, sequence) {
 
   const channel = actsNormalizeChannelKey(state.channel) || await detectPreferredChannelResolved(deal);
   if (!channel) return { ok: false, error: 'Не удалось определить канал первоначальной отправки акта.' };
+  if (channel === 'telegram' && !config.actsTelegramEnabled) {
+    console.warn(`[acts-push] task=${state.taskId}: Telegram для актов временно отключён; пуш не отправляю.`);
+    return { ok: false, blocked: true, reason: 'acts-telegram-disabled', error: 'Telegram для актов временно отключён.' };
+  }
   const text = actsPushMessage();
 
   // v84: пуш обязательно идёт тому же контакту, которому был отправлен сам акт.
@@ -15540,7 +15555,7 @@ app.listen(PORT, () => {
   console.log(`[startup] ACTS_FILE_PIPELINE_V135=ON; ACTS_PUSH_V150=NEW_CLOSED_DEALS_ONLY; exact-inbound-binding=quoted-message/chat/channel/unique-fallback; historical-push-cutoff=${config.actsPushNewOnlyAfterIso}; human-reply-first=true; diag=/api/acts-smart-dialog/diag`);
   console.log(`[startup] WAZZUP_INBOUND_AI_V150=ON; hard-client-reply-stop=ON; immediate-ack=ON; act-semantic-dialog=ON; globalActSemanticReply=ON; exactActTaskBinding=ON; act-email-resend=ON; aiTestPhoneTail=${config.wazzupAiTestPhoneTail}; aiTestDeal=${config.wazzupAiTestDealId}; aiTestEnabled=${config.wazzupAiTestEnabled}; salesPilot=${config.wazzupSalesPilotEnabled}`);
   console.log(`[startup] ACTS_WAZZUP_WEBHOOK_REPAIR_V136=ON; forced-reregister=true`);
-  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
+  console.log(`[startup] webhook=${config.bitrixWebhookUrl ? 'yes' : 'no'}, autopilot=${config.autopilotEnabled}, acts=${config.actsTasksEnabled}, actsSend=${config.actsSendToClientEnabled}, actsTelegram=${config.actsTelegramEnabled}, actsPoll=${config.actsDonePollEnabled}, actsPush=${config.actsPushEnabled}, actsIncoming=${config.actsIncomingEnabled}, actsSmartDialog=${config.actsSmartDialogEnabled}, actsSmartDialogTestDeal=${config.actsSmartDialogTestDealId || 'none'}, incomingWazzup=${config.actsIncomingWazzupEnabled}, incomingEmail=${config.actsIncomingEmailEnabled}, clientDocs=${config.clientDocsIncomingEnabled}, clientDocsWazzup=${config.clientDocsWazzupEnabled}, clientDocsEmail=${config.clientDocsEmailEnabled}, clientDocsAll=${config.clientDocsAllDeals}, clientDocsTestDeal=${config.clientDocsTestDealId || 'not-set'}, firstCallTestMin=${config.firstCallTestMinutes || 0}, docsReminderTestMin=${config.docsReminderTestMinutes || 0}, executorTestDeal=${config.executorTestDealId || config.liveChatTestDealId || 'not-set'}, actsTestDeal=${config.actsTestDealId || 'not-set'}, actsAllDeals=${config.actsAllDeals}, actsProject=${config.actsProjectId}, actsProductionStart=${config.actsProductionStartIso}, actsReconManual=${Boolean(config.actsReconToken)}, actsReconAuto=${config.actsReconAutoEnabled}, actsReconLeader=${config.actsReconLeaderId}, distributionExperts=${(config.distributionExpertIds || []).join(',') || 'production-department-auto'}, collectionV85=${config.collectionControlEnabled}, selectionV85=${config.selectionControlEnabled}, cjmTestMode=${config.cjmTestMode}, cjmTestDeal=${config.cjmTestDealId}, cjmTestAllowNoCall=${config.cjmTestAllowNoCall}, noCallDeterministicV88=ON, cjmPriorityV89=ON.`);
 
   if (config.actsIncomingEnabled && config.actsIncomingWazzupEnabled) {
     setTimeout(() => actsLogWazzupIncomingWebhookStatus(), 5000);

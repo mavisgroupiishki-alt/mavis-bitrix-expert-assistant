@@ -1,9 +1,27 @@
 'use strict';
 
-function deliveryChannelPlan(preferredChannel) {
+function deliveryChannelPlan(preferredChannel, options = {}) {
+  const telegramEnabled = options.telegramEnabled !== false;
   const channels = ['telegram', 'viber', 'email'];
-  if (!channels.includes(preferredChannel)) return channels;
-  return [preferredChannel, ...channels.filter((channel) => channel !== preferredChannel)];
+  const plan = !channels.includes(preferredChannel)
+    ? channels
+    : [preferredChannel, ...channels.filter((channel) => channel !== preferredChannel)];
+  return telegramEnabled ? plan : plan.filter((channel) => channel !== 'telegram');
+}
+
+// Wazzup rejects a second request with the same crmMessageId only after it has
+// accepted the original one. This is an idempotency acknowledgement, not a
+// delivery failure that should schedule another act send.
+function isWazzupRepeatedCrmMessageError(data, fallback = '') {
+  const values = [
+    fallback,
+    data && data.error,
+    data && data.description,
+    data && data.error_description,
+    data && data.message,
+    data && data.detail,
+  ];
+  return values.some((value) => /REPEATED_CRM_MESSAGE_ID/i.test(String(value || '')));
 }
 
 function createInFlightLock() {
@@ -37,4 +55,4 @@ function isTechnicalProductionComment(value) {
   );
 }
 
-module.exports = { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment };
+module.exports = { createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError };
