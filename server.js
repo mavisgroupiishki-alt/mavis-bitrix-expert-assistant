@@ -10119,6 +10119,8 @@ const ACTS_EXPERT_FOLDERS = [
   { surname: 'николаева', first: 'екатерина', folder: 'Екатерина' },
   { surname: 'баженова', first: 'мария', folder: 'Мария' },
   { surname: 'панькова', first: 'ольга', folder: 'Ольга' },
+  { surname: '', first: 'владислав', folder: 'Владислав' },
+  { surname: '', first: 'данила', folder: 'Данила' },
 ];
 
 const ACTS_RU_MONTHS = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
@@ -10135,7 +10137,10 @@ function actsMonthFolderFromDeal(deal) {
 
 function actsResolveExpertFolderName(user) {
   const full = `${user && (user.LAST_NAME || user.lastName) || ''} ${user && (user.NAME || user.name) || ''}`.toLowerCase().replace(/ё/g,'е');
-  const hit = ACTS_EXPERT_FOLDERS.find((x) => full.includes(x.surname.replace(/ё/g,'е')) || (full.includes(x.first) && full.includes(x.surname)));
+  const hit = ACTS_EXPERT_FOLDERS.find((x) => {
+    const surname = String(x.surname || '').replace(/ё/g,'е');
+    return surname ? full.includes(surname) : full.includes(x.first);
+  });
   return hit ? hit.folder : '';
 }
 
@@ -10278,6 +10283,8 @@ async function actsAiCheckSignedAct(buffer, fileName, contentType, messageText =
   const ext = String(fileName || '').split('.').pop().toLowerCase();
   const isImage = ['jpg','jpeg','png','webp'].includes(ext) || /^image\//i.test(contentType || '');
   const isPdf = ext === 'pdf' || /^application\/pdf/i.test(contentType || '') || (buffer && buffer.subarray(0, 4).toString() === '%PDF');
+  const isOfficeDocument = ['doc','docx'].includes(ext)
+    || /application\/(msword|vnd\.openxmlformats-officedocument\.wordprocessingml\.document)/i.test(contentType || '');
   const ai = resolveAiProvider();
   if (!ai.apiKey) return { isSignedAct: false, confidence: 'low', reason: 'AI key не задан — документ не принимаю автоматически' };
 
@@ -10299,10 +10306,13 @@ async function actsAiCheckSignedAct(buffer, fileName, contentType, messageText =
         { type: 'text', text: prompt },
         { type: 'image_url', image_url: { url: dataUrl } },
       ];
-    } else if (isPdf) {
-      // v73: PDF передаём модели целиком как file input. Это позволяет анализировать как текст PDF,
-      // так и изображения страниц (включая скан подписи), вместо эвристики по имени файла.
-      const dataUrl = `data:application/pdf;base64,${buffer.toString('base64')}`;
+    } else if (isPdf || isOfficeDocument) {
+      // Файл передаём модели целиком: это работает и для PDF-сканов, и для DOC/DOCX,
+      // которые клиенты часто присылают вместо PDF после подписания.
+      const mime = isPdf ? 'application/pdf' : (contentType || (ext === 'docx'
+        ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        : 'application/msword'));
+      const dataUrl = `data:${mime};base64,${buffer.toString('base64')}`;
       content = [
         { type: 'file', file: { filename: fileName || 'document.pdf', file_data: dataUrl } },
         { type: 'text', text: prompt },
@@ -10444,28 +10454,22 @@ function actsHistoricalAwait(promise, label, timeoutMs = 15000) {
 
 async function actsHistoricalLoadEmailCandidates(monthRaw) {
   const range = actsHistoricalMonthRange(monthRaw);
-  console.log(`[acts-historical] Подбираю задачи проекта #${config.actsProjectId} за ${monthRaw}.`);
-  const tasks = await bitrixRestList('tasks.task.list', {
+  console.log(`[acts-historical] Подбираю успешно закрытые сделки Производства за ${monthRaw}.`);
+  const deals = await bitrixRestList('crm.deal.list', {
     filter: {
-      GROUP_ID: config.actsProjectId,
-      '>=CREATED_DATE': range.startIso,
-      '<CREATED_DATE': range.endIso,
+      CATEGORY_ID: Number(config.productionCategoryId || 28),
+      STAGE_SEMANTIC_ID: 'S',
+      '>=CLOSEDATE': range.startIso,
+      '<CLOSEDATE': range.endIso,
     },
-    select: ['ID', 'TITLE', 'CREATED_BY', 'CREATED_BY_ID', 'CREATED_DATE', 'UF_CRM_TASK'],
-    order: { CREATED_DATE: 'ASC' },
-  }, 1000);
-  console.log(`[acts-historical] Задач за ${monthRaw}: ${tasks.length}. Проверяю экспертов и CRM-связи.`);
-  // Не запрашиваем user.get для каждой из 152 задач по очереди: это задерживает
-  // разовый импорт и может упереться в очередь Bitrix. Одним запросом строим
-  // справочник сотрудников, затем обращаемся к CRM только по нужным экспертам.
+    select: ['ID', 'TITLE', 'CLOSEDATE', 'ASSIGNED_BY_ID', 'CONTACT_ID', 'COMPANY_ID'],
+    order: { CLOSEDATE: 'ASC', ID: 'ASC' },
+  }, 5000);
+  console.log(`[acts-historical] Закрытых сделок за ${monthRaw}: ${deals.length}. Проверяю связанные задачи актов и контакты.`);
   const users = await actsHistoricalAwait(
     bitrixRestCall('user.get', { FILTER: { ACTIVE: 'Y' } }),
     'справочник сотрудников',
   ).catch(() => []);
-  const userCache = new Map((Array.isArray(users) ? users : []).map((user) => [
-    String(user && user.ID || ''),
-    actsHistoricalNormalizeName(`${user && user.NAME || ''} ${user && user.LAST_NAME || ''}`),
-  ]));
   const expertFolderByUserId = new Map((Array.isArray(users) ? users : []).map((user) => [
     String(user && user.ID || ''),
     actsResolveExpertFolderName(user),
@@ -10474,21 +10478,18 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
   const entityCache = new Map();
   const candidates = [];
 
-  for (const [index, task] of tasks.entries()) {
-    if ((index + 1) % 10 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено задач: ${index + 1}/${tasks.length}.`);
-    const creatorId = actsHistoricalTaskCreatorId(task);
-    if (!creatorId) continue;
-    if (!ACTS_HISTORICAL_EXPERT_NAMES.has(userCache.get(creatorId))) continue;
-    const expertFolder = expertFolderByUserId.get(creatorId);
+  for (const [index, deal] of deals.entries()) {
+    if ((index + 1) % 10 === 0) console.log(`[acts-historical] Подготовлено кандидатов: ${candidates.length}; просмотрено сделок: ${index + 1}/${deals.length}.`);
+    const expertFolder = expertFolderByUserId.get(String(deal.ASSIGNED_BY_ID || ''));
     if (!expertFolder) continue;
-
-    const dealId = actsExtractDealIdsFromTask(task)[0];
-    if (!dealId) continue;
-    const deal = await actsHistoricalAwait(
-      bitrixRestCall('crm.deal.get', { id: dealId }),
-      `сделка ${dealId}`,
-    ).catch(() => null);
-    if (!deal) continue;
+    const dealId = String(deal.ID || '');
+    const linkedTasks = (await actsHistoricalAwait(actsReconTasksForDeal(dealId), `задачи акта сделки ${dealId}`).catch(() => []))
+      .filter(actsReconIsActTask);
+    if (linkedTasks.length !== 1) {
+      console.warn(`[acts-historical] deal=${dealId}: задач актов=${linkedTasks.length}; автоматический выбор пропускаю.`);
+      continue;
+    }
+    const task = linkedTasks[0];
 
     const emails = new Set();
     const phones = new Set();
@@ -10517,8 +10518,8 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       state: {
         taskId: String(actsTaskField(task, ['id', 'ID'])),
         dealId: String(dealId),
-        sentAtMs: Date.parse(String(actsTaskField(task, ['createdDate', 'CREATED_DATE']) || '')) || 0,
-        createdDate: actsTaskField(task, ['createdDate', 'CREATED_DATE']) || '',
+        sentAtMs: Date.parse(String(deal.CLOSEDATE || '')) || 0,
+        createdDate: deal.CLOSEDATE || '',
       },
       deal,
       emails,
