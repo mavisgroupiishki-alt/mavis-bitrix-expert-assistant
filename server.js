@@ -26,7 +26,8 @@ const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = 
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
-const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('./acts-delivery');
+const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
+const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 
@@ -141,6 +142,7 @@ const config = {
   callTranscriptionEnabled: String(process.env.CALL_TRANSCRIPTION_ENABLED || 'false').toLowerCase() === 'true',
   aiControlFieldCode: process.env.AI_CONTROL_FIELD_CODE || process.env.STOP_AI_FIELD_CODE || 'UF_CRM_1784898776915',
   serverTasksEnabled: String(process.env.SERVER_TASKS_ENABLED || 'false').toLowerCase() === 'true',
+  autopilotDeliveryFailureTasksEnabled: String(process.env.AUTOPILOT_DELIVERY_FAILURE_TASKS_ENABLED || 'false').toLowerCase() === 'true',
   stageMonitoringEnabled: String(process.env.STAGE_MONITORING_ENABLED || 'false').toLowerCase() === 'true',
   requireAssignedExpertCall: String(process.env.REQUIRE_ASSIGNED_EXPERT_CALL || 'true').toLowerCase() !== 'false',
   strictPreferredChannel: String(process.env.STRICT_PREFERRED_CHANNEL || 'true').toLowerCase() !== 'false',
@@ -381,7 +383,7 @@ async function bitrixRestCall(method, params = {}) {
     const isCoreAssistantTask = /^Распредели сделку:/i.test(title)
       || /позвони клиенту.*4\+.*час/i.test(title)
       || /я отправил ход работы клиенту/i.test(title)
-      || /не смог отправить ход работы клиенту/i.test(title);
+      || (/не смог отправить ход работы клиенту/i.test(title) && config.autopilotDeliveryFailureTasksEnabled);
     const isRecruitingTask = /^НАЙМ:/i.test(title) && config.recruitingTasksEnabled;
     if (!isForemanTask && !isActsTask && !isCoreAssistantTask && !isRecruitingTask) {
       console.log(`[tasks] blocked by SERVER_TASKS_ENABLED=false: ${title || 'без названия'}`);
@@ -3215,67 +3217,52 @@ async function processIncomingEmails() {
 // Отправляет специальный промпт чтобы найти название компании
 async function analyzeDocumentWithVisionForCompany(fileContent, fileName, contentType) {
   try {
-    // Кодируем в base64
-    const base64Content = Buffer.isBuffer(fileContent) 
-      ? fileContent.toString('base64') 
-      : Buffer.from(fileContent).toString('base64');
+    const ext = String(fileName || '').split('.').pop().toLowerCase();
+    const normalizedContentType = String(contentType || '').split(';')[0].toLowerCase();
+    const buffer = Buffer.isBuffer(fileContent) ? fileContent : Buffer.from(fileContent);
+    const isImage = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)
+      || /^image\//.test(normalizedContentType);
+    const isPdf = ext === 'pdf'
+      || normalizedContentType === 'application/pdf'
+      || buffer.subarray(0, 4).toString() === '%PDF';
+    if (!isImage && !isPdf) return { company: null, confidence: 'low' };
 
-    // Определяем тип медиа
-    let mediaType = 'application/pdf';
-    if (contentType) {
-      mediaType = contentType;
-    } else if (fileName) {
-      if (fileName.match(/\.(jpg|jpeg|png|gif)$/i)) mediaType = 'image/jpeg';
-      else if (fileName.match(/\.pdf$/i)) mediaType = 'application/pdf';
-    }
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY || '',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-4-6',
-        max_tokens: 300,
-        messages: [
+    const base64Content = buffer.toString('base64');
+    const mediaType = /^image\//.test(normalizedContentType)
+      ? normalizedContentType
+      : `image/${ext === 'jpg' ? 'jpeg' : ext || 'jpeg'}`;
+    const documentPart = isPdf
+      ? {
+          type: 'file',
+          file: {
+            filename: fileName || 'document.pdf',
+            file_data: `data:application/pdf;base64,${base64Content}`,
+          },
+        }
+      : { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64Content}` } };
+    const rawText = await callAiChatCompletion({
+      model: config.aiModel,
+      temperature: 0,
+      messages: [{
+        role: 'user',
+        content: [
+          documentPart,
           {
-            role: 'user',
-            content: [
-              {
-                type: 'document',
-                source: {
-                  type: 'base64',
-                  media_type: mediaType,
-                  data: base64Content,
-                },
-              },
-              {
-                type: 'text',
-                text: `Это деловой документ. Определи:
+            type: 'text',
+            text: `Это деловой документ. Определи:
 1. Название компании/организации в документе (ООО, ИП, АО и т.д.)
 2. Уровень уверенности: high (явно видно), medium (можно определить), low (не ясно)
 
 Ответь ТОЛЬКО JSON: {"company": "название", "confidence": "high|medium|low"}
 
 ВАЖНО: Ищи в начале документа, на бланке, в подписях. Если название компании не видно — вернись {"company": null, "confidence": "low"}`,
-              },
-            ],
           },
         ],
-      }),
+      }],
     });
 
-    if (!response.ok) {
-      console.warn(`[email] Vision API error: ${response.status}`);
-      return { company: null, confidence: 'low' };
-    }
-
-    const data = await response.json();
-    const textContent = data.content?.find((c) => c.type === 'text')?.text || '';
-
     try {
-      const result = JSON.parse(textContent);
+      const result = JSON.parse(rawText);
       return {
         company: result.company,
         confidence: result.confidence || 'low',
@@ -5215,21 +5202,36 @@ async function getContactEmail(deal) {
   return null;
 }
 
-async function sendEmailThroughBitrix(dealId, responsibleId, contactId, toEmail, dealTitle, text) {
+async function sendEmailThroughBitrix(dealId, responsibleId, contactId, toEmail, dealTitle, text, subject = '') {
   // Отправляем письмо через Bitrix crm.activity.add (тип EMAIL).
   // Это стандартный способ отправить email из Bitrix без внешнего SMTP —
   // письмо уходит с ящика подключённого к Bitrix и фиксируется в таймлайне сделки.
+  const senderId = Number(responsibleId || 1);
+  let staff = null;
+  try {
+    const users = await bitrixRestCall('user.get', { ID: senderId });
+    staff = Array.isArray(users) ? users[0] : users;
+  } catch (_) {}
+
+  const settings = bitrixEmailSenderSettings({
+    staff,
+    emailFrom: config.emailFrom,
+    emailSenderName: config.emailSenderName,
+  });
+  if (!settings) throw new Error('Не задан отправитель письма: у ответственного нет email и EMAIL_FROM пустой.');
+
   await bitrixRestCall('crm.activity.add', {
     fields: {
       TYPE_ID: 4, // 4 = Email
-      SUBJECT: `Ход работы по сделке: ${dealTitle}`,
+      SUBJECT: subject || `Ход работы по сделке: ${dealTitle}`,
       DESCRIPTION: text,
       DESCRIPTION_TYPE: 1, // 1 = text
       DIRECTION: 2, // 2 = исходящее
       OWNER_TYPE_ID: 2, // 2 = Deal
       OWNER_ID: dealId,
-      RESPONSIBLE_ID: responsibleId || 1,
+      RESPONSIBLE_ID: senderId,
       COMPLETED: 'Y',
+      SETTINGS: settings,
       COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
     },
   });
@@ -5743,7 +5745,7 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
     // v77: «Эксперт назначен» → «Сбор информации» только после фактической успешной отправки.
     // Ошибка канала/контакта не должна считаться выполненным автопилотом.
     if (!clientMessageWithEmail || !sent) {
-      if (clientMessageWithEmail) {
+      if (clientMessageWithEmail && shouldCreateAutopilotDeliveryFailureTask(config.autopilotDeliveryFailureTasksEnabled)) {
         try {
           const shouldCreate = await shouldCreateTaskAgain(dealId, 'не смог отправить ход работы клиенту', 4);
           if (shouldCreate) {
@@ -5759,8 +5761,8 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
           }
         } catch (_) {}
       }
-      // Ошибка доставки уже передана эксперту одной открытой задачей. В таймлайн
-      // не добавляем транспортный шум и не создаём повторяющиеся комментарии.
+      // В таймлайн не добавляем транспортный шум и не создаём повторяющиеся
+      // комментарии; при включённом флаге выше создаётся одна задача эксперту.
       console.warn(`${logPrefix} ${sendStatus}`);
       return;
     }
@@ -11386,25 +11388,15 @@ function finalizeDocsReminderMessage(_baseText, docList) {
 }
 
 async function sendEmailTextThroughBitrix(deal, toEmail, subject, text) {
-  await bitrixRestCall('crm.activity.add', {
-    fields: {
-      TYPE_ID: 4,
-      SUBJECT: subject || `Документы по сделке: ${deal.TITLE}`,
-      DESCRIPTION: text,
-      DESCRIPTION_TYPE: 1,
-      DIRECTION: 2,
-      OWNER_TYPE_ID: 2,
-      OWNER_ID: deal.ID,
-      RESPONSIBLE_ID: deal.ASSIGNED_BY_ID || 1,
-      COMPLETED: 'Y',
-      COMMUNICATIONS: [{
-        VALUE: toEmail,
-        ENTITY_ID: Number(deal.CONTACT_ID || 0),
-        ENTITY_TYPE_ID: 3,
-        TYPE: 'EMAIL',
-      }],
-    },
-  });
+  return sendEmailThroughBitrix(
+    deal.ID,
+    deal.ASSIGNED_BY_ID,
+    deal.CONTACT_ID,
+    toEmail,
+    deal.TITLE,
+    text,
+    subject || `Документы по сделке: ${deal.TITLE}`,
+  );
 }
 
 async function sendClientTextByPreferredChannel(deal, text, subject = '') {

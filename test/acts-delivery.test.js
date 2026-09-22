@@ -2,7 +2,8 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError } = require('../acts-delivery');
+const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('../acts-delivery');
+const { bitrixEmailSenderSettings } = require('../bitrix-email');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
@@ -26,6 +27,30 @@ test('uses Email after a confirmed Wazzup failure, but never after an uncertain 
   assert.equal(canUseEmailFallbackAfterWazzupError({ possiblyDelivered: false }), true);
   assert.equal(canUseEmailFallbackAfterWazzupError(new Error('POST_MESSAGE_ERROR')), true);
   assert.equal(canUseEmailFallbackAfterWazzupError({ possiblyDelivered: true }), false);
+});
+
+test('creates no technical delivery-failure tasks unless explicitly enabled', () => {
+  assert.equal(shouldCreateAutopilotDeliveryFailureTask(false), false);
+  assert.equal(shouldCreateAutopilotDeliveryFailureTask(true), true);
+});
+
+test('always supplies a Bitrix email sender from the configured mailbox or responsible user', () => {
+  assert.deepEqual(bitrixEmailSenderSettings({
+    staff: { NAME: 'Анна', LAST_NAME: 'Иванова', EMAIL: 'anna@example.com' },
+    emailFrom: 'mavis.group@mail.ru',
+    emailSenderName: 'MAVIS GROUP',
+  }), { MESSAGE_FROM: 'MAVIS GROUP <mavis.group@mail.ru>' });
+  assert.deepEqual(bitrixEmailSenderSettings({
+    staff: { NAME: 'Анна', LAST_NAME: 'Иванова' },
+    emailFrom: 'mavis.group@mail.ru',
+    emailSenderName: 'MAVIS GROUP',
+  }), { MESSAGE_FROM: 'MAVIS GROUP <mavis.group@mail.ru>' });
+  assert.deepEqual(bitrixEmailSenderSettings({
+    staff: { NAME: 'Анна', LAST_NAME: 'Иванова', EMAIL: 'anna@example.com' },
+    emailFrom: '',
+    emailSenderName: 'MAVIS GROUP',
+  }), { MESSAGE_FROM: 'Анна Иванова <anna@example.com>' });
+  assert.equal(bitrixEmailSenderSettings({ staff: null, emailFrom: '', emailSenderName: 'MAVIS GROUP' }), null);
 });
 
 test('allows only one concurrent delivery for the same task and deal', () => {

@@ -28,6 +28,10 @@ function canUseEmailFallbackAfterWazzupError(error) {
   return !Boolean(error && error.possiblyDelivered);
 }
 
+function shouldCreateAutopilotDeliveryFailureTask(enabled) {
+  return enabled === true;
+}
+
 function createInFlightLock() {
   const keys = new Set();
 
@@ -59,4 +63,4 @@ function isTechnicalProductionComment(value) {
   );
 }
 
-module.exports = { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError };
+module.exports = { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask };
