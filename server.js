@@ -10752,13 +10752,15 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
   return { range, candidates };
 }
 
-function actsHistoricalPickCandidate(candidates, aiCompany) {
+function actsHistoricalPickCandidate(candidates, ...companyHints) {
   if (candidates.length === 1) return candidates[0];
-  const detected = normalizeCompanyNameForMatch(aiCompany || '');
-  if (!detected) return null;
+  const detected = companyHints
+    .map((value) => normalizeCompanyNameForMatch(value || ''))
+    .filter(Boolean);
+  if (!detected.length) return null;
   const matched = candidates.filter((candidate) => {
     const company = normalizeCompanyNameForMatch(candidate.companyName || '');
-    return company && (company.includes(detected) || detected.includes(company));
+    return company && detected.some((value) => company.includes(value) || value.includes(company));
   });
   return matched.length === 1 ? matched[0] : null;
 }
@@ -10852,11 +10854,19 @@ async function actsRunHistoricalEmailImport(monthRaw) {
           return null;
         });
         if (!parsed) continue;
-        const sender = actsCleanText(parsed && parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address).toLowerCase();
+        const parsedAddresses = [
+          ...(parsed && parsed.from && parsed.from.value || []),
+          ...(parsed && parsed.replyTo && parsed.replyTo.value || []),
+          ...(parsed && parsed.sender && parsed.sender.value || []),
+        ]
+          .map((entry) => actsCleanText(entry && entry.address).toLowerCase())
+          .filter(Boolean);
+        const sender = parsedAddresses[0] || '';
         // Для письма с неизвестного CRM адреса пробуем все кандидаты, но
         // actsHistoricalPickCandidate примет его только при одном совпадении
         // компании, распознанной в подписанном документе.
-        const possible = byEmail.get(sender) || candidates;
+        const matchedByAddress = [...new Set(parsedAddresses.flatMap((email) => byEmail.get(email) || []))];
+        const possible = matchedByAddress.length ? matchedByAddress : candidates;
         const attachments = (parsed && parsed.attachments || []).filter((file) => file && file.size > 0);
         if (!possible.length || !attachments.length) continue;
         result.letters++;
@@ -10876,9 +10886,18 @@ async function actsRunHistoricalEmailImport(monthRaw) {
             result.rejected.push({ fileName, reason: check.reason || 'подписанный акт не подтверждён' });
             continue;
           }
-          const target = actsHistoricalPickCandidate(possible, check.company);
+          const messageContext = `${parsed.subject || ''}\n${parsed.text || ''}`.slice(0, 5000);
+          const target = actsHistoricalPickCandidate(possible, check.company, messageContext);
           if (!target) {
-            result.ambiguous.push({ fileName, sender, candidates: possible.map((x) => x.state.taskId) });
+            result.ambiguous.push({
+              fileName,
+              sender,
+              messageUid: String(uid),
+              subject: actsCleanText(parsed.subject || ''),
+              detectedCompany: actsCleanText(check.company || ''),
+              actNumber: actsCleanText(check.actNumber || ''),
+              candidates: possible.map((x) => x.state.taskId),
+            });
             continue;
           }
           const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${target.state.taskId}`;

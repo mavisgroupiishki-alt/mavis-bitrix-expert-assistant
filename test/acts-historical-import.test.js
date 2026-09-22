@@ -69,7 +69,26 @@ test('historical email scan includes explicit act subjects from senders absent i
   assert.ok(start >= 0 && end > start, 'historical email importer must be present in server.js');
   const importer = source.slice(start, end);
   assert.match(importer, /subject:\s*'акт'/);
-  assert.match(importer, /byEmail\.get\(sender\)\s*\|\|\s*candidates/);
+  assert.match(importer, /matchedByAddress\.length\s*\?\s*matchedByAddress\s*:\s*candidates/);
+  assert.match(importer, /parsed\.replyTo/);
+  assert.match(importer, /messageUid/);
+});
+
+test('historical candidate selection can use the company from the email text', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('function actsHistoricalPickCandidate(');
+  const end = source.indexOf('\nasync function actsRunHistoricalEmailImport(', start);
+  assert.ok(start >= 0 && end > start, 'historical candidate picker must be present in server.js');
+  const context = {
+    normalizeCompanyNameForMatch: (value) => String(value || '').toLowerCase().replace(/[^a-zа-я0-9]+/gi, ''),
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.pick = actsHistoricalPickCandidate;`, context);
+  const candidates = [
+    { companyName: 'Альфа Строй' },
+    { companyName: 'Бета Проект' },
+  ];
+  assert.equal(context.pick(candidates, '', 'Направляем подписанный акт для Альфа Строй'), candidates[0]);
+  assert.equal(context.pick(candidates, '', 'Альфа Строй и Бета Проект'), null);
 });
 
 test('historical candidate loader uses a unique title fallback for legacy act tasks', () => {
