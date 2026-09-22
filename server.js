@@ -1514,7 +1514,9 @@ app.post('/api/dashboard-chat', async (req, res) => {
     const question = clipText(String(payload.question || '').trim(), 900);
     if (!question) return res.status(400).json({ ok: false, error: 'Question is required.' });
     const liveBitrix = await dashboardLiveBitrixContext(question);
-    const contextData = { ...(payload.context || {}), live_bitrix: liveBitrix };
+    // The dashboard snapshot can be large. Keep the question-specific Bitrix
+    // result first so the 32 KiB prompt cap cannot cut it off.
+    const contextData = { live_bitrix: liveBitrix, ...(payload.context || {}) };
     const context = clipText(JSON.stringify(contextData, null, 2), 32000);
     const allowedLinks = dashboardChatContextLinks(contextData);
     const history = Array.isArray(payload.history) ? payload.history.slice(-6).map((item) => ({
