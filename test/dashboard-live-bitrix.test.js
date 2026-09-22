@@ -63,7 +63,7 @@ test('answers count questions directly from the live Bitrix result', () => {
     filters: { stages: ['2. Сбор информации'], experts: ['Елизавета Горбатова'] },
   });
 
-  assert.match(result.answer, /54 сделок/);
+  assert.match(result.answer, /54 сделки/);
   assert.match(result.answer, /Сбор информации/);
   assert.equal(result.links.length, 0);
 });

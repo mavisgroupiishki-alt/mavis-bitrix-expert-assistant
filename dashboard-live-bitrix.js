@@ -106,8 +106,17 @@ function exactLiveAnswer(question, live) {
   const suffix = scope.length ? ` по фильтру: ${scope.join(', ')}` : '';
   const count = Number(live.matching_count || 0);
   const amount = Number(live.matching_amount || 0);
+  const countTail = Math.abs(count) % 100;
+  const countLast = Math.abs(count) % 10;
+  const dealWord = countTail >= 11 && countTail <= 14
+    ? 'сделок'
+    : countLast === 1
+      ? 'сделка'
+      : countLast >= 2 && countLast <= 4
+        ? 'сделки'
+        : 'сделок';
   const answerParts = [];
-  if (asksCount) answerParts.push(`${count} ${count === 1 ? 'сделка' : count >= 2 && count <= 4 ? 'сделки' : 'сделок'}`);
+  if (asksCount) answerParts.push(`${count} ${dealWord}`);
   if (asksAmount) answerParts.push(`${amount.toLocaleString('ru-RU')} BYN`);
   return {
     answer: `На текущий момент${suffix}: ${answerParts.join(', ')}.`,
