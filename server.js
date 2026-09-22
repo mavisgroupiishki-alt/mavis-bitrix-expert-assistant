@@ -30,7 +30,7 @@ const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannel
 const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
-const { categoryForQuestion, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
+const { categoryForQuestion, exactLiveAnswer, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1524,6 +1524,8 @@ app.post('/api/dashboard-chat', async (req, res) => {
     const question = clipText(String(payload.question || '').trim(), 900);
     if (!question) return res.status(400).json({ ok: false, error: 'Question is required.' });
     const liveBitrix = await dashboardLiveBitrixContext(question);
+    const exactAnswer = exactLiveAnswer(question, liveBitrix);
+    if (exactAnswer) return res.json({ ok: true, ...exactAnswer });
     // The dashboard snapshot can be large. Keep the question-specific Bitrix
     // result first so the 32 KiB prompt cap cannot cut it off.
     const contextData = { live_bitrix: liveBitrix, ...(payload.context || {}) };

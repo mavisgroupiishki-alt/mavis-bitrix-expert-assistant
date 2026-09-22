@@ -91,4 +91,33 @@ function selectLiveDeals({ question, category, stages = [], users = [], deals = 
   };
 }
 
-module.exports = { categoryForQuestion, personName, searchText, selectLiveDeals, stageId, stageName };
+function exactLiveAnswer(question, live) {
+  if (!live || !live.available) return null;
+  const text = searchText(question);
+  const asksCount = /(сколько|количество|число|кол во|колво)/.test(text) && /(сдел|шт)/.test(text);
+  const asksAmount = /(сумм|выручк|денег|руб|byn)/.test(text);
+  if (!asksCount && !asksAmount) return null;
+
+  const filters = live.filters || {};
+  const scope = [
+    ...(filters.stages || []).map((stage) => `стадия «${stage}»`),
+    ...(filters.experts || []).map((expert) => `эксперт ${expert}`),
+  ];
+  const suffix = scope.length ? ` по фильтру: ${scope.join(', ')}` : '';
+  const count = Number(live.matching_count || 0);
+  const amount = Number(live.matching_amount || 0);
+  const answerParts = [];
+  if (asksCount) answerParts.push(`${count} ${count === 1 ? 'сделка' : count >= 2 && count <= 4 ? 'сделки' : 'сделок'}`);
+  if (asksAmount) answerParts.push(`${amount.toLocaleString('ru-RU')} BYN`);
+  return {
+    answer: `На текущий момент${suffix}: ${answerParts.join(', ')}.`,
+    facts: [
+      `Источник: live-запрос Bitrix на момент ответа.`,
+      `Найдено сделок: ${count}; сумма: ${amount.toLocaleString('ru-RU')} BYN.`,
+    ],
+    recommendations: [],
+    links: [],
+  };
+}
+
+module.exports = { categoryForQuestion, exactLiveAnswer, personName, searchText, selectLiveDeals, stageId, stageName };

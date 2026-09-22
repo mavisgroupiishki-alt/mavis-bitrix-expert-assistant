@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { categoryForQuestion, selectLiveDeals } = require('../dashboard-live-bitrix');
+const { categoryForQuestion, exactLiveAnswer, selectLiveDeals } = require('../dashboard-live-bitrix');
 
 test('selects the live production deals for an expert and a human stage name', () => {
   const result = selectLiveDeals({
@@ -53,4 +53,17 @@ test('does not treat a generic question word as a request for a deal list', () =
 
 test('uses the dormant funnel for questions about stuck deals', () => {
   assert.deepEqual(categoryForQuestion('сколько сделок в зависших сейчас'), { id: 30, label: 'Зависшие' });
+});
+
+test('answers count questions directly from the live Bitrix result', () => {
+  const result = exactLiveAnswer('сколько сделок на стадии сбор информации у эксперта Елизаветы Горбатовой', {
+    available: true,
+    matching_count: 54,
+    matching_amount: 80100,
+    filters: { stages: ['2. Сбор информации'], experts: ['Елизавета Горбатова'] },
+  });
+
+  assert.match(result.answer, /54 сделок/);
+  assert.match(result.answer, /Сбор информации/);
+  assert.equal(result.links.length, 0);
 });
