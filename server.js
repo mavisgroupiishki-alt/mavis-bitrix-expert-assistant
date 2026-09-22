@@ -10686,8 +10686,25 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
     const expertFolder = expertFolderByUserId.get(String(deal.ASSIGNED_BY_ID || ''));
     if (!expertFolder) continue;
     const dealId = String(deal.ID || '');
-    const linkedTasks = (await actsHistoricalAwait(actsReconTasksForDeal(dealId), `задачи акта сделки ${dealId}`).catch(() => []))
+    const companyName = deal.COMPANY_ID ? await actsHistoricalAwait(
+      getCompanyName(deal.COMPANY_ID),
+      `название компании ${deal.COMPANY_ID}`,
+    ).catch(() => '') : actsCleanText(deal.TITLE || '');
+    let linkedTasks = (await actsHistoricalAwait(actsReconTasksForDeal(dealId), `задачи акта сделки ${dealId}`).catch(() => []))
       .filter(actsReconIsActTask);
+    // Старые задачи иногда есть в «Акты счета», но без CRM-привязки D_ID.
+    // В таком случае используем только единственную задачу, совпавшую по
+    // компании/услуге: при нескольких совпадениях документ не привязываем.
+    if (linkedTasks.length !== 1) {
+      const fallbackTasks = await actsHistoricalAwait(
+        actsReconFallbackTasksByTitle(companyName, detectServiceFromDeal(deal) || ''),
+        `резервная задача акта сделки ${dealId}`,
+      ).catch(() => []);
+      if (fallbackTasks.length === 1) {
+        linkedTasks = fallbackTasks;
+        console.log(`[acts-historical] deal=${dealId}: задача акта ${actsTaskField(fallbackTasks[0], ['id', 'ID'])} найдена по названию компании.`);
+      }
+    }
     if (linkedTasks.length !== 1) {
       console.warn(`[acts-historical] deal=${dealId}: задач актов=${linkedTasks.length}; автоматический выбор пропускаю.`);
       continue;
@@ -10728,10 +10745,7 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
       emails,
       phones,
       expertFolder,
-      companyName: deal.COMPANY_ID ? await actsHistoricalAwait(
-        getCompanyName(deal.COMPANY_ID),
-        `название компании ${deal.COMPANY_ID}`,
-      ).catch(() => '') : '',
+      companyName,
     });
   }
   console.log(`[acts-historical] Кандидатов с контактами: ${candidates.length}; с почтой: ${candidates.filter((x) => x.emails.size).length}; с телефоном: ${candidates.filter((x) => x.phones.size).length}.`);

@@ -23,8 +23,10 @@ function historicalCandidateLoader() {
     bitrixRestCall: async () => [],
     actsResolveExpertFolderName: () => '',
     actsReconTasksForDeal: async () => [],
+    actsReconFallbackTasksByTitle: async () => [],
     actsReconIsActTask: () => false,
     actsTaskField: () => '',
+    detectServiceFromDeal: () => '',
     normalizePhoneDigits: () => '',
     actsCleanText: (value) => String(value || ''),
     getCompanyName: async () => '',
@@ -68,6 +70,15 @@ test('historical email scan includes explicit act subjects from senders absent i
   const importer = source.slice(start, end);
   assert.match(importer, /subject:\s*'акт'/);
   assert.match(importer, /byEmail\.get\(sender\)\s*\|\|\s*candidates/);
+});
+
+test('historical candidate loader uses a unique title fallback for legacy act tasks', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('async function actsHistoricalLoadEmailCandidates(monthRaw) {');
+  const end = source.indexOf('\nfunction actsHistoricalPickCandidate(', start);
+  const loader = source.slice(start, end);
+  assert.match(loader, /actsReconFallbackTasksByTitle\(companyName, detectServiceFromDeal\(deal\) \|\| ''\)/);
+  assert.match(loader, /fallbackTasks\.length === 1/);
 });
 
 test('historical Wazzup importer fails before starting an extra email candidate scan without OAuth', async () => {
