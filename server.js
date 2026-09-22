@@ -30,7 +30,7 @@ const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannel
 const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
-const { categoryForQuestion, selectLiveDeals } = require('./dashboard-live-bitrix');
+const { categoryForQuestion, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1467,15 +1467,25 @@ async function dashboardLiveBitrixContext(question) {
   const category = categoryForQuestion(question, config.autopilotCategoryId || 28);
   const options = { timeoutMs: DASHBOARD_LIVE_BITRIX_TIMEOUT_MS, deadlineAt: Date.now() + DASHBOARD_LIVE_REQUEST_TIMEOUT_MS };
   try {
-    const [stages, users, deals] = await Promise.all([
+    const [stages, users] = await Promise.all([
       dashboardLiveStages(category.id, options),
       dashboardLiveUsers(options),
-      bitrixRestList('crm.deal.list', {
-        order: { ID: 'DESC' },
-        filter: { CATEGORY_ID: category.id, CLOSED: 'N' },
-        select: ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME'],
-      }, 1000, options),
     ]);
+    const requested = selectLiveDeals({ question, category, stages, users, deals: [] });
+    const selectedStages = new Set(requested.filters.stages);
+    const selectedExperts = new Set(requested.filters.experts);
+    const stageIds = stages.filter((stage) => selectedStages.has(stageName(stage))).map(stageId);
+    const expertIds = users.filter((user) => selectedExperts.has(personName(user))).map((user) => String(user.ID || user.id || ''));
+    const filter = { CATEGORY_ID: category.id, CLOSED: 'N' };
+    // A named expert or stage should be answered with a server-side Bitrix
+    // filter, rather than downloading the whole funnel and timing out.
+    if (stageIds.length === 1) filter.STAGE_ID = stageIds[0];
+    if (expertIds.length === 1) filter.ASSIGNED_BY_ID = expertIds[0];
+    const deals = await bitrixRestList('crm.deal.list', {
+      order: { ID: 'DESC' },
+      filter,
+      select: ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'OPPORTUNITY', 'CURRENCY_ID', 'DATE_CREATE', 'MOVED_TIME'],
+    }, (stageIds.length || expertIds.length) ? 200 : 100, options);
     return {
       available: true,
       retrieved_at: new Date().toISOString(),
