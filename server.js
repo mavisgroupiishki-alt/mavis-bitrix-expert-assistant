@@ -12642,6 +12642,56 @@ function actsMaintenanceTokenMatches(req) {
   return authorizationMatchesToken(req, process.env.ACTS_MAINTENANCE_TOKEN);
 }
 
+// Разовый исторический поиск не должен быть привязан к перезапуску сервиса:
+// иначе любой обычный деплой начинает обход почты заново. Запуск доступен
+// только через maintenance-токен, ничего клиентам не отправляет и не меняет
+// флаг Seen у писем (это обеспечивает actsRunHistoricalEmailImport).
+let actsHistoricalEmailImportRun = null;
+let actsHistoricalEmailImportStatus = {
+  state: 'idle', month: '', startedAt: '', finishedAt: '', result: null, error: '',
+};
+
+function actsStartHistoricalEmailImport(monthRaw) {
+  if (actsHistoricalEmailImportRun) return false;
+  actsHistoricalEmailImportStatus = {
+    state: 'running', month: monthRaw, startedAt: new Date().toISOString(), finishedAt: '', result: null, error: '',
+  };
+  actsHistoricalEmailImportRun = actsRunHistoricalEmailImport(monthRaw)
+    .then((result) => {
+      actsHistoricalEmailImportStatus = {
+        ...actsHistoricalEmailImportStatus, state: 'completed', finishedAt: new Date().toISOString(), result,
+      };
+    })
+    .catch((error) => {
+      actsHistoricalEmailImportStatus = {
+        ...actsHistoricalEmailImportStatus, state: 'failed', finishedAt: new Date().toISOString(), error: error.message || String(error),
+      };
+      console.error(`[acts-historical] controlled import failed: ${error.message || error}`);
+    })
+    .finally(() => { actsHistoricalEmailImportRun = null; });
+  return true;
+}
+
+// Статус и запуск оставлены отдельным обслуживающим маршрутом, чтобы исторический
+// импорт можно было завершить один раз без повторных автозапусков при деплое.
+app.post('/api/maintenance/acts-historical-email-import', (req, res) => {
+  if (!actsMaintenanceTokenMatches(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
+  }
+  const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+  const month = String(req.body && req.body.month || config.actsHistoricalImportMonth || '').trim();
+  try {
+    actsHistoricalMonthRange(month);
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error.message || String(error) });
+  }
+  if (!execute) return res.json({ ok: true, dryRun: true, status: actsHistoricalEmailImportStatus, month });
+  if (!actsStartHistoricalEmailImport(month)) {
+    return res.status(409).json({ ok: false, error: 'Исторический импорт уже выполняется.', status: actsHistoricalEmailImportStatus });
+  }
+  return res.status(202).json({ ok: true, started: true, month, status: actsHistoricalEmailImportStatus });
+});
+
 async function actsFindTechnicalProductionComments(commentLimit = 1000) {
   const deals = await bitrixRestList('crm.deal.list', {
     filter: { CATEGORY_ID: Number(config.productionCategoryId || config.autopilotCategoryId || 28) },
