@@ -60,6 +60,16 @@ test('historical candidate loader starts with an empty closed-deal result', asyn
   assert.equal(result.candidates.length, 0);
 });
 
+test('historical email scan includes explicit act subjects from senders absent in CRM', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('async function actsRunHistoricalEmailImport(monthRaw) {');
+  const end = source.indexOf('\nfunction actsHistoricalCsvParse(', start);
+  assert.ok(start >= 0 && end > start, 'historical email importer must be present in server.js');
+  const importer = source.slice(start, end);
+  assert.match(importer, /subject:\s*'акт'/);
+  assert.match(importer, /byEmail\.get\(sender\)\s*\|\|\s*candidates/);
+});
+
 test('historical Wazzup importer fails before starting an extra email candidate scan without OAuth', async () => {
   const run = historicalWazzupImporter();
   await assert.rejects(run('2026-09'), /Не задан WAZZUP_CLIENT_ACCESS_TOKEN/);

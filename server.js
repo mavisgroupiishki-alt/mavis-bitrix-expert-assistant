@@ -10799,6 +10799,25 @@ async function actsRunHistoricalEmailImport(monthRaw) {
           console.log(`[acts-historical] Почта: проверено адресов ${index + 1}/${emailList.length}; найдено писем ${uidSet.size}.`);
         }
       }
+      // Клиенты нередко присылают подписанный акт с адреса бухгалтера или
+      // руководителя, которого нет в карточке контакта. Такие письма раньше
+      // вообще не попадали в разовый поиск. Берём только явные письма об акте;
+      // ниже они будут привязаны исключительно по уникально распознанной
+      // компании, поэтому случайный контакт не получит чужой документ.
+      const subjectActUids = await client.search({
+        since: range.start,
+        before: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        subject: 'акт',
+      }).catch((error) => {
+        result.errors.push(`поиск писем с актом в теме: ${error.message || error}`);
+        return [];
+      });
+      let subjectOnlyCount = 0;
+      for (const uid of subjectActUids || []) {
+        if (!uidSet.has(uid)) subjectOnlyCount++;
+        uidSet.add(uid);
+      }
+      console.log(`[acts-historical] Дополнительно найдено писем с «акт» в теме: ${subjectActUids.length}; новых вне контактов: ${subjectOnlyCount}.`);
       const uids = [...uidSet];
       for (const [index, uid] of uids.entries()) {
         const message = await actsHistoricalAwait(
@@ -10820,7 +10839,10 @@ async function actsRunHistoricalEmailImport(monthRaw) {
         });
         if (!parsed) continue;
         const sender = actsCleanText(parsed && parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address).toLowerCase();
-        const possible = byEmail.get(sender) || [];
+        // Для письма с неизвестного CRM адреса пробуем все кандидаты, но
+        // actsHistoricalPickCandidate примет его только при одном совпадении
+        // компании, распознанной в подписанном документе.
+        const possible = byEmail.get(sender) || candidates;
         const attachments = (parsed && parsed.attachments || []).filter((file) => file && file.size > 0);
         if (!possible.length || !attachments.length) continue;
         result.letters++;
