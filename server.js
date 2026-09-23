@@ -30,7 +30,7 @@ const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannel
 const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
-const { categoryForQuestion, exactLiveAnswer, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
+const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1421,7 +1421,7 @@ function dashboardBitrixPortalUrl() {
   }
 }
 
-const dashboardLiveBitrixMetadata = { users: null, usersAt: 0, stages: new Map() };
+const dashboardLiveBitrixMetadata = { users: null, usersAt: 0, stages: new Map(), sources: null, sourcesAt: 0 };
 const DASHBOARD_LIVE_METADATA_TTL_MS = 5 * 60 * 1000;
 const DASHBOARD_LIVE_BITRIX_TIMEOUT_MS = 12 * 1000;
 const DASHBOARD_LIVE_REQUEST_TIMEOUT_MS = 16 * 1000;
@@ -1460,27 +1460,58 @@ async function dashboardLiveStages(categoryId, options) {
   return value;
 }
 
+async function dashboardLiveSources(options) {
+  if (dashboardLiveBitrixMetadata.sources && Date.now() - dashboardLiveBitrixMetadata.sourcesAt < DASHBOARD_LIVE_METADATA_TTL_MS) {
+    return dashboardLiveBitrixMetadata.sources;
+  }
+  const sources = await bitrixRestList('crm.status.list', { filter: { ENTITY_ID: 'SOURCE' } }, 200, options);
+  dashboardLiveBitrixMetadata.sources = Array.isArray(sources) ? sources : [];
+  dashboardLiveBitrixMetadata.sourcesAt = Date.now();
+  return dashboardLiveBitrixMetadata.sources;
+}
+
 async function dashboardLiveBitrixContext(question) {
   if (!config.bitrixWebhookUrl) {
     return { available: false, error: 'Прямой read-only доступ к Bitrix ещё не настроен.' };
   }
   const category = categoryForQuestion(question, config.autopilotCategoryId || 28);
+  const sourceQuestion = isSourceQuestion(question);
   const options = { timeoutMs: DASHBOARD_LIVE_BITRIX_TIMEOUT_MS, deadlineAt: Date.now() + DASHBOARD_LIVE_REQUEST_TIMEOUT_MS };
   try {
-    const [stages, users] = await Promise.all([
-      dashboardLiveStages(category.id, options),
-      dashboardLiveUsers(options),
+    const [stages, users, sources] = await Promise.all([
+      category.id === null ? Promise.resolve([]) : dashboardLiveStages(category.id, options),
+      sourceQuestion ? Promise.resolve([]) : dashboardLiveUsers(options),
+      sourceQuestion ? dashboardLiveSources(options) : Promise.resolve([]),
     ]);
     const requested = selectLiveDeals({ question, category, stages, users, deals: [] });
     const selectedStages = new Set(requested.filters.stages);
     const selectedExperts = new Set(requested.filters.experts);
+    const selectedSources = sourceQuestion ? matchingSourceOptions(question, sources) : [];
+    if (sourceQuestion && !selectedSources.length) {
+      return {
+        available: true,
+        retrieved_at: new Date().toISOString(),
+        source: 'live_bitrix',
+        category,
+        query_scope: 'Стандартный справочник источников на момент запроса',
+        filters: { stages: [], experts: [] },
+        category_active_count: 0,
+        matching_count: 0,
+        matching_amount: 0,
+        deals: [],
+        deals_truncated: false,
+        source_matches: [],
+      };
+    }
     const stageIds = stages.filter((stage) => selectedStages.has(stageName(stage))).map(stageId);
     const expertIds = users.filter((user) => selectedExperts.has(personName(user))).map((user) => String(user.ID || user.id || ''));
-    const filter = { CATEGORY_ID: category.id, CLOSED: 'N' };
+    const filter = { CLOSED: 'N' };
+    if (category.id !== null) filter.CATEGORY_ID = category.id;
     // A named expert or stage should be answered with a server-side Bitrix
     // filter, rather than downloading the whole funnel and timing out.
     if (stageIds.length === 1) filter.STAGE_ID = stageIds[0];
     if (expertIds.length === 1) filter.ASSIGNED_BY_ID = expertIds[0];
+    if (selectedSources.length === 1) filter.SOURCE_ID = String(selectedSources[0].STATUS_ID || selectedSources[0].ID || '');
     const deals = await bitrixRestList('crm.deal.list', {
       order: { ID: 'DESC' },
       filter,
@@ -1497,6 +1528,7 @@ async function dashboardLiveBitrixContext(question) {
         deals: Array.isArray(deals) ? deals : [],
         portalUrl: dashboardBitrixPortalUrl(),
       }),
+      source_matches: selectedSources,
     };
   } catch (error) {
     console.warn(`[dashboard-chat] Bitrix live query failed: ${error.message || String(error)}`);

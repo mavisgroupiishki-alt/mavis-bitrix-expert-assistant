@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { categoryForQuestion, exactLiveAnswer, selectLiveDeals } = require('../dashboard-live-bitrix');
+const { categoryForQuestion, exactLiveAnswer, matchingSourceOptions, selectLiveDeals } = require('../dashboard-live-bitrix');
 
 test('selects the live production deals for an expert and a human stage name', () => {
   const result = selectLiveDeals({
@@ -53,6 +53,29 @@ test('does not treat a generic question word as a request for a deal list', () =
 
 test('uses the dormant funnel for questions about stuck deals', () => {
   assert.deepEqual(categoryForQuestion('сколько сделок в зависших сейчас'), { id: 30, label: 'Зависшие' });
+});
+
+test('searches all funnels for a question about a named Bitrix source', () => {
+  assert.deepEqual(categoryForQuestion('источник партнерка Белтехэкспертиза в Bitrix есть?'), { id: null, label: 'Все воронки' });
+});
+
+test('answers a named source question directly from the live Bitrix source catalog', () => {
+  const sources = [
+    { STATUS_ID: 'PARTNER', NAME: 'Партнерка Белтехэкспертиза' },
+    { STATUS_ID: 'WEB', NAME: 'Сайт' },
+  ];
+  const matches = matchingSourceOptions('источник партнерка белтехэкспертиза в битрикс есть посмотри', sources);
+  assert.deepEqual(matches, [sources[0]]);
+
+  const answer = exactLiveAnswer('источник партнерка белтехэкспертиза в битрикс есть посмотри', {
+    available: true,
+    source_matches: matches,
+    matching_count: 3,
+    matching_amount: 6400,
+  });
+
+  assert.match(answer.answer, /Партнерка Белтехэкспертиза/);
+  assert.match(answer.answer, /3 сделок/);
 });
 
 test('answers count questions directly from the live Bitrix result', () => {

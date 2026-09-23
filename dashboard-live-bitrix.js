@@ -11,9 +11,33 @@ function searchText(value) {
 
 function categoryForQuestion(question, productionCategoryId = 28) {
   const text = searchText(question);
+  if (/(^|\s)(источник|источника|источники|партнер|партнерка|партнеры)/.test(text)) return { id: null, label: 'Все воронки' };
   if (/(^|\s)завис/.test(text)) return { id: 30, label: 'Зависшие' };
   if (/(^|\s)(продаж|лид|менеджер|холодн|входящ|повторн)/.test(text)) return { id: 0, label: 'Продажи' };
   return { id: Number(productionCategoryId) || 28, label: 'Производство' };
+}
+
+function isSourceQuestion(question) {
+  return /(^|\s)(источник|источника|источники|партнер|партнерка|партнеры)/.test(searchText(question));
+}
+
+function sourceOptionName(option) {
+  return String(option && (option.NAME || option.name || option.VALUE || option.value || option.STATUS_ID || option.id) || '').trim();
+}
+
+function matchingSourceOptions(question, options = []) {
+  const text = searchText(question);
+  const terms = text.split(' ').filter((term) => term.length >= 4 && ![
+    'источник', 'источника', 'источники',
+    'битрикс', 'посмотри', 'смотри', 'есть', 'мне', 'чтобы', 'сколько', 'сделок',
+  ].includes(term));
+  return options.filter((option) => {
+    const name = searchText(sourceOptionName(option));
+    if (!name) return false;
+    return terms.some((term) => name.includes(term) || term.includes(name) || (
+      term.length >= 5 && name.split(' ').some((word) => word.startsWith(term.slice(0, -1)))
+    ));
+  });
 }
 
 function stageId(stage) {
@@ -94,6 +118,29 @@ function selectLiveDeals({ question, category, stages = [], users = [], deals = 
 function exactLiveAnswer(question, live) {
   if (!live || !live.available) return null;
   const text = searchText(question);
+  if (isSourceQuestion(question)) {
+    const sources = Array.isArray(live.source_matches) ? live.source_matches : [];
+    if (sources.length) {
+      const names = sources.map(sourceOptionName).filter(Boolean);
+      const count = Number(live.matching_count || 0);
+      const amount = Number(live.matching_amount || 0);
+      return {
+        answer: `В Bitrix найден источник: ${names.map((name) => `«${name}»`).join(', ')}. На текущий момент по нему ${count} сделок на сумму ${amount.toLocaleString('ru-RU')} BYN.`,
+        facts: [
+          'Источник и сделки проверены прямым read-only запросом в Bitrix на момент ответа.',
+          `Найдено активных сделок: ${count}; сумма: ${amount.toLocaleString('ru-RU')} BYN.`,
+        ],
+        recommendations: [],
+        links: [],
+      };
+    }
+    return {
+      answer: 'В стандартном справочнике источников Bitrix совпадение не найдено. Возможно, это значение хранится в отдельном пользовательском поле сделки.',
+      facts: ['Проверен стандартный справочник источников Bitrix в реальном времени.'],
+      recommendations: ['Напишите точное название поля, если «Белтехэкспертиза» хранится не в стандартном источнике — я подключу его к поиску.'],
+      links: [],
+    };
+  }
   const asksCount = /(сколько|количество|число|кол во|колво)/.test(text) && /(сдел|шт)/.test(text);
   const asksAmount = /(сумм|выручк|денег|руб|byn)/.test(text);
   if (!asksCount && !asksAmount) return null;
@@ -129,4 +176,4 @@ function exactLiveAnswer(question, live) {
   };
 }
 
-module.exports = { categoryForQuestion, exactLiveAnswer, personName, searchText, selectLiveDeals, stageId, stageName };
+module.exports = { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, searchText, selectLiveDeals, sourceOptionName, stageId, stageName };
