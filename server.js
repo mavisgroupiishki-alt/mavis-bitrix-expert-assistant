@@ -10587,6 +10587,24 @@ async function actsSaveIncomingScanForState({ state, deal, source, fileName, buf
   return { ok: true, taskId: state.taskId, dealId: deal.ID, fileName, storage };
 }
 
+async function actsSaveHistoricalScanWithoutTask({ deal, source, fileName, buffer, periodDate = '', expertFolderOverride = '' }) {
+  const marker = `${ACTS_SCAN_RECEIVED_MARKER} historical-deal=${deal.ID}`;
+  if (await fgTimelineHasMarker(deal.ID, marker, 200).catch(() => false)) {
+    return { ok: true, skipped: true, dealId: deal.ID, fileName };
+  }
+  const storage = await actsGetExpertActFolder(deal, periodDate, expertFolderOverride);
+  const saved = await uploadFileToDiskFolder(storage.expertFolderId, fileName, buffer);
+  if (!saved) throw new Error('не удалось сохранить исторический скан в папку эксперта');
+  const fileId = String(saved.ID || saved.id || '');
+  await bitrixRestCall('crm.timeline.comment.add', { fields: {
+    ENTITY_ID: deal.ID,
+    ENTITY_TYPE: 'deal',
+    COMMENT: `Исторический подписанный акт сохранён: ${source} — ${fileName}. Папка: ${storage.monthFolderName}/${storage.expertFolder}. Задача акта не найдена, поэтому состояние автопушей не изменялось.\n\n${marker}${fileId ? ` file=${fileId}` : ''}`,
+  }});
+  console.log(`[acts-historical] ✅ deal=${deal.ID}: ${fileName} → ${storage.monthFolderName}/${storage.expertFolder}; задача акта не найдена.`);
+  return { ok: true, historicalWithoutTask: true, dealId: deal.ID, fileName, storage };
+}
+
 async function actsProcessIncomingAttachments({ source, commType, commValue, messageText = '', attachments = [], skipCompanyFolder = false }) {
   if (!config.actsIncomingEnabled || !attachments.length) return { ok: true, processed: 0 };
   const waiting = await actsFindWaitingStatesByComm(commType, commValue);
@@ -10705,11 +10723,11 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
         console.log(`[acts-historical] deal=${dealId}: задача акта ${actsTaskField(fallbackTasks[0], ['id', 'ID'])} найдена по названию компании.`);
       }
     }
-    if (linkedTasks.length !== 1) {
-      console.warn(`[acts-historical] deal=${dealId}: задач актов=${linkedTasks.length}; автоматический выбор пропускаю.`);
-      continue;
-    }
-    const task = linkedTasks[0];
+    // Скан не должен исчезать из отчёта только потому, что у старой сделки
+    // нет корректно связанной задачи акта. Для такой сделки сохраняем скан в
+    // папку эксперта, но не трогаем состояние пушей.
+    const task = linkedTasks.length === 1 ? linkedTasks[0] : null;
+    if (!task) console.warn(`[acts-historical] deal=${dealId}: задач актов=${linkedTasks.length}; оставляю кандидатом без задачи.`);
 
     const emails = new Set();
     const phones = new Set();
@@ -10736,7 +10754,7 @@ async function actsHistoricalLoadEmailCandidates(monthRaw) {
 
     candidates.push({
       state: {
-        taskId: String(actsTaskField(task, ['id', 'ID'])),
+        taskId: task ? String(actsTaskField(task, ['id', 'ID'])) : '',
         dealId: String(dealId),
         sentAtMs: Date.parse(String(deal.CLOSEDATE || '')) || 0,
         createdDate: deal.CLOSEDATE || '',
@@ -10900,19 +10918,27 @@ async function actsRunHistoricalEmailImport(monthRaw) {
             });
             continue;
           }
-          const marker = `${ACTS_SCAN_RECEIVED_MARKER} task=${target.state.taskId}`;
+          const marker = target.state.taskId
+            ? `${ACTS_SCAN_RECEIVED_MARKER} task=${target.state.taskId}`
+            : `${ACTS_SCAN_RECEIVED_MARKER} historical-deal=${target.state.dealId}`;
           if (await fgTimelineHasMarker(target.state.dealId, marker, 200).catch(() => false)) continue;
           try {
-            const saved = await actsSaveIncomingScanForState({
-              state: target.state, deal: target.deal,
-              source: `исторический email за ${monthRaw}`,
-              fileName, buffer: attachment.content, contentType: attachment.contentType || '',
-              periodDate: target.state.createdDate, expertFolderOverride: target.expertFolder,
-              skipCompanyFolder: true, notifyExpert: false,
-            });
+            const saved = target.state.taskId
+              ? await actsSaveIncomingScanForState({
+                state: target.state, deal: target.deal,
+                source: `исторический email за ${monthRaw}`,
+                fileName, buffer: attachment.content, contentType: attachment.contentType || '',
+                periodDate: target.state.createdDate, expertFolderOverride: target.expertFolder,
+                skipCompanyFolder: true, notifyExpert: false,
+              })
+              : await actsSaveHistoricalScanWithoutTask({
+                deal: target.deal, source: `исторический email за ${monthRaw}`,
+                fileName, buffer: attachment.content,
+                periodDate: target.state.createdDate, expertFolderOverride: target.expertFolder,
+              });
             result.saved.push(saved);
           } catch (e) {
-            result.errors.push({ fileName, taskId: target.state.taskId, error: String(e.message || e) });
+            result.errors.push({ fileName, taskId: target.state.taskId || null, error: String(e.message || e) });
           }
         }
         if ((index + 1) % 10 === 0 || index + 1 === uids.length) {

@@ -62,6 +62,42 @@ test('historical candidate loader starts with an empty closed-deal result', asyn
   assert.equal(result.candidates.length, 0);
 });
 
+test('historical candidate loader keeps a closed deal when its act task is missing', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const start = source.indexOf('async function actsHistoricalLoadEmailCandidates(monthRaw) {');
+  const end = source.indexOf('\nfunction actsHistoricalPickCandidate(', start);
+  const context = {
+    Map,
+    Set,
+    console: { log() {}, warn() {} },
+    config: { productionCategoryId: 28 },
+    actsHistoricalMonthRange: () => ({ startIso: '2026-09-01', endIso: '2026-10-01' }),
+    actsHistoricalAwait: (promise) => promise,
+    bitrixRestList: async (method) => method === 'crm.deal.list' ? [{
+      ID: '77', TITLE: 'БелГрупп инокс', CLOSEDATE: '2026-09-10', ASSIGNED_BY_ID: '9', COMPANY_ID: '5', CONTACT_ID: '',
+    }] : [],
+    bitrixRestCall: async (method) => {
+      if (method === 'user.get') return [{ ID: '9', NAME: 'Лиза', LAST_NAME: 'Эксперт' }];
+      if (method === 'crm.company.get') return { EMAIL: [{ VALUE: 'bel-grupp@mail.ru' }], PHONE: [] };
+      return [];
+    },
+    actsResolveExpertFolderName: () => 'Лиза',
+    actsReconTasksForDeal: async () => [],
+    actsReconFallbackTasksByTitle: async () => [],
+    actsReconIsActTask: () => false,
+    actsTaskField: () => '',
+    detectServiceFromDeal: () => '',
+    normalizePhoneDigits: () => '',
+    actsCleanText: (value) => String(value || ''),
+    getCompanyName: async () => 'БелГрупп инокс',
+  };
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.load = actsHistoricalLoadEmailCandidates;`, context);
+  const result = await context.load('2026-09');
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].state.taskId, '');
+  assert.equal(result.candidates[0].companyName, 'БелГрупп инокс');
+});
+
 test('historical email scan includes explicit act subjects from senders absent in CRM', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   const start = source.indexOf('async function actsRunHistoricalEmailImport(monthRaw) {');
