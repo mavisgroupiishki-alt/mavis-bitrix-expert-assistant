@@ -12876,41 +12876,48 @@ app.post('/api/maintenance/production-comment-cleanup', async (req, res) => {
 // Одноразовое выравнивание уже созданных сделок после изменения БП #936
 // «Сделка. Инициализация маршрута Производства». В UI этот БП стартует только
 // при создании сделки, поэтому для исторических сделок запускаем его явно.
-// Список услуг намеренно фиксирован: эндпоинт не может быть использован для
-// произвольного массового запуска БП.
 const PRODUCTION_ROUTE_BACKFILL_TEMPLATE_ID = 936;
-const PRODUCTION_ROUTE_BACKFILL_SERVICES = ['ИК СПК', 'Периодика СУОТ 45001', 'Периодика ИСО 9001'];
 
 async function productionRouteBackfillReport() {
   const productionCategoryId = Number(config.productionCategoryId || config.autopilotCategoryId || 28);
-  // Услуга в Производстве — общее текстовое поле, а не enum. Значение сверяем
-  // повторно после выборки, чтобы фильтр Bitrix не захватил похожее название.
+  // Услуга в Производстве — текстовое поле. Берём все незакрытые карточки
+  // воронки, но не запускаем маршрут на карточке, где услуга ещё не задана.
   const serviceFieldCode = config.serviceFieldCode || 'UF_CRM_1765113071';
-
-  const dealsById = new Map();
-  for (const requestedService of PRODUCTION_ROUTE_BACKFILL_SERVICES) {
-    const rows = await bitrixRestList('crm.deal.list', {
-      filter: { CATEGORY_ID: productionCategoryId, [serviceFieldCode]: requestedService },
-      order: { ID: 'ASC' },
-      select: ['ID', 'TITLE', 'CATEGORY_ID', serviceFieldCode],
-    }, 5000);
-    for (const deal of rows) {
-      if (String(deal && deal.CATEGORY_ID) !== String(productionCategoryId)) continue;
-      if (normalizeControlValue(deal && deal[serviceFieldCode]) !== normalizeControlValue(requestedService)) continue;
-      dealsById.set(String(deal.ID), {
+  const rows = await bitrixRestList('crm.deal.list', {
+    filter: { CATEGORY_ID: productionCategoryId, CLOSED: 'N' },
+    order: { ID: 'ASC' },
+    select: ['ID', 'TITLE', 'CATEGORY_ID', 'CLOSED', 'STAGE_ID', serviceFieldCode],
+  }, 5000);
+  const skippedWithoutService = [];
+  const deals = [];
+  for (const deal of rows) {
+    if (String(deal && deal.CATEGORY_ID) !== String(productionCategoryId)) continue;
+    const service = String(deal && deal[serviceFieldCode] || '').trim();
+    if (!service) {
+      skippedWithoutService.push({
         dealId: String(deal.ID),
         title: String(deal.TITLE || ''),
-        service: String(deal[serviceFieldCode] || requestedService),
+        stageId: String(deal.STAGE_ID || ''),
+        reason: 'service-not-filled',
       });
+      continue;
     }
+    deals.push({
+      dealId: String(deal.ID),
+      title: String(deal.TITLE || ''),
+      service,
+      stageId: String(deal.STAGE_ID || ''),
+    });
   }
 
   return {
     templateId: PRODUCTION_ROUTE_BACKFILL_TEMPLATE_ID,
     productionCategoryId,
     serviceFieldCode,
-    services: PRODUCTION_ROUTE_BACKFILL_SERVICES,
-    deals: [...dealsById.values()].sort((a, b) => Number(a.dealId) - Number(b.dealId)),
+    scope: 'all-active-production-deals-with-service',
+    scannedDeals: rows.length,
+    deals: deals.sort((a, b) => Number(a.dealId) - Number(b.dealId)),
+    skippedWithoutService,
   };
 }
 
