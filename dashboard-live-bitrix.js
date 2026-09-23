@@ -31,13 +31,16 @@ function matchingSourceOptions(question, options = []) {
     'источник', 'источника', 'источники',
     'битрикс', 'посмотри', 'смотри', 'есть', 'мне', 'чтобы', 'сколько', 'сделок',
   ].includes(term));
-  return options.filter((option) => {
+  const scored = options.map((option) => {
     const name = searchText(sourceOptionName(option));
-    if (!name) return false;
-    return terms.some((term) => name.includes(term) || term.includes(name) || (
+    if (!name) return { option, score: 0 };
+    const score = terms.reduce((total, term) => total + (name.includes(term) || term.includes(name) || (
       term.length >= 5 && name.split(' ').some((word) => word.startsWith(term.slice(0, -1)))
-    ));
+    ) ? 1 : 0), 0);
+    return { option, score };
   });
+  const topScore = Math.max(0, ...scored.map(({ score }) => score));
+  return topScore ? scored.filter(({ score }) => score === topScore).map(({ option }) => option) : [];
 }
 
 function stageId(stage) {

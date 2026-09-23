@@ -61,11 +61,12 @@ test('searches all funnels for a question about a named Bitrix source', () => {
 
 test('answers a named source question directly from the live Bitrix source catalog', () => {
   const sources = [
+    { STATUS_ID: 'PARTNER', NAME: 'Партнерка' },
     { STATUS_ID: 'PARTNER', NAME: 'Партнерка Белтехэкспертиза' },
     { STATUS_ID: 'WEB', NAME: 'Сайт' },
   ];
   const matches = matchingSourceOptions('источник партнерка белтехэкспертиза в битрикс есть посмотри', sources);
-  assert.deepEqual(matches, [sources[0]]);
+  assert.deepEqual(matches, [sources[1]]);
 
   const answer = exactLiveAnswer('источник партнерка белтехэкспертиза в битрикс есть посмотри', {
     available: true,
