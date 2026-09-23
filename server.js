@@ -12921,8 +12921,60 @@ async function productionRouteBackfillReport() {
   };
 }
 
+let productionRouteBackfillRun = null;
+let productionRouteBackfillStatus = {
+  state: 'idle', startedAt: '', finishedAt: '', found: 0, started: 0, errors: [], skippedWithoutService: 0,
+};
+
+function productionRouteBackfillStatusResponse() {
+  return {
+    ...productionRouteBackfillStatus,
+    errors: productionRouteBackfillStatus.errors.slice(0, 20),
+  };
+}
+
+function startProductionRouteBackfill(report) {
+  if (productionRouteBackfillRun) return false;
+  productionRouteBackfillStatus = {
+    state: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: '',
+    found: report.deals.length,
+    started: 0,
+    errors: [],
+    skippedWithoutService: report.skippedWithoutService.length,
+  };
+  productionRouteBackfillRun = (async () => {
+    for (const deal of report.deals) {
+      try {
+        await bitrixRestCall('bizproc.workflow.start', {
+          TEMPLATE_ID: report.templateId,
+          DOCUMENT_ID: ['crm', 'CCrmDocumentDeal', `DEAL_${deal.dealId}`],
+        });
+        productionRouteBackfillStatus.started += 1;
+      } catch (error) {
+        productionRouteBackfillStatus.errors.push({
+          dealId: deal.dealId,
+          title: deal.title,
+          error: error.message || String(error),
+        });
+      }
+    }
+    productionRouteBackfillStatus.state = productionRouteBackfillStatus.errors.length ? 'completed-with-errors' : 'completed';
+    productionRouteBackfillStatus.finishedAt = new Date().toISOString();
+    console.log(`[production-route-backfill] template=${report.templateId}; found=${report.deals.length}; started=${productionRouteBackfillStatus.started}; errors=${productionRouteBackfillStatus.errors.length}.`);
+  })().catch((error) => {
+    productionRouteBackfillStatus.state = 'failed';
+    productionRouteBackfillStatus.finishedAt = new Date().toISOString();
+    productionRouteBackfillStatus.errors.push({ error: error.message || String(error) });
+    console.error('[production-route-backfill]', error.message || error);
+  }).finally(() => { productionRouteBackfillRun = null; });
+  return true;
+}
+
 // По умолчанию возвращает только состав. Реальный запуск требует execute=true
-// и уже существующий секрет обслуживания актов.
+// и уже существующий секрет обслуживания актов. Сам запуск идёт в фоне, чтобы
+// ответ прокси не мог прервать обработку части исторических карточек.
 app.post('/api/maintenance/production-route-backfill', async (req, res) => {
   if (!actsMaintenanceTokenMatches(req)) {
     return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
@@ -12931,28 +12983,18 @@ app.post('/api/maintenance/production-route-backfill', async (req, res) => {
   const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
   try {
     const report = await productionRouteBackfillReport();
-    if (!execute) return res.status(200).json({ ok: true, dryRun: true, ...report });
-
-    const started = [];
-    const errors = [];
-    for (const deal of report.deals) {
-      try {
-        const workflowId = await bitrixRestCall('bizproc.workflow.start', {
-          TEMPLATE_ID: report.templateId,
-          DOCUMENT_ID: ['crm', 'CCrmDocumentDeal', `DEAL_${deal.dealId}`],
-        });
-        started.push({ ...deal, workflowId: String(workflowId || '') });
-      } catch (error) {
-        errors.push({ ...deal, error: error.message || String(error) });
-      }
+    if (!execute) return res.status(200).json({ ok: true, dryRun: true, ...report, status: productionRouteBackfillStatusResponse() });
+    if (!startProductionRouteBackfill(report)) {
+      return res.status(409).json({ ok: false, error: 'Пересчёт маршрутов уже выполняется.', status: productionRouteBackfillStatusResponse() });
     }
-    console.log(`[production-route-backfill] template=${report.templateId}; found=${report.deals.length}; started=${started.length}; errors=${errors.length}.`);
-    return res.status(errors.length ? 207 : 200).json({
-      ok: errors.length === 0,
+    return res.status(202).json({
+      ok: true,
+      started: true,
       dryRun: false,
-      ...report,
-      started,
-      errors,
+      scope: report.scope,
+      found: report.deals.length,
+      skippedWithoutService: report.skippedWithoutService.length,
+      status: productionRouteBackfillStatusResponse(),
     });
   } catch (error) {
     console.error('[production-route-backfill]', error.message || error);
