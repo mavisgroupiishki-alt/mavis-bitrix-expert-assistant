@@ -2388,7 +2388,10 @@ async function loadSigningDocuments(deal) {
       companyUnp,
       matcher.normalizeCompanyName(companyTitle),
     ].filter(Boolean))];
-    const exactGroups = await mapLimit(taskQueryFactories(exactTerms, 0), 2, (query) => query());
+    // Bitrix can keep paginating tasks.task.list for a long time even with a
+    // specific title/UNP filter. Keep the card responsive by using its first
+    // page; the exact direct relation above remains the primary source.
+    const exactGroups = await mapLimit(taskQueryFactories(exactTerms, 50), 2, (query) => query());
     if (!isCurrentRequest()) return;
     const exactTasks = signingUniqueTasks([directTasks, ...exactGroups]);
 
