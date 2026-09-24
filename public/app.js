@@ -2375,10 +2375,10 @@ async function loadSigningDocuments(deal) {
       .map((term) => String(term || '').trim())
       .filter(Boolean)
       .map((term) => () => bxList('tasks.task.list', {
-        // tasks.task.list searches title patterns through TITLE itself. The
-        // previous %TITLE key was ignored by Bitrix, so it returned an
-        // arbitrary first page of project tasks instead of matching acts.
-        filter: { GROUP_ID: projectId, TITLE: `%${term}%` },
+        // In tasks.task.list the % prefix chooses a substring comparison;
+        // wildcards belong to the value.  Filtering by DESCRIPTION is not
+        // supported and previously returned a random first project page.
+        filter: { GROUP_ID: projectId, '%TITLE': `%${term}%` },
         select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
         order: { ID: 'DESC' },
       }, limit));
@@ -6191,7 +6191,10 @@ function escapeHtml(value) {
 function showError(message) { document.getElementById('loading').classList.add('hidden'); const el = document.getElementById('error'); el.textContent = message; el.classList.remove('hidden'); }
 function hideError() { document.getElementById('error').classList.add('hidden'); }
 
-document.getElementById('reload').addEventListener('click', () => state.mode === 'dealTab' ? loadDealTab(state.currentDealId) : loadDeals());
+document.getElementById('reload').addEventListener('click', () => {
+  if (state.mode === 'signingDocumentsTab') return loadSigningDocumentsTab(state.currentDealId);
+  return state.mode === 'dealTab' ? loadDealTab(state.currentDealId) : loadDeals();
+});
 
 const registerDealTabBtn = document.getElementById('register-deal-tab');
 if (registerDealTabBtn) {
