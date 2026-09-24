@@ -14,6 +14,7 @@
     <p>Будут добавлены:</p>
     <ul style="text-align:left;max-width:560px;margin:12px auto 20px;line-height:1.6">
       <li>вкладка «ИИ-ассистент» в карточке сделки;</li>
+      <li>вкладка «Документы на подпись» в карточке сделки;</li>
       <li>пункт «Возврат оригиналов» в меню приложений Bitrix24.</li>
     </ul>
     <button id="finish-install" class="primary">Завершить установку</button>
@@ -83,6 +84,13 @@
         ));
         results.push(await bindIfMissing(
           existing,
+          'CRM_DEAL_DETAIL_TAB',
+          window.location.origin + '/deal?view=signing-documents',
+          'Документы на подпись',
+          'Документы из проекта «Акты счета», ожидающие подписи по текущей сделке'
+        ));
+        results.push(await bindIfMissing(
+          existing,
           'LEFT_MENU',
           window.location.origin + '/doc-return-report',
           'Возврат оригиналов',
@@ -91,7 +99,7 @@
 
         status.textContent = results.join(' · ') + '. Завершаем установку…';
         BX24.installFinish();
-        status.textContent = 'Готово. Пункт «Возврат оригиналов» появится в группе «Приложения» левого меню.';
+        status.textContent = 'Готово. В карточке сделки появится вкладка «Документы на подпись», а «Возврат оригиналов» — в группе «Приложения» левого меню.';
       } catch (e) {
         status.textContent = 'Ошибка: ' + (e.message || e) + '. Проверьте права приложения: placement, task, crm, user.';
         button.disabled = false;

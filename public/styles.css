@@ -184,6 +184,24 @@ body.deal-mode #deal-details { padding: 16px 18px; }
 body.deal-mode .dialog-actions { padding: 0 18px 16px; }
 body.deal-mode .analysis { margin: 0 18px 18px; }
 
+.signing-documents { margin: 0 18px 16px; border: 1px solid #bfdbfe; border-radius: 14px; background: #f8fbff; padding: 14px; }
+.signing-documents-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
+.signing-documents-header h3 { margin:0; font-size:17px; }
+.signing-documents-header p { margin:4px 0 0; }
+.signing-documents-count { display:inline-flex; align-items:center; border-radius:999px; padding:5px 10px; font-size:13px; font-weight:800; background:#dbeafe; color:#1d4ed8; white-space:nowrap; }
+.signing-documents-empty { margin:0; color:var(--muted); }
+.signing-documents-list { display:grid; gap:8px; }
+.signing-document { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:10px; border:1px solid var(--line); border-radius:10px; background:#fff; }
+.signing-document-title { font-weight:700; line-height:1.35; }
+.signing-document-meta { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; color:var(--muted); font-size:12px; }
+.signing-document button { flex:0 0 auto; }
+.match-chip { display:inline-block; border-radius:999px; padding:3px 7px; background:#ecfdf5; color:#047857; font-weight:700; }
+.match-chip.name { background:#eff6ff; color:#1d4ed8; }
+.signing-review { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.signing-review summary { cursor:pointer; color:#9a5a00; font-weight:700; }
+.signing-review ul { margin:8px 0 0; padding-left:18px; }
+@media (max-width: 700px) { .signing-documents-header, .signing-document { flex-direction:column; } }
+
 
 /* v41: чистый рабочий режим внутри карточки сделки */
 .deal-mode-help {
