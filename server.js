@@ -14,6 +14,7 @@ const V149_PRODUCTION_RULES = {
 };
 
 const express = require('express');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const helmet = require('helmet');
@@ -31,6 +32,7 @@ const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
+const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1043,6 +1045,7 @@ app.get('/config.js', (_req, res) => {
     aiControlFieldCode: config.aiControlFieldCode,
     aiEnabled: config.aiEnabled,
     aiModel: config.aiModel,
+    actsProjectId: config.actsProjectId,
     allowRopViewAll: config.allowRopViewAll,
     autoLoadMeta: config.autoLoadMeta,
     emailFrom: config.emailFrom,
@@ -2821,8 +2824,12 @@ app.post('/api/ai/transcribe-url', async (req, res) => {
 });
 
 // Main app page used as "Путь вашего обработчика" in Bitrix24.
-app.all(['/', '/app', '/deal'], (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// CRM tabs are opened with POST; Bitrix places the current deal ID in
+// PLACEMENT_OPTIONS. Pass that context into the browser before app.js starts.
+const APP_PAGE_TEMPLATE = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+app.all(['/', '/app', '/deal'], (req, res) => {
+  const placementOptions = parsePlacementOptions(req.body);
+  res.type('html').send(injectPlacementOptions(APP_PAGE_TEMPLATE, placementOptions));
 });
 
 // Installation page used as "Путь для первоначальной установки" in Bitrix24.

@@ -309,6 +309,7 @@ function getPlacementInfoSafe() {
 
 function getDealIdFromPlacement(info) {
   const options = normalizePlacementOptions(info && info.options);
+  const postedOptions = normalizePlacementOptions(window.BITRIX_PLACEMENT_OPTIONS);
   const params = new URLSearchParams(window.location.search || '');
   const candidates = [
     options.ID,
@@ -319,6 +320,12 @@ function getDealIdFromPlacement(info) {
     options.DEAL_ID,
     options.dealId,
     options.entity_id,
+    postedOptions.ID,
+    postedOptions.id,
+    postedOptions.ENTITY_ID,
+    postedOptions.entityId,
+    postedOptions.DEAL_ID,
+    postedOptions.dealId,
     options.entityId,
     params.get('deal_id'),
     params.get('DEAL_ID'),
@@ -446,12 +453,44 @@ async function loadDealTab(dealId) {
   if (note) note.textContent = 'Режим карточки сделки: ассистент работает только с текущей сделкой. Общий кабинет оставлен для отчётности руководителя и контроля.';
 }
 
+async function loadSigningDocumentsTab(dealId) {
+  const dialog = document.getElementById('deal-dialog');
+  dialog.setAttribute('open', '');
+  dialog.classList.add('deal-tab-panel');
+  if (!dealId) {
+    document.getElementById('dialog-title').textContent = 'Документы на подпись';
+    renderSigningDocuments({ error: 'Не удалось определить сделку. Обновите карточку и откройте вкладку ещё раз.' });
+    return;
+  }
+
+  renderSigningDocumentsLoading();
+  const deal = await bxCall('crm.deal.get', { id: dealId });
+  state.currentDealId = String(dealId);
+  state.deals = [deal];
+  state.selectedDeal = deal;
+  document.getElementById('dialog-title').textContent = deal.TITLE || `Сделка ${dealId}`;
+
+  if (deal.COMPANY_ID) {
+    try {
+      const company = await bxCall('crm.company.get', { id: deal.COMPANY_ID });
+      state.companies.set(String(deal.COMPANY_ID), company);
+    } catch (_) {}
+  }
+  await loadSigningDocuments(deal);
+}
+
 async function init() {
   try {
     await new Promise((resolve) => BX24.init(resolve));
     state.placementInfo = getPlacementInfoSafe();
     state.mode = isSigningDocumentsTab() ? 'signingDocumentsTab' : isDealTabPlacement(state.placementInfo) ? 'dealTab' : 'dashboard';
     state.currentDealId = getDealIdFromPlacement(state.placementInfo);
+
+    if (state.mode === 'signingDocumentsTab') {
+      prepareSigningDocumentsTabUi();
+      await loadSigningDocumentsTab(state.currentDealId);
+      return;
+    }
 
     state.user = await bxCall('user.current');
     try { state.isAdmin = Boolean(await bxCall('user.admin')); } catch (_) { state.isAdmin = false; }
@@ -464,9 +503,8 @@ async function init() {
     state.enumMaps = buildEnumMaps(state.fields);
     state.fieldMap = detectFieldMap(state.fields);
 
-    if (state.mode === 'dealTab' || state.mode === 'signingDocumentsTab') {
-      if (state.mode === 'signingDocumentsTab') prepareSigningDocumentsTabUi();
-      else prepareDealTabUi();
+    if (state.mode === 'dealTab') {
+      prepareDealTabUi();
       await loadDealTab(state.currentDealId);
     } else {
       await maybeRegisterDealTabPlacement();
