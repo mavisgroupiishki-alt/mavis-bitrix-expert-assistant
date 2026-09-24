@@ -457,6 +457,46 @@ async function bitrixRestList(method, params = {}, limit = 200, options = {}) {
   return out.slice(0, limit);
 }
 
+function signingDocumentsSearchTerms(companyName) {
+  const source = String(companyName || '');
+  const normalized = source
+    .toLocaleLowerCase('ru-RU')
+    .replace(/(^|[^\p{L}\p{N}])(?:ооо|оао|зао|чуп|уп|ип|одо|общество с ограниченной ответственностью|частное предприятие|индивидуальный предприниматель)(?=$|[^\p{L}\p{N}])/giu, '$1')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const rawWords = source.match(/[\p{L}\p{N}]{6,}/gu) || [];
+  return [...new Set([normalized, ...rawWords].filter((term) => term && !/^(частное|предприятие)$/iu.test(term)))].slice(0, 4);
+}
+
+async function signingDocumentsServerTasks(dealId) {
+  const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+  const company = deal && deal.COMPANY_ID
+    ? await bitrixRestCall('crm.company.get', { id: deal.COMPANY_ID }).catch(() => null)
+    : null;
+  const companyName = String(company && company.TITLE || deal && deal.TITLE || '');
+  const projectId = Number(config.actsProjectId || 36);
+  const select = ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'];
+  const direct = await bitrixRestList('tasks.task.list', {
+    filter: { GROUP_ID: projectId, UF_CRM_TASK: `D_${dealId}` },
+    select,
+    order: { ID: 'DESC' },
+  }, 100);
+  const groups = await Promise.all(signingDocumentsSearchTerms(companyName).map((term) =>
+    bitrixRestList('tasks.task.list', {
+      filter: { GROUP_ID: projectId, '%TITLE': term },
+      select,
+      order: { ID: 'DESC' },
+    }, 100).catch(() => [])
+  ));
+  const byId = new Map();
+  [...direct, ...groups.flat()].forEach((task) => {
+    const id = String(task && (task.ID || task.id) || '');
+    if (id) byId.set(id, task);
+  });
+  return { tasks: [...byId.values()] };
+}
+
 function recruitingBearerMatches(header) {
   const expected = Buffer.from(String(config.recruitingIntakeToken || ''));
   const actual = Buffer.from(String(header || '').replace(/^Bearer\s+/i, ''));
@@ -2830,6 +2870,22 @@ const APP_PAGE_TEMPLATE = fs.readFileSync(path.join(__dirname, 'public', 'index.
 app.all(['/', '/app', '/deal'], (req, res) => {
   const placementOptions = parsePlacementOptions(req.body);
   res.type('html').send(injectPlacementOptions(APP_PAGE_TEMPLATE, placementOptions));
+});
+
+// The local app executes REST as the viewing user. Group-task visibility may
+// therefore be narrower than the project board. This read-only endpoint uses
+// the service's Bitrix webhook and returns only candidate tasks for one deal.
+app.get('/api/signing-documents/:dealId', async (req, res) => {
+  const dealId = String(req.params.dealId || '');
+  if (!/^\d+$/.test(dealId)) {
+    res.status(400).json({ ok: false, error: 'Некорректный ID сделки.' });
+    return;
+  }
+  try {
+    res.json({ ok: true, ...(await signingDocumentsServerTasks(dealId)) });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: error.message || String(error) });
+  }
 });
 
 // Installation page used as "Путь для первоначальной установки" in Bitrix24.

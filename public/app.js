@@ -2278,6 +2278,13 @@ function signingFallbackTerms(companyName, companyUnp, matcher) {
   return matcher.companyReviewSearchTerms(companyName, companyUnp);
 }
 
+async function signingServerTasksForDeal(dealId) {
+  const response = await fetch(`/api/signing-documents/${encodeURIComponent(String(dealId))}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return Array.isArray(data.tasks) ? data.tasks : [];
+}
+
 function signingUniqueTasks(taskGroups) {
   const byId = new Map();
   taskGroups.flat().forEach((task) => {
@@ -2371,6 +2378,7 @@ async function loadSigningDocuments(deal) {
     if (!isCurrentRequest()) return;
     const companyLabels = signingFieldLabels(companyFieldsResult);
     const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
+    const serverTasksPromise = signingServerTasksForDeal(deal.ID).catch(() => []);
     const titleTerms = [...new Set([
       ...matcher.companySearchTerms(companyTitle),
       ...(String(companyTitle).match(/[\p{L}\p{N}]{6,}/gu) || []).filter((term) => !/^(частное|предприятие)$/iu.test(term)),
@@ -2397,9 +2405,12 @@ async function loadSigningDocuments(deal) {
         order: { ID: 'DESC' },
       }, 50).catch(() => []),
     ]);
-    const titleGroups = await mapLimit(titleQueries, 3, (query) => query());
+    const [titleGroups, serverTasks] = await Promise.all([
+      mapLimit(titleQueries, 3, (query) => query()),
+      serverTasksPromise,
+    ]);
     if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks([directTasks, ...titleGroups]);
+    const tasks = signingUniqueTasks([directTasks, ...titleGroups, serverTasks]);
 
     const resultFor = (tasks) => matcher.splitTasksForDeal({
       tasks,
