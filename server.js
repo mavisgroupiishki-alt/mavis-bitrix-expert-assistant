@@ -465,10 +465,10 @@ function signingDocumentsSearchTerms(companyName) {
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const rawWords = source.match(/[\p{L}\p{N}]{6,}/gu) || [];
+  const rawWords = (source.match(/[\p{L}\p{N}]{6,}/gu) || []).map((term) => term.toLocaleLowerCase('ru-RU'));
   const baseTerms = [normalized, ...rawWords].filter((term) => term && !/^(частное|предприятие)$/iu.test(term));
   const prefixes = baseTerms.filter((term) => term.length >= 8).map((term) => term.slice(0, 8));
-  return [...new Set([...baseTerms, ...prefixes])].slice(0, 6);
+  return [...new Set([...baseTerms, ...prefixes])].slice(0, 4);
 }
 
 async function signingDocumentsServerTasks(dealId) {

@@ -2345,6 +2345,7 @@ async function loadSigningDocuments(deal) {
     if (!matcher) throw new Error('Не загружен модуль сверки документов.');
     renderSigningDocumentsLoading();
     const projectId = Number(APP_CONFIG.actsProjectId || 36);
+    const serverTasksPromise = signingServerTasksForDeal(deal.ID).catch(() => []);
     const [stagesResult, directTasks] = await Promise.all([
       bxCall('task.stages.get', { entityId: projectId }),
       bxList('tasks.task.list', {
@@ -2374,43 +2375,14 @@ async function loadSigningDocuments(deal) {
     });
     renderSigningDocuments({ ...directResult, stageNames, reviewLoading: true });
 
-    const companyFieldsResult = await bxCall('crm.company.fields').catch(() => ({}));
-    if (!isCurrentRequest()) return;
-    const companyLabels = signingFieldLabels(companyFieldsResult);
-    const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    const serverTasksPromise = signingServerTasksForDeal(deal.ID).catch(() => []);
-    const titleTerms = [...new Set([
-      ...matcher.companySearchTerms(companyTitle),
-      ...(String(companyTitle).match(/[\p{L}\p{N}]{6,}/gu) || []).filter((term) => !/^(частное|предприятие)$/iu.test(term)),
-    ])];
-    // Bitrix installations differ in whether the title comparison accepts
-    // wildcards in the value. Ask both supported variants, then compare the
-    // returned tasks locally by CRM link, UNP and company title.
-    const titleQueries = titleTerms.flatMap((term) => [
-      () => bxList('tasks.task.list', {
-        filter: { GROUP_ID: projectId, '%TITLE': term },
-        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-        order: { ID: 'DESC' },
-      }, 50),
-      () => bxList('tasks.task.list', {
-        filter: { GROUP_ID: projectId, '%TITLE': `%${term}%` },
-        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-        order: { ID: 'DESC' },
-      }, 50),
-      // Some Bitrix portals retain the older task.item.list index for group
-      // tasks. It exposes the same task fields and is a fallback only.
-      () => bxList('task.item.list', {
-        filter: { GROUP_ID: projectId, '%TITLE': term },
-        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-        order: { ID: 'DESC' },
-      }, 50).catch(() => []),
-    ]);
-    const [titleGroups, serverTasks] = await Promise.all([
-      mapLimit(titleQueries, 3, (query) => query()),
+    const [companyFieldsResult, serverTasks] = await Promise.all([
+      bxCall('crm.company.fields').catch(() => ({})),
       serverTasksPromise,
     ]);
     if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks([directTasks, ...titleGroups, serverTasks]);
+    const companyLabels = signingFieldLabels(companyFieldsResult);
+    const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
+    const tasks = signingUniqueTasks([directTasks, serverTasks]);
 
     const resultFor = (tasks) => matcher.splitTasksForDeal({
       tasks,
