@@ -185,7 +185,7 @@
       if (!stageId || (knownStages.size && !knownStages.has(stageId))) {
         review.push({ ...row, match: { ...match, reason: `${match.reason || 'совпадение найдено'}; стадия задачи не определена` } });
       } else if (stageId === String(archiveStageId)) archived.push(row);
-      else if (match.confidence === 'review') review.push(row);
+      else if (match.kind === 'deal-id-in-text') review.push(row);
       else pending.push(row);
     });
     return { pending, archived, review };

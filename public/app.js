@@ -2371,25 +2371,28 @@ async function loadSigningDocuments(deal) {
     if (!isCurrentRequest()) return;
     const companyLabels = signingFieldLabels(companyFieldsResult);
     const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    const taskQueries = [
-      ...signingFallbackTerms(companyTitle, companyUnp, matcher).flatMap((term) => [
+    const taskQueryFactories = (terms, limit) => terms.flatMap((term) => [
         () => bxList('tasks.task.list', {
           filter: { GROUP_ID: projectId, '%TITLE': term },
           select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
           order: { ID: 'DESC' },
-        }, 50),
+        }, limit),
         () => bxList('tasks.task.list', {
           filter: { GROUP_ID: projectId, '%DESCRIPTION': term },
           select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
           order: { ID: 'DESC' },
-        }, 50),
-      ]),
-    ];
-    const taskGroups = await mapLimit(taskQueries, 3, (query) => query());
+        }, limit),
+      ]);
+    const allTerms = signingFallbackTerms(companyTitle, companyUnp, matcher);
+    const exactTerms = [...new Set([
+      companyUnp,
+      matcher.normalizeCompanyName(companyTitle),
+    ].filter(Boolean))];
+    const exactGroups = await mapLimit(taskQueryFactories(exactTerms, 0), 2, (query) => query());
     if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks([directTasks, ...taskGroups]);
+    const exactTasks = signingUniqueTasks([directTasks, ...exactGroups]);
 
-    const result = matcher.splitTasksForDeal({
+    const resultFor = (tasks) => matcher.splitTasksForDeal({
       tasks,
       dealId: String(deal.ID),
       companyName: companyTitle,
@@ -2397,8 +2400,15 @@ async function loadSigningDocuments(deal) {
       archiveStageId,
       knownStageIds: stages.map((stage) => signingTaskValue(stage, ['ID', 'id'])).filter(Boolean),
     });
+    const fuzzyTerms = allTerms.filter((term) => !exactTerms.includes(term));
+    renderSigningDocuments({ ...resultFor(exactTasks), stageNames, reviewLoading: fuzzyTerms.length > 0 });
+    if (!fuzzyTerms.length) return;
+
+    const fuzzyGroups = await mapLimit(taskQueryFactories(fuzzyTerms, 50), 3, (query) => query());
     if (!isCurrentRequest()) return;
-    renderSigningDocuments({ ...result, stageNames });
+    const tasks = signingUniqueTasks([exactTasks, ...fuzzyGroups]);
+    if (!isCurrentRequest()) return;
+    renderSigningDocuments({ ...resultFor(tasks), stageNames });
   } catch (error) {
     if (isCurrentRequest()) renderSigningDocumentsError(error, String(deal.ID));
   }

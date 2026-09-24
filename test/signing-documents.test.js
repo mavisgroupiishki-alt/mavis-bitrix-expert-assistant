@@ -82,6 +82,19 @@ test('treats every stage except Archive as a document awaiting signature', () =>
   assert.equal(result.pending.length, 1);
 });
 
+test('shows a non-archived company-name match as a document awaiting signature', () => {
+  const result = splitTasksForDeal({
+    dealId: '38100',
+    companyName: 'ООО «ВитАрхитектСтрой»',
+    archiveStageId: '264',
+    knownStageIds: ['123', '264'],
+    tasks: [{ ID: '18', TITLE: 'ДОГОВОР ВитАрхитектСтрой', STAGE_ID: '123' }],
+  });
+  assert.equal(result.pending.length, 1);
+  assert.equal(result.review.length, 0);
+  assert.equal(result.pending[0].match.kind, 'company-name');
+});
+
 test('keeps a task with an unknown stage out of the pending count', () => {
   const result = splitTasksForDeal({
     dealId: '38100',
