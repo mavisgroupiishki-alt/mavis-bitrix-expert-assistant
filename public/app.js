@@ -2389,6 +2389,13 @@ async function loadSigningDocuments(deal) {
         select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
         order: { ID: 'DESC' },
       }, 50),
+      // Some Bitrix portals retain the older task.item.list index for group
+      // tasks. It exposes the same task fields and is a fallback only.
+      () => bxList('task.item.list', {
+        filter: { GROUP_ID: projectId, '%TITLE': term },
+        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
+        order: { ID: 'DESC' },
+      }, 50).catch(() => []),
     ]);
     const titleGroups = await mapLimit(titleQueries, 3, (query) => query());
     if (!isCurrentRequest()) return;
