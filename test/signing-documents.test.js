@@ -26,15 +26,35 @@ test('keeps a task with matching UNP for manual review until it has a CRM deal l
   assert.equal(result.confidence, 'review');
 });
 
-test('does not show a task linked to another deal even when the company UNP matches', () => {
+test('shows a matching company task even when its CRM link points to an earlier deal', () => {
   const result = matchTaskToDeal({
     dealId: '38100',
     companyName: 'ООО «Эд Сервис»',
     companyUnp: '123456789',
     task: { ID: '111', TITLE: 'Счёт — Эд Сервис, УНП 123456789', UF_CRM_TASK: ['D_38101'] },
   });
+  assert.equal(result.confidence, 'review');
+  assert.equal(result.kind, 'unp');
+});
+
+test('does not show a task linked to another deal when its company does not match', () => {
+  const result = matchTaskToDeal({
+    dealId: '38100',
+    companyName: 'ООО «Эд Сервис»',
+    task: { ID: '112', TITLE: 'Счёт — Чужая компания', UF_CRM_TASK: ['D_38101'] },
+  });
   assert.equal(result.confidence, 'none');
   assert.equal(result.kind, 'other-deal');
+});
+
+test('recognises a long company name with a minor typo in a task title', () => {
+  const result = matchTaskToDeal({
+    dealId: '39446',
+    companyName: 'ВитАрхитектСтрой, Частное предприятие',
+    task: { ID: '48598', TITLE: 'Счёт №2 Витархитекстстрой Расширение. 1400.00' },
+  });
+  assert.equal(result.confidence, 'review');
+  assert.equal(result.kind, 'company-name');
 });
 
 test('keeps every company-name match for manual review', () => {

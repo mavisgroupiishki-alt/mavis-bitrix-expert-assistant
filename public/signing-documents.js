@@ -44,6 +44,29 @@
       .filter((part) => part.length >= 3 && !GENERIC_TITLE_WORDS.has(part));
   }
 
+  function editDistance(left, right) {
+    const source = String(left || '');
+    const target = String(right || '');
+    const previous = Array.from({ length: target.length + 1 }, (_, index) => index);
+    for (let sourceIndex = 1; sourceIndex <= source.length; sourceIndex += 1) {
+      const current = [sourceIndex];
+      for (let targetIndex = 1; targetIndex <= target.length; targetIndex += 1) {
+        current[targetIndex] = Math.min(
+          current[targetIndex - 1] + 1,
+          previous[targetIndex] + 1,
+          previous[targetIndex - 1] + (source[sourceIndex - 1] === target[targetIndex - 1] ? 0 : 1)
+        );
+      }
+      previous.splice(0, previous.length, ...current);
+    }
+    return previous[target.length];
+  }
+
+  function similarCompanyToken(left, right) {
+    const minimumLength = Math.min(left.length, right.length);
+    return minimumLength >= 8 && editDistance(left, right) <= Math.max(1, Math.floor(minimumLength * 0.12));
+  }
+
   function companySearchTerms(value) {
     const normalized = normalizeCompanyName(value);
     const terms = new Set();
@@ -139,6 +162,10 @@
     if (companyParts.length === 1 && companyParts[0].length >= 6 && titleParts.has(companyParts[0])) {
       return { score: 0.8, reason: `совпадает название: ${companyParts[0]}` };
     }
+    const similar = companyParts.filter((part) => [...titleParts].some((titlePart) => similarCompanyToken(part, titlePart)));
+    if (similar.length) {
+      return { score: 0.75, reason: `название похоже: ${similar.join(', ')}` };
+    }
     if (common.length) return { score, reason: `частично совпадает: ${common.join(', ')}` };
     return { score: 0, reason: '' };
   }
@@ -149,16 +176,20 @@
     if (linkedDealIds.includes(String(dealId))) {
       return { taskId, kind: 'crm-link', confidence: 'confirmed', reason: 'задача прямо связана со сделкой', score: 1 };
     }
-    // A task already tied to another deal must never leak into this card through
-    // the same company UNP or a similar company name.
-    if (linkedDealIds.length) {
-      return { taskId, kind: 'other-deal', confidence: 'none', reason: 'задача связана с другой сделкой', score: 0 };
-    }
 
     const resolvedUnp = normalizeUnp(companyUnp) || unpFromCompany(companyFields && companyFields.company, companyFields && companyFields.labels);
     const taskUnps = extractUnps(taskText(task));
+    const hasEarlierDealLink = linkedDealIds.length > 0;
     if (resolvedUnp && taskUnps.includes(resolvedUnp)) {
-      return { taskId, kind: 'unp', confidence: 'review', reason: `совпадает УНП ${resolvedUnp}, но CRM-связь со сделкой не заполнена`, score: 1 };
+      return {
+        taskId,
+        kind: 'unp',
+        confidence: 'review',
+        reason: hasEarlierDealLink
+          ? `совпадает УНП ${resolvedUnp}; CRM-связь ведёт к предыдущей сделке этого клиента`
+          : `совпадает УНП ${resolvedUnp}, но CRM-связь со сделкой не заполнена`,
+        score: 1,
+      };
     }
 
     const textDealIds = extractDealIds(task);
@@ -167,8 +198,15 @@
     }
     const titleScore = scoreCompanyTitle(companyName, task);
     if (titleScore.score > 0) {
-      return { taskId, kind: 'company-name', confidence: 'review', reason: titleScore.reason, score: titleScore.score };
+      return {
+        taskId,
+        kind: 'company-name',
+        confidence: 'review',
+        reason: hasEarlierDealLink ? `${titleScore.reason}; CRM-связь ведёт к предыдущей сделке этого клиента` : titleScore.reason,
+        score: titleScore.score,
+      };
     }
+    if (hasEarlierDealLink) return { taskId, kind: 'other-deal', confidence: 'none', reason: 'задача связана с другой сделкой', score: 0 };
     return { taskId, kind: 'none', confidence: 'none', reason: '', score: 0 };
   }
 
