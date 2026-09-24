@@ -2344,7 +2344,7 @@ async function loadSigningDocuments(deal) {
         filter: { GROUP_ID: projectId, UF_CRM_TASK: `D_${deal.ID}` },
         select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
         order: { ID: 'DESC' },
-      }, 0),
+      }, 50),
     ]);
     if (!isCurrentRequest()) return;
     const stages = signingStageRows(stagesResult);
@@ -2371,28 +2371,16 @@ async function loadSigningDocuments(deal) {
     if (!isCurrentRequest()) return;
     const companyLabels = signingFieldLabels(companyFieldsResult);
     const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    const taskQueryFactories = (terms, limit) => terms
-      .map((term) => String(term || '').trim())
-      .filter(Boolean)
-      .map((term) => () => bxList('tasks.task.list', {
-        // In tasks.task.list the % prefix chooses a substring comparison;
-        // wildcards belong to the value.  Filtering by DESCRIPTION is not
-        // supported and previously returned a random first project page.
-        filter: { GROUP_ID: projectId, '%TITLE': `%${term}%` },
-        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-        order: { ID: 'DESC' },
-      }, limit));
-    const allTerms = signingFallbackTerms(companyTitle, companyUnp, matcher);
-    const exactTerms = [...new Set([
-      companyUnp,
-      matcher.normalizeCompanyName(companyTitle),
-    ].filter(Boolean))];
-    // Bitrix can keep paginating tasks.task.list for a long time even with a
-    // specific title/UNP filter. Keep the card responsive by using its first
-    // page; the exact direct relation above remains the primary source.
-    const exactGroups = await mapLimit(taskQueryFactories(exactTerms, 50), 2, (query) => query());
+    // The legacy Bitrix task API applies title filters inconsistently for
+    // Cyrillic names. Load this project's tasks once and match deterministically
+    // in the app by CRM link, UNP and the normalized company title.
+    const projectTasks = await bxList('tasks.task.list', {
+      filter: { GROUP_ID: projectId },
+      select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
+      order: { ID: 'DESC' },
+    }, 0);
     if (!isCurrentRequest()) return;
-    const exactTasks = signingUniqueTasks([directTasks, ...exactGroups]);
+    const tasks = signingUniqueTasks([directTasks, projectTasks]);
 
     const resultFor = (tasks) => matcher.splitTasksForDeal({
       tasks,
@@ -2402,14 +2390,6 @@ async function loadSigningDocuments(deal) {
       archiveStageId,
       knownStageIds: stages.map((stage) => signingTaskValue(stage, ['ID', 'id'])).filter(Boolean),
     });
-    const fuzzyTerms = allTerms.filter((term) => !exactTerms.includes(term));
-    renderSigningDocuments({ ...resultFor(exactTasks), stageNames, reviewLoading: fuzzyTerms.length > 0 });
-    if (!fuzzyTerms.length) return;
-
-    const fuzzyGroups = await mapLimit(taskQueryFactories(fuzzyTerms, 50), 3, (query) => query());
-    if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks([exactTasks, ...fuzzyGroups]);
-    if (!isCurrentRequest()) return;
     renderSigningDocuments({ ...resultFor(tasks), stageNames });
   } catch (error) {
     if (isCurrentRequest()) renderSigningDocumentsError(error, String(deal.ID));
