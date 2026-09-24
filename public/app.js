@@ -2371,18 +2371,17 @@ async function loadSigningDocuments(deal) {
     if (!isCurrentRequest()) return;
     const companyLabels = signingFieldLabels(companyFieldsResult);
     const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    const taskQueryFactories = (terms, limit) => terms.flatMap((term) => [
-        () => bxList('tasks.task.list', {
-          filter: { GROUP_ID: projectId, '%TITLE': term },
-          select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-          order: { ID: 'DESC' },
-        }, limit),
-        () => bxList('tasks.task.list', {
-          filter: { GROUP_ID: projectId, '%DESCRIPTION': term },
-          select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-          order: { ID: 'DESC' },
-        }, limit),
-      ]);
+    const taskQueryFactories = (terms, limit) => terms
+      .map((term) => String(term || '').trim())
+      .filter(Boolean)
+      .map((term) => () => bxList('tasks.task.list', {
+        // tasks.task.list searches title patterns through TITLE itself. The
+        // previous %TITLE key was ignored by Bitrix, so it returned an
+        // arbitrary first page of project tasks instead of matching acts.
+        filter: { GROUP_ID: projectId, TITLE: `%${term}%` },
+        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
+        order: { ID: 'DESC' },
+      }, limit));
     const allTerms = signingFallbackTerms(companyTitle, companyUnp, matcher);
     const exactTerms = [...new Set([
       companyUnp,
