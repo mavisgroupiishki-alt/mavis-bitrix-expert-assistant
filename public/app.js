@@ -2275,9 +2275,7 @@ function signingMatchLabel(match) {
 }
 
 function signingFallbackTerms(companyName, companyUnp, matcher) {
-  const terms = new Set(matcher.companySearchTerms(companyName));
-  if (companyUnp) terms.add(String(companyUnp));
-  return [...terms];
+  return matcher.companyReviewSearchTerms(companyName, companyUnp);
 }
 
 function signingUniqueTasks(taskGroups) {
@@ -2289,7 +2287,7 @@ function signingUniqueTasks(taskGroups) {
   return [...byId.values()];
 }
 
-function renderSigningDocuments({ pending = [], review = [], stageNames = new Map(), error = '' } = {}) {
+function renderSigningDocuments({ pending = [], review = [], stageNames = new Map(), error = '', reviewLoading = false } = {}) {
   const box = document.getElementById('signing-documents');
   if (!box) return;
   box.classList.remove('hidden');
@@ -2309,7 +2307,8 @@ function renderSigningDocuments({ pending = [], review = [], stageNames = new Ma
     </article>`;
   }).join('');
   const reviewHtml = review.length ? `<details class="signing-review"><summary>Проверить вручную: ${review.length}</summary><ul>${review.map(({ task, match }) => `<li>${escapeHtml(signingTaskValue(task, ['TITLE', 'title']) || `Задача ${signingTaskValue(task, ['ID', 'id'])}`)} <span class="muted">— ${escapeHtml(match.reason)}</span></li>`).join('')}</ul></details>` : '';
-  box.innerHTML = `<div class="signing-documents-header"><div><h3>Документы на подпись</h3><p class="muted">Задачи проекта «Акты счета», кроме стадии «Архив».</p></div><span class="signing-documents-count">${pending.length}</span></div>${rows || '<p class="signing-documents-empty">Нет документов, ожидающих подписи.</p>'}${reviewHtml}`;
+  const reviewLoadingHtml = reviewLoading ? '<p class="muted signing-review-loading">Дополнительно ищем похожие задачи по УНП и названию…</p>' : '';
+  box.innerHTML = `<div class="signing-documents-header"><div><h3>Документы на подпись</h3><p class="muted">Задачи проекта «Акты счета», кроме стадии «Архив».</p></div><span class="signing-documents-count">${pending.length}</span></div>${rows || '<p class="signing-documents-empty">Нет документов с прямой связью со сделкой.</p>'}${reviewLoadingHtml}${reviewHtml}`;
   box.querySelectorAll('[data-signing-task-id]').forEach((button) => {
     button.addEventListener('click', () => {
       const path = signingTaskPath(button.getAttribute('data-signing-task-id'));
@@ -2339,41 +2338,56 @@ async function loadSigningDocuments(deal) {
     if (!matcher) throw new Error('Не загружен модуль сверки документов.');
     renderSigningDocumentsLoading();
     const projectId = Number(APP_CONFIG.actsProjectId || 36);
-    const company = deal.COMPANY_ID ? state.companies.get(String(deal.COMPANY_ID)) : null;
-    const companyFieldsResult = await bxCall('crm.company.fields').catch(() => ({}));
-    if (!isCurrentRequest()) return;
-    const companyLabels = signingFieldLabels(companyFieldsResult);
-    const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    const companyTitle = company && company.TITLE ? company.TITLE : '';
-    const taskQueries = [
-      () => bxList('tasks.task.list', {
+    const [stagesResult, directTasks] = await Promise.all([
+      bxCall('task.stages.get', { entityId: projectId }),
+      bxList('tasks.task.list', {
         filter: { GROUP_ID: projectId, UF_CRM_TASK: `D_${deal.ID}` },
         select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
         order: { ID: 'DESC' },
       }, 0),
+    ]);
+    if (!isCurrentRequest()) return;
+    const stages = signingStageRows(stagesResult);
+    const archive = stages.find((stage) => /архив/i.test(String(signingTaskValue(stage, ['TITLE', 'title']))));
+    const archiveStageId = signingTaskValue(archive, ['ID', 'id']);
+    if (!archiveStageId) throw new Error('В проекте «Акты счета» не найдена стадия «Архив».');
+    const stageNames = new Map(stages.map((stage) => [
+      String(signingTaskValue(stage, ['ID', 'id'])),
+      String(signingTaskValue(stage, ['TITLE', 'title']) || ''),
+    ]));
+    const company = deal.COMPANY_ID ? state.companies.get(String(deal.COMPANY_ID)) : null;
+    const companyTitle = company && company.TITLE ? company.TITLE : '';
+    const directResult = matcher.splitTasksForDeal({
+      tasks: directTasks,
+      dealId: String(deal.ID),
+      companyName: companyTitle,
+      companyUnp: '',
+      archiveStageId,
+      knownStageIds: stages.map((stage) => signingTaskValue(stage, ['ID', 'id'])).filter(Boolean),
+    });
+    renderSigningDocuments({ ...directResult, stageNames, reviewLoading: true });
+
+    const companyFieldsResult = await bxCall('crm.company.fields').catch(() => ({}));
+    if (!isCurrentRequest()) return;
+    const companyLabels = signingFieldLabels(companyFieldsResult);
+    const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
+    const taskQueries = [
       ...signingFallbackTerms(companyTitle, companyUnp, matcher).flatMap((term) => [
         () => bxList('tasks.task.list', {
           filter: { GROUP_ID: projectId, '%TITLE': term },
           select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
           order: { ID: 'DESC' },
-        }, 0),
+        }, 50),
         () => bxList('tasks.task.list', {
           filter: { GROUP_ID: projectId, '%DESCRIPTION': term },
           select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
           order: { ID: 'DESC' },
-        }, 0),
+        }, 50),
       ]),
     ];
-    const [stagesResult, taskGroups] = await Promise.all([
-      bxCall('task.stages.get', { entityId: projectId }),
-      mapLimit(taskQueries, 3, (query) => query()),
-    ]);
+    const taskGroups = await mapLimit(taskQueries, 3, (query) => query());
     if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks(taskGroups);
-    const stages = signingStageRows(stagesResult);
-    const archive = stages.find((stage) => /архив/i.test(String(signingTaskValue(stage, ['TITLE', 'title']))));
-    const archiveStageId = signingTaskValue(archive, ['ID', 'id']);
-    if (!archiveStageId) throw new Error('В проекте «Акты счета» не найдена стадия «Архив».');
+    const tasks = signingUniqueTasks([directTasks, ...taskGroups]);
 
     const result = matcher.splitTasksForDeal({
       tasks,
@@ -2383,10 +2397,6 @@ async function loadSigningDocuments(deal) {
       archiveStageId,
       knownStageIds: stages.map((stage) => signingTaskValue(stage, ['ID', 'id'])).filter(Boolean),
     });
-    const stageNames = new Map(stages.map((stage) => [
-      String(signingTaskValue(stage, ['ID', 'id'])),
-      String(signingTaskValue(stage, ['TITLE', 'title']) || ''),
-    ]));
     if (!isCurrentRequest()) return;
     renderSigningDocuments({ ...result, stageNames });
   } catch (error) {

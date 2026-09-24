@@ -63,6 +63,20 @@
     return [...terms];
   }
 
+  function companyReviewSearchTerms(companyName, companyUnp) {
+    const terms = [];
+    const add = (term) => {
+      const value = String(term || '');
+      if (value && !terms.includes(value) && terms.length < 4) terms.push(value);
+    };
+    add(normalizeUnp(companyUnp));
+    const nameTerms = companySearchTerms(companyName);
+    add(normalizeCompanyName(companyName));
+    nameTerms.filter((term) => term.includes(' ')).forEach(add);
+    nameTerms.forEach(add);
+    return terms;
+  }
+
   function normalizeUnp(value) {
     const match = text(value).match(/(?<!\d)(\d{9})(?!\d)/);
     return match ? match[1] : '';
@@ -179,6 +193,7 @@
 
   return {
     companySearchTerms,
+    companyReviewSearchTerms,
     extractDealIds,
     extractCrmDealIds,
     extractUnps,

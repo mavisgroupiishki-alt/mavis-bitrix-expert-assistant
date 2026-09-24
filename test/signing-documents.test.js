@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { companySearchTerms, matchTaskToDeal, splitTasksForDeal } = require('../public/signing-documents');
+const { companyReviewSearchTerms, companySearchTerms, matchTaskToDeal, splitTasksForDeal } = require('../public/signing-documents');
 
 test('prefers the direct CRM deal link over every other company indicator', () => {
   const result = matchTaskToDeal({
@@ -58,6 +58,14 @@ test('builds bounded search variants for a shortened company name', () => {
   assert.ok(terms.includes('строй сервис'));
   assert.ok(terms.includes('строй-сервис'));
   assert.ok(terms.length <= 8);
+});
+
+test('prioritizes UNP and a shortened name while bounding manual-review searches', () => {
+  const terms = companyReviewSearchTerms('ООО «Строй Сервис Плюс»', '123456789');
+  assert.equal(terms[0], '123456789');
+  assert.ok(terms.includes('строй сервис плюс'));
+  assert.ok(terms.includes('строй сервис'));
+  assert.ok(terms.length <= 4);
 });
 
 test('treats every stage except Archive as a document awaiting signature', () => {
