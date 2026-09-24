@@ -2371,16 +2371,28 @@ async function loadSigningDocuments(deal) {
     if (!isCurrentRequest()) return;
     const companyLabels = signingFieldLabels(companyFieldsResult);
     const companyUnp = company ? matcher.unpFromCompany(company, companyLabels) : '';
-    // The legacy Bitrix task API applies title filters inconsistently for
-    // Cyrillic names. Load this project's tasks once and match deterministically
-    // in the app by CRM link, UNP and the normalized company title.
-    const projectTasks = await bxList('tasks.task.list', {
-      filter: { GROUP_ID: projectId },
-      select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
-      order: { ID: 'DESC' },
-    }, 0);
+    const titleTerms = [...new Set([
+      ...matcher.companySearchTerms(companyTitle),
+      ...(String(companyTitle).match(/[\p{L}\p{N}]{6,}/gu) || []).filter((term) => !/^(частное|предприятие)$/iu.test(term)),
+    ])];
+    // Bitrix installations differ in whether the title comparison accepts
+    // wildcards in the value. Ask both supported variants, then compare the
+    // returned tasks locally by CRM link, UNP and company title.
+    const titleQueries = titleTerms.flatMap((term) => [
+      () => bxList('tasks.task.list', {
+        filter: { GROUP_ID: projectId, '%TITLE': term },
+        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
+        order: { ID: 'DESC' },
+      }, 50),
+      () => bxList('tasks.task.list', {
+        filter: { GROUP_ID: projectId, '%TITLE': `%${term}%` },
+        select: ['ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'UF_CRM_TASK', 'CHANGED_DATE'],
+        order: { ID: 'DESC' },
+      }, 50),
+    ]);
+    const titleGroups = await mapLimit(titleQueries, 3, (query) => query());
     if (!isCurrentRequest()) return;
-    const tasks = signingUniqueTasks([directTasks, projectTasks]);
+    const tasks = signingUniqueTasks([directTasks, ...titleGroups]);
 
     const resultFor = (tasks) => matcher.splitTasksForDeal({
       tasks,
