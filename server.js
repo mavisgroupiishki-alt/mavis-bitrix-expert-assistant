@@ -197,6 +197,8 @@ const config = {
   autopilotTimelineDiagnostics: String(process.env.AUTOPILOT_TIMELINE_DIAGNOSTICS || 'false').toLowerCase() === 'true',
   autopilotTranscribeRetries: Math.max(1, Number(process.env.AUTOPILOT_TRANSCRIBE_RETRIES || 2)),
   autopilotRetryCooldownMinutes: Math.max(1, Number(process.env.AUTOPILOT_RETRY_COOLDOWN_MINUTES || 60)),
+  // Пустая расшифровка обычно означает, что запись ещё не доступна STT. Не повторяем её каждый час.
+  autopilotTranscriptionRetryCooldownMinutes: Math.max(60, Number(process.env.AUTOPILOT_TRANSCRIPTION_RETRY_COOLDOWN_MINUTES || 240)),
   // v77: блок 1 CJM — контроль стадии «На распределении».
   // Явный ID надёжнее названия; fallback соответствует текущей воронке Производства.
   unassignedStageId: process.env.UNASSIGNED_STAGE_ID || 'C28:UC_01240N',
@@ -5832,7 +5834,7 @@ async function runServerAutopilotForDeal(deal, stageId) {
           return;
         }
         const retryKey = autopilotRetryKey(dealId, 'transcription', callRecord.activityId);
-        const retryAt = autopilotRetryGate.defer(retryKey, config.autopilotRetryCooldownMinutes);
+        const retryAt = autopilotRetryGate.defer(retryKey, config.autopilotTranscriptionRetryCooldownMinutes);
         autopilotDeferredTranscriptionByDeal.set(String(dealId), String(callRecord.activityId));
         console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю не раньше ${toMinskLocalIso(retryAt)} — без комментариев в CRM.`);
         return;

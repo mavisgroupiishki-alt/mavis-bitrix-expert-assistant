@@ -33,3 +33,13 @@ test('delivery failures use the same cooldown instead of retrying every autopilo
   assert.equal(gate.isDeferred('38668:delivery', new Date('2026-09-24T08:10:00.000Z')), true);
   assert.equal(gate.isDeferred('38668:delivery', new Date('2026-09-24T09:00:00.000Z')), false);
 });
+
+test('empty transcription waits four hours before another STT attempt', () => {
+  const gate = createAutopilotRetryGate();
+  const startedAt = new Date('2026-09-24T08:00:00.000Z');
+
+  gate.defer('33700:transcription:991', 240, startedAt);
+
+  assert.equal(gate.isDeferred('33700:transcription:991', new Date('2026-09-24T11:59:59.000Z')), true);
+  assert.equal(gate.isDeferred('33700:transcription:991', new Date('2026-09-24T12:00:00.000Z')), false);
+});
