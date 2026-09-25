@@ -7,14 +7,12 @@ const { bitrixEmailSenderSettings } = require('../bitrix-email');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
-test('uses the preferred channel first and falls back only after it', () => {
-  assert.deepEqual(deliveryChannelPlan('telegram'), ['telegram', 'viber', 'email']);
-  assert.deepEqual(deliveryChannelPlan('viber'), ['viber', 'telegram', 'email']);
-  assert.deepEqual(deliveryChannelPlan('email'), ['email', 'telegram', 'viber']);
-  assert.deepEqual(deliveryChannelPlan(''), ['telegram', 'viber', 'email']);
-  assert.deepEqual(deliveryChannelPlan('telegram', { telegramEnabled: false }), ['viber', 'email']);
-  assert.deepEqual(deliveryChannelPlan('viber', { telegramEnabled: false }), ['viber', 'email']);
-  assert.deepEqual(deliveryChannelPlan('email', { telegramEnabled: false }), ['email', 'viber']);
+test('sends acts only by email regardless of the preferred channel', () => {
+  assert.deepEqual(deliveryChannelPlan('telegram'), ['email']);
+  assert.deepEqual(deliveryChannelPlan('viber'), ['email']);
+  assert.deepEqual(deliveryChannelPlan('email'), ['email']);
+  assert.deepEqual(deliveryChannelPlan(''), ['email']);
+  assert.deepEqual(deliveryChannelPlan('telegram', { telegramEnabled: false }), ['email']);
 });
 
 test('treats a repeated Wazzup crmMessageId as an accepted idempotent delivery', () => {

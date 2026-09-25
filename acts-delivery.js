@@ -1,12 +1,9 @@
 'use strict';
 
-function deliveryChannelPlan(preferredChannel, options = {}) {
-  const telegramEnabled = options.telegramEnabled !== false;
-  const channels = ['telegram', 'viber', 'email'];
-  const plan = !channels.includes(preferredChannel)
-    ? channels
-    : [preferredChannel, ...channels.filter((channel) => channel !== preferredChannel)];
-  return telegramEnabled ? plan : plan.filter((channel) => channel !== 'telegram');
+function deliveryChannelPlan() {
+  // Акты — юридически значимые документы: отправляем только по e-mail.
+  // Предпочтительный канал связи остаётся для остальных сообщений ассистента.
+  return ['email'];
 }
 
 // Wazzup rejects a second request with the same crmMessageId only after it has

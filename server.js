@@ -5177,10 +5177,9 @@ function preferredChannelLabel(channel) {
   return { telegram: 'Telegram', viber: 'Viber', email: 'Email' }[channel] || 'не определён';
 }
 
-function actsDeliveryChannelPlan(preferredChannel) {
-  // Следующий канал — только fallback после подтверждённой неудачи предыдущего.
-  // Дополнительная email-копия отключена: она и была источником дублей.
-  return deliveryChannelPlan(preferredChannel, { telegramEnabled: config.actsTelegramEnabled });
+function actsDeliveryChannelPlan() {
+  // Для актов канал зафиксирован: только e-mail, без Wazzup fallback.
+  return deliveryChannelPlan();
 }
 
 // Приоритет адресата: последняя Wazzup-переписка, затем последняя CRM-переписка.
@@ -12564,7 +12563,8 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
 
   const text = actsBuildClientMessage(deal, task, file);
   const taskId = String(actsTaskField(task, ['id','ID']) || '');
-  const preferredChannel = await detectPreferredChannelResolved(deal);
+  // Предпочтительный канал сделки не участвует в юридически значимой отправке акта.
+  const preferredChannel = 'email';
   const recipientsResult = await actsResolveDeliveryRecipients(deal);
   if (!recipientsResult.ok) {
     return { ok: false, skipped: true, message: recipientsResult.reason };
@@ -12671,7 +12671,7 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     return null;
   };
 
-  for (const channel of actsDeliveryChannelPlan(preferredChannel)) {
+  for (const channel of actsDeliveryChannelPlan()) {
     if (uncertainDelivery || primary) break;
     if (channel === 'email') {
       const sent = await tryEmail();
