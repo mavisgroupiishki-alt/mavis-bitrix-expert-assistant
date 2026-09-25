@@ -34,7 +34,7 @@ const { authorizationMatchesToken, requestMatchesToken } = require('./request-au
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 const { inspectAudioPayload, shouldTryAlternateAudioUrl } = require('./autopilot-audio-validation');
 const { createAutopilotRetryGate } = require('./autopilot-retry');
-const { isPreferredChannelFieldLabel } = require('./preferred-channel-field');
+const { enumLabelForValue, isPreferredChannelFieldLabel } = require('./preferred-channel-field');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 
 const app = express();
@@ -5144,6 +5144,13 @@ async function detectPreferredChannelResolved(deal) {
           const fields = await bitrixRestList('crm.deal.userfield.list', { filter: { FIELD_NAME: code } }, 10);
           const field = fields.find((f) => String(f.FIELD_NAME || f.fieldName || '') === code) || fields[0];
           list = field && (field.LIST || field.list);
+        }
+        if (!Array.isArray(list) || !list.length) {
+          const field = await bitrixRestCall('crm.deal.userfield.get', { id: code });
+          for (const id of ids) {
+            const label = enumLabelForValue(field, id);
+            if (label) enumMap.set(id, label);
+          }
         }
         if (Array.isArray(list)) {
           for (const item of list) {
