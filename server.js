@@ -34,6 +34,7 @@ const { authorizationMatchesToken, requestMatchesToken } = require('./request-au
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 const { inspectAudioPayload } = require('./autopilot-audio-validation');
 const { createAutopilotRetryGate } = require('./autopilot-retry');
+const { isPreferredChannelFieldLabel } = require('./preferred-channel-field');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 
 const app = express();
@@ -5077,8 +5078,7 @@ async function discoverPreferredChannelFields() {
         f.LIST_COLUMN_LABEL, f.listColumnLabel,
         f.LIST_FILTER_LABEL, f.listFilterLabel,
       ].filter(Boolean).join(' ');
-      const n = normalizeControlValue(labels);
-      return /предпочитаем/.test(n) && /(канал|способ)/.test(n) && /связ/.test(n);
+      return isPreferredChannelFieldLabel(labels);
     }).map((f) => ({
       code: String(f.FIELD_NAME || f.fieldName || ''),
       label: String(f.EDIT_FORM_LABEL || f.editFormLabel || f.LIST_COLUMN_LABEL || f.listColumnLabel || f.LIST_FILTER_LABEL || f.listFilterLabel || ''),
