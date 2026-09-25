@@ -32,6 +32,8 @@ const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
+const { inspectAudioPayload } = require('./autopilot-audio-validation');
+const { createAutopilotRetryGate } = require('./autopilot-retry');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 
 const app = express();
@@ -193,6 +195,7 @@ const config = {
   autopilotPollIntervalMinutes: Number(process.env.AUTOPILOT_POLL_INTERVAL_MINUTES || 10),
   autopilotTimelineDiagnostics: String(process.env.AUTOPILOT_TIMELINE_DIAGNOSTICS || 'false').toLowerCase() === 'true',
   autopilotTranscribeRetries: Math.max(1, Number(process.env.AUTOPILOT_TRANSCRIBE_RETRIES || 2)),
+  autopilotRetryCooldownMinutes: Math.max(1, Number(process.env.AUTOPILOT_RETRY_COOLDOWN_MINUTES || 60)),
   // v77: блок 1 CJM — контроль стадии «На распределении».
   // Явный ID надёжнее названия; fallback соответствует текущей воронке Производства.
   unassignedStageId: process.env.UNASSIGNED_STAGE_ID || 'C28:UC_01240N',
@@ -4227,6 +4230,12 @@ const AUTOPILOT_START_DATE = new Date();
 const autopilotProcessed = new Set();
 // v77: короткие/служебные звонки, уже проверенные в текущем процессе Render.
 const autopilotRejectedCallIds = new Set(); // `${dealId}:${activityId}`
+const autopilotRetryGate = createAutopilotRetryGate();
+const autopilotDeferredTranscriptionByDeal = new Map(); // dealId → activityId
+
+function autopilotRetryKey(dealId, kind, activityId = '') {
+  return `${String(dealId)}:${kind}${activityId ? `:${String(activityId)}` : ''}`;
+}
 
 async function getAutopilotStageIds() {
   if (getAutopilotStageIds._cached) return getAutopilotStageIds._cached;
@@ -4379,6 +4388,7 @@ async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
   }
   const urls = await resolveAllAudioUrlsForActivity(callRecord && callRecord.activity, callRecord && callRecord.url);
   let lastText = ''; let lastError = null;
+  let nonAudioFound = false; let retryableFailureFound = false;
   const retries = Math.max(1, Number(config.autopilotTranscribeRetries || 2));
   for (const url of urls) {
     for (let attempt = 1; attempt <= retries; attempt++) {
@@ -4387,11 +4397,20 @@ async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
         lastText = text;
         if (!transcriptLooksLikePlaceholder(text)) return { text, source: `audio:${attempt}`, ready: true };
         console.warn(`${logPrefix} STT вернул служебную/пустую расшифровку (попытка ${attempt}/${retries}): "${normalizeTranscriptQuality(text).slice(0, 120)}"`);
-      } catch (e) { lastError = e; console.warn(`${logPrefix} STT попытка ${attempt}/${retries} не удалась: ${e.message || e}`); }
+      } catch (e) {
+        lastError = e;
+        if (e && e.code === 'NON_AUDIO_PAYLOAD') {
+          nonAudioFound = true;
+          console.warn(`${logPrefix} Вложение не является аудиозаписью (${e.message || e}) — этот URL пропускаю.`);
+          break;
+        }
+        retryableFailureFound = true;
+        console.warn(`${logPrefix} STT попытка ${attempt}/${retries} не удалась: ${e.message || e}`);
+      }
       if (attempt < retries) await new Promise((r) => setTimeout(r, 1200));
     }
   }
-  return { text: lastText, source: '', ready: false, error: lastError };
+  return { text: lastText, source: '', ready: false, error: lastError, permanent: nonAudioFound && !retryableFailureFound };
 }
 
 async function transcribeAudioUrl(audioUrl, fileName) {
@@ -4405,6 +4424,12 @@ async function transcribeAudioUrl(audioUrl, fileName) {
   const arrayBuffer = await audioResp.arrayBuffer();
   if (arrayBuffer.byteLength > 25 * 1024 * 1024) throw new Error('Аудиозапись больше 25 МБ.');
   const contentType = audioResp.headers.get('content-type') || 'audio/mpeg';
+  const payloadCheck = inspectAudioPayload(contentType, Buffer.from(arrayBuffer));
+  if (!payloadCheck.ok) {
+    const error = new Error(`получен файл, который не похож на аудио: ${payloadCheck.reason}`);
+    error.code = 'NON_AUDIO_PAYLOAD';
+    throw error;
+  }
   const safeFileName = String(fileName || 'call.mp3').replace(/[^a-zA-Z0-9._-]/g, '_') || 'call.mp3';
   const configuredModel = config.transcribeModel || 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
   const shouldSendModel = Boolean(config.transcribeSendModel && configuredModel);
@@ -4562,6 +4587,9 @@ function activityPassesExpertGate(act, deal, opts = {}) {
 
 async function findCallForDeal(dealId, opts = {}) {
   const deal = opts.deal || null;
+  const quiet = opts.quiet === true;
+  const skipActivityId = String(opts.skipActivityId || '');
+  const log = (...args) => { if (!quiet) console.log(...args); };
   // FILES не возвращается через select: ['*'] в Bitrix REST — нужно запрашивать явно.
   const acts = await bitrixRestList('crm.activity.list', {
     filter: { OWNER_ID: dealId, OWNER_TYPE_ID: 2 },
@@ -4579,45 +4607,46 @@ async function findCallForDeal(dealId, opts = {}) {
   });
 
   for (const act of callActs) {
+    if (skipActivityId && String(act.ID) === skipActivityId) continue;
     if (autopilotRejectedCallIds.has(`${dealId}:${act.ID}`)) {
-      console.log(`[findCall deal=${dealId} act=${act.ID}] skip: звонок ранее признан не первым содержательным касанием`);
+      log(`[findCall deal=${dealId} act=${act.ID}] skip: звонок ранее признан не первым содержательным касанием`);
       continue;
     }
     const gate = activityPassesExpertGate(act, deal, opts);
     if (!gate.ok) {
-      console.log(`[findCall deal=${dealId} act=${act.ID}] skip: ${gate.reason}`);
+      log(`[findCall deal=${dealId} act=${act.ID}] skip: ${gate.reason}`);
       continue;
     }
     const logAct = `[findCall deal=${dealId} act=${act.ID}]`;
     const files = Array.isArray(act.FILES) ? act.FILES : [];
-    console.log(`${logAct} FILES count=${files.length}`);
+    log(`${logAct} FILES count=${files.length}`);
     for (const f of files) {
       const fileId = f && (f.ID || f.id || f.FILE_ID || f.fileId);
       if (!fileId) continue;
       try {
         const file = await bitrixRestCall('disk.file.get', { id: fileId });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl || file.VIEW_URL);
-        console.log(`${logAct} disk.file.get id=${fileId} → url=${url ? 'OK' : 'пусто'}`);
+        log(`${logAct} disk.file.get id=${fileId} → url=${url ? 'OK' : 'пусто'}`);
         if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
-      } catch (e) { console.log(`${logAct} disk.file.get id=${fileId} → ошибка: ${e.message}`); }
+      } catch (e) { log(`${logAct} disk.file.get id=${fileId} → ошибка: ${e.message}`); }
       const directUrl = f && (f.DOWNLOAD_URL || f.downloadUrl || f.VIEW_URL || f.url);
       if (directUrl) return { activityId: act.ID, subject: act.SUBJECT, url: directUrl, fileName: `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
     }
 
     const raw = JSON.stringify(act);
     const fileIdMatch = raw.match(/crm_show_file\.php\?fileId=(\d+)/);
-    console.log(`${logAct} crm_show_file fileId=${fileIdMatch ? fileIdMatch[1] : 'не найден'}`);
+    log(`${logAct} crm_show_file fileId=${fileIdMatch ? fileIdMatch[1] : 'не найден'}`);
     if (fileIdMatch) {
       try {
         const file = await bitrixRestCall('disk.file.get', { id: fileIdMatch[1] });
         const url = file && (file.DOWNLOAD_URL || file.downloadUrl);
-        console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → url=${url ? 'OK' : 'пусто'}`);
+        log(`${logAct} disk.file.get id=${fileIdMatch[1]} → url=${url ? 'OK' : 'пусто'}`);
         if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: file.NAME || `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
-      } catch (e) { console.log(`${logAct} disk.file.get id=${fileIdMatch[1]} → ошибка: ${e.message}`); }
+      } catch (e) { log(`${logAct} disk.file.get id=${fileIdMatch[1]} → ошибка: ${e.message}`); }
     }
 
     const candidates = serverCollectActivityAudioCandidates(act);
-    console.log(`${logAct} candidates=${candidates.length}`);
+    log(`${logAct} candidates=${candidates.length}`);
     for (const c of candidates) {
       const url = await serverResolveCandidateDownloadUrl(c);
       if (url) return { activityId: act.ID, subject: act.SUBJECT, url, fileName: `call-${dealId}.mp3`, activity: act, durationSec: gate.durationSec ?? activityCallDurationSeconds(act) };
@@ -5673,10 +5702,21 @@ async function runServerAutopilotForDeal(deal, stageId) {
     // v87: для тестового Бобика можно прогнать CJM без звонка вообще. Это ТОЛЬКО тестовый fallback.
     // Все остальные сделки по-прежнему требуют содержательный звонок >=60 сек.
     const testDeal = isCjmTestDeal(dealId);
+    const noCallRetryKey = autopilotRetryKey(dealId, 'no-call');
+    const deferredActivityId = autopilotDeferredTranscriptionByDeal.get(String(dealId));
+    const transcriptionRetryKey = deferredActivityId
+      ? autopilotRetryKey(dealId, 'transcription', deferredActivityId)
+      : '';
+    const transcriptionIsDeferred = transcriptionRetryKey && autopilotRetryGate.isDeferred(transcriptionRetryKey);
+    if (deferredActivityId && !transcriptionIsDeferred) {
+      autopilotDeferredTranscriptionByDeal.delete(String(dealId));
+    }
     let callRecord = await findCallForDeal(dealId, {
       deal,
       assignedById: testDeal ? '' : deal.ASSIGNED_BY_ID,
       minDate: testDeal ? '' : deal.MOVED_TIME,
+      quiet: autopilotRetryGate.isDeferred(noCallRetryKey) || transcriptionIsDeferred,
+      skipActivityId: transcriptionIsDeferred ? deferredActivityId : '',
     });
     let noCallTestMode = false;
     if (!callRecord && testDeal && config.cjmTestAllowNoCall) {
@@ -5693,9 +5733,13 @@ async function runServerAutopilotForDeal(deal, stageId) {
       console.log(`${logPrefix} v87 TEST: звонка нет — для Бобика формирую стартовый Ход работы только из данных сделки и стандартного перечня документов.`);
     }
     if (!callRecord) {
-      console.log(`${logPrefix} Запись звонка не найдена — пропускаю, попробую в следующем цикле.`);
+      if (transcriptionIsDeferred) return;
+      if (autopilotRetryGate.isDeferred(noCallRetryKey)) return;
+      const retryAt = autopilotRetryGate.defer(noCallRetryKey, config.autopilotRetryCooldownMinutes);
+      console.log(`${logPrefix} Запись звонка не найдена — следующая проверка не раньше ${toMinskLocalIso(retryAt)}.`);
       return;
     }
+    autopilotRetryGate.clear(noCallRetryKey);
     if (testDeal && await autopilotTimelineHasMarker(dealId, `${AUTOPILOT_CALL_DONE_MARKER} activity=${callRecord.activityId}`, 500)) {
       console.log(`${logPrefix} Тестовый цикл activity=${callRecord.activityId} уже успешно использован — повторно не отправляю.`);
       autopilotProcessed.add(String(dealId));
@@ -5709,9 +5753,19 @@ async function runServerAutopilotForDeal(deal, stageId) {
       const transcription = await transcribeCallBestEffort(callRecord, logPrefix);
       transcript = String(transcription.text || '').trim();
       if (!transcription.ready || transcriptLooksLikePlaceholder(transcript)) {
-        console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю позже БЕЗ комментариев в CRM.`);
+        if (transcription.permanent) {
+          autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
+          console.warn(`${logPrefix} activity=${callRecord.activityId} содержит неаудио-вложение. Автопилот не будет повторять расшифровку этого звонка.`);
+          return;
+        }
+        const retryKey = autopilotRetryKey(dealId, 'transcription', callRecord.activityId);
+        const retryAt = autopilotRetryGate.defer(retryKey, config.autopilotRetryCooldownMinutes);
+        autopilotDeferredTranscriptionByDeal.set(String(dealId), String(callRecord.activityId));
+        console.warn(`${logPrefix} Запись звонка есть (${callRecord.durationSec ?? 'неизвестно'} сек), но качественная расшифровка ещё не получена. Повторю не раньше ${toMinskLocalIso(retryAt)} — без комментариев в CRM.`);
         return;
       }
+      autopilotRetryGate.clear(autopilotRetryKey(dealId, 'transcription', callRecord.activityId));
+      autopilotDeferredTranscriptionByDeal.delete(String(dealId));
       if (looksLikeCallbackOnlyTranscript(transcript)) {
         autopilotRejectedCallIds.add(`${dealId}:${callRecord.activityId}`);
         console.log(`${logPrefix} Звонок ${callRecord.activityId} похож на короткое служебное касание/просьбу перезвонить — ход работы не запускаю.`);
