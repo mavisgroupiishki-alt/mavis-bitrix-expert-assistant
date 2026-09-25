@@ -2935,12 +2935,16 @@ function normalizeCompanyNameForMatch(name) {
     .trim();
 }
 
-function companyHintsFromMailSubject(subject) {
-  // Имя отправителя часто не внесено в CRM, но клиент указывает компанию в теме.
+function companyHintsFromMailSubject(subject, attachmentNames = []) {
+  // Имя отправителя часто не внесено в CRM, но клиент указывает компанию в теме
+  // или в имени приложенного документа.
   // Используем только явно оформленное название после организационной формы, чтобы
   // не принять произвольную тему письма за компанию.
   const hints = new Set();
-  const text = String(subject || '');
+  const text = [subject, ...(Array.isArray(attachmentNames) ? attachmentNames : [])]
+    .map((value) => String(value || ''))
+    .filter(Boolean)
+    .join('\n');
   const explicitCompany = /(?:^|[^\p{L}\p{N}_])(?:ООО|ОАО|ЗАО|ЧТУП|ЧУП|УП|ИП)\s*[«"]\s*([^»"\r\n]{2,120})\s*[»"]/giu;
   let match;
   while ((match = explicitCompany.exec(text))) {
@@ -2954,6 +2958,12 @@ function companyHintsFromMailSubject(subject) {
   const allCapsRecipient = /(?:^|[^\p{L}\p{N}_])(?:для|ДЛЯ|for|FOR)\s+(?:ООО\s*)?[«"]?([А-ЯЁ][А-ЯЁ0-9-]{2,80})[»"]?/gu;
   while ((match = allCapsRecipient.exec(text))) {
     const name = String(match[1] || '').trim();
+    if (name) hints.add(name);
+  }
+
+  const unquotedCompany = /(?:^|[^\p{L}\p{N}_])(?:ООО|ОАО|ЗАО|ЧТУП|ЧУП|УП|ИП)\s+([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 -]{1,100}?)(?=\s*[().,;]|$)/giu;
+  while ((match = unquotedCompany.exec(text))) {
+    const name = String(match[1] || '').replace(/\s+/g, ' ').trim();
     if (name) hints.add(name);
   }
   return [...hints];
@@ -3312,7 +3322,7 @@ async function processIncomingEmails() {
           if (!matchInfo || !matchInfo.deals.length) {
             console.log(`[email] Email ${senderEmail} не найден в CRM — проверяю явное название компании в теме...`);
 
-            for (const companyHint of companyHintsFromMailSubject(subject)) {
+            for (const companyHint of companyHintsFromMailSubject(subject, attachments.map((att) => att.filename || ''))) {
               const subjectMatch = await findDealsByCompanyName(companyHint);
               if (subjectMatch && subjectMatch.deals && subjectMatch.deals.length) {
                 matchInfo = subjectMatch;

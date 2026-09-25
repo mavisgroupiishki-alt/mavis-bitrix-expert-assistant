@@ -8,7 +8,7 @@ const vm = require('node:vm');
 
 function companyHintsFromMailSubject() {
   const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  const start = source.indexOf('function companyHintsFromMailSubject(subject) {');
+  const start = source.indexOf('function companyHintsFromMailSubject(');
   const end = source.indexOf('\nasync function getOrCreateCompanyFolder(', start);
   assert.ok(start >= 0 && end > start, 'mail subject company-hint extractor must be present in server.js');
   const context = {};
@@ -34,5 +34,13 @@ test('extracts an all-caps company name following «для» in a document subje
   assert.deepEqual(
     [...extract('Договор на ПО для ПРОЕКТСТРОЙГАРАНТ')],
     ['ПРОЕКТСТРОЙГАРАНТ'],
+  );
+});
+
+test('extracts an unquoted company name from an attachment filename', () => {
+  const extract = companyHintsFromMailSubject();
+  assert.deepEqual(
+    [...extract('Re: Покупка Форгенто', ['5650 ООО Форгенто (Бобруйск).pdf'])],
+    ['Форгенто'],
   );
 });
