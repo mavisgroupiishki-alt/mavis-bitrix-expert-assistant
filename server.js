@@ -5703,6 +5703,12 @@ async function runServerAutopilotForDeal(deal, stageId) {
       return;
     }
 
+    const deliveryRetryKey = autopilotRetryKey(dealId, 'delivery');
+    if (autopilotRetryGate.isDeferred(deliveryRetryKey)) {
+      console.log(`${logPrefix} Отправка хода работы отложена после ошибки канала — не повторяю попытку до истечения паузы.`);
+      return;
+    }
+
     // 2. Ищем запись звонка.
     // v87: для тестового Бобика можно прогнать CJM без звонка вообще. Это ТОЛЬКО тестовый fallback.
     // Все остальные сделки по-прежнему требуют содержательный звонок >=60 сек.
@@ -6041,9 +6047,12 @@ documents_due_date — ОБЯЗАТЕЛЬНО дата в формате YYYY-MM
       }
       // В таймлайн не добавляем транспортный шум и не создаём повторяющиеся
       // комментарии; при включённом флаге выше создаётся одна задача эксперту.
-      console.warn(`${logPrefix} ${sendStatus}`);
+      const retryAt = autopilotRetryGate.defer(deliveryRetryKey, config.autopilotRetryCooldownMinutes);
+      console.warn(`${logPrefix} ${sendStatus} Повтор не раньше ${toMinskLocalIso(retryAt)}.`);
       return;
     }
+
+    autopilotRetryGate.clear(deliveryRetryKey);
 
     const clientMsgForComment = `\n\n📨 Отправлено клиенту:\n${clientMessageWithEmail}${documentMessage ? '\n\n' + documentMessage : ''}`;
     const callDoneSuffix = testDeal ? `\n${AUTOPILOT_CALL_DONE_MARKER} activity=${callRecord.activityId}` : '';
