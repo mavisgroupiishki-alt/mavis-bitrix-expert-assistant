@@ -2935,6 +2935,21 @@ function normalizeCompanyNameForMatch(name) {
     .trim();
 }
 
+function companyHintsFromMailSubject(subject) {
+  // Имя отправителя часто не внесено в CRM, но клиент указывает компанию в теме.
+  // Используем только явно оформленное название после организационной формы, чтобы
+  // не принять произвольную тему письма за компанию.
+  const hints = new Set();
+  const text = String(subject || '');
+  const explicitCompany = /(?:^|[^\p{L}\p{N}_])(?:ООО|ОАО|ЗАО|ЧТУП|ЧУП|УП|ИП)\s*[«"]\s*([^»"\r\n]{2,120})\s*[»"]/giu;
+  let match;
+  while ((match = explicitCompany.exec(text))) {
+    const name = String(match[1] || '').replace(/\s+/g, ' ').trim();
+    if (name) hints.add(name);
+  }
+  return [...hints];
+}
+
 async function getOrCreateCompanyFolder(companyName) {
   // Папки компаний лежат прямо в корне Общего диска (не во вложенной структуре).
   const rootId = await getCommonDriveRootId();
@@ -3286,31 +3301,44 @@ async function processIncomingEmails() {
           let matchInfo = await findContactAndDealsByEmail(senderEmail);
           
           if (!matchInfo || !matchInfo.deals.length) {
-            console.log(`[email] Email ${senderEmail} не найден в CRM — пробую Vision анализ...`);
-            
-            // ✅ 2. ВТОРОЙ СПОСОБ: Vision анализ вложений
-            let visionCompany = null;
-            let visionConfidence = 'low';
-            
-            for (const att of attachments) {
-              try {
-                // ✅ УЛУЧШЕННЫЙ ПРОМПТ для Vision
-                const analysis = await analyzeDocumentWithVisionForCompany(att.content, att.filename || 'file', att.contentType);
-                
-                if (analysis.company && analysis.confidence !== 'low') {
-                  visionCompany = analysis.company;
-                  visionConfidence = analysis.confidence;
-                  console.log(`[email] ✅ Vision нашёл компанию: "${visionCompany}" (${analysis.confidence})`);
-                  break;
-                }
-              } catch (_) {}
-              await new Promise((r) => setTimeout(r, 500));
+            console.log(`[email] Email ${senderEmail} не найден в CRM — проверяю явное название компании в теме...`);
+
+            for (const companyHint of companyHintsFromMailSubject(subject)) {
+              const subjectMatch = await findDealsByCompanyName(companyHint);
+              if (subjectMatch && subjectMatch.deals && subjectMatch.deals.length) {
+                matchInfo = subjectMatch;
+                console.log(`[email] ✅ Компания из темы найдена: "${companyHint}"`);
+                break;
+              }
             }
 
-            // ✅ 3. ЕСЛИ Vision сработал - ищем сделку по названию компании в Bitrix
-            if (visionCompany) {
-              console.log(`[email] 🔍 Ищу сделку по названию компании: "${visionCompany}"`);
-              matchInfo = await findDealsByCompanyName(visionCompany);
+            if (!matchInfo || !matchInfo.deals || !matchInfo.deals.length) {
+              console.log(`[email] Компания по теме не найдена — пробую Vision анализ...`);
+            
+              // ✅ 2. ВТОРОЙ СПОСОБ: Vision анализ вложений
+              let visionCompany = null;
+              let visionConfidence = 'low';
+            
+              for (const att of attachments) {
+                try {
+                  // ✅ УЛУЧШЕННЫЙ ПРОМПТ для Vision
+                  const analysis = await analyzeDocumentWithVisionForCompany(att.content, att.filename || 'file', att.contentType);
+                
+                  if (analysis.company && analysis.confidence !== 'low') {
+                    visionCompany = analysis.company;
+                    visionConfidence = analysis.confidence;
+                    console.log(`[email] ✅ Vision нашёл компанию: "${visionCompany}" (${analysis.confidence})`);
+                    break;
+                  }
+                } catch (_) {}
+                await new Promise((r) => setTimeout(r, 500));
+              }
+
+              // ✅ 3. ЕСЛИ Vision сработал - ищем сделку по названию компании в Bitrix
+              if (visionCompany) {
+                console.log(`[email] 🔍 Ищу сделку по названию компании: "${visionCompany}"`);
+                matchInfo = await findDealsByCompanyName(visionCompany);
+              }
             }
 
             // ✅ 4. ЕСЛИ НИЧЕГО НЕ СРАБОТАЛО - загружаем в "Неопределённые"
