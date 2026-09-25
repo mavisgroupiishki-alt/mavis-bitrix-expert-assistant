@@ -34,7 +34,7 @@ const { authorizationMatchesToken, requestMatchesToken } = require('./request-au
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 const { inspectAudioPayload, shouldTryAlternateAudioUrl } = require('./autopilot-audio-validation');
 const { createAutopilotRetryGate } = require('./autopilot-retry');
-const { enumLabelForValue, isPreferredChannelFieldLabel } = require('./preferred-channel-field');
+const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromValue } = require('./preferred-channel-field');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 
 const app = express();
@@ -5102,11 +5102,7 @@ async function discoverPreferredChannelFields() {
 }
 
 function channelFromText(value) {
-  const val = normalizeControlValue(value);
-  if (/\b(телеграм|telegram|tg)\b/i.test(val)) return 'telegram';
-  if (/\b(вайбер|viber)\b/i.test(val)) return 'viber';
-  if (/\b(email|e-mail|почта|mail)\b/i.test(val)) return 'email';
-  return null;
+  return preferredChannelFromValue(normalizeControlValue(value));
 }
 
 function detectPreferredChannel(deal) {
