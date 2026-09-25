@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { inspectAudioPayload } = require('../autopilot-audio-validation');
+const { inspectAudioPayload, shouldTryAlternateAudioUrl } = require('../autopilot-audio-validation');
 
 test('rejects an HTML or text response masquerading as a call recording', () => {
   const result = inspectAudioPayload('text/html; charset=utf-8', Buffer.from('<!doctype html><title>Document</title>'));
@@ -20,4 +20,9 @@ test('accepts an MP3 recording delivered as application/octet-stream', () => {
   const result = inspectAudioPayload('application/octet-stream', Buffer.from([0x49, 0x44, 0x33, 0x04, 0x00, 0x00]));
 
   assert.deepEqual(result, { ok: true });
+});
+
+test('does not fan out to alternate Bitrix download links after STT accepted a recording', () => {
+  assert.equal(shouldTryAlternateAudioUrl(true), false);
+  assert.equal(shouldTryAlternateAudioUrl(false), true);
 });

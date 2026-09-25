@@ -32,7 +32,7 @@ const { bitrixEmailSenderSettings } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
-const { inspectAudioPayload } = require('./autopilot-audio-validation');
+const { inspectAudioPayload, shouldTryAlternateAudioUrl } = require('./autopilot-audio-validation');
 const { createAutopilotRetryGate } = require('./autopilot-retry');
 const { isPreferredChannelFieldLabel } = require('./preferred-channel-field');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
@@ -4392,9 +4392,11 @@ async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
   let nonAudioFound = false; let retryableFailureFound = false;
   const retries = Math.max(1, Number(config.autopilotTranscribeRetries || 2));
   for (const url of urls) {
+    let sttRequestSucceeded = false;
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         const text = await transcribeAudioUrl(url, callRecord && callRecord.fileName);
+        sttRequestSucceeded = true;
         lastText = text;
         if (!transcriptLooksLikePlaceholder(text)) return { text, source: `audio:${attempt}`, ready: true };
         console.warn(`${logPrefix} STT вернул служебную/пустую расшифровку (попытка ${attempt}/${retries}): "${normalizeTranscriptQuality(text).slice(0, 120)}"`);
@@ -4410,6 +4412,7 @@ async function transcribeCallBestEffort(callRecord, logPrefix = '[autopilot]') {
       }
       if (attempt < retries) await new Promise((r) => setTimeout(r, 1200));
     }
+    if (!shouldTryAlternateAudioUrl(sttRequestSucceeded)) break;
   }
   return { text: lastText, source: '', ready: false, error: lastError, permanent: nonAudioFound && !retryableFailureFound };
 }

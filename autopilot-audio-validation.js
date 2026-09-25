@@ -39,4 +39,11 @@ function inspectAudioPayload(contentType, buffer) {
   return { ok: false, reason: `неизвестный формат (${type || 'без content-type'})` };
 }
 
-module.exports = { inspectAudioPayload };
+// A successful STT request, even one with an empty transcript, proves that the
+// current URL was an audio candidate. Do not fan out to alternate download URLs:
+// Bitrix may expose the same file through several links and multiply STT calls.
+function shouldTryAlternateAudioUrl(sttRequestSucceeded) {
+  return !sttRequestSucceeded;
+}
+
+module.exports = { inspectAudioPayload, shouldTryAlternateAudioUrl };
