@@ -28,3 +28,11 @@ test('does not treat an arbitrary subject as a company name', () => {
   const extract = companyHintsFromMailSubject();
   assert.deepEqual([...extract('Fwd: документы во вложении')], []);
 });
+
+test('extracts an all-caps company name following «для» in a document subject', () => {
+  const extract = companyHintsFromMailSubject();
+  assert.deepEqual(
+    [...extract('Договор на ПО для ПРОЕКТСТРОЙГАРАНТ')],
+    ['ПРОЕКТСТРОЙГАРАНТ'],
+  );
+});

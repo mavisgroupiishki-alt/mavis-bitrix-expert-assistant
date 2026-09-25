@@ -2947,6 +2947,15 @@ function companyHintsFromMailSubject(subject) {
     const name = String(match[1] || '').replace(/\s+/g, ' ').trim();
     if (name) hints.add(name);
   }
+
+  // В темах вроде «Договор ... для ПРОЕКТСТРОЙГАРАНТ» компания часто
+  // указана без организационной формы. Берём только одно слово в верхнем
+  // регистре, чтобы не превратить обычный текст темы в поисковый запрос.
+  const allCapsRecipient = /(?:^|[^\p{L}\p{N}_])(?:для|ДЛЯ|for|FOR)\s+(?:ООО\s*)?[«"]?([А-ЯЁ][А-ЯЁ0-9-]{2,80})[»"]?/gu;
+  while ((match = allCapsRecipient.exec(text))) {
+    const name = String(match[1] || '').trim();
+    if (name) hints.add(name);
+  }
   return [...hints];
 }
 
