@@ -3565,7 +3565,22 @@ async function findDealsByCompanyName(companyNameQuery) {
       return null;
     }
 
-    const company = companies[0];
+    // Bitrix ~TITLE can return an unrelated fuzzy first result. A document may
+    // be attached only when the normalized company title confirms this hint.
+    const exactCompany = companies.find((candidate) =>
+      normalizeCompanyNameForMatch(candidate.TITLE || '') === normalized
+    );
+    const partialCompanies = exactCompany ? [exactCompany] : companies.filter((candidate) => {
+      const candidateName = normalizeCompanyNameForMatch(candidate.TITLE || '');
+      return normalized.length >= 5 && candidateName &&
+        (candidateName.includes(normalized) || normalized.includes(candidateName));
+    });
+    if (partialCompanies.length !== 1) {
+      console.log(`[email] Компания "${companyNameQuery}" не подтверждена среди результатов CRM.`);
+      return null;
+    }
+
+    const company = partialCompanies[0];
     console.log(`[email] Найдена компания: "${company.TITLE}"`);
 
     // Ищем сделки этой компании
