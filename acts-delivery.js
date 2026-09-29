@@ -6,6 +6,10 @@ function deliveryChannelPlan() {
   return ['email'];
 }
 
+function actEmailSubject() {
+  return 'Акт выполненных работ';
+}
+
 // Wazzup rejects a second request with the same crmMessageId only after it has
 // accepted the original one. This is an idempotency acknowledgement, not a
 // delivery failure that should schedule another act send.
@@ -60,4 +64,4 @@ function isTechnicalProductionComment(value) {
   );
 }
 
-module.exports = { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask };
+module.exports = { actEmailSubject, canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask };

@@ -27,7 +27,7 @@ const { availableRejectAction, createRabotaByClient, rabotaResponseToIntake } = 
 const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStageTaskPlan } = require('./recruiting-stage-tasks');
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
-const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
+const { actEmailSubject, canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
 const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
@@ -12603,7 +12603,7 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file, r
       contactId,
       recipientEntityType,
       toEmail,
-      subject: `Акт по сделке: ${deal.TITLE || dealId}`,
+      subject: actEmailSubject(),
       description: text + (file && file.url ? `\n\nСсылка на файл акта: ${file.url}` : ''),
       settings,
       storageElementIds: storageIds,
@@ -12630,7 +12630,7 @@ async function sendActEmailThroughSmtp({ deal, taskId, contactId, contactLabel, 
     },
     file,
     downloaded,
-  }, `Акт по сделке: ${(deal && (deal.TITLE || deal.ID)) || 'MAVIS'}`, text);
+  }, actEmailSubject(), text);
 
   return {
     activityId: smtpResult.messageId ? `smtp:${smtpResult.messageId}` : 'smtp-confirmed',

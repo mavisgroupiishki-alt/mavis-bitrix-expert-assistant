@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('../acts-delivery');
+const { actEmailSubject, canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('../acts-delivery');
 const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('../bitrix-email');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
@@ -13,6 +13,11 @@ test('sends acts only by email regardless of the preferred channel', () => {
   assert.deepEqual(deliveryChannelPlan('email'), ['email']);
   assert.deepEqual(deliveryChannelPlan(''), ['email']);
   assert.deepEqual(deliveryChannelPlan('telegram', { telegramEnabled: false }), ['email']);
+});
+
+test('uses a neutral subject for client act emails', () => {
+  assert.equal(actEmailSubject(), 'Акт выполненных работ');
+  assert.equal(actEmailSubject().includes('сделк'), false);
 });
 
 test('treats a repeated Wazzup crmMessageId as an accepted idempotent delivery', () => {
