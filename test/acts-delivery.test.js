@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('../acts-delivery');
-const { bitrixEmailSenderSettings } = require('../bitrix-email');
+const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('../bitrix-email');
 const { MAIL_PROCESSED_FLAG, markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('../mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, requestToken, tokenMatches } = require('../request-auth');
 
@@ -49,6 +49,39 @@ test('always supplies a Bitrix email sender from the configured mailbox or respo
     emailSenderName: 'MAVIS GROUP',
   }), { MESSAGE_FROM: 'Анна Иванова <anna@example.com>' });
   assert.equal(bitrixEmailSenderSettings({ staff: null, emailFrom: '', emailSenderName: 'MAVIS GROUP' }), null);
+});
+
+test('builds an outgoing act email with the configured mailbox and an attachment reference', () => {
+  const settings = bitrixEmailSenderSettings({
+    staff: { NAME: 'Эксперт', LAST_NAME: 'Мависов', EMAIL: 'expert@example.test' },
+    emailFrom: 'mavis.group@mail.ru',
+    emailSenderName: 'MAVIS GROUP',
+  });
+
+  assert.deepEqual(bitrixOutgoingEmailActivityFields({
+    ownerId: 38072,
+    responsibleId: 2182,
+    contactId: 440,
+    toEmail: 'client@example.test',
+    subject: 'Акт по сделке',
+    description: 'Направляем акт.',
+    settings,
+    storageElementIds: ['n12345'],
+  }), {
+    TYPE_ID: 4,
+    SUBJECT: 'Акт по сделке',
+    DESCRIPTION: 'Направляем акт.',
+    DESCRIPTION_TYPE: 1,
+    DIRECTION: 2,
+    OWNER_TYPE_ID: 2,
+    OWNER_ID: 38072,
+    RESPONSIBLE_ID: 2182,
+    COMPLETED: 'Y',
+    SETTINGS: { MESSAGE_FROM: 'MAVIS GROUP <mavis.group@mail.ru>' },
+    COMMUNICATIONS: [{ VALUE: 'client@example.test', ENTITY_ID: 440, ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
+    STORAGE_TYPE_ID: 3,
+    STORAGE_ELEMENT_IDS: ['n12345'],
+  });
 });
 
 test('allows only one concurrent delivery for the same task and deal', () => {

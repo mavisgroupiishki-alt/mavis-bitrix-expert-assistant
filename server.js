@@ -28,7 +28,7 @@ const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStage
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
 const { canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
-const { bitrixEmailSenderSettings } = require('./bitrix-email');
+const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
@@ -5537,21 +5537,19 @@ async function sendEmailThroughBitrix(dealId, responsibleId, contactId, toEmail,
   });
   if (!settings) throw new Error('Не задан отправитель письма: у ответственного нет email и EMAIL_FROM пустой.');
 
-  await bitrixRestCall('crm.activity.add', {
-    fields: {
-      TYPE_ID: 4, // 4 = Email
-      SUBJECT: subject || `Ход работы по сделке: ${dealTitle}`,
-      DESCRIPTION: text,
-      DESCRIPTION_TYPE: 1, // 1 = text
-      DIRECTION: 2, // 2 = исходящее
-      OWNER_TYPE_ID: 2, // 2 = Deal
-      OWNER_ID: dealId,
-      RESPONSIBLE_ID: senderId,
-      COMPLETED: 'Y',
-      SETTINGS: settings,
-      COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: 3, TYPE: 'EMAIL' }],
-    },
+  const activityId = await bitrixRestCall('crm.activity.add', {
+    fields: bitrixOutgoingEmailActivityFields({
+      ownerId: dealId,
+      responsibleId: senderId,
+      contactId,
+      toEmail,
+      subject: subject || `Ход работы по сделке: ${dealTitle}`,
+      description: text,
+      settings,
+    }),
   });
+  if (!activityId) throw new Error('Bitrix не вернул ID созданного исходящего e-mail.');
+  return { activityId: String(activityId), sender: settings.MESSAGE_FROM };
 }
 
 async function findSiblingDeals(deal, stageId) {
@@ -12591,35 +12589,29 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file, r
     staff = Array.isArray(u) ? u[0] : u;
   } catch (_) {}
 
-  const fields = {
-    TYPE_ID: 4,
-    SUBJECT: `Акт по сделке: ${deal.TITLE || dealId}`,
-    DESCRIPTION: text + (file && file.url ? `
-
-Ссылка на файл акта: ${file.url}` : ''),
-    DESCRIPTION_TYPE: 1,
-    DIRECTION: 2,
-    OWNER_TYPE_ID: 2,
-    OWNER_ID: dealId,
-    RESPONSIBLE_ID: responsibleId,
-    COMPLETED: 'Y',
-    START_TIME: new Date().toISOString(),
-    END_TIME: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-    COMMUNICATIONS: [{ VALUE: toEmail, ENTITY_ID: Number(contactId || 0), ENTITY_TYPE_ID: Number(recipientEntityType || 3), TYPE: 'EMAIL' }],
-  };
-
-  if (staff && staff.EMAIL) {
-    const senderName = `${staff.NAME || ''} ${staff.LAST_NAME || ''}`.trim() || config.emailSenderName || 'MAVIS GROUP';
-    fields.SETTINGS = { MESSAGE_FROM: `${senderName} <${staff.EMAIL}>` };
-  }
-
   const storageIds = actsBuildEmailStorageElementIds(file);
-  if (storageIds.length) {
-    fields.STORAGE_TYPE_ID = 3;
-    fields.STORAGE_ELEMENT_IDS = storageIds;
-  }
+  const settings = bitrixEmailSenderSettings({
+    staff,
+    emailFrom: config.emailFrom,
+    emailSenderName: config.emailSenderName,
+  });
+  if (!settings) throw new Error('Не задан отправитель письма: у ответственного нет email и EMAIL_FROM пустой.');
 
-  return await bitrixRestCall('crm.activity.add', { fields });
+  const activityId = await bitrixRestCall('crm.activity.add', {
+    fields: bitrixOutgoingEmailActivityFields({
+      ownerId: dealId,
+      responsibleId,
+      contactId,
+      recipientEntityType,
+      toEmail,
+      subject: `Акт по сделке: ${deal.TITLE || dealId}`,
+      description: text + (file && file.url ? `\n\nСсылка на файл акта: ${file.url}` : ''),
+      settings,
+      storageElementIds: storageIds,
+    }),
+  });
+  if (!activityId) throw new Error('Bitrix не вернул ID созданного исходящего e-mail с актом.');
+  return { activityId: String(activityId), sender: settings.MESSAGE_FROM };
 }
 
 
@@ -12668,10 +12660,12 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
       const email = actsEntityEmail(recipient);
       if (!email) continue;
       try {
-        await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId);
+        const delivery = await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId);
+        console.log(`[acts-email] deal=${deal.ID}; task=${taskId}; activity=${delivery.activityId}; to=${maskEmailForLog(email)}; from=${delivery.sender}.`);
         return {
           ok: true, channel: 'Email', contactId: recipient.entityId, contactLabel: recipient.label,
           recipientSource: recipient.source, email: maskEmailForLog(email), recipientEntityType: recipient.entityTypeId,
+          activityId: delivery.activityId, sender: delivery.sender,
         };
       } catch (e) {
         attempts.push({ channel: 'email', recipient: recipient.label, error: e.message || String(e) });
@@ -12896,12 +12890,18 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       }
     }
 
+    if (sendResult && sendResult.ok) {
+      console.log(`[acts-delivery] status=sent; task=${taskId}; deal=${dealId}; channel=email; activity=${sendResult.activityId || 'unknown'}; to=${sendResult.email || 'unknown'}; from=${sendResult.sender || 'unknown'}.`);
+    } else {
+      console.error(`[acts-delivery] status=failed; task=${taskId}; deal=${dealId}; reason=${(sendResult && (sendResult.message || sendResult.error)) || 'unknown'}.`);
+    }
+
     const fileLines = files.length
       ? files.map((f) => `— ${f.name || f.id}${f.url ? `\n  ${f.url}` : ''}`).join('\n')
       : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
     const sendLines = sendResult && sendResult.ok
-      ? `✅ Клиенту отправлено через ${sendResult.channel || 'предпочитаемый канал'}: сообщение + файл акта.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.contactLabel || 'не определён'} (#${sendResult.contactId || '?'}) — ${sendResult.phone || sendResult.email || 'скрыт'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
-      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: поле «Предпочитаемый канал связи», наличие актуального контакта по последней переписке, телефон/email этого контакта, настройки Wazzup Telegram/Viber и файл акта в задаче.`;
+      ? `✅ Акт отправлен клиенту по e-mail.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.contactLabel || 'не определён'} (#${sendResult.contactId || '?'}) — ${sendResult.email || 'скрыт'}\nID исходящего e-mail в Bitrix: ${sendResult.activityId || 'не получен'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
+      : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: e-mail контакта/компании, доступность файла акта и подключение ящика ${config.emailFrom || 'отправителя'} в Bitrix.`;
 
     const pushStateLine = sendResult && sendResult.ok
       ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()} wazzupChatId=${sendResult.wazzupChatId || ''} wazzupChannelId=${sendResult.wazzupChannelId || ''} wazzupMessageId=${sendResult.wazzupMessageId || ''} wazzupFileMessageId=${sendResult.wazzupFileMessageId || ''}`
@@ -12937,7 +12937,7 @@ app.post('/api/acts/task-done', async (req, res) => {
     console.log(`[acts-task-done] POST вызван${taskId ? `, task=${taskId}` : ', но task_id не найден'}.`);
     if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
     const result = await actsHandleTaskDone(taskId, 'task-done-post');
-    console.log(`[acts-task-done] task=${taskId}: ${JSON.stringify({ ok: result.ok, event: result.event, dealIds: result.dealIds, results: result.results && result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, message: x.sent.message, error: x.sent.error } })) })}`);
+    console.log(`[acts-task-done] task=${taskId}: ${JSON.stringify({ ok: result.ok, event: result.event, dealIds: result.dealIds, results: result.results && result.results.map(x => ({ dealId: x.dealId, duplicate: x.duplicate, sent: x.sent && { ok: x.sent.ok, channel: x.sent.channel, activityId: x.sent.activityId, message: x.sent.message, error: x.sent.error } })) })}`);
     res.status(result.ok ? 200 : 422).json(result);
   } catch (e) {
     console.error('[acts-task-done]', e.message || e);
