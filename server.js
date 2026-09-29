@@ -1083,7 +1083,11 @@ app.post('/api/recruiting/rabota/webhook/:token', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'mavis-bitrix-expert-assistant' });
+  res.json({
+    ok: true,
+    service: 'mavis-bitrix-expert-assistant',
+    release: String(process.env.RENDER_GIT_COMMIT || 'local').slice(0, 12),
+  });
 });
 
 app.get('/config.js', (_req, res) => {
