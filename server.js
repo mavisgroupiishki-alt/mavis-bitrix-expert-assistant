@@ -37,6 +37,7 @@ const { createAutopilotRetryGate } = require('./autopilot-retry');
 const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromValue } = require('./preferred-channel-field');
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
+const { trustedBitrixFileUrl } = require('./acts-file-security');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12455,17 +12456,10 @@ function actsAbsoluteBitrixFileUrl(rawUrl) {
 }
 
 function actsTrustedFileUrl(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl);
-    const portalHost = new URL(actsBitrixOrigin()).hostname.toLowerCase();
-    const additionalHosts = String(process.env.BITRIX_FILE_DOWNLOAD_HOSTS || '')
-      .split(',')
-      .map((host) => host.trim().toLowerCase())
-      .filter(Boolean);
-    return parsed.protocol === 'https:' && new Set([portalHost, ...additionalHosts]).has(parsed.hostname.toLowerCase());
-  } catch (_) {
-    return false;
-  }
+  return trustedBitrixFileUrl(rawUrl, {
+    portalUrl: actsBitrixOrigin(),
+    additionalHosts: process.env.BITRIX_FILE_DOWNLOAD_HOSTS || '',
+  });
 }
 
 async function actsFetchBinaryFromUrl(sourceUrl, fileName) {
