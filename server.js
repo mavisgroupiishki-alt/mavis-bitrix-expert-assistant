@@ -12619,6 +12619,33 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file, r
   return { activityId: String(activityId), sender: settings.MESSAGE_FROM };
 }
 
+// Файлы, приложенные только в чат задачи, Bitrix отдаёт с URL, но без
+// attached-object ID. crm.activity.add не умеет приложить такой файл, хотя
+// сам бинарный документ уже доступен. В этом случае не отказываемся от
+// отправки: используем тот же проверенный SMTP + IMAP «Отправленные», что и
+// контроль возврата оригиналов. Этот fallback включается только ДО попытки
+// Bitrix-отправки, поэтому не может создать дубль после неопределённого ответа
+// crm.activity.add.
+async function sendActEmailThroughSmtp({ deal, taskId, contactId, contactLabel, toEmail, text, file, downloaded }) {
+  const smtpResult = await docReturnSendViaSmtp({
+    taskId: `act-${String(taskId || 'unknown')}-deal-${String(deal && deal.ID || 'unknown')}`,
+    recipient: {
+      email: String(toEmail || '').trim(),
+      source: 'crm-recipient',
+      label: String(contactLabel || `Контакт ${contactId || ''}`).trim(),
+    },
+    file,
+    downloaded,
+  }, `Акт по сделке: ${(deal && (deal.TITLE || deal.ID)) || 'MAVIS'}`, text);
+
+  return {
+    activityId: smtpResult.messageId ? `smtp:${smtpResult.messageId}` : 'smtp-confirmed',
+    sender: `${config.emailSenderName || 'MAVIS GROUP'} <${DOC_RETURN_SMTP_USER}>`,
+    smtp: true,
+    sentCopySaved: smtpResult.sentCopySaved,
+  };
+}
+
 
 async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   if (!config.actsSendToClientEnabled) {
@@ -12644,17 +12671,14 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   let primary = null;
   let preparedWazzupFile = null;
   let emailValidated = false;
+  let downloadedEmailFile = null;
   let uncertainDelivery = null;
 
   const tryEmail = async () => {
     const storageIds = actsBuildEmailStorageElementIds(file);
-    if (!storageIds.length) {
-      attempts.push({ channel: 'email', error: 'Bitrix не дал attachment-id для вложения' });
-      return null;
-    }
     if (!emailValidated) {
       try {
-        await actsDownloadRealFile(file);
+        downloadedEmailFile = await actsDownloadRealFile(file);
         emailValidated = true;
       } catch (e) {
         attempts.push({ channel: 'email', error: `файл не прошёл проверку: ${e.message || e}` });
@@ -12665,15 +12689,34 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
       const email = actsEntityEmail(recipient);
       if (!email) continue;
       try {
-        const delivery = await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId);
-        console.log(`[acts-email] deal=${deal.ID}; task=${taskId}; activity=${delivery.activityId}; to=${maskEmailForLog(email)}; from=${delivery.sender}.`);
+        const delivery = storageIds.length
+          ? await sendActEmailThroughBitrix(deal, recipient.entityId, email, text, file, recipient.entityTypeId)
+          : await sendActEmailThroughSmtp({
+            deal,
+            taskId,
+            contactId: recipient.entityId,
+            contactLabel: recipient.label,
+            toEmail: email,
+            text,
+            file,
+            downloaded: downloadedEmailFile,
+          });
+        console.log(
+          `[acts-email] deal=${deal.ID}; task=${taskId}; transport=${delivery.smtp ? 'smtp-fallback' : 'bitrix'}; ` +
+          `activity=${delivery.activityId}; to=${maskEmailForLog(email)}; from=${delivery.sender}.`
+        );
         return {
           ok: true, channel: 'Email', contactId: recipient.entityId, contactLabel: recipient.label,
           recipientSource: recipient.source, email: maskEmailForLog(email), recipientEntityType: recipient.entityTypeId,
           activityId: delivery.activityId, sender: delivery.sender,
+          note: delivery.smtp ? 'Файл был только в чате задачи, поэтому письмо отправлено через SMTP и сохранено в «Отправленные».' : '',
         };
       } catch (e) {
-        attempts.push({ channel: 'email', recipient: recipient.label, error: e.message || String(e) });
+        attempts.push({
+          channel: 'email',
+          recipient: recipient.label,
+          error: `${storageIds.length ? 'Bitrix e-mail' : 'SMTP fallback'}: ${e.message || e}`,
+        });
       }
     }
     attempts.push({ channel: 'email', error: 'нет доступного адреса у контактов и компании' });
