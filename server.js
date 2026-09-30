@@ -15997,12 +15997,14 @@ async function actsScanRequestRunAutorun() {
     return;
   }
 
-  for (let batch = 1; batch <= 6; batch++) {
+  // Внутренний HTTP-запрос Render обрывается примерно через 5 минут. Три письма
+  // укладываются в это окно, а durable-маркеры безопасно двигают очередь дальше.
+  for (let batch = 1; batch <= 20; batch++) {
     try {
       const response = await fetch(`http://127.0.0.1:${PORT}/api/maintenance/acts-scan-request-campaign`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ execute: true, max: 10 }),
+        body: JSON.stringify({ execute: true, max: 3 }),
       });
       const report = await response.json().catch(() => ({}));
       console.log(`[scan-request] AUTORUN batch=${batch}; http=${response.status}; report=${JSON.stringify(report)}`);
