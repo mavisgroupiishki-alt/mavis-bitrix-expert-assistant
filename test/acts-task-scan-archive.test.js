@@ -20,7 +20,7 @@ function archiveHelpers() {
     actsTaskField: (task, names) => names.map((name) => task[name]).find((value) => value !== undefined),
     actsResolveTaskFiles: async () => ({ files: [] }),
     actsDownloadRealFile: async () => ({ buffer: Buffer.from('file'), fileName: 'scan.pdf' }),
-    actsGetTaskResponsibleActFolder: async () => ({ expertFolderId: '90', expertFolder: 'Акты Елизавета март 2026' }),
+    actsGetTaskCreatorActFolder: async () => ({ expertFolderId: '90', expertFolder: 'Акты Елизавета март 2026' }),
     uploadFileToDiskFolder: async () => ({ ID: '100' }),
     docReturnGetTaskCommentRows: async () => [],
     docReturnAddTaskComment: async () => 'task.commentitem.add',
@@ -30,14 +30,14 @@ function archiveHelpers() {
   return context.helpers;
 }
 
-test('accepts only an Acts task at the Scan exists stage with responsible expert and creation date', () => {
+test('accepts only an Acts task at the Scan exists stage with creator and creation date', () => {
   const { actsTaskScanArchiveEligibility } = archiveHelpers();
   assert.equal(
-    JSON.stringify(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' })),
-    JSON.stringify({ ok: true, taskId: '7', responsibleId: '1960', createdDate: '2026-03-12T09:00:00+03:00' }),
+    JSON.stringify(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' })),
+    JSON.stringify({ ok: true, taskId: '7', creatorId: '1960', createdDate: '2026-03-12T09:00:00+03:00' }),
   );
-  assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12' }).ok, false);
-  assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12' }, ['256']).ok, true);
+  assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', CREATED_BY: '1960', CREATED_DATE: '2026-03-12' }).ok, false);
+  assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', CREATED_BY: '1960', CREATED_DATE: '2026-03-12' }, ['256']).ok, true);
   assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480' }).ok, false);
 });
 
@@ -69,7 +69,7 @@ test('archives every real task attachment once and uses the task creation date f
   const { actsArchiveTaskScan } = archiveHelpers();
   const uploaded = [];
   const comments = [];
-  const task = { ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' };
+  const task = { ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' };
   const result = await actsArchiveTaskScan('7', 'test', {
     getTask: async () => task,
     resolveFiles: async () => ({ files: [
@@ -78,8 +78,8 @@ test('archives every real task attachment once and uses the task creation date f
       { name: 'only-name.pdf', source: 'task-name-only' },
     ] }),
     download: async (file) => ({ buffer: Buffer.from(file.id || file.attachedId), fileName: file.name }),
-    getFolder: async (responsibleId, createdDate) => {
-      assert.equal(responsibleId, '1960');
+    getFolder: async (creatorId, createdDate) => {
+      assert.equal(creatorId, '1960');
       assert.equal(createdDate, '2026-03-12T09:00:00+03:00');
       return { expertFolderId: '90', expertFolder: 'Акты Елизавета март 2026' };
     },
@@ -101,7 +101,7 @@ test('archives every real task attachment once and uses the task creation date f
 test('skips an attachment that already has an archive marker', async () => {
   const { actsArchiveTaskScan } = archiveHelpers();
   const result = await actsArchiveTaskScan('7', 'test', {
-    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12' }),
+    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12' }),
     resolveFiles: async () => ({ files: [{ id: '22', name: 'акт.pdf', url: 'https://mavisgroup.bitrix24.by/download/22' }] }),
     getComments: async () => [{ POST_MESSAGE: '[MAVIS_ACTS_TASK_SCAN_ARCHIVE] task=7 file=22' }],
     download: async () => { throw new Error('must not download duplicate'); },
@@ -117,7 +117,7 @@ test('archives only the latest real attachment when requested for a historical b
   const uploaded = [];
   const result = await actsArchiveTaskScan('7', 'backfill:2026-08', {
     latestOnly: true,
-    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-08-12' }),
+    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-08-12' }),
     resolveFiles: async () => ({ files: [
       { id: '22', name: 'old.pdf', date: '2026-08-12T10:00:00+03:00' },
       { id: '23', name: 'latest.pdf', date: '2026-08-12T11:00:00+03:00' },
