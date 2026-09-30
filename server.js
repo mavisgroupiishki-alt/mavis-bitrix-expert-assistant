@@ -15597,7 +15597,7 @@ async function actsScanRequestLoadScope() {
       },
       order: { ID: 'ASC' },
       select: [
-        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID',
+        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY',
         'CREATED_DATE', 'CHANGED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
       ],
     }, 1000),
@@ -15635,17 +15635,17 @@ async function actsScanRequestLoadScope() {
   const excluded = [];
   for (const task of tasks || []) {
     const taskId = actsScanRequestTaskId(task);
-    const responsibleId = String(actsTaskField(task, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '').trim();
+    const createdBy = String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'created_by']) || '').trim();
     const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
     const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
     const stageTitle = stageTitles.get(stageId) || '';
 
-    if (!taskId || !selectedUserIds.has(responsibleId) || !isScanRequestSeptember2026(createdDate)) continue;
+    if (!taskId || !selectedUserIds.has(createdBy) || !isScanRequestSeptember2026(createdDate)) continue;
     const row = {
       taskId,
       title: String(actsTaskField(task, ['title', 'TITLE']) || ''),
       task,
-      responsibleId,
+      createdBy,
       selectedUserIds,
       createdDate,
       stageId,
@@ -15661,7 +15661,7 @@ async function actsScanRequestLoadScope() {
   }
 
   console.log(
-    `[scan-request] scope: tasksFetched=${(tasks || []).length}; responsibleUsers=${selectedUserIds.size}; ` +
+    `[scan-request] scope: tasksFetched=${(tasks || []).length}; authorUsers=${selectedUserIds.size}; ` +
     `ready=${ready.length}; excluded=${excluded.length}.`
   );
   return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
@@ -15671,7 +15671,7 @@ async function actsScanRequestLoadTask(taskId) {
   const raw = await bitrixRestCall('tasks.task.get', {
     taskId: Number(taskId),
     select: [
-      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID',
+      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY',
       'CREATED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
     ],
   });
@@ -15779,8 +15779,8 @@ async function actsScanRequestPrepareContext(row) {
     return { blocked: true, reason: 'stage-excluded-after-selection' };
   }
 
-  const responsibleId = String(actsTaskField(freshTask, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '');
-  if (!row.selectedUserIds.has(responsibleId)) return { blocked: true, reason: 'responsible-changed-after-selection' };
+  const createdBy = String(actsTaskField(freshTask, ['createdBy', 'CREATED_BY', 'created_by']) || '');
+  if (!row.selectedUserIds.has(createdBy)) return { blocked: true, reason: 'author-changed-after-selection' };
   const createdDate = String(actsTaskField(freshTask, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
   if (!isScanRequestSeptember2026(createdDate)) return { blocked: true, reason: 'created-date-outside-september-2026' };
 
@@ -15941,7 +15941,7 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         ok: true,
         dryRun: true,
         projectId: config.actsProjectId,
-        scope: 'September 2026; six approved responsible users; except Archive and Scan exists',
+        scope: 'September 2026; six approved task authors; except Archive and Scan exists',
         found: scope.ready.length + scope.excluded.length,
         eligible: eligible.length,
         alreadySent: alreadySent.length,
