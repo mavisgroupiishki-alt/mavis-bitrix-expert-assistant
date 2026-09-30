@@ -38,7 +38,7 @@ const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromVal
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
-const { isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15700,6 +15700,7 @@ async function actsScanRequestReadState(task) {
   const rows = Array.isArray(raw) ? raw : (raw && (raw.items || raw.result) || []);
   const comments = Array.isArray(rows) ? rows.map(actsScanRequestCommentText).filter(Boolean) : [];
   let state = scanRequestState(comments, taskId);
+  if (state === 'blocked' && canRetryScanRequestLegacyRecipientBlock(comments)) state = 'ready';
   if (state !== 'ready') return state;
 
   const chatId = String(actsTaskField(task, ['chatId', 'CHAT_ID', 'chat_id']) || '').trim();
@@ -15730,37 +15731,23 @@ function actsScanRequestExternalEmails(entity) {
 }
 
 async function actsScanRequestResolveRecipient(deal) {
-  const contact = await actsResolveRecipientContact(deal).catch(() => null);
-  if (contact && contact.ok && contact.contact) {
-    const emails = actsScanRequestExternalEmails(contact.contact);
-    if (emails.length === 1) {
-      return {
-        ok: true, email: emails[0], entityId: Number(contact.contactId || 0), entityTypeId: 3,
-        source: contact.source || 'contact', label: contact.label || `Контакт ${contact.contactId}`,
-      };
-    }
-    if (emails.length > 1) return { ok: false, reason: 'ambiguous-contact-email' };
+  // По согласованному правилу: последняя Wazzup-переписка в приоритете;
+  // если её нет, письмо всё равно уходит на первый доступный адрес сделки.
+  const resolved = await actsResolveDeliveryRecipients(deal);
+  if (!resolved.ok) return { ok: false, reason: resolved.reason || 'crm-external-email-not-found' };
+  for (const candidate of resolved.recipients) {
+    const email = actsScanRequestExternalEmails(candidate.entity)[0];
+    if (!email) continue;
+    return {
+      ok: true,
+      email,
+      entityId: Number(candidate.entityId || 0),
+      entityTypeId: Number(candidate.entityTypeId || 0),
+      source: candidate.source || 'contact',
+      label: candidate.label || `Контакт ${candidate.entityId}`,
+    };
   }
-
-  const companyId = String(deal && deal.COMPANY_ID || '').trim();
-  if (companyId && companyId !== '0') {
-    const company = await bitrixRestCall('crm.company.get', { id: Number(companyId) });
-    const emails = actsScanRequestExternalEmails(company);
-    if (emails.length === 1) {
-      return { ok: true, email: emails[0], entityId: Number(companyId), entityTypeId: 4, source: 'company', label: String(company.TITLE || `Компания ${companyId}`) };
-    }
-    if (emails.length > 1) return { ok: false, reason: 'ambiguous-company-email' };
-  }
-
-  if (!contact || !contact.ok || !contact.contact) {
-    return { ok: false, reason: contact && contact.reason || 'crm-external-email-not-found' };
-  }
-  const emails = actsScanRequestExternalEmails(contact.contact);
-  if (emails.length !== 1) return { ok: false, reason: emails.length ? 'ambiguous-contact-email' : 'crm-external-email-not-found' };
-  return {
-    ok: true, email: emails[0], entityId: Number(contact.contactId || 0), entityTypeId: 3,
-    source: contact.source || 'contact', label: contact.label || `Контакт ${contact.contactId}`,
-  };
+  return { ok: false, reason: 'crm-external-email-not-found' };
 }
 
 async function actsScanRequestMarkBlocked(task, reason) {

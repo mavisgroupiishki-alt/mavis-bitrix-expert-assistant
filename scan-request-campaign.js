@@ -58,6 +58,12 @@ function scanRequestState(comments, taskId) {
   return 'ready';
 }
 
+function canRetryScanRequestLegacyRecipientBlock(comments) {
+  return (comments || []).some((comment) =>
+    /не удалось определить последнюю переписку/i.test(String(comment || ''))
+  );
+}
+
 function scanRequestActNumber(title) {
   const match = String(title || '').match(/(?:^|\s)акт(?:\s+выполненных\s+работ)?\s*(?:№|n\.?|no\.?)?\s*(\d+)(?=\s|$|[.,;:()\-])/iu);
   return match ? match[1] : '';
@@ -82,6 +88,7 @@ module.exports = {
   SCAN_REQUEST_BLOCKED_MARKER,
   SCAN_REQUEST_PENDING_MARKER,
   SCAN_REQUEST_SENT_MARKER,
+  canRetryScanRequestLegacyRecipientBlock,
   hasScanRequestSentMarker,
   isScanRequestExcludedStage,
   isScanRequestSeptember2026,

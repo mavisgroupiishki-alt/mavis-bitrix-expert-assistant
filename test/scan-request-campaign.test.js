@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  canRetryScanRequestLegacyRecipientBlock,
   hasScanRequestSentMarker,
   isScanRequestExcludedStage,
   isScanRequestSeptember2026,
@@ -23,6 +24,11 @@ test('keeps pending and blocked tasks out of automatic retries', () => {
   assert.equal(scanRequestState(['[MAVIS_SCAN_REQUEST_PENDING] task=49726'], 49726), 'pending');
   assert.equal(scanRequestState(['[MAVIS_SCAN_REQUEST_BLOCKED] task=49726'], 49726), 'blocked');
   assert.equal(scanRequestState([], 49726), 'ready');
+});
+
+test('retries only the old ambiguous-contact block after recipient fallback is enabled', () => {
+  assert.equal(canRetryScanRequestLegacyRecipientBlock(['В сделке 2 контакта(ов), но не удалось определить последнюю переписку.']), true);
+  assert.equal(canRetryScanRequestLegacyRecipientBlock(['Причина: act-file-not-found-in-task.']), false);
 });
 
 test('never falls back from an act file to an arbitrary task document', () => {
