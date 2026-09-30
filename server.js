@@ -38,6 +38,7 @@ const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromVal
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
+const { isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15413,6 +15414,441 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
     sentUid: sentCopy && sentCopy.uid || null,
   };
 }
+
+// Разовая сентябрьская рассылка запроса подписанных сканов. Это отдельный контур:
+// он не использует маркеры первичной отправки акта и не меняет Kanban-стадии.
+const ACTS_SCAN_REQUEST_AUTHORS = [
+  ['екатерина николаева'],
+  ['елизавета горбатова'],
+  ['иоланта кананович'],
+  ['ольга панькова'],
+  // В старых задачах имя могло быть заведено как «Данила Канцен»;
+  // оба написания относятся к одному согласованному сотруднику.
+  ['даниил кацен', 'данила канцен'],
+  ['владислав климков'],
+];
+const ACTS_SCAN_REQUEST_AUTHOR_NAMES = new Set(ACTS_SCAN_REQUEST_AUTHORS.flat());
+const ACTS_SCAN_REQUEST_PILOT_TASK_IDS = new Set(
+  String(process.env.ACTS_SCAN_REQUEST_PILOT_TASK_IDS || '49736')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
+const ACTS_SCAN_REQUEST_SUBJECT = 'Акт выполненных работ';
+const ACTS_SCAN_REQUEST_BODY = [
+  'Добрый день! Очень очень просим прислать вам скан/фото подписанного с вашей стороны акта выполненных работ, мы прикрепили его ниже во вложении.',
+  '',
+  'Бухгалтерия закрывает месяц и просит нас собрать акты как можно быстрее, будем вам очень благодарны, если ответным письмом отправите скан/фото!',
+].join('\n');
+const actsScanRequestLocks = new Set();
+
+function actsScanRequestUserNames(user) {
+  const first = String(user && (user.NAME || user.name) || '').trim();
+  const last = String(user && (user.LAST_NAME || user.lastName || user.last_name) || '').trim();
+  return [
+    normalizeScanRequestText(`${first} ${last}`),
+    normalizeScanRequestText(`${last} ${first}`),
+  ].filter(Boolean);
+}
+
+function actsScanRequestTaskId(task) {
+  return String(actsTaskField(task, ['id', 'ID']) || '').trim();
+}
+
+async function actsScanRequestLoadScope() {
+  const [users, stagesRaw, tasks] = await Promise.all([
+    // Иоланта может быть уволена, поэтому намеренно не фильтруем ACTIVE.
+    bitrixRestList('user.get', { FILTER: {} }, 500),
+    bitrixRestCall('task.stages.get', { entityId: Number(config.actsProjectId) }),
+    bitrixRestList('tasks.task.list', {
+      filter: {
+        GROUP_ID: Number(config.actsProjectId),
+        '>=CREATED_DATE': '2026-09-01T00:00:00+03:00',
+        '<=CREATED_DATE': '2026-09-30T23:59:59+03:00',
+      },
+      order: { ID: 'ASC' },
+      select: [
+        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID',
+        'CREATED_DATE', 'CHANGED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+      ],
+    }, 1000),
+  ]);
+
+  const selectedUserIds = new Set();
+  for (const user of users || []) {
+    const id = String(user && (user.ID || user.id) || '').trim();
+    if (id && actsScanRequestUserNames(user).some((name) => ACTS_SCAN_REQUEST_AUTHOR_NAMES.has(name))) {
+      selectedUserIds.add(id);
+    }
+  }
+
+  if (selectedUserIds.size < ACTS_SCAN_REQUEST_AUTHORS.length) {
+    const found = new Set();
+    for (const user of users || []) {
+      for (const name of actsScanRequestUserNames(user)) {
+        if (ACTS_SCAN_REQUEST_AUTHOR_NAMES.has(name)) found.add(name);
+      }
+    }
+    const missing = ACTS_SCAN_REQUEST_AUTHORS
+      .filter((variants) => !variants.some((name) => found.has(name)))
+      .map((variants) => variants[0]);
+    throw new Error(`Не найдены сотрудники кампании: ${missing.join(', ') || 'неизвестно'}. Рассылка не начата.`);
+  }
+
+  const stageTitles = new Map(
+    Object.values(stagesRaw || {}).map((stage) => [
+      String(stage && (stage.ID || stage.id) || ''),
+      String(stage && (stage.TITLE || stage.title) || ''),
+    ])
+  );
+
+  const ready = [];
+  const excluded = [];
+  for (const task of tasks || []) {
+    const taskId = actsScanRequestTaskId(task);
+    const responsibleId = String(actsTaskField(task, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '').trim();
+    const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
+    const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+    const stageTitle = stageTitles.get(stageId) || '';
+
+    if (!taskId || !selectedUserIds.has(responsibleId) || !isScanRequestSeptember2026(createdDate)) continue;
+    const row = {
+      taskId,
+      title: String(actsTaskField(task, ['title', 'TITLE']) || ''),
+      task,
+      responsibleId,
+      selectedUserIds,
+      createdDate,
+      stageId,
+      stageTitle,
+    };
+    if (ACTS_SCAN_REQUEST_PILOT_TASK_IDS.has(taskId)) {
+      excluded.push({ ...row, reason: 'pilot-already-sent' });
+    } else if (isScanRequestExcludedStage(stageTitle)) {
+      excluded.push({ ...row, reason: 'stage-excluded' });
+    } else {
+      ready.push(row);
+    }
+  }
+
+  return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
+}
+
+async function actsScanRequestLoadTask(taskId) {
+  const raw = await bitrixRestCall('tasks.task.get', {
+    taskId: Number(taskId),
+    select: [
+      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID',
+      'CREATED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+    ],
+  });
+  const task = raw && (raw.task || raw.TASK || raw);
+  if (!task) throw new Error(`Задача ${taskId} не найдена.`);
+  const groupId = String(actsTaskField(task, ['groupId', 'GROUP_ID', 'group_id']) || '');
+  if (groupId !== String(config.actsProjectId)) {
+    throw new Error(`Задача ${taskId} не из проекта «Акты Счета».`);
+  }
+  return task;
+}
+
+function actsScanRequestCommentText(comment) {
+  return String(comment && (
+    comment.POST_MESSAGE || comment.postMessage || comment.MESSAGE || comment.message ||
+    comment.TEXT || comment.text || comment.content || comment.CONTENT || ''
+  ) || '').trim();
+}
+
+async function actsScanRequestReadState(task) {
+  const taskId = actsScanRequestTaskId(task);
+  const raw = await bitrixRestCall('task.commentitem.getlist', {
+    TASKID: Number(taskId), ORDER: { ID: 'DESC' }, FILTER: {},
+  });
+  const rows = Array.isArray(raw) ? raw : (raw && (raw.items || raw.result) || []);
+  const comments = Array.isArray(rows) ? rows.map(actsScanRequestCommentText).filter(Boolean) : [];
+  let state = scanRequestState(comments, taskId);
+  if (state !== 'ready') return state;
+
+  const chatId = String(actsTaskField(task, ['chatId', 'CHAT_ID', 'chat_id']) || '').trim();
+  if (!chatId) return state;
+  const dialog = await bitrixRestCall('im.dialog.messages.get', { DIALOG_ID: `chat${chatId}`, LIMIT: 100 });
+  const messages = (dialog && (dialog.messages || dialog.MESSAGES)) || [];
+  state = scanRequestState((messages || []).map(actsScanRequestCommentText), taskId);
+  if (state !== 'ready') return state;
+
+  // Если task.commentitem.add ранее перешёл на fallback в чат, тот же SENT-marker
+  // сохраняется в timeline сделки. Это не даёт ему «исчезнуть» после 100 новых сообщений.
+  const dealIds = actsExtractDealIdsFromTask(task);
+  if (dealIds.length !== 1) return state;
+  const timeline = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: dealIds[0], ENTITY_TYPE: 'deal' },
+    order: { ID: 'DESC' }, select: ['ID', 'COMMENT'],
+  }, 100);
+  return timeline.some((comment) => String(comment && comment.COMMENT || '').includes(scanRequestSentMarker(taskId)))
+    ? 'sent'
+    : state;
+}
+
+function actsScanRequestExternalEmails(entity) {
+  const values = Array.isArray(entity && entity.EMAIL) ? entity.EMAIL : [];
+  return [...new Set(values
+    .map((row) => String(row && row.VALUE || '').trim().toLowerCase())
+    .filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && !docReturnIsForbiddenRecipient(email)))];
+}
+
+async function actsScanRequestResolveRecipient(deal) {
+  const contact = await actsResolveRecipientContact(deal).catch(() => null);
+  if (contact && contact.ok && contact.contact) {
+    const emails = actsScanRequestExternalEmails(contact.contact);
+    if (emails.length === 1) {
+      return {
+        ok: true, email: emails[0], entityId: Number(contact.contactId || 0), entityTypeId: 3,
+        source: contact.source || 'contact', label: contact.label || `Контакт ${contact.contactId}`,
+      };
+    }
+    if (emails.length > 1) return { ok: false, reason: 'ambiguous-contact-email' };
+  }
+
+  const companyId = String(deal && deal.COMPANY_ID || '').trim();
+  if (companyId && companyId !== '0') {
+    const company = await bitrixRestCall('crm.company.get', { id: Number(companyId) });
+    const emails = actsScanRequestExternalEmails(company);
+    if (emails.length === 1) {
+      return { ok: true, email: emails[0], entityId: Number(companyId), entityTypeId: 4, source: 'company', label: String(company.TITLE || `Компания ${companyId}`) };
+    }
+    if (emails.length > 1) return { ok: false, reason: 'ambiguous-company-email' };
+  }
+
+  if (!contact || !contact.ok || !contact.contact) {
+    return { ok: false, reason: contact && contact.reason || 'crm-external-email-not-found' };
+  }
+  const emails = actsScanRequestExternalEmails(contact.contact);
+  if (emails.length !== 1) return { ok: false, reason: emails.length ? 'ambiguous-contact-email' : 'crm-external-email-not-found' };
+  return {
+    ok: true, email: emails[0], entityId: Number(contact.contactId || 0), entityTypeId: 3,
+    source: contact.source || 'contact', label: contact.label || `Контакт ${contact.contactId}`,
+  };
+}
+
+async function actsScanRequestMarkBlocked(task, reason) {
+  const taskId = actsScanRequestTaskId(task);
+  const marker = scanRequestBlockedMarker(taskId);
+  await docReturnAddTaskComment(task, [
+    'Запрос на скан подписанного акта автоматически не отправлен.',
+    `Причина: ${String(reason || 'нужно проверить данные').slice(0, 500)}.`,
+    marker,
+  ].join('\n'));
+}
+
+async function actsScanRequestPrepareContext(row) {
+  const freshTask = await actsScanRequestLoadTask(row.taskId);
+  const freshStageId = String(actsTaskField(freshTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
+  if (isScanRequestExcludedStage(row.stageTitles.get(freshStageId) || '')) {
+    return { blocked: true, reason: 'stage-excluded-after-selection' };
+  }
+
+  const responsibleId = String(actsTaskField(freshTask, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '');
+  if (!row.selectedUserIds.has(responsibleId)) return { blocked: true, reason: 'responsible-changed-after-selection' };
+  const createdDate = String(actsTaskField(freshTask, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
+  if (!isScanRequestSeptember2026(createdDate)) return { blocked: true, reason: 'created-date-outside-september-2026' };
+
+  const basic = await docReturnLoadBasicContext(row.taskId, freshTask);
+  const state = await actsScanRequestReadState(freshTask);
+  if (state !== 'ready') return { skipped: true, reason: state };
+
+  const dealIds = actsExtractDealIdsFromTask(freshTask);
+  if (dealIds.length !== 1 || !basic.deal) {
+    return { blocked: true, reason: dealIds.length ? 'crm-deal-not-found' : 'crm-deal-not-linked' };
+  }
+
+  // Адреса из текста документов намеренно не используем, чтобы не написать не тому человеку.
+  const recipient = await actsScanRequestResolveRecipient(basic.deal);
+  if (!recipient.ok) return { blocked: true, reason: recipient.reason || 'crm-external-email-not-found' };
+
+  const fileResolution = await actsResolveTaskFiles(freshTask);
+  const fileSelection = selectScanRequestActFile(fileResolution.files || [], row.title);
+  if (!fileSelection.file) return { blocked: true, reason: fileSelection.reason };
+  const file = fileSelection.file;
+
+  let downloaded;
+  try {
+    downloaded = await actsDownloadRealFile(file);
+  } catch (error) {
+    return { blocked: true, reason: `act-file-download-failed: ${error.message || error}` };
+  }
+
+  return {
+    basic,
+    ctx: { ...basic, recipient, file, downloaded },
+  };
+}
+
+async function actsScanRequestSendOne(row) {
+  if (actsScanRequestLocks.has(row.taskId)) {
+    return { taskId: row.taskId, title: row.title, status: 'skipped', reason: 'in-flight' };
+  }
+  actsScanRequestLocks.add(row.taskId);
+  let pendingWritten = false;
+  try {
+    const prepared = await actsScanRequestPrepareContext(row);
+    if (prepared.skipped || prepared.blocked) {
+      if (prepared.blocked) {
+        try {
+          await actsScanRequestMarkBlocked(await actsScanRequestLoadTask(row.taskId), prepared.reason);
+        } catch (error) {
+          return { taskId: row.taskId, title: row.title, status: 'failed', reason: `blocked-state-write-failed: ${error.message || error}` };
+        }
+      }
+      return {
+        taskId: row.taskId,
+        title: row.title,
+        status: prepared.skipped ? 'skipped' : 'blocked',
+        reason: prepared.reason,
+      };
+    }
+
+    await docReturnAddTaskComment(prepared.basic.task, [
+      'Запрос на скан подписанного акта принят в обработку. Повторно автоматически не отправлять до фиксации результата.',
+      scanRequestPendingMarker(row.taskId),
+    ].join('\n'));
+    pendingWritten = true;
+
+    const result = await docReturnSendViaSmtp(prepared.ctx, ACTS_SCAN_REQUEST_SUBJECT, ACTS_SCAN_REQUEST_BODY);
+    if (!result || result.sent !== true) throw new Error('SMTP не подтвердил отправку.');
+
+    const marker = scanRequestSentMarker(row.taskId);
+    const comment = [
+      'Запрос на скан подписанного акта отправлен клиенту по e-mail.',
+      `Файл: ${prepared.ctx.downloaded.fileName}.`,
+      `Получатель: ${docReturnMaskEmail(prepared.ctx.recipient.email)}.`,
+      marker,
+    ].join('\n');
+    let commentVia = '';
+    try {
+      commentVia = await docReturnAddTaskComment(prepared.basic.task, comment);
+    } catch (taskCommentError) {
+      // SMTP уже подтвердил письмо. Pending-маркер остаётся стопом от повтора,
+      // пока результат не будет сверён вручную.
+      return {
+        taskId: row.taskId, title: row.title, dealId: prepared.basic.dealId,
+        status: 'blocked', reason: `smtp-confirmed-sent-marker-write-failed: ${taskCommentError.message || taskCommentError}`,
+        email: docReturnMaskEmail(prepared.ctx.recipient.email), file: prepared.ctx.downloaded.fileName,
+      };
+    }
+    if (commentVia === 'im.message.add') {
+      try {
+        await fgAddCommentOnce(prepared.basic.dealId, marker, 'Запрос на скан подписанного акта отправлен клиенту по e-mail.');
+      } catch (timelineError) {
+        return {
+          taskId: row.taskId, title: row.title, dealId: prepared.basic.dealId,
+          status: 'blocked', reason: `smtp-confirmed-chat-marker-without-timeline-marker: ${timelineError.message || timelineError}`,
+          email: docReturnMaskEmail(prepared.ctx.recipient.email), file: prepared.ctx.downloaded.fileName,
+        };
+      }
+    }
+
+    console.log(
+      `[scan-request] SENT task=${row.taskId}; deal=${prepared.basic.dealId}; ` +
+      `to=${docReturnMaskEmail(prepared.ctx.recipient.email)}; file=${prepared.ctx.downloaded.fileName}; comment=${commentVia}`
+    );
+    return {
+      taskId: row.taskId,
+      title: row.title,
+      dealId: prepared.basic.dealId,
+      status: 'sent',
+      email: docReturnMaskEmail(prepared.ctx.recipient.email),
+      file: prepared.ctx.downloaded.fileName,
+      sentCopySaved: result.sentCopySaved,
+      commentVia,
+    };
+  } catch (error) {
+    console.error(`[scan-request] FAILED task=${row.taskId}: ${error.message || error}`);
+    if (pendingWritten) {
+      return { taskId: row.taskId, title: row.title, status: 'blocked', reason: `pending-send-outcome-unknown: ${error.message || error}` };
+    }
+    return { taskId: row.taskId, title: row.title, status: 'failed', reason: error.message || String(error) };
+  } finally {
+    actsScanRequestLocks.delete(row.taskId);
+  }
+}
+
+app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
+  if (!actsMaintenanceTokenMatches(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
+  }
+
+  const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+  const requestedMax = Number(req.body && req.body.max);
+  const max = Number.isFinite(requestedMax) ? Math.max(1, Math.min(Math.floor(requestedMax), 10)) : 10;
+
+  try {
+    const scope = await actsScanRequestLoadScope();
+    const eligible = [];
+    const alreadySent = [];
+    const pending = [];
+    const blocked = [];
+    for (let index = 0; index < scope.ready.length; index += 5) {
+      const states = await Promise.all(scope.ready.slice(index, index + 5).map(async (row) => {
+        try {
+          return { row, state: await actsScanRequestReadState(row.task), error: '' };
+        } catch (error) {
+          // Нельзя считать unreadable-задачу готовой: её маркер мог быть в чате.
+          return { row, state: 'unreadable', error: error.message || String(error) };
+        }
+      }));
+      for (const item of states) {
+        if (item.state === 'ready') eligible.push(item.row);
+        else if (item.state === 'sent') alreadySent.push(item.row);
+        else if (item.state === 'pending') pending.push(item.row);
+        else blocked.push({ ...item.row, reason: item.state, stateError: item.error });
+      }
+    }
+
+    if (!execute) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        projectId: config.actsProjectId,
+        scope: 'September 2026; six approved responsible users; except Archive and Scan exists',
+        found: scope.ready.length + scope.excluded.length,
+        eligible: eligible.length,
+        alreadySent: alreadySent.length,
+        pending: pending.map((row) => ({ taskId: row.taskId, title: row.title })),
+        blocked: blocked.map((row) => ({ taskId: row.taskId, title: row.title, reason: row.reason || 'blocked' })),
+        excluded: scope.excluded.map((row) => ({ taskId: row.taskId, title: row.title, reason: row.reason })),
+        next: eligible.slice(0, max).map((row) => ({ taskId: row.taskId, title: row.title, stage: row.stageTitle })),
+      });
+    }
+
+    const selected = eligible.slice(0, max);
+    const results = [];
+    let consecutiveFailures = 0;
+    for (let index = 0; index < selected.length; index += 3) {
+      const batch = await Promise.all(selected.slice(index, index + 3).map(actsScanRequestSendOne));
+      results.push(...batch);
+      for (const row of batch) {
+        consecutiveFailures = row.status === 'failed' ? consecutiveFailures + 1 : 0;
+      }
+      if (consecutiveFailures >= 3) break;
+    }
+    const counts = results.reduce((acc, row) => {
+      acc[row.status] = (acc[row.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    return res.status(counts.failed ? 207 : 200).json({
+      ok: !counts.failed,
+      dryRun: false,
+      selected: selected.length,
+      remainingBeforeRun: Math.max(0, eligible.length - results.length),
+      stoppedAfterConsecutiveFailures: consecutiveFailures >= 3,
+      counts,
+      results,
+    });
+  } catch (error) {
+    console.error('[scan-request] campaign error:', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
 
 async function docReturnSendEmail(ctx, sequence) {
   const subject = 'Срочно! Возврат оригинала!';
