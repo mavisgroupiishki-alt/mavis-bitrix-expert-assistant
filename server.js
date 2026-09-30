@@ -14946,13 +14946,19 @@ async function docReturnGetTaskCommentRows(taskId) {
       ORDER: { ID: 'DESC' },
       FILTER: {},
     });
-    return Array.isArray(raw)
-      ? raw
-      : (raw && Array.isArray(raw.items))
-        ? raw.items
-        : (raw && Array.isArray(raw.result))
-          ? raw.result
-          : [];
+    const objectRows = (value) => value && typeof value === 'object'
+      ? Object.values(value).filter((row) => row && typeof row === 'object' && (
+        row.ID || row.id || row.POST_MESSAGE || row.postMessage || row.MESSAGE || row.message
+      ))
+      : [];
+    if (Array.isArray(raw)) return raw;
+    if (Array.isArray(raw && raw.items)) return raw.items;
+    if (Array.isArray(raw && raw.result)) return raw.result;
+    for (const value of [raw && raw.items, raw && raw.result, raw && raw.comments, raw]) {
+      const rows = objectRows(value);
+      if (rows.length) return rows;
+    }
+    return [];
   } catch (e) {
     console.warn(`[doc-return] task=${taskId}: комментарии недоступны: ${e.message || e}`);
     return [];
