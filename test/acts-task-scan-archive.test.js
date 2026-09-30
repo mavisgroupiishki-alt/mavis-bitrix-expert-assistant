@@ -112,6 +112,20 @@ test('skips an attachment that already has an archive marker', async () => {
   assert.equal(JSON.stringify(result.skipped), JSON.stringify([{ fileName: 'акт.pdf', reason: 'already-archived' }]));
 });
 
+test('recognizes an archive marker followed by the human-readable archive note', async () => {
+  const { actsArchiveTaskScan } = archiveHelpers();
+  const result = await actsArchiveTaskScan('7', 'test', {
+    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12' }),
+    resolveFiles: async () => ({ files: [{ id: '22', name: 'акт.pdf', url: 'https://mavisgroup.bitrix24.by/download/22' }] }),
+    getComments: async () => [{ POST_MESSAGE: '[MAVIS_ACTS_TASK_SCAN_ARCHIVE] task=7 file=22\nСкан сохранён на Битрикс Диск.' }],
+    download: async () => { throw new Error('must not download duplicate'); },
+    getFolder: async () => { throw new Error('must not create folder for duplicate'); },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(JSON.stringify(result.saved), '[]');
+  assert.equal(JSON.stringify(result.skipped), JSON.stringify([{ fileName: 'акт.pdf', reason: 'already-archived' }]));
+});
+
 test('archives only the latest real attachment when requested for a historical backfill', async () => {
   const { actsArchiveTaskScan } = archiveHelpers();
   const uploaded = [];

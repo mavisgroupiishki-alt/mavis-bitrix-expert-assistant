@@ -10730,7 +10730,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     if (!eligibility.ok) return { ok: false, taskId: id, saved: [], skipped: [], errors: [eligibility.reason] };
 
     const comments = await getComments(id);
-    const existingMarkers = new Set((comments || []).map(actsTaskScanArchiveCommentText));
+    const existingCommentTexts = (comments || []).map(actsTaskScanArchiveCommentText);
     const resolution = await resolveFiles(task);
     const realFiles = actsTaskScanArchiveRealFiles(resolution);
     const files = dependencies.latestOnly ? [actsTaskScanArchiveLatestFile(realFiles)].filter(Boolean) : realFiles;
@@ -10738,7 +10738,10 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
       return { ok: false, taskId: id, saved: [], skipped: [], errors: ['В задаче нет прикреплённых файлов для сохранения.'] };
     }
 
-    const pending = files.filter((file) => !existingMarkers.has(actsTaskScanArchiveMarker(id, file)));
+    const hasArchiveMarker = (file) => existingCommentTexts.some((text) =>
+      text.includes(actsTaskScanArchiveMarker(id, file))
+    );
+    const pending = files.filter((file) => !hasArchiveMarker(file));
     const saved = [];
     const skipped = files
       .filter((file) => !pending.includes(file))
@@ -10756,7 +10759,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
         await upload(folder.expertFolderId, downloaded.fileName || fileName, downloaded.buffer);
         const marker = actsTaskScanArchiveMarker(id, file);
         await addComment(task, `${marker}\nСкан сохранён на Битрикс Диск: ${folder.expertFolder} → ${downloaded.fileName || fileName}.`);
-        existingMarkers.add(marker);
+        existingCommentTexts.push(marker);
         saved.push({ fileName: downloaded.fileName || fileName, folder: folder.expertFolder });
       } catch (error) {
         errors.push({ fileName, error: error.message || String(error) });
