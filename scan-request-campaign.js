@@ -29,6 +29,10 @@ function isScanRequestExcludedStage(title) {
   return normalized === 'архив' || normalized === 'скан есть';
 }
 
+function scanRequestStageTitle(stageTitles, stageId) {
+  return stageTitles instanceof Map ? String(stageTitles.get(String(stageId || '')) || '') : '';
+}
+
 function scanRequestSentMarker(taskId) {
   return `${SCAN_REQUEST_SENT_MARKER} task=${String(taskId || '').trim()}`;
 }
@@ -84,6 +88,7 @@ module.exports = {
   normalizeScanRequestText,
   scanRequestBlockedMarker,
   scanRequestPendingMarker,
+  scanRequestStageTitle,
   scanRequestState,
   scanRequestSentMarker,
   selectScanRequestActFile,

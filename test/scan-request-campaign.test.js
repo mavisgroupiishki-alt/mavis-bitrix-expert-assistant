@@ -7,6 +7,7 @@ const {
   isScanRequestExcludedStage,
   isScanRequestSeptember2026,
   scanRequestSentMarker,
+  scanRequestStageTitle,
   scanRequestState,
   selectScanRequestActFile,
 } = require('../scan-request-campaign');
@@ -49,6 +50,12 @@ test('excludes only Archive and Scan exists stages', () => {
   assert.equal(isScanRequestExcludedStage('Архив'), true);
   assert.equal(isScanRequestExcludedStage('  СКАН   ЕСТЬ '), true);
   assert.equal(isScanRequestExcludedStage('Сделаны'), false);
+});
+
+test('looks up a freshly loaded stage without crashing when stage metadata is absent', () => {
+  const stages = new Map([['1480', 'Архив']]);
+  assert.equal(scanRequestStageTitle(stages, '1480'), 'Архив');
+  assert.equal(scanRequestStageTitle(undefined, '1480'), '');
 });
 
 test('recognizes only the dedicated scan-request success marker', () => {

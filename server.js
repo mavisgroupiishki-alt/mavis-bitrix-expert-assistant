@@ -38,7 +38,7 @@ const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromVal
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
-const { isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15650,6 +15650,7 @@ async function actsScanRequestLoadScope() {
       createdDate,
       stageId,
       stageTitle,
+      stageTitles,
     };
     if (ACTS_SCAN_REQUEST_PILOT_TASK_IDS.has(taskId)) {
       excluded.push({ ...row, reason: 'pilot-already-sent' });
@@ -15775,7 +15776,7 @@ async function actsScanRequestMarkBlocked(task, reason) {
 async function actsScanRequestPrepareContext(row) {
   const freshTask = await actsScanRequestLoadTask(row.taskId);
   const freshStageId = String(actsTaskField(freshTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
-  if (isScanRequestExcludedStage(row.stageTitles.get(freshStageId) || '')) {
+  if (isScanRequestExcludedStage(scanRequestStageTitle(row.stageTitles, freshStageId))) {
     return { blocked: true, reason: 'stage-excluded-after-selection' };
   }
 
