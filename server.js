@@ -295,6 +295,10 @@ const config = {
   // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
   actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
   actsDonePollIntervalSeconds: Number(process.env.ACTS_DONE_POLL_INTERVAL_SECONDS || 60),
+  // Скан, который сотрудник прикрепил к задаче и перевёл её в «СКАН ЕСТЬ»,
+  // складываем на Общий Диск без участия клиента и без изменений CRM.
+  actsTaskScanArchiveEnabled: String(process.env.ACTS_TASK_SCAN_ARCHIVE_ENABLED || 'true').toLowerCase() !== 'false',
+  actsTaskScanArchivePollIntervalSeconds: Number(process.env.ACTS_TASK_SCAN_ARCHIVE_POLL_INTERVAL_SECONDS || 60),
   // v70: автоотправка актов переведена в боевой режим по всей воронке.
   // При необходимости аварийно ограничить отправку одной сделкой — задай ACTS_ALL_DEALS=false.
   actsTestDealId: process.env.ACTS_TEST_DEAL_ID || '38072',
@@ -10623,6 +10627,160 @@ async function actsGetExpertActFolder(deal, periodDate = '', expertFolderOverrid
   return { expertFolderId, expertFolder, monthFolderName, year, user };
 }
 
+// Скан из задачи должен попадать в папку автора задачи («Постановщик»), а не
+// ответственного по CRM-сделке: в проекте «Акты Счета» исполнителем обычно
+// выступает сотрудник бэк-офиса.
+const ACTS_TASK_SCAN_ARCHIVE_STAGE_ID = '1480';
+const ACTS_TASK_SCAN_ARCHIVE_MARKER = '[MAVIS_ACTS_TASK_SCAN_ARCHIVE]';
+const ACTS_TASK_SCAN_ARCHIVE_INITIAL_LOOKBACK_MS = 10 * 60 * 1000;
+const ACTS_TASK_SCAN_ARCHIVE_OVERLAP_MS = 30 * 1000;
+const actsTaskScanArchiveLocks = new Set();
+let actsTaskScanArchivePollRunning = false;
+let actsTaskScanArchiveLastPollAt = Date.now() - ACTS_TASK_SCAN_ARCHIVE_INITIAL_LOOKBACK_MS;
+
+function actsTaskScanArchiveEligibility(task) {
+  const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
+  const groupId = String(actsTaskField(task, ['groupId', 'GROUP_ID', 'group_id']) || '').trim();
+  const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '').trim();
+  const creatorId = String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'created_by', 'createdById', 'CREATED_BY_ID']) || '').trim();
+  const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '').trim();
+
+  if (!taskId) return { ok: false, reason: 'task-id-missing' };
+  if (groupId !== String(config.actsProjectId)) return { ok: false, reason: 'outside-acts-project', taskId, groupId };
+  if (stageId !== ACTS_TASK_SCAN_ARCHIVE_STAGE_ID) return { ok: false, reason: 'outside-scan-stage', taskId, stageId };
+  if (!creatorId) return { ok: false, reason: 'task-creator-missing', taskId };
+  if (!createdDate || Number.isNaN(Date.parse(createdDate))) return { ok: false, reason: 'task-created-date-missing', taskId };
+  return { ok: true, taskId, creatorId, createdDate };
+}
+
+function actsTaskScanArchiveMarker(taskId, file) {
+  const sourceId = String(file && (file.attachedId || file.id || file.url || file.name) || '').trim();
+  return `${ACTS_TASK_SCAN_ARCHIVE_MARKER} task=${String(taskId)} file=${sourceId}`;
+}
+
+function actsTaskScanArchiveCommentText(comment) {
+  return String(comment && (
+    comment.POST_MESSAGE || comment.postMessage || comment.MESSAGE || comment.message ||
+    comment.TEXT || comment.text || comment.COMMENT || comment.comment || ''
+  ) || '');
+}
+
+async function actsGetTaskAuthorActFolder(creatorId, createdDate) {
+  const userRows = await bitrixRestCall('user.get', { ID: Number(creatorId) });
+  const user = Array.isArray(userRows) ? userRows[0] : userRows;
+  const expertFolder = actsResolveExpertFolderName(user);
+  if (!expertFolder) {
+    const expertHuman = `${user && (user.LAST_NAME || user.lastName) || ''} ${user && (user.NAME || user.name) || ''}`.trim() || `ID ${creatorId}`;
+    throw new Error(`Автор задачи «${expertHuman}» не сопоставлен с папками актов.`);
+  }
+  return actsGetExpertActFolder({ ASSIGNED_BY_ID: String(creatorId) }, createdDate, expertFolder);
+}
+
+async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependencies = {}) {
+  const id = String(taskId || '').trim();
+  if (!/^\d+$/.test(id)) return { ok: false, taskId: id, saved: [], skipped: [], errors: ['Некорректный ID задачи.'] };
+  if (actsTaskScanArchiveLocks.has(id)) return { ok: true, taskId: id, saved: [], skipped: [{ reason: 'in-flight' }], errors: [] };
+
+  actsTaskScanArchiveLocks.add(id);
+  try {
+    const getTask = dependencies.getTask || (async () => {
+      const raw = await bitrixRestCall('tasks.task.get', {
+        taskId: Number(id),
+        select: [
+          'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY', 'CREATED_DATE',
+          'CHANGED_DATE', 'CHAT_ID', 'UF_TASK_WEBDAV_FILES', 'UF_CRM_TASK',
+        ],
+      });
+      return raw && (raw.task || raw.TASK || raw);
+    });
+    const resolveFiles = dependencies.resolveFiles || actsResolveTaskFiles;
+    const download = dependencies.download || actsDownloadRealFile;
+    const getFolder = dependencies.getFolder || actsGetTaskAuthorActFolder;
+    const upload = dependencies.upload || uploadFileToDiskFolder;
+    const getComments = dependencies.getComments || docReturnGetTaskCommentRows;
+    const addComment = dependencies.addComment || docReturnAddTaskComment;
+
+    const task = await getTask(id);
+    if (!task) throw new Error(`Задача ${id} не найдена.`);
+    const eligibility = actsTaskScanArchiveEligibility(task);
+    if (!eligibility.ok) return { ok: false, taskId: id, saved: [], skipped: [], errors: [eligibility.reason] };
+
+    const comments = await getComments(id);
+    const existingMarkers = new Set((comments || []).map(actsTaskScanArchiveCommentText));
+    const resolution = await resolveFiles(task);
+    const files = (resolution && resolution.files || []).filter((file) => file && file.source !== 'task-name-only' && (file.id || file.attachedId || file.url));
+    if (!files.length) {
+      return { ok: false, taskId: id, saved: [], skipped: [], errors: ['В задаче нет прикреплённых файлов для сохранения.'] };
+    }
+
+    const pending = files.filter((file) => !existingMarkers.has(actsTaskScanArchiveMarker(id, file)));
+    const saved = [];
+    const skipped = files
+      .filter((file) => !pending.includes(file))
+      .map((file) => ({ fileName: file.name || `файл ${file.id || file.attachedId}`, reason: 'already-archived' }));
+    const errors = [];
+    let folder = null;
+
+    for (const file of pending) {
+      const fileName = String(file.name || `файл ${file.id || file.attachedId}`).trim();
+      try {
+        if (!folder) folder = await getFolder(eligibility.creatorId, eligibility.createdDate);
+        if (!folder || !folder.expertFolderId) throw new Error('Не найдена папка эксперта на Битрикс Диске.');
+        const downloaded = await download(file);
+        if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) throw new Error('Не удалось получить содержимое файла.');
+        await upload(folder.expertFolderId, downloaded.fileName || fileName, downloaded.buffer);
+        const marker = actsTaskScanArchiveMarker(id, file);
+        await addComment(task, `${marker}\nСкан сохранён на Битрикс Диск: ${folder.expertFolder} → ${downloaded.fileName || fileName}.`);
+        existingMarkers.add(marker);
+        saved.push({ fileName: downloaded.fileName || fileName, folder: folder.expertFolder });
+      } catch (error) {
+        errors.push({ fileName, error: error.message || String(error) });
+      }
+    }
+
+    console.log(`[acts-task-scan-archive] task=${id}; source=${source}; saved=${saved.length}; skipped=${skipped.length}; errors=${errors.length}; folder=${folder && folder.expertFolder || '-'}.`);
+    return { ok: errors.length === 0, taskId: id, folder: folder && folder.expertFolder || '', saved, skipped, errors };
+  } finally {
+    actsTaskScanArchiveLocks.delete(id);
+  }
+}
+
+async function actsRunTaskScanArchivePoll(trigger = 'interval') {
+  if (!config.bitrixWebhookUrl || !config.actsTaskScanArchiveEnabled) {
+    return { ok: true, skipped: true, reason: 'disabled-or-no-bitrix' };
+  }
+  if (actsTaskScanArchivePollRunning) return { ok: true, skipped: true, reason: 'poll-already-running' };
+
+  actsTaskScanArchivePollRunning = true;
+  const cycleStartedAt = Date.now();
+  try {
+    const since = new Date(Math.max(0, actsTaskScanArchiveLastPollAt - ACTS_TASK_SCAN_ARCHIVE_OVERLAP_MS)).toISOString();
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: {
+        GROUP_ID: Number(config.actsProjectId),
+        STAGE_ID: ACTS_TASK_SCAN_ARCHIVE_STAGE_ID,
+        '>=CHANGED_DATE': since,
+      },
+      order: { ID: 'ASC' },
+      select: ['ID', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY', 'CREATED_DATE', 'CHANGED_DATE'],
+    }, 200);
+    const results = [];
+    for (const task of tasks || []) {
+      const taskId = String(actsTaskField(task, ['id', 'ID']) || '');
+      if (taskId) results.push(await actsArchiveTaskScan(taskId, `poll:${trigger}`));
+    }
+    const failed = results.filter((result) => !result.ok && !(result.skipped && result.skipped.length));
+    console.log(`[acts-task-scan-archive] poll=${trigger}; since=${since}; candidates=${results.length}; failed=${failed.length}.`);
+    return { ok: failed.length === 0, checked: results.length, results };
+  } catch (error) {
+    console.error(`[acts-task-scan-archive] poll=${trigger}: ${error.message || error}`);
+    return { ok: false, error: error.message || String(error) };
+  } finally {
+    actsTaskScanArchiveLastPollAt = cycleStartedAt;
+    actsTaskScanArchivePollRunning = false;
+  }
+}
+
 function actsIncomingFileNameFromUrl(urlRaw, fallback = '') {
   try {
     const u = new URL(String(urlRaw || ''));
@@ -16240,6 +16398,19 @@ app.listen(PORT, () => {
     setInterval(runActsDonePollingCycle, actsPollMs);
   } else {
     console.log('[acts-poll] Резервный контроль актов выключен.');
+  }
+
+  if (config.bitrixWebhookUrl && config.actsTaskScanArchiveEnabled) {
+    const archivePollMs = Math.max(30, config.actsTaskScanArchivePollIntervalSeconds || 60) * 1000;
+    console.log(`[acts-task-scan-archive] Включено: «СКАН ЕСТЬ» → Диск, проверка каждые ${archivePollMs / 1000} сек.`);
+    setTimeout(() => actsRunTaskScanArchivePoll('startup').catch((e) =>
+      console.error(`[acts-task-scan-archive] startup: ${e.message || e}`)
+    ), 5000);
+    setInterval(() => actsRunTaskScanArchivePoll('interval').catch((e) =>
+      console.error(`[acts-task-scan-archive] interval: ${e.message || e}`)
+    ), archivePollMs);
+  } else {
+    console.log('[acts-task-scan-archive] Архивирование сканов выключено: нужен BITRIX_WEBHOOK_URL и ACTS_TASK_SCAN_ARCHIVE_ENABLED=true.');
   }
 
   if (config.bitrixWebhookUrl && config.actsPushEnabled) {
