@@ -10721,7 +10721,6 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     const download = dependencies.download || actsDownloadRealFile;
     const getFolder = dependencies.getFolder || actsGetTaskCreatorActFolder;
     const upload = dependencies.upload || uploadFileToDiskFolder;
-    const getComments = dependencies.getComments || docReturnGetTaskCommentRows;
     const addComment = dependencies.addComment || docReturnAddTaskComment;
 
     const task = await getTask(id);
@@ -10729,8 +10728,13 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     const eligibility = actsTaskScanArchiveEligibility(task, dependencies.allowedStageIds);
     if (!eligibility.ok) return { ok: false, taskId: id, saved: [], skipped: [], errors: [eligibility.reason] };
 
+    // В Bitrix комментарий может оказаться в обычной ленте или в чате задачи.
+    // Для идемпотентности читаем оба источника тем же способом, что и напоминания.
+    const getComments = dependencies.getComments || (() => docReturnReadTaskComments({ taskId: id, task }));
     const comments = await getComments(id);
-    const existingCommentTexts = (comments || []).map(actsTaskScanArchiveCommentText);
+    const existingCommentTexts = (comments || []).map((comment) =>
+      typeof comment === 'string' ? comment : actsTaskScanArchiveCommentText(comment)
+    );
     const resolution = await resolveFiles(task);
     const realFiles = actsTaskScanArchiveRealFiles(resolution);
     const files = dependencies.latestOnly ? [actsTaskScanArchiveLatestFile(realFiles)].filter(Boolean) : realFiles;
