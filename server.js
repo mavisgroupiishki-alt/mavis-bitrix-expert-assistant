@@ -39,6 +39,7 @@ const { injectPlacementOptions, parsePlacementOptions } = require('./placement-c
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
 const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -3500,15 +3501,17 @@ async function processIncomingEmails() {
 // Отправляет специальный промпт чтобы найти название компании
 async function analyzeDocumentWithVisionForCompany(fileContent, fileName, contentType) {
   try {
+    const buffer = Buffer.isBuffer(fileContent) ? fileContent : Buffer.from(fileContent);
+    const policy = visionInputPolicy(buffer, fileName, contentType);
+    if (!policy.allowed) {
+      if (policy.reason === 'file-too-large') {
+        console.warn(`[email] Vision пропущен: ${String(fileName || 'file')} (${policy.size} bytes) больше безопасного лимита ${VISION_MAX_DOCUMENT_BYTES}.`);
+      }
+      return { company: null, confidence: 'low' };
+    }
     const ext = String(fileName || '').split('.').pop().toLowerCase();
     const normalizedContentType = String(contentType || '').split(';')[0].toLowerCase();
-    const buffer = Buffer.isBuffer(fileContent) ? fileContent : Buffer.from(fileContent);
-    const isImage = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)
-      || /^image\//.test(normalizedContentType);
-    const isPdf = ext === 'pdf'
-      || normalizedContentType === 'application/pdf'
-      || buffer.subarray(0, 4).toString() === '%PDF';
-    if (!isImage && !isPdf) return { company: null, confidence: 'low' };
+    const { isImage, isPdf } = policy;
 
     const base64Content = buffer.toString('base64');
     const mediaType = /^image\//.test(normalizedContentType)
@@ -12299,9 +12302,9 @@ function classifyFileByName(fileName) {
 }
 
 async function clientDocsAnalyzeAttachment(buffer, fileName, contentType, messageText = '') {
+  const policy = visionInputPolicy(buffer, fileName, contentType);
   const ext = String(fileName || '').split('.').pop().toLowerCase();
-  const isImage = ['jpg','jpeg','png','webp'].includes(ext) || /^image\//i.test(contentType || '');
-  const isPdf = ext === 'pdf' || /^application\/pdf/i.test(contentType || '') || (buffer && buffer.subarray(0,4).toString() === '%PDF');
+  const { isImage, isPdf } = policy;
 
   if (!isImage && !isPdf) {
     return {
@@ -12309,6 +12312,15 @@ async function clientDocsAnalyzeAttachment(buffer, fileName, contentType, messag
       person: null, organization: null, instrument: null,
       readable: null, confidence: 'low', fileName,
       notes: 'тип определён только по имени файла',
+    };
+  }
+
+  if (!policy.allowed) {
+    return {
+      documentType: clientDocsClassifyByName(fileName),
+      person: null, organization: null, instrument: null,
+      readable: null, confidence: 'low', fileName,
+      notes: `Vision пропущен: размер файла ${policy.size} байт превышает безопасный лимит ${VISION_MAX_DOCUMENT_BYTES} байт`,
     };
   }
 
