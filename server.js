@@ -15968,6 +15968,33 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
   }
 });
 
+// Одноразовый запуск только изнутри Render. Флаг не открывает endpoint наружу:
+// запрос всё равно проходит с уже настроенным maintenance-токеном сервиса.
+async function actsScanRequestRunAutorun() {
+  if (String(process.env.ACTS_SCAN_REQUEST_AUTORUN || '').toLowerCase() !== 'true') return;
+  const token = String(process.env.ACTS_MAINTENANCE_TOKEN || '').trim();
+  if (!token) {
+    console.error('[scan-request] AUTORUN not started: ACTS_MAINTENANCE_TOKEN is missing.');
+    return;
+  }
+
+  for (let batch = 1; batch <= 6; batch++) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${PORT}/api/maintenance/acts-scan-request-campaign`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ execute: true, max: 10 }),
+      });
+      const report = await response.json().catch(() => ({}));
+      console.log(`[scan-request] AUTORUN batch=${batch}; http=${response.status}; report=${JSON.stringify(report)}`);
+      if (!response.ok || !report.selected || report.stoppedAfterConsecutiveFailures) break;
+    } catch (error) {
+      console.error(`[scan-request] AUTORUN batch=${batch} failed: ${error.message || error}`);
+      break;
+    }
+  }
+}
+
 async function docReturnSendEmail(ctx, sequence) {
   const subject = 'Срочно! Возврат оригинала!';
   const fileName = ctx.downloaded && ctx.downloaded.fileName
@@ -16865,6 +16892,12 @@ console.log(
 );
 
 app.listen(PORT, () => {
+  if (String(process.env.ACTS_SCAN_REQUEST_AUTORUN || '').toLowerCase() === 'true') {
+    console.log('[scan-request] AUTORUN enabled: first batch will start in 15 seconds.');
+    setTimeout(() => actsScanRequestRunAutorun().catch((error) =>
+      console.error(`[scan-request] AUTORUN startup failed: ${error.message || error}`)
+    ), 15 * 1000);
+  }
   if (DOC_RETURN_ENABLED && config.bitrixWebhookUrl) {
     const docReturnPollMs = DOC_RETURN_POLL_MINUTES * 60 * 1000;
     console.log(`[doc-return] Автоконтроль включён: каждые ${DOC_RETURN_POLL_MINUTES} мин.`);
