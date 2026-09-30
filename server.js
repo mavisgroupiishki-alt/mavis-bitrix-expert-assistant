@@ -8506,14 +8506,16 @@ async function actsResolveTaskFiles(task) {
       const fileId = obj && (obj.ID || obj.id || obj.OBJECT_ID || obj.objectId);
       const name = actsCleanText(obj && (obj.NAME || obj.name || obj.TITLE || obj.title));
       const url = obj && (obj.DOWNLOAD_URL || obj.downloadUrl || obj.URL || obj.url || obj.DETAIL_URL || obj.detailUrl);
-      addFile({ id: String(fileId || id), attachedId: String(id), name: name || `файл ${id}`, url: url || '', date, source });
+      const objectDate = obj && (obj.UPDATE_TIME || obj.updateTime || obj.DATE_UPDATE || obj.dateUpdate || obj.CREATE_TIME || obj.createTime || obj.DATE_CREATE || obj.dateCreate || '');
+      addFile({ id: String(fileId || id), attachedId: String(id), name: name || `файл ${id}`, url: url || '', date: date || objectDate, source });
       return true;
     } catch (e) { firstError = e.message || String(e); }
     try {
       const f = await bitrixRestCall('disk.file.get', { id });
       const name = actsCleanText(f && (f.NAME || f.name || f.TITLE || f.title));
       const url = f && (f.DOWNLOAD_URL || f.downloadUrl || f.URL || f.url || f.DETAIL_URL || f.detailUrl);
-      addFile({ id: String(id), attachedId: '', name: name || `файл ${id}`, url: url || '', date, source });
+      const fileDate = f && (f.UPDATE_TIME || f.updateTime || f.DATE_UPDATE || f.dateUpdate || f.CREATE_TIME || f.createTime || f.DATE_CREATE || f.dateCreate || '');
+      addFile({ id: String(id), attachedId: '', name: name || `файл ${id}`, url: url || '', date: date || fileDate, source });
       return true;
     } catch (e) {
       const secondError = e.message || String(e);
@@ -10665,6 +10667,25 @@ function actsTaskScanArchiveCommentText(comment) {
   ) || '');
 }
 
+function actsTaskScanArchiveRealFiles(resolution) {
+  return (resolution && resolution.files || []).filter((file) => file && file.source !== 'task-name-only' && (file.id || file.attachedId || file.url));
+}
+
+function actsTaskScanArchiveLatestFile(files) {
+  const candidates = (files || []).filter(Boolean);
+  const numericId = (file) => Number(String(file.attachedId || file.id || '').replace(/\D/g, '')) || 0;
+  const timestamp = (file) => {
+    const value = Date.parse(String(file.date || ''));
+    return Number.isFinite(value) ? value : 0;
+  };
+  return candidates.reduce((latest, file) => {
+    if (!latest) return file;
+    const timeDiff = timestamp(file) - timestamp(latest);
+    if (timeDiff !== 0) return timeDiff > 0 ? file : latest;
+    return numericId(file) > numericId(latest) ? file : latest;
+  }, null);
+}
+
 async function actsGetTaskResponsibleActFolder(responsibleId, createdDate) {
   const userRows = await bitrixRestCall('user.get', { ID: Number(responsibleId) });
   const user = Array.isArray(userRows) ? userRows[0] : userRows;
@@ -10708,7 +10729,8 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     const comments = await getComments(id);
     const existingMarkers = new Set((comments || []).map(actsTaskScanArchiveCommentText));
     const resolution = await resolveFiles(task);
-    const files = (resolution && resolution.files || []).filter((file) => file && file.source !== 'task-name-only' && (file.id || file.attachedId || file.url));
+    const realFiles = actsTaskScanArchiveRealFiles(resolution);
+    const files = dependencies.latestOnly ? [actsTaskScanArchiveLatestFile(realFiles)].filter(Boolean) : realFiles;
     if (!files.length) {
       return { ok: false, taskId: id, saved: [], skipped: [], errors: ['В задаче нет прикреплённых файлов для сохранения.'] };
     }
@@ -10779,6 +10801,85 @@ async function actsRunTaskScanArchivePoll(trigger = 'interval') {
     actsTaskScanArchiveLastPollAt = cycleStartedAt;
     actsTaskScanArchivePollRunning = false;
   }
+}
+
+const ACTS_TASK_SCAN_ARCHIVE_BACKFILL_ALLOWED_MONTHS = new Set(['2026-08', '2026-09']);
+let actsTaskScanArchiveBackfillRun = null;
+let actsTaskScanArchiveBackfillStatus = {
+  state: 'idle', months: [], startedAt: '', finishedAt: '', result: null, error: '',
+};
+
+function actsTaskScanArchiveBackfillMonths(rawMonths) {
+  const input = Array.isArray(rawMonths) ? rawMonths : String(rawMonths || '').split(',');
+  const months = [...new Set(input.map((month) => String(month || '').trim()).filter(Boolean))];
+  if (!months.length || months.length > 2 || months.some((month) => !ACTS_TASK_SCAN_ARCHIVE_BACKFILL_ALLOWED_MONTHS.has(month))) {
+    throw new Error('Разрешена разовая догрузка только за 2026-08 и 2026-09.');
+  }
+  return months.sort();
+}
+
+function actsTaskScanArchiveBackfillRange(month) {
+  const [yearRaw, monthRaw] = String(month).split('-');
+  const next = new Date(Date.UTC(Number(yearRaw), Number(monthRaw), 1));
+  const nextYear = next.getUTCFullYear();
+  const nextMonth = String(next.getUTCMonth() + 1).padStart(2, '0');
+  return { from: `${month}-01T00:00:00+03:00`, to: `${nextYear}-${nextMonth}-01T00:00:00+03:00` };
+}
+
+async function actsRunTaskScanArchiveBackfill(monthsRaw) {
+  const months = actsTaskScanArchiveBackfillMonths(monthsRaw);
+  const tasksById = new Map();
+  for (const month of months) {
+    const range = actsTaskScanArchiveBackfillRange(month);
+    const tasks = await bitrixRestList('tasks.task.list', {
+      filter: {
+        GROUP_ID: Number(config.actsProjectId),
+        STAGE_ID: ACTS_TASK_SCAN_ARCHIVE_STAGE_ID,
+        '>=CREATED_DATE': range.from,
+        '<CREATED_DATE': range.to,
+      },
+      order: { ID: 'ASC' },
+      select: ['ID', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'CREATED_DATE'],
+    }, 1000);
+    for (const task of tasks || []) {
+      const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
+      if (taskId) tasksById.set(taskId, { taskId, month });
+    }
+  }
+
+  const results = [];
+  for (const { taskId, month } of tasksById.values()) {
+    results.push(await actsArchiveTaskScan(taskId, `backfill:${month}`, { latestOnly: true }));
+  }
+  const saved = results.reduce((count, result) => count + result.saved.length, 0);
+  const skipped = results.reduce((count, result) => count + result.skipped.length, 0);
+  const errors = results.flatMap((result) => result.errors || []).length;
+  const summary = { months, tasks: results.length, saved, skipped, errors, results };
+  console.log(`[acts-task-scan-archive] backfill months=${months.join(',')}; tasks=${summary.tasks}; saved=${saved}; skipped=${skipped}; errors=${errors}.`);
+  return summary;
+}
+
+function actsStartTaskScanArchiveBackfill(monthsRaw) {
+  if (actsTaskScanArchiveBackfillRun) return false;
+  const months = actsTaskScanArchiveBackfillMonths(monthsRaw);
+  actsTaskScanArchiveBackfillStatus = {
+    state: 'running', months, startedAt: new Date().toISOString(), finishedAt: '', result: null, error: '',
+  };
+  actsTaskScanArchiveBackfillRun = actsRunTaskScanArchiveBackfill(months)
+    .then((result) => {
+      actsTaskScanArchiveBackfillStatus = {
+        ...actsTaskScanArchiveBackfillStatus, state: result.errors ? 'completed-with-errors' : 'completed',
+        finishedAt: new Date().toISOString(), result,
+      };
+    })
+    .catch((error) => {
+      actsTaskScanArchiveBackfillStatus = {
+        ...actsTaskScanArchiveBackfillStatus, state: 'failed', finishedAt: new Date().toISOString(), error: error.message || String(error),
+      };
+      console.error(`[acts-task-scan-archive] backfill failed: ${error.message || error}`);
+    })
+    .finally(() => { actsTaskScanArchiveBackfillRun = null; });
+  return true;
 }
 
 function actsIncomingFileNameFromUrl(urlRaw, fallback = '') {
@@ -13152,6 +13253,23 @@ app.get('/api/acts/task-done', async (req, res) => {
 function actsMaintenanceTokenMatches(req) {
   return authorizationMatchesToken(req, process.env.ACTS_MAINTENANCE_TOKEN);
 }
+
+app.post('/api/maintenance/acts-task-scan-archive-backfill', (req, res) => {
+  if (!actsMaintenanceTokenMatches(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_MAINTENANCE_TOKEN is required.' });
+  }
+  try {
+    const months = actsTaskScanArchiveBackfillMonths(req.body && req.body.months);
+    const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+    if (!execute) return res.json({ ok: true, dryRun: true, months, status: actsTaskScanArchiveBackfillStatus });
+    if (!actsStartTaskScanArchiveBackfill(months)) {
+      return res.status(409).json({ ok: false, error: 'Догрузка сканов уже выполняется.', status: actsTaskScanArchiveBackfillStatus });
+    }
+    return res.status(202).json({ ok: true, started: true, months, status: actsTaskScanArchiveBackfillStatus });
+  } catch (error) {
+    return res.status(400).json({ ok: false, error: error.message || String(error) });
+  }
+});
 
 // Разовый исторический поиск не должен быть привязан к перезапуску сервиса:
 // иначе любой обычный деплой начинает обход почты заново. Запуск доступен

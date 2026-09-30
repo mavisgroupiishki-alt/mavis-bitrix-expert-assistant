@@ -26,7 +26,7 @@ function archiveHelpers() {
     docReturnAddTaskComment: async () => 'task.commentitem.add',
     bitrixRestCall: async () => ({}),
   };
-  vm.runInNewContext(`${source.slice(start, end)}; globalThis.helpers = { actsTaskScanArchiveEligibility, actsTaskScanArchiveMarker, actsArchiveTaskScan };`, context);
+  vm.runInNewContext(`${source.slice(start, end)}; globalThis.helpers = { actsTaskScanArchiveEligibility, actsTaskScanArchiveMarker, actsTaskScanArchiveLatestFile, actsArchiveTaskScan };`, context);
   return context.helpers;
 }
 
@@ -50,6 +50,18 @@ test('uses the source file identity for a stable per-file duplicate marker', () 
     actsTaskScanArchiveMarker('7', { attachedId: 'n9', id: '22', name: 'акт.pdf' }),
     '[MAVIS_ACTS_TASK_SCAN_ARCHIVE] task=7 file=n9',
   );
+});
+
+test('selects the newest attachment by its date and then by file identity', () => {
+  const { actsTaskScanArchiveLatestFile } = archiveHelpers();
+  assert.equal(
+    actsTaskScanArchiveLatestFile([
+      { id: '22', name: 'old.pdf', date: '2026-08-03T10:00:00+03:00' },
+      { id: '23', name: 'new.pdf', date: '2026-08-03T11:00:00+03:00' },
+    ]).name,
+    'new.pdf',
+  );
+  assert.equal(actsTaskScanArchiveLatestFile([{ id: '22' }, { id: '23' }]).id, '23');
 });
 
 test('archives every real task attachment once and uses the task creation date for the folder', async () => {
@@ -97,4 +109,25 @@ test('skips an attachment that already has an archive marker', async () => {
   assert.equal(result.ok, true);
   assert.equal(JSON.stringify(result.saved), '[]');
   assert.equal(JSON.stringify(result.skipped), JSON.stringify([{ fileName: 'акт.pdf', reason: 'already-archived' }]));
+});
+
+test('archives only the latest real attachment when requested for a historical backfill', async () => {
+  const { actsArchiveTaskScan } = archiveHelpers();
+  const uploaded = [];
+  const result = await actsArchiveTaskScan('7', 'backfill:2026-08', {
+    latestOnly: true,
+    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-08-12' }),
+    resolveFiles: async () => ({ files: [
+      { id: '22', name: 'old.pdf', date: '2026-08-12T10:00:00+03:00' },
+      { id: '23', name: 'latest.pdf', date: '2026-08-12T11:00:00+03:00' },
+      { name: 'text only', source: 'task-name-only' },
+    ] }),
+    getFolder: async () => ({ expertFolderId: '90', expertFolder: 'Акты Елизавета август 2026' }),
+    download: async (file) => ({ buffer: Buffer.from(file.id), fileName: file.name }),
+    upload: async (_folderId, fileName) => { uploaded.push(fileName); },
+    getComments: async () => [],
+    addComment: async () => 'task.commentitem.add',
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(uploaded, ['latest.pdf']);
 });
