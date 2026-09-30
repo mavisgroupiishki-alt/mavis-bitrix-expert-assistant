@@ -37,6 +37,7 @@ test('accepts only an Acts task at the Scan exists stage with responsible expert
     JSON.stringify({ ok: true, taskId: '7', responsibleId: '1960', createdDate: '2026-03-12T09:00:00+03:00' }),
   );
   assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12' }).ok, false);
+  assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12' }, ['256']).ok, true);
   assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480' }).ok, false);
 });
 

@@ -10640,7 +10640,7 @@ const actsTaskScanArchiveLocks = new Set();
 let actsTaskScanArchivePollRunning = false;
 let actsTaskScanArchiveLastPollAt = Date.now() - ACTS_TASK_SCAN_ARCHIVE_INITIAL_LOOKBACK_MS;
 
-function actsTaskScanArchiveEligibility(task) {
+function actsTaskScanArchiveEligibility(task, allowedStageIds = [ACTS_TASK_SCAN_ARCHIVE_STAGE_ID]) {
   const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
   const groupId = String(actsTaskField(task, ['groupId', 'GROUP_ID', 'group_id']) || '').trim();
   const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '').trim();
@@ -10649,7 +10649,7 @@ function actsTaskScanArchiveEligibility(task) {
 
   if (!taskId) return { ok: false, reason: 'task-id-missing' };
   if (groupId !== String(config.actsProjectId)) return { ok: false, reason: 'outside-acts-project', taskId, groupId };
-  if (stageId !== ACTS_TASK_SCAN_ARCHIVE_STAGE_ID) return { ok: false, reason: 'outside-scan-stage', taskId, stageId };
+  if (!allowedStageIds.map(String).includes(stageId)) return { ok: false, reason: 'outside-scan-stage', taskId, stageId };
   if (!responsibleId) return { ok: false, reason: 'task-responsible-missing', taskId };
   if (!createdDate || Number.isNaN(Date.parse(createdDate))) return { ok: false, reason: 'task-created-date-missing', taskId };
   return { ok: true, taskId, responsibleId, createdDate };
@@ -10723,7 +10723,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
 
     const task = await getTask(id);
     if (!task) throw new Error(`Задача ${id} не найдена.`);
-    const eligibility = actsTaskScanArchiveEligibility(task);
+    const eligibility = actsTaskScanArchiveEligibility(task, dependencies.allowedStageIds);
     if (!eligibility.ok) return { ok: false, taskId: id, saved: [], skipped: [], errors: [eligibility.reason] };
 
     const comments = await getComments(id);
@@ -10804,6 +10804,7 @@ async function actsRunTaskScanArchivePoll(trigger = 'interval') {
 }
 
 const ACTS_TASK_SCAN_ARCHIVE_BACKFILL_ALLOWED_MONTHS = new Set(['2026-08', '2026-09']);
+const ACTS_TASK_SCAN_ARCHIVE_BACKFILL_EXPERT_FOLDERS = new Set(['Елизавета', 'Екатерина', 'Ольга', 'Владислав', 'Данила']);
 let actsTaskScanArchiveBackfillRun = null;
 let actsTaskScanArchiveBackfillStatus = {
   state: 'idle', months: [], startedAt: '', finishedAt: '', result: null, error: '',
@@ -10828,34 +10829,45 @@ function actsTaskScanArchiveBackfillRange(month) {
 
 async function actsRunTaskScanArchiveBackfill(monthsRaw) {
   const months = actsTaskScanArchiveBackfillMonths(monthsRaw);
+  const users = await bitrixRestList('user.get', { FILTER: {} }, 500);
+  const expertIds = new Set((users || [])
+    .filter((user) => ACTS_TASK_SCAN_ARCHIVE_BACKFILL_EXPERT_FOLDERS.has(actsResolveExpertFolderName(user)))
+    .map((user) => String(user && (user.ID || user.id) || '').trim())
+    .filter(Boolean));
+  if (!expertIds.size) throw new Error('Не найдены согласованные эксперты для догрузки сканов.');
+  const archiveStageId = await actsResolveArchiveStageId();
+  const stageIds = [...new Set([ACTS_TASK_SCAN_ARCHIVE_STAGE_ID, archiveStageId].filter(Boolean))];
   const tasksById = new Map();
   for (const month of months) {
     const range = actsTaskScanArchiveBackfillRange(month);
-    const tasks = await bitrixRestList('tasks.task.list', {
-      filter: {
-        GROUP_ID: Number(config.actsProjectId),
-        STAGE_ID: ACTS_TASK_SCAN_ARCHIVE_STAGE_ID,
-        '>=CREATED_DATE': range.from,
-        '<CREATED_DATE': range.to,
-      },
-      order: { ID: 'ASC' },
-      select: ['ID', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'CREATED_DATE'],
-    }, 1000);
-    for (const task of tasks || []) {
-      const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
-      if (taskId) tasksById.set(taskId, { taskId, month });
+    for (const stageId of stageIds) {
+      const tasks = await bitrixRestList('tasks.task.list', {
+        filter: {
+          GROUP_ID: Number(config.actsProjectId),
+          STAGE_ID: stageId,
+          '>=CREATED_DATE': range.from,
+          '<CREATED_DATE': range.to,
+        },
+        order: { ID: 'ASC' },
+        select: ['ID', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'CREATED_DATE'],
+      }, 1000);
+      for (const task of tasks || []) {
+        const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
+        const responsibleId = String(actsTaskField(task, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '').trim();
+        if (taskId && expertIds.has(responsibleId)) tasksById.set(taskId, { taskId, month });
+      }
     }
   }
 
   const results = [];
   for (const { taskId, month } of tasksById.values()) {
-    results.push(await actsArchiveTaskScan(taskId, `backfill:${month}`, { latestOnly: true }));
+    results.push(await actsArchiveTaskScan(taskId, `backfill:${month}`, { latestOnly: true, allowedStageIds: stageIds }));
   }
   const saved = results.reduce((count, result) => count + result.saved.length, 0);
   const skipped = results.reduce((count, result) => count + result.skipped.length, 0);
   const errors = results.flatMap((result) => result.errors || []).length;
-  const summary = { months, tasks: results.length, saved, skipped, errors, results };
-  console.log(`[acts-task-scan-archive] backfill months=${months.join(',')}; tasks=${summary.tasks}; saved=${saved}; skipped=${skipped}; errors=${errors}.`);
+  const summary = { months, stages: stageIds, experts: expertIds.size, tasks: results.length, saved, skipped, errors, results };
+  console.log(`[acts-task-scan-archive] backfill months=${months.join(',')}; stages=${stageIds.join(',')}; tasks=${summary.tasks}; saved=${saved}; skipped=${skipped}; errors=${errors}.`);
   return summary;
 }
 
