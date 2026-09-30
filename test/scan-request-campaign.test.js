@@ -28,6 +28,7 @@ test('keeps pending and blocked tasks out of automatic retries', () => {
 
 test('retries only the old ambiguous-contact block after recipient fallback is enabled', () => {
   assert.equal(canRetryScanRequestLegacyRecipientBlock(['В сделке 2 контакта(ов), но не удалось определить последнюю переписку.']), true);
+  assert.equal(canRetryScanRequestLegacyRecipientBlock(['Причина: ambiguous-contact-email.']), true);
   assert.equal(canRetryScanRequestLegacyRecipientBlock(['Причина: act-file-not-found-in-task.']), false);
 });
 

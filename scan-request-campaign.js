@@ -60,7 +60,7 @@ function scanRequestState(comments, taskId) {
 
 function canRetryScanRequestLegacyRecipientBlock(comments) {
   return (comments || []).some((comment) =>
-    /не удалось определить последнюю переписку/i.test(String(comment || ''))
+    /не удалось определить последнюю переписку|ambiguous-(?:contact|company)-email/i.test(String(comment || ''))
   );
 }
 
