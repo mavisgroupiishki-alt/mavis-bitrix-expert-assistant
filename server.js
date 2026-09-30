@@ -15571,6 +15571,9 @@ const ACTS_SCAN_REQUEST_BODY = [
   'Бухгалтерия закрывает месяц и просит нас собрать акты как можно быстрее, будем вам очень благодарны, если ответным письмом отправите скан/фото!',
 ].join('\n');
 const actsScanRequestLocks = new Set();
+// Только для одного живого процесса рассылки: после первого чтения маркера не
+// запрашиваем историю уже завершённой задачи перед каждым следующим пакетом.
+const actsScanRequestResolvedIds = new Set();
 
 function actsScanRequestUserNames(user) {
   const first = String(user && (user.NAME || user.name) || '').trim();
@@ -15912,6 +15915,9 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
     // следующие вызовы увидят durable SENT/BLOCKED/PENDING-маркеры и продолжат очередь.
     for (let index = 0; index < scope.ready.length && eligible.length < max; index += 5) {
       const states = await Promise.all(scope.ready.slice(index, index + 5).map(async (row) => {
+        if (actsScanRequestResolvedIds.has(row.taskId)) {
+          return { row, state: 'resolved-cache', error: '' };
+        }
         try {
           return { row, state: await actsScanRequestReadState(row.task), error: '' };
         } catch (error) {
@@ -15920,10 +15926,20 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         }
       }));
       for (const item of states) {
-        if (item.state === 'ready') eligible.push(item.row);
-        else if (item.state === 'sent') alreadySent.push(item.row);
-        else if (item.state === 'pending') pending.push(item.row);
-        else blocked.push({ ...item.row, reason: item.state, stateError: item.error });
+        if (item.state === 'ready') {
+          if (eligible.length < max) eligible.push(item.row);
+        } else if (item.state === 'sent') {
+          actsScanRequestResolvedIds.add(item.row.taskId);
+          alreadySent.push(item.row);
+        } else if (item.state === 'pending') {
+          actsScanRequestResolvedIds.add(item.row.taskId);
+          pending.push(item.row);
+        } else if (item.state === 'resolved-cache') {
+          alreadySent.push(item.row);
+        } else {
+          if (item.state === 'blocked') actsScanRequestResolvedIds.add(item.row.taskId);
+          blocked.push({ ...item.row, reason: item.state, stateError: item.error });
+        }
       }
     }
 
@@ -15958,6 +15974,11 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
       acc[row.status] = (acc[row.status] || 0) + 1;
       return acc;
     }, {});
+    for (const row of results) {
+      if (row.status === 'sent' || row.status === 'blocked') {
+        actsScanRequestResolvedIds.add(row.taskId);
+      }
+    }
 
     return res.status(counts.failed ? 207 : 200).json({
       ok: !counts.failed,
