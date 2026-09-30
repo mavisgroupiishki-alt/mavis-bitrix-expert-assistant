@@ -15594,7 +15594,6 @@ async function actsScanRequestLoadScope() {
       filter: {
         GROUP_ID: Number(config.actsProjectId),
         '>=CREATED_DATE': '2026-09-01T00:00:00+03:00',
-        '<=CREATED_DATE': '2026-09-30T23:59:59+03:00',
       },
       order: { ID: 'ASC' },
       select: [
@@ -15661,6 +15660,10 @@ async function actsScanRequestLoadScope() {
     }
   }
 
+  console.log(
+    `[scan-request] scope: tasksFetched=${(tasks || []).length}; responsibleUsers=${selectedUserIds.size}; ` +
+    `ready=${ready.length}; excluded=${excluded.length}.`
+  );
   return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
 }
 
