@@ -13,7 +13,7 @@
 - Only project `36` and stage `1480` («СКАН ЕСТЬ») are eligible.
 - Do not move tasks, send client messages, or add CRM comments.
 - Reuse the existing approved expert-folder convention unless the user explicitly authorizes a new hierarchy: `Акты/<year>/Акты_<month>/Акты <expert> <month> <year>`.
-- The month is the task's `CREATED_DATE`; the expert is its `CREATED_BY` (the task's «Постановщик» in this board).
+- The month is the task's `CREATED_DATE`; the expert is its `RESPONSIBLE_ID` (the task's «Ответственный» in this board).
 - Do not add dependencies, expose tokens, or deploy without explicit approval.
 
 ---
@@ -25,15 +25,15 @@
 - Create: `test/acts-task-scan-archive.test.js`
 
 **Interfaces:**
-- Produces: `actsTaskScanArchiveEligibility(task)` returning `{ ok, reason, taskId, creatorId, createdDate }`.
+- Produces: `actsTaskScanArchiveEligibility(task)` returning `{ ok, reason, taskId, responsibleId, createdDate }`.
 - Produces: `actsTaskScanArchiveMarker(taskId, file)` returning a stable marker based on the task and source Disk file/attachment identifier.
 
 - [ ] **Step 1: Write failing tests.**
 
 ```js
 assert.deepEqual(
-  actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' }),
-  { ok: true, taskId: '7', creatorId: '1960', createdDate: '2026-03-12T09:00:00+03:00' },
+  actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' }),
+  { ok: true, taskId: '7', responsibleId: '1960', createdDate: '2026-03-12T09:00:00+03:00' },
 );
 assert.equal(actsTaskScanArchiveEligibility({ ID: '7', GROUP_ID: '36', STAGE_ID: '256' }).ok, false);
 assert.equal(actsTaskScanArchiveMarker('7', { id: '22', name: 'акт.pdf' }), 'MAVIS_ACTS_TASK_SCAN_ARCHIVE task=7 file=22');
@@ -47,7 +47,7 @@ Expected: FAIL because the helpers are not exported.
 
 - [ ] **Step 3: Implement the pure helpers.**
 
-Read `GROUP_ID`, `STAGE_ID`, `CREATED_BY`, `CREATED_DATE`, and `ID` through `actsTaskField`. Return an explicit reason for every rejected task; do not infer the author from a linked CRM deal.
+Read `GROUP_ID`, `STAGE_ID`, `RESPONSIBLE_ID`, `CREATED_DATE`, and `ID` through `actsTaskField`. Return an explicit reason for every rejected task; do not infer the expert from a linked CRM deal.
 
 - [ ] **Step 4: Run the focused test and confirm it passes.**
 
@@ -69,7 +69,7 @@ Expected: PASS.
 
 ```js
 const result = await actsArchiveTaskScan('7', 'test', {
-  getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' }),
+  getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', RESPONSIBLE_ID: '1960', CREATED_DATE: '2026-03-12T09:00:00+03:00' }),
   getUser: async () => ({ ID: '1960', NAME: 'Елизавета', LAST_NAME: 'Горбатова' }),
   resolveFiles: async () => ({ files: [{ id: '22', name: 'акт.pdf', url: 'https://example.test/act.pdf' }] }),
   download: async () => ({ buffer: Buffer.from('pdf'), fileName: 'акт.pdf', contentType: 'application/pdf' }),
@@ -82,7 +82,7 @@ assert.equal(result.folder, 'Акты Елизавета март 2026');
 
 - [ ] **Step 2: Implement minimal archive flow.**
 
-Load the task with the fields required by `actsResolveTaskFiles`; reject a non-eligible task before resolving files. Resolve every actual file (not `task-name-only`), download its bytes using the current safe file downloader, create/use the expert folder from `CREATED_DATE` and `CREATED_BY`, then call `uploadFileToDiskFolder`. Record stable duplicate markers in the task only after the specific upload succeeds, so retries do not copy the same source file again.
+Load the task with the fields required by `actsResolveTaskFiles`; reject a non-eligible task before resolving files. Resolve every actual file (not `task-name-only`), download its bytes using the current safe file downloader, create/use the expert folder from `CREATED_DATE` and `RESPONSIBLE_ID`, then call `uploadFileToDiskFolder`. Record stable duplicate markers in the task only after the specific upload succeeds, so retries do not copy the same source file again.
 
 - [ ] **Step 3: Add failure-path tests.**
 

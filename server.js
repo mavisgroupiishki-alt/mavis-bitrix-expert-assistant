@@ -10627,9 +10627,8 @@ async function actsGetExpertActFolder(deal, periodDate = '', expertFolderOverrid
   return { expertFolderId, expertFolder, monthFolderName, year, user };
 }
 
-// Скан из задачи должен попадать в папку автора задачи («Постановщик»), а не
-// ответственного по CRM-сделке: в проекте «Акты Счета» исполнителем обычно
-// выступает сотрудник бэк-офиса.
+// Скан из задачи должен попадать в папку её ответственного эксперта. Это не
+// ответственный по CRM-сделке и не постановщик задачи.
 const ACTS_TASK_SCAN_ARCHIVE_STAGE_ID = '1480';
 const ACTS_TASK_SCAN_ARCHIVE_MARKER = '[MAVIS_ACTS_TASK_SCAN_ARCHIVE]';
 const ACTS_TASK_SCAN_ARCHIVE_INITIAL_LOOKBACK_MS = 10 * 60 * 1000;
@@ -10642,15 +10641,15 @@ function actsTaskScanArchiveEligibility(task) {
   const taskId = String(actsTaskField(task, ['id', 'ID']) || '').trim();
   const groupId = String(actsTaskField(task, ['groupId', 'GROUP_ID', 'group_id']) || '').trim();
   const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '').trim();
-  const creatorId = String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'created_by', 'createdById', 'CREATED_BY_ID']) || '').trim();
+  const responsibleId = String(actsTaskField(task, ['responsibleId', 'RESPONSIBLE_ID', 'responsible_id']) || '').trim();
   const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '').trim();
 
   if (!taskId) return { ok: false, reason: 'task-id-missing' };
   if (groupId !== String(config.actsProjectId)) return { ok: false, reason: 'outside-acts-project', taskId, groupId };
   if (stageId !== ACTS_TASK_SCAN_ARCHIVE_STAGE_ID) return { ok: false, reason: 'outside-scan-stage', taskId, stageId };
-  if (!creatorId) return { ok: false, reason: 'task-creator-missing', taskId };
+  if (!responsibleId) return { ok: false, reason: 'task-responsible-missing', taskId };
   if (!createdDate || Number.isNaN(Date.parse(createdDate))) return { ok: false, reason: 'task-created-date-missing', taskId };
-  return { ok: true, taskId, creatorId, createdDate };
+  return { ok: true, taskId, responsibleId, createdDate };
 }
 
 function actsTaskScanArchiveMarker(taskId, file) {
@@ -10665,15 +10664,15 @@ function actsTaskScanArchiveCommentText(comment) {
   ) || '');
 }
 
-async function actsGetTaskAuthorActFolder(creatorId, createdDate) {
-  const userRows = await bitrixRestCall('user.get', { ID: Number(creatorId) });
+async function actsGetTaskResponsibleActFolder(responsibleId, createdDate) {
+  const userRows = await bitrixRestCall('user.get', { ID: Number(responsibleId) });
   const user = Array.isArray(userRows) ? userRows[0] : userRows;
   const expertFolder = actsResolveExpertFolderName(user);
   if (!expertFolder) {
-    const expertHuman = `${user && (user.LAST_NAME || user.lastName) || ''} ${user && (user.NAME || user.name) || ''}`.trim() || `ID ${creatorId}`;
-    throw new Error(`Автор задачи «${expertHuman}» не сопоставлен с папками актов.`);
+    const expertHuman = `${user && (user.LAST_NAME || user.lastName) || ''} ${user && (user.NAME || user.name) || ''}`.trim() || `ID ${responsibleId}`;
+    throw new Error(`Ответственный задачи «${expertHuman}» не сопоставлен с папками актов.`);
   }
-  return actsGetExpertActFolder({ ASSIGNED_BY_ID: String(creatorId) }, createdDate, expertFolder);
+  return actsGetExpertActFolder({ ASSIGNED_BY_ID: String(responsibleId) }, createdDate, expertFolder);
 }
 
 async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependencies = {}) {
@@ -10687,7 +10686,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
       const raw = await bitrixRestCall('tasks.task.get', {
         taskId: Number(id),
         select: [
-          'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY', 'CREATED_DATE',
+          'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'CREATED_DATE',
           'CHANGED_DATE', 'CHAT_ID', 'UF_TASK_WEBDAV_FILES', 'UF_CRM_TASK',
         ],
       });
@@ -10695,7 +10694,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     });
     const resolveFiles = dependencies.resolveFiles || actsResolveTaskFiles;
     const download = dependencies.download || actsDownloadRealFile;
-    const getFolder = dependencies.getFolder || actsGetTaskAuthorActFolder;
+    const getFolder = dependencies.getFolder || actsGetTaskResponsibleActFolder;
     const upload = dependencies.upload || uploadFileToDiskFolder;
     const getComments = dependencies.getComments || docReturnGetTaskCommentRows;
     const addComment = dependencies.addComment || docReturnAddTaskComment;
@@ -10724,7 +10723,7 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     for (const file of pending) {
       const fileName = String(file.name || `файл ${file.id || file.attachedId}`).trim();
       try {
-        if (!folder) folder = await getFolder(eligibility.creatorId, eligibility.createdDate);
+        if (!folder) folder = await getFolder(eligibility.responsibleId, eligibility.createdDate);
         if (!folder || !folder.expertFolderId) throw new Error('Не найдена папка эксперта на Битрикс Диске.');
         const downloaded = await download(file);
         if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) throw new Error('Не удалось получить содержимое файла.');
@@ -10762,7 +10761,7 @@ async function actsRunTaskScanArchivePoll(trigger = 'interval') {
         '>=CHANGED_DATE': since,
       },
       order: { ID: 'ASC' },
-      select: ['ID', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY', 'CREATED_DATE', 'CHANGED_DATE'],
+      select: ['ID', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'CREATED_DATE', 'CHANGED_DATE'],
     }, 200);
     const results = [];
     for (const task of tasks || []) {
