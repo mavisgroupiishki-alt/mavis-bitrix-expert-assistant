@@ -15919,7 +15919,10 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
     const alreadySent = [];
     const pending = [];
     const blocked = [];
-    for (let index = 0; index < scope.ready.length; index += 5) {
+    // Не читаем историю комментариев всех 51 задач до первого письма: Bitrix
+    // медленно отвечает на task-chat. Проверяем только пока не набран текущий пакет;
+    // следующие вызовы увидят durable SENT/BLOCKED/PENDING-маркеры и продолжат очередь.
+    for (let index = 0; index < scope.ready.length && eligible.length < max; index += 5) {
       const states = await Promise.all(scope.ready.slice(index, index + 5).map(async (row) => {
         try {
           return { row, state: await actsScanRequestReadState(row.task), error: '' };
@@ -15948,11 +15951,11 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         pending: pending.map((row) => ({ taskId: row.taskId, title: row.title })),
         blocked: blocked.map((row) => ({ taskId: row.taskId, title: row.title, reason: row.reason || 'blocked' })),
         excluded: scope.excluded.map((row) => ({ taskId: row.taskId, title: row.title, reason: row.reason })),
-        next: eligible.slice(0, max).map((row) => ({ taskId: row.taskId, title: row.title, stage: row.stageTitle })),
+        next: eligible.map((row) => ({ taskId: row.taskId, title: row.title, stage: row.stageTitle })),
       });
     }
 
-    const selected = eligible.slice(0, max);
+    const selected = eligible;
     const results = [];
     let consecutiveFailures = 0;
     for (let index = 0; index < selected.length; index += 3) {
@@ -15972,7 +15975,7 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
       ok: !counts.failed,
       dryRun: false,
       selected: selected.length,
-      remainingBeforeRun: Math.max(0, eligible.length - results.length),
+      remainingUnknown: 'Очередь продолжится в следующем пакете; задачи после текущего окна не сканировались заранее.',
       stoppedAfterConsecutiveFailures: consecutiveFailures >= 3,
       counts,
       results,
