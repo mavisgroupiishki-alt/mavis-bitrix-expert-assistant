@@ -10770,7 +10770,10 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
       }
     }
 
-    console.log(`[acts-task-scan-archive] task=${id}; source=${source}; saved=${saved.length}; skipped=${skipped.length}; errors=${errors.length}; folder=${folder && folder.expertFolder || '-'}.`);
+    const errorSummary = errors.length
+      ? `; error-details=${errors.map(({ fileName, error }) => `${fileName}: ${error}`).join(' | ')}`
+      : '';
+    console.log(`[acts-task-scan-archive] task=${id}; source=${source}; saved=${saved.length}; skipped=${skipped.length}; errors=${errors.length}; folder=${folder && folder.expertFolder || '-'}${errorSummary}.`);
     return { ok: errors.length === 0, taskId: id, folder: folder && folder.expertFolder || '', saved, skipped, errors };
   } finally {
     actsTaskScanArchiveLocks.delete(id);
