@@ -10753,10 +10753,29 @@ async function actsArchiveTaskScan(taskId, source = 'task-scan-poll', dependenci
     const errors = [];
     let folder = null;
 
+    // Задачи на стадии «Скан есть» иногда создаёт бухгалтерия или менеджер,
+    // а не эксперт. Не отправляем их вложения в произвольную папку и не
+    // создаём одну и ту же ошибку на каждом цикле опроса.
+    if (pending.length) {
+      try {
+        folder = await getFolder(eligibility.creatorId, eligibility.createdDate);
+      } catch (error) {
+        const message = error && (error.message || String(error)) || '';
+        if (/не сопоставлен с папками актов/i.test(message)) {
+          const unsorted = pending.map((file) => ({
+            fileName: String(file.name || `файл ${file.id || file.attachedId}`).trim(),
+            reason: 'creator-folder-unmapped',
+          }));
+          console.warn(`[acts-task-scan-archive] task=${id}; source=${source}; saved=0; skipped=${skipped.length + unsorted.length}; errors=0; reason=${message}.`);
+          return { ok: true, taskId: id, folder: '', saved, skipped: [...skipped, ...unsorted], errors: [] };
+        }
+        throw error;
+      }
+    }
+
     for (const file of pending) {
       const fileName = String(file.name || `файл ${file.id || file.attachedId}`).trim();
       try {
-        if (!folder) folder = await getFolder(eligibility.creatorId, eligibility.createdDate);
         if (!folder || !folder.expertFolderId) throw new Error('Не найдена папка эксперта на Битрикс Диске.');
         const downloaded = await download(file);
         if (!downloaded || !downloaded.buffer || !downloaded.buffer.length) throw new Error('Не удалось получить содержимое файла.');

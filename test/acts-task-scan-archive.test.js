@@ -98,6 +98,21 @@ test('archives every real task attachment once and uses the task creation date f
   assert.match(comments[1], /task=7 file=n23/);
 });
 
+test('skips a non-expert creator instead of retrying the same attachments forever', async () => {
+  const { actsArchiveTaskScan } = archiveHelpers();
+  const result = await actsArchiveTaskScan('7', 'test', {
+    getTask: async () => ({ ID: '7', GROUP_ID: '36', STAGE_ID: '1480', CREATED_BY: '1960', CREATED_DATE: '2026-03-12' }),
+    resolveFiles: async () => ({ files: [{ id: '22', name: 'scan.pdf', url: 'https://mavisgroup.bitrix24.by/download/22' }] }),
+    getFolder: async () => { throw new Error('Постановщик задачи «Ирина» не сопоставлен с папками актов.'); },
+    download: async () => { throw new Error('must not download without an expert folder'); },
+    getComments: async () => [],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(JSON.stringify(result.saved), '[]');
+  assert.equal(JSON.stringify(result.errors), '[]');
+  assert.equal(JSON.stringify(result.skipped), JSON.stringify([{ fileName: 'scan.pdf', reason: 'creator-folder-unmapped' }]));
+});
+
 test('skips an attachment that already has an archive marker', async () => {
   const { actsArchiveTaskScan } = archiveHelpers();
   const result = await actsArchiveTaskScan('7', 'test', {
