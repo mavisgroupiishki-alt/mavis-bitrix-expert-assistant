@@ -14358,6 +14358,9 @@ const DOC_RETURN_MAX_CHECKS_PER_CYCLE = Math.max(
 );
 // Temporary SMTP/REST failures retry later; data failures go straight to «Ручная отправка».
 const DOC_RETURN_ERROR_COOLDOWN_MINUTES = Math.max(5, Math.min(30, Number(process.env.DOC_RETURN_ERROR_COOLDOWN_MINUTES || 15)));
+// Один короткий повтор только для безопасного чтения задачи. Это закрывает
+// редкие сетевые обрывы Bitrix без повторной отправки клиентского письма.
+const DOC_RETURN_TASK_READ_RETRIES = Math.max(0, Math.min(2, Number(process.env.DOC_RETURN_TASK_READ_RETRIES || 1)));
 // v106: one sender only — server polling. Bitrix robots/webhooks cannot trigger a second send.
 const DOC_RETURN_ALLOW_WEBHOOK = false;
 const DOC_RETURN_CONCURRENCY = Math.max(3, Math.min(5, Number(process.env.DOC_RETURN_CONCURRENCY || 3)));
@@ -14921,25 +14924,46 @@ async function docReturnResolveStages(force = false) {
   return docReturnStageCache;
 }
 
-async function docReturnLoadTask(taskId) {
-  const raw = await bitrixRestCall('tasks.task.get', {
-    taskId: Number(taskId),
-    select: [
-      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
-      'RESPONSIBLE_ID', 'CREATED_BY', 'CREATED_DATE', 'CHANGED_DATE',
-      'DEADLINE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
-    ],
-  });
-  const task = raw && (raw.task || raw.TASK || raw);
-  if (!task) throw new Error(`Задача ${taskId} не найдена.`);
+function docReturnIsTransientRestReadError(error) {
+  const text = String(error && (error.message || error) || '');
+  return /\bfetch failed\b|\bECONNRESET\b|\bECONNREFUSED\b|\bEAI_AGAIN\b|\bETIMEDOUT\b|\bAbortError\b|\bHTTP (?:429|5\d\d)\b/i.test(text);
+}
 
-  const groupId = String(docReturnTaskValue(task, ['groupId', 'GROUP_ID', 'group_id']) || '');
-  if (groupId !== DOC_RETURN_PROJECT_ID) {
-    throw new Error(
-      `Защитный стоп: задача ${taskId} не из проекта ${DOC_RETURN_PROJECT_ID} (GROUP_ID=${groupId || 'пусто'}).`
-    );
+async function docReturnLoadTask(taskId, options = {}) {
+  const call = options.call || bitrixRestCall;
+  const wait = options.wait || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const retries = Math.max(0, Number(options.transientRetries ?? DOC_RETURN_TASK_READ_RETRIES));
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const raw = await call('tasks.task.get', {
+        taskId: Number(taskId),
+        select: [
+          'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'STATUS', 'REAL_STATUS',
+          'RESPONSIBLE_ID', 'CREATED_BY', 'CREATED_DATE', 'CHANGED_DATE',
+          'DEADLINE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+        ],
+      });
+      const task = raw && (raw.task || raw.TASK || raw);
+      if (!task) throw new Error(`Задача ${taskId} не найдена.`);
+
+      const groupId = String(docReturnTaskValue(task, ['groupId', 'GROUP_ID', 'group_id']) || '');
+      if (groupId !== DOC_RETURN_PROJECT_ID) {
+        throw new Error(
+          `Защитный стоп: задача ${taskId} не из проекта ${DOC_RETURN_PROJECT_ID} (GROUP_ID=${groupId || 'пусто'}).`
+        );
+      }
+      return task;
+    } catch (error) {
+      if (attempt >= retries || !docReturnIsTransientRestReadError(error)) throw error;
+      const delayMs = 750 * (attempt + 1);
+      console.warn(
+        `[doc-return] task=${taskId}: временный сбой чтения Bitrix; ` +
+        `повтор ${attempt + 1}/${retries} через ${delayMs} мс: ${error.message || error}`
+      );
+      await wait(delayMs);
+    }
   }
-  return task;
 }
 
 async function docReturnLoadBasicContext(taskId, task = null) {
