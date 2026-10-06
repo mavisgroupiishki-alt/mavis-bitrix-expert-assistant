@@ -15662,8 +15662,7 @@ async function actsScanRequestLoadScope() {
       },
       order: { ID: 'ASC' },
       select: [
-        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'ASSIGNED_BY_ID',
-        'CREATED_DATE', 'CHANGED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+        '*', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
       ],
     }, 1000),
   ]);
@@ -15735,8 +15734,7 @@ async function actsScanRequestLoadTask(taskId) {
   const raw = await bitrixRestCall('tasks.task.get', {
     taskId: Number(taskId),
     select: [
-      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'ASSIGNED_BY_ID',
-      'CREATED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
+      '*', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
     ],
   });
   const task = raw && (raw.task || raw.TASK || raw);
