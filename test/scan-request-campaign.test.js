@@ -70,6 +70,8 @@ test('uses the task responsible, not its creator, for the campaign scope', () =>
   assert.equal(scanRequestResponsibleId({ responsibleId: 42, createdBy: 7 }), '42');
   assert.equal(scanRequestResponsibleId({ RESPONSIBLE_ID: '43', CREATED_BY: '7' }), '43');
   assert.equal(scanRequestResponsibleId({ ASSIGNED_BY_ID: '44', CREATED_BY: '7' }), '44');
+  assert.equal(scanRequestResponsibleId({ ResponsibleId: '45', CREATED_BY: '7' }), '45');
+  assert.equal(scanRequestResponsibleId({ responsible: { id: '46' }, CREATED_BY: '7' }), '46');
   assert.equal(scanRequestResponsibleId({ CREATED_BY: '7' }), '');
 });
 

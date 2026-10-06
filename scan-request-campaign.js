@@ -35,14 +35,21 @@ function scanRequestStageTitle(stageTitles, stageId) {
 
 function scanRequestResponsibleId(task) {
   if (!task || typeof task !== 'object') return '';
-  const fields = [
-    'responsibleId', 'RESPONSIBLE_ID', 'responsible_id',
-    'assignedById', 'ASSIGNED_BY_ID', 'assigned_by_id',
-  ];
-  for (const field of fields) {
-    if (task[field] !== undefined && task[field] !== null && String(task[field]).trim()) {
-      return String(task[field]).trim();
+  const fields = new Set([
+    'responsibleid', 'responsible_id', 'assignedbyid', 'assigned_by_id',
+  ]);
+  for (const [field, value] of Object.entries(task)) {
+    if (fields.has(String(field).toLowerCase()) && value !== undefined && value !== null && String(value).trim()) {
+      return String(value).trim();
     }
+  }
+  for (const [field, value] of Object.entries(task)) {
+    if (!['responsible', 'assignedby', 'assigned_by'].includes(String(field).toLowerCase())) continue;
+    if (value && typeof value === 'object') {
+      const id = value.id || value.ID || value.userId || value.USER_ID;
+      if (id !== undefined && id !== null && String(id).trim()) return String(id).trim();
+    }
+    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
   }
   return '';
 }
