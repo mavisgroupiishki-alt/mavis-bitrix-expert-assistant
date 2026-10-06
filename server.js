@@ -15771,33 +15771,19 @@ function actsScanRequestCommentText(comment) {
 
 async function actsScanRequestReadState(task) {
   const taskId = actsScanRequestTaskId(task);
+  // Запрашиваем только служебные метки именно этой рассылки. Полная история
+  // комментариев/чата некоторых старых задач отвечает дольше минуты и не нужна
+  // для решения о повторной отправке.
   const raw = await bitrixRestCall('task.commentitem.getlist', {
-    TASKID: Number(taskId), ORDER: { ID: 'DESC' }, FILTER: {},
-  });
-  const rows = Array.isArray(raw) ? raw : (raw && (raw.items || raw.result) || []);
+    TASKID: Number(taskId), ORDER: { ID: 'DESC' }, FILTER: { '%POST_MESSAGE': '[MAVIS_SCAN_REQUEST' },
+  }, { timeoutMs: 15000 });
+  const rows = Array.isArray(raw)
+    ? raw
+    : (raw && (raw.items || raw.result) || Object.values(raw || {}).filter((row) => row && typeof row === 'object'));
   const comments = Array.isArray(rows) ? rows.map(actsScanRequestCommentText).filter(Boolean) : [];
   let state = scanRequestState(comments, taskId);
   if (state === 'blocked' && canRetryScanRequestLegacyRecipientBlock(comments)) state = 'ready';
-  if (state !== 'ready') return state;
-
-  const chatId = String(actsTaskField(task, ['chatId', 'CHAT_ID', 'chat_id']) || '').trim();
-  if (!chatId) return state;
-  const dialog = await bitrixRestCall('im.dialog.messages.get', { DIALOG_ID: `chat${chatId}`, LIMIT: 100 });
-  const messages = (dialog && (dialog.messages || dialog.MESSAGES)) || [];
-  state = scanRequestState((messages || []).map(actsScanRequestCommentText), taskId);
-  if (state !== 'ready') return state;
-
-  // Если task.commentitem.add ранее перешёл на fallback в чат, тот же SENT-marker
-  // сохраняется в timeline сделки. Это не даёт ему «исчезнуть» после 100 новых сообщений.
-  const dealIds = actsExtractDealIdsFromTask(task);
-  if (dealIds.length !== 1) return state;
-  const timeline = await bitrixRestList('crm.timeline.comment.list', {
-    filter: { ENTITY_ID: dealIds[0], ENTITY_TYPE: 'deal' },
-    order: { ID: 'DESC' }, select: ['ID', 'COMMENT'],
-  }, 100);
-  return timeline.some((comment) => String(comment && comment.COMMENT || '').includes(scanRequestSentMarker(taskId)))
-    ? 'sent'
-    : state;
+  return state;
 }
 
 function actsScanRequestExternalEmails(entity) {
