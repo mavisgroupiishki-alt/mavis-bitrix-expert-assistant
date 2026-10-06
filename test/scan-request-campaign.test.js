@@ -8,6 +8,7 @@ const {
   isScanRequestExcludedStage,
   isScanRequestSeptember2026,
   scanRequestSentMarker,
+  scanRequestResponsibleId,
   scanRequestStageTitle,
   scanRequestState,
   selectScanRequestActFile,
@@ -63,6 +64,13 @@ test('looks up a freshly loaded stage without crashing when stage metadata is ab
   const stages = new Map([['1480', 'Архив']]);
   assert.equal(scanRequestStageTitle(stages, '1480'), 'Архив');
   assert.equal(scanRequestStageTitle(undefined, '1480'), '');
+});
+
+test('uses the task responsible, not its creator, for the campaign scope', () => {
+  assert.equal(scanRequestResponsibleId({ responsibleId: 42, createdBy: 7 }), '42');
+  assert.equal(scanRequestResponsibleId({ RESPONSIBLE_ID: '43', CREATED_BY: '7' }), '43');
+  assert.equal(scanRequestResponsibleId({ ASSIGNED_BY_ID: '44', CREATED_BY: '7' }), '44');
+  assert.equal(scanRequestResponsibleId({ CREATED_BY: '7' }), '');
 });
 
 test('recognizes only the dedicated scan-request success marker', () => {

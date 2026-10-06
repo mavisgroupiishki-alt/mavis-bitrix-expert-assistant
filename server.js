@@ -38,7 +38,7 @@ const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromVal
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
-const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestResponsibleId, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 
 const app = express();
@@ -15618,7 +15618,7 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
 
 // Разовая сентябрьская рассылка запроса подписанных сканов. Это отдельный контур:
 // он не использует маркеры первичной отправки акта и не меняет Kanban-стадии.
-const ACTS_SCAN_REQUEST_AUTHORS = [
+const ACTS_SCAN_REQUEST_RESPONSIBLES = [
   ['екатерина николаева'],
   ['елизавета горбатова'],
   ['иоланта кананович'],
@@ -15628,19 +15628,9 @@ const ACTS_SCAN_REQUEST_AUTHORS = [
   ['даниил кацен', 'данила канцен'],
   ['владислав климков'],
 ];
-const ACTS_SCAN_REQUEST_AUTHOR_NAMES = new Set(ACTS_SCAN_REQUEST_AUTHORS.flat());
-const ACTS_SCAN_REQUEST_PILOT_TASK_IDS = new Set(
-  String(process.env.ACTS_SCAN_REQUEST_PILOT_TASK_IDS || '49736')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
-);
+const ACTS_SCAN_REQUEST_RESPONSIBLE_NAMES = new Set(ACTS_SCAN_REQUEST_RESPONSIBLES.flat());
 const ACTS_SCAN_REQUEST_SUBJECT = 'Акт выполненных работ';
-const ACTS_SCAN_REQUEST_BODY = [
-  'Добрый день! Очень очень просим прислать вам скан/фото подписанного с вашей стороны акта выполненных работ, мы прикрепили его ниже во вложении.',
-  '',
-  'Бухгалтерия закрывает месяц и просит нас собрать акты как можно быстрее, будем вам очень благодарны, если ответным письмом отправите скан/фото!',
-].join('\n');
+const ACTS_SCAN_REQUEST_BODY = 'Добрый день! Так и не получили от вас скан/фото акта выполненных работ.. Может получится прислать его сегодня? Бухгалтерия очень требует, будем очень благодарны!';
 const actsScanRequestLocks = new Set();
 // Только для одного живого процесса рассылки: после первого чтения маркера не
 // запрашиваем историю уже завершённой задачи перед каждым следующим пакетом.
@@ -15668,10 +15658,11 @@ async function actsScanRequestLoadScope() {
       filter: {
         GROUP_ID: Number(config.actsProjectId),
         '>=CREATED_DATE': '2026-09-01T00:00:00+03:00',
+        '<CREATED_DATE': '2026-10-01T00:00:00+03:00',
       },
       order: { ID: 'ASC' },
       select: [
-        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY',
+        'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'ASSIGNED_BY_ID',
         'CREATED_DATE', 'CHANGED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
       ],
     }, 1000),
@@ -15680,19 +15671,19 @@ async function actsScanRequestLoadScope() {
   const selectedUserIds = new Set();
   for (const user of users || []) {
     const id = String(user && (user.ID || user.id) || '').trim();
-    if (id && actsScanRequestUserNames(user).some((name) => ACTS_SCAN_REQUEST_AUTHOR_NAMES.has(name))) {
+    if (id && actsScanRequestUserNames(user).some((name) => ACTS_SCAN_REQUEST_RESPONSIBLE_NAMES.has(name))) {
       selectedUserIds.add(id);
     }
   }
 
-  if (selectedUserIds.size < ACTS_SCAN_REQUEST_AUTHORS.length) {
+  if (selectedUserIds.size < ACTS_SCAN_REQUEST_RESPONSIBLES.length) {
     const found = new Set();
     for (const user of users || []) {
       for (const name of actsScanRequestUserNames(user)) {
-        if (ACTS_SCAN_REQUEST_AUTHOR_NAMES.has(name)) found.add(name);
+        if (ACTS_SCAN_REQUEST_RESPONSIBLE_NAMES.has(name)) found.add(name);
       }
     }
-    const missing = ACTS_SCAN_REQUEST_AUTHORS
+    const missing = ACTS_SCAN_REQUEST_RESPONSIBLES
       .filter((variants) => !variants.some((name) => found.has(name)))
       .map((variants) => variants[0]);
     throw new Error(`Не найдены сотрудники кампании: ${missing.join(', ') || 'неизвестно'}. Рассылка не начата.`);
@@ -15709,26 +15700,24 @@ async function actsScanRequestLoadScope() {
   const excluded = [];
   for (const task of tasks || []) {
     const taskId = actsScanRequestTaskId(task);
-    const createdBy = String(actsTaskField(task, ['createdBy', 'CREATED_BY', 'created_by']) || '').trim();
+    const responsibleId = scanRequestResponsibleId(task);
     const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
     const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
     const stageTitle = stageTitles.get(stageId) || '';
 
-    if (!taskId || !selectedUserIds.has(createdBy) || !isScanRequestSeptember2026(createdDate)) continue;
+    if (!taskId || !selectedUserIds.has(responsibleId) || !isScanRequestSeptember2026(createdDate)) continue;
     const row = {
       taskId,
       title: String(actsTaskField(task, ['title', 'TITLE']) || ''),
       task,
-      createdBy,
+      responsibleId,
       selectedUserIds,
       createdDate,
       stageId,
       stageTitle,
       stageTitles,
     };
-    if (ACTS_SCAN_REQUEST_PILOT_TASK_IDS.has(taskId)) {
-      excluded.push({ ...row, reason: 'pilot-already-sent' });
-    } else if (isScanRequestExcludedStage(stageTitle)) {
+    if (isScanRequestExcludedStage(stageTitle)) {
       excluded.push({ ...row, reason: 'stage-excluded' });
     } else {
       ready.push(row);
@@ -15736,7 +15725,7 @@ async function actsScanRequestLoadScope() {
   }
 
   console.log(
-    `[scan-request] scope: tasksFetched=${(tasks || []).length}; authorUsers=${selectedUserIds.size}; ` +
+    `[scan-request] scope: tasksFetched=${(tasks || []).length}; responsibleUsers=${selectedUserIds.size}; ` +
     `ready=${ready.length}; excluded=${excluded.length}.`
   );
   return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
@@ -15746,7 +15735,7 @@ async function actsScanRequestLoadTask(taskId) {
   const raw = await bitrixRestCall('tasks.task.get', {
     taskId: Number(taskId),
     select: [
-      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'CREATED_BY',
+      'ID', 'TITLE', 'DESCRIPTION', 'GROUP_ID', 'STAGE_ID', 'RESPONSIBLE_ID', 'ASSIGNED_BY_ID',
       'CREATED_DATE', 'CHAT_ID', 'UF_CRM_TASK', 'UF_TASK_WEBDAV_FILES',
     ],
   });
@@ -15841,8 +15830,8 @@ async function actsScanRequestPrepareContext(row) {
     return { blocked: true, reason: 'stage-excluded-after-selection' };
   }
 
-  const createdBy = String(actsTaskField(freshTask, ['createdBy', 'CREATED_BY', 'created_by']) || '');
-  if (!row.selectedUserIds.has(createdBy)) return { blocked: true, reason: 'author-changed-after-selection' };
+  const responsibleId = scanRequestResponsibleId(freshTask);
+  if (!row.selectedUserIds.has(responsibleId)) return { blocked: true, reason: 'responsible-changed-after-selection' };
   const createdDate = String(actsTaskField(freshTask, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
   if (!isScanRequestSeptember2026(createdDate)) return { blocked: true, reason: 'created-date-outside-september-2026' };
 
@@ -16019,7 +16008,7 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         ok: true,
         dryRun: true,
         projectId: config.actsProjectId,
-        scope: 'September 2026; six approved task authors; except Archive and Scan exists',
+        scope: 'September 2026; six approved task responsibles; except Archive and Scan exists',
         found: scope.ready.length + scope.excluded.length,
         eligible: eligible.length,
         alreadySent: alreadySent.length,

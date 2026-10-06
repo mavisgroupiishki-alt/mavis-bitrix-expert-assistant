@@ -33,6 +33,20 @@ function scanRequestStageTitle(stageTitles, stageId) {
   return stageTitles instanceof Map ? String(stageTitles.get(String(stageId || '')) || '') : '';
 }
 
+function scanRequestResponsibleId(task) {
+  if (!task || typeof task !== 'object') return '';
+  const fields = [
+    'responsibleId', 'RESPONSIBLE_ID', 'responsible_id',
+    'assignedById', 'ASSIGNED_BY_ID', 'assigned_by_id',
+  ];
+  for (const field of fields) {
+    if (task[field] !== undefined && task[field] !== null && String(task[field]).trim()) {
+      return String(task[field]).trim();
+    }
+  }
+  return '';
+}
+
 function scanRequestSentMarker(taskId) {
   return `${SCAN_REQUEST_SENT_MARKER} task=${String(taskId || '').trim()}`;
 }
@@ -95,6 +109,7 @@ module.exports = {
   normalizeScanRequestText,
   scanRequestBlockedMarker,
   scanRequestPendingMarker,
+  scanRequestResponsibleId,
   scanRequestStageTitle,
   scanRequestState,
   scanRequestSentMarker,
