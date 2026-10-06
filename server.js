@@ -414,6 +414,7 @@ async function bitrixRestCall(method, params = {}, options = {}) {
   const controller = timeoutMs > 0 ? new AbortController() : null;
   const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   let response;
+  let data;
   try {
     response = await fetch(`${config.bitrixWebhookUrl}/${method}.json`, {
       method: 'POST',
@@ -421,10 +422,12 @@ async function bitrixRestCall(method, params = {}, options = {}) {
       body: JSON.stringify(params),
       signal: controller ? controller.signal : undefined,
     });
+    // AbortController должен защищать не только ожидание заголовков, но и
+    // чтение тела ответа. Иначе зависший большой ответ Bitrix обходил timeout.
+    data = await response.json().catch(() => ({}));
   } finally {
     if (timeout) clearTimeout(timeout);
   }
-  const data = await response.json().catch(() => ({}));
   if (!response.ok || data.error) {
     const msg = data && (data.error_description || data.error) ? `${data.error}: ${data.error_description || ''}` : `HTTP ${response.status}`;
     throw new Error(`Bitrix REST ${method}: ${msg}`);
