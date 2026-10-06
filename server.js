@@ -15970,6 +15970,9 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
   // прошлые попытки были dry-run, но история комментариев некоторых старых задач
   // не отвечает. После первой отправки остаются PENDING/SENT-маркеры.
   const initialRun = execute && req.body && req.body.initialRun === true;
+  const skipTaskIds = new Set(Array.isArray(req.body && req.body.skipTaskIds)
+    ? req.body.skipTaskIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : []);
   const requestedMax = Number(req.body && req.body.max);
   const max = Number.isFinite(requestedMax) ? Math.max(1, Math.min(Math.floor(requestedMax), 10)) : 10;
 
@@ -16026,7 +16029,11 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         }
       }
     }
-    if (initialRun) eligible.push(...scope.ready.slice(0, max));
+    if (initialRun) {
+      eligible.push(...scope.ready
+        .filter((row) => !skipTaskIds.has(row.taskId) && !actsScanRequestResolvedIds.has(row.taskId))
+        .slice(0, max));
+    }
 
     if (!execute) {
       return res.json({
