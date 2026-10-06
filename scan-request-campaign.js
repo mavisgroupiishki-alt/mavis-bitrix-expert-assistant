@@ -33,18 +33,18 @@ function scanRequestStageTitle(stageTitles, stageId) {
   return stageTitles instanceof Map ? String(stageTitles.get(String(stageId || '')) || '') : '';
 }
 
-function scanRequestResponsibleId(task) {
+function scanRequestCreatorId(task) {
   if (!task || typeof task !== 'object') return '';
   const fields = new Set([
-    'responsibleid', 'responsible_id', 'assignedbyid', 'assigned_by_id',
+    'createdby', 'created_by', 'createdbyid', 'created_by_id',
   ]);
   for (const [field, value] of Object.entries(task)) {
-    if (fields.has(String(field).toLowerCase()) && value !== undefined && value !== null && String(value).trim()) {
+    if (fields.has(String(field).toLowerCase()) && value !== undefined && value !== null && typeof value !== 'object' && String(value).trim()) {
       return String(value).trim();
     }
   }
   for (const [field, value] of Object.entries(task)) {
-    if (!['responsible', 'assignedby', 'assigned_by'].includes(String(field).toLowerCase())) continue;
+    if (!['createdby', 'created_by', 'creator'].includes(String(field).toLowerCase())) continue;
     if (value && typeof value === 'object') {
       const id = value.id || value.ID || value.userId || value.USER_ID;
       if (id !== undefined && id !== null && String(id).trim()) return String(id).trim();
@@ -116,7 +116,7 @@ module.exports = {
   normalizeScanRequestText,
   scanRequestBlockedMarker,
   scanRequestPendingMarker,
-  scanRequestResponsibleId,
+  scanRequestCreatorId,
   scanRequestStageTitle,
   scanRequestState,
   scanRequestSentMarker,

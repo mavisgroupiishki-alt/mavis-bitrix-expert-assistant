@@ -38,7 +38,7 @@ const { enumLabelForValue, isPreferredChannelFieldLabel, preferredChannelFromVal
 const { injectPlacementOptions, parsePlacementOptions } = require('./placement-context');
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
-const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestPendingMarker, scanRequestResponsibleId, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestCreatorId, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 
 const app = express();
@@ -15699,17 +15699,17 @@ async function actsScanRequestLoadScope() {
   const excluded = [];
   for (const task of tasks || []) {
     const taskId = actsScanRequestTaskId(task);
-    const responsibleId = scanRequestResponsibleId(task);
+    const creatorId = scanRequestCreatorId(task);
     const createdDate = String(actsTaskField(task, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
     const stageId = String(actsTaskField(task, ['stageId', 'STAGE_ID', 'stage_id']) || '');
     const stageTitle = stageTitles.get(stageId) || '';
 
-    if (!taskId || !selectedUserIds.has(responsibleId) || !isScanRequestSeptember2026(createdDate)) continue;
+    if (!taskId || !selectedUserIds.has(creatorId) || !isScanRequestSeptember2026(createdDate)) continue;
     const row = {
       taskId,
       title: String(actsTaskField(task, ['title', 'TITLE']) || ''),
       task,
-      responsibleId,
+      creatorId,
       selectedUserIds,
       createdDate,
       stageId,
@@ -15724,7 +15724,7 @@ async function actsScanRequestLoadScope() {
   }
 
   console.log(
-    `[scan-request] scope: tasksFetched=${(tasks || []).length}; responsibleUsers=${selectedUserIds.size}; ` +
+    `[scan-request] scope: tasksFetched=${(tasks || []).length}; creatorUsers=${selectedUserIds.size}; ` +
     `ready=${ready.length}; excluded=${excluded.length}.`
   );
   return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
@@ -15828,8 +15828,8 @@ async function actsScanRequestPrepareContext(row) {
     return { blocked: true, reason: 'stage-excluded-after-selection' };
   }
 
-  const responsibleId = scanRequestResponsibleId(freshTask);
-  if (!row.selectedUserIds.has(responsibleId)) return { blocked: true, reason: 'responsible-changed-after-selection' };
+  const creatorId = scanRequestCreatorId(freshTask);
+  if (!row.selectedUserIds.has(creatorId)) return { blocked: true, reason: 'creator-changed-after-selection' };
   const createdDate = String(actsTaskField(freshTask, ['createdDate', 'CREATED_DATE', 'created_date']) || '');
   if (!isScanRequestSeptember2026(createdDate)) return { blocked: true, reason: 'created-date-outside-september-2026' };
 

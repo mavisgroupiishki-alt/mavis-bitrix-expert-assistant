@@ -8,7 +8,7 @@ const {
   isScanRequestExcludedStage,
   isScanRequestSeptember2026,
   scanRequestSentMarker,
-  scanRequestResponsibleId,
+  scanRequestCreatorId,
   scanRequestStageTitle,
   scanRequestState,
   selectScanRequestActFile,
@@ -66,13 +66,13 @@ test('looks up a freshly loaded stage without crashing when stage metadata is ab
   assert.equal(scanRequestStageTitle(undefined, '1480'), '');
 });
 
-test('uses the task responsible, not its creator, for the campaign scope', () => {
-  assert.equal(scanRequestResponsibleId({ responsibleId: 42, createdBy: 7 }), '42');
-  assert.equal(scanRequestResponsibleId({ RESPONSIBLE_ID: '43', CREATED_BY: '7' }), '43');
-  assert.equal(scanRequestResponsibleId({ ASSIGNED_BY_ID: '44', CREATED_BY: '7' }), '44');
-  assert.equal(scanRequestResponsibleId({ ResponsibleId: '45', CREATED_BY: '7' }), '45');
-  assert.equal(scanRequestResponsibleId({ responsible: { id: '46' }, CREATED_BY: '7' }), '46');
-  assert.equal(scanRequestResponsibleId({ CREATED_BY: '7' }), '');
+test('uses the task creator, not its responsible, for the campaign scope', () => {
+  assert.equal(scanRequestCreatorId({ responsibleId: 42, createdBy: 7 }), '7');
+  assert.equal(scanRequestCreatorId({ RESPONSIBLE_ID: '43', CREATED_BY: '7' }), '7');
+  assert.equal(scanRequestCreatorId({ ASSIGNED_BY_ID: '44', CREATED_BY: '7' }), '7');
+  assert.equal(scanRequestCreatorId({ CreatedBy: '45', RESPONSIBLE_ID: '7' }), '45');
+  assert.equal(scanRequestCreatorId({ createdBy: { id: '46' }, RESPONSIBLE_ID: '7' }), '46');
+  assert.equal(scanRequestCreatorId({ RESPONSIBLE_ID: '7' }), '');
 });
 
 test('recognizes only the dedicated scan-request success marker', () => {
