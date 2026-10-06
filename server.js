@@ -15826,7 +15826,7 @@ async function actsScanRequestMarkBlocked(task, reason) {
   ].join('\n'));
 }
 
-async function actsScanRequestPrepareContext(row) {
+async function actsScanRequestPrepareContext(row, options = {}) {
   const freshTask = await actsScanRequestLoadTask(row.taskId);
   const freshStageId = String(actsTaskField(freshTask, ['stageId', 'STAGE_ID', 'stage_id']) || '');
   if (isScanRequestExcludedStage(scanRequestStageTitle(row.stageTitles, freshStageId))) {
@@ -15839,8 +15839,10 @@ async function actsScanRequestPrepareContext(row) {
   if (!isScanRequestSeptember2026(createdDate)) return { blocked: true, reason: 'created-date-outside-september-2026' };
 
   const basic = await docReturnLoadBasicContext(row.taskId, freshTask);
-  const state = await actsScanRequestReadState(freshTask);
-  if (state !== 'ready') return { skipped: true, reason: state };
+  if (!options.initialRun) {
+    const state = await actsScanRequestReadState(freshTask);
+    if (state !== 'ready') return { skipped: true, reason: state };
+  }
 
   const dealIds = actsExtractDealIdsFromTask(freshTask);
   if (dealIds.length !== 1 || !basic.deal) {
@@ -15869,14 +15871,14 @@ async function actsScanRequestPrepareContext(row) {
   };
 }
 
-async function actsScanRequestSendOne(row) {
+async function actsScanRequestSendOne(row, options = {}) {
   if (actsScanRequestLocks.has(row.taskId)) {
     return { taskId: row.taskId, title: row.title, status: 'skipped', reason: 'in-flight' };
   }
   actsScanRequestLocks.add(row.taskId);
   let pendingWritten = false;
   try {
-    const prepared = await actsScanRequestPrepareContext(row);
+    const prepared = await actsScanRequestPrepareContext(row, options);
     if (prepared.skipped || prepared.blocked) {
       if (prepared.blocked) {
         try {
@@ -15964,6 +15966,10 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
   }
 
   const execute = req.body && (req.body.execute === true || String(req.body.execute).toLowerCase() === 'true');
+  // Разрешён только вместе с execute и используется для первого запуска: все
+  // прошлые попытки были dry-run, но история комментариев некоторых старых задач
+  // не отвечает. После первой отправки остаются PENDING/SENT-маркеры.
+  const initialRun = execute && req.body && req.body.initialRun === true;
   const requestedMax = Number(req.body && req.body.max);
   const max = Number.isFinite(requestedMax) ? Math.max(1, Math.min(Math.floor(requestedMax), 10)) : 10;
 
@@ -15985,10 +15991,11 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
     const alreadySent = [];
     const pending = [];
     const blocked = [];
-    // Не читаем историю комментариев всех 51 задач до первого письма: Bitrix
-    // медленно отвечает на task-chat. Проверяем только пока не набран текущий пакет;
-    // следующие вызовы увидят durable SENT/BLOCKED/PENDING-маркеры и продолжат очередь.
-    for (let index = 0; index < scope.ready.length && eligible.length < max;) {
+    // Не читаем историю комментариев всех задач до первого письма: Bitrix
+    // медленно отвечает на task-chat. Для явно подтверждённого первого запуска
+    // пропускаем только это чтение: условия задачи, вложение и адресат проверяются
+    // непосредственно перед отправкой, а PENDING/SENT-маркеры всё равно пишутся.
+    for (let index = 0; index < scope.ready.length && eligible.length < max && !initialRun;) {
       const batchRows = scope.ready.slice(index, index + Math.min(5, max - eligible.length));
       index += batchRows.length;
       const states = await Promise.all(batchRows.map(async (row) => {
@@ -16019,6 +16026,7 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         }
       }
     }
+    if (initialRun) eligible.push(...scope.ready.slice(0, max));
 
     if (!execute) {
       return res.json({
@@ -16040,7 +16048,9 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
     const results = [];
     let consecutiveFailures = 0;
     for (let index = 0; index < selected.length; index += 3) {
-      const batch = await Promise.all(selected.slice(index, index + 3).map(actsScanRequestSendOne));
+      const batch = await Promise.all(selected.slice(index, index + 3).map((row) =>
+        actsScanRequestSendOne(row, { initialRun })
+      ));
       results.push(...batch);
       for (const row of batch) {
         consecutiveFailures = row.status === 'failed' ? consecutiveFailures + 1 : 0;
