@@ -15649,6 +15649,19 @@ function actsScanRequestTaskId(task) {
   return String(actsTaskField(task, ['id', 'ID']) || '').trim();
 }
 
+function actsScanRequestUserLabel(user) {
+  return `${String(user && (user.NAME || user.name) || '').trim()} ${String(user && (user.LAST_NAME || user.lastName || user.last_name) || '').trim()}`.trim();
+}
+
+function actsScanRequestCountByCreator(rows, creatorLabels) {
+  const counts = Object.fromEntries([...creatorLabels.values()].map((label) => [label, 0]));
+  for (const row of rows || []) {
+    const label = creatorLabels.get(String(row && row.creatorId || '')) || 'Неизвестный постановщик';
+    counts[label] = (counts[label] || 0) + 1;
+  }
+  return counts;
+}
+
 async function actsScanRequestLoadScope() {
   const [users, stagesRaw, tasks] = await Promise.all([
     // Иоланта может быть уволена, поэтому намеренно не фильтруем ACTIVE.
@@ -15668,10 +15681,12 @@ async function actsScanRequestLoadScope() {
   ]);
 
   const selectedUserIds = new Set();
+  const creatorLabels = new Map();
   for (const user of users || []) {
     const id = String(user && (user.ID || user.id) || '').trim();
     if (id && actsScanRequestUserNames(user).some((name) => ACTS_SCAN_REQUEST_RESPONSIBLE_NAMES.has(name))) {
       selectedUserIds.add(id);
+      creatorLabels.set(id, actsScanRequestUserLabel(user) || `ID ${id}`);
     }
   }
 
@@ -15710,6 +15725,7 @@ async function actsScanRequestLoadScope() {
       title: String(actsTaskField(task, ['title', 'TITLE']) || ''),
       task,
       creatorId,
+      creatorName: creatorLabels.get(creatorId) || `ID ${creatorId}`,
       selectedUserIds,
       createdDate,
       stageId,
@@ -15727,7 +15743,7 @@ async function actsScanRequestLoadScope() {
     `[scan-request] scope: tasksFetched=${(tasks || []).length}; creatorUsers=${selectedUserIds.size}; ` +
     `ready=${ready.length}; excluded=${excluded.length}.`
   );
-  return { ready, excluded, selectedUserIds: [...selectedUserIds], stageTitles };
+  return { ready, excluded, selectedUserIds: [...selectedUserIds], creatorLabels, stageTitles };
 }
 
 async function actsScanRequestLoadTask(taskId) {
@@ -15964,6 +15980,18 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
 
   try {
     const scope = await actsScanRequestLoadScope();
+    if (req.body && req.body.summary === true) {
+      return res.json({
+        ok: true,
+        summary: true,
+        projectId: config.actsProjectId,
+        scope: 'September 2026; six approved task creators; except Archive and Scan exists',
+        found: scope.ready.length + scope.excluded.length,
+        byCreator: actsScanRequestCountByCreator([...scope.ready, ...scope.excluded], scope.creatorLabels),
+        excludedByCreator: actsScanRequestCountByCreator(scope.excluded, scope.creatorLabels),
+        readyByCreator: actsScanRequestCountByCreator(scope.ready, scope.creatorLabels),
+      });
+    }
     const eligible = [];
     const alreadySent = [];
     const pending = [];
@@ -15971,8 +15999,10 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
     // Не читаем историю комментариев всех 51 задач до первого письма: Bitrix
     // медленно отвечает на task-chat. Проверяем только пока не набран текущий пакет;
     // следующие вызовы увидят durable SENT/BLOCKED/PENDING-маркеры и продолжат очередь.
-    for (let index = 0; index < scope.ready.length && eligible.length < max; index += 5) {
-      const states = await Promise.all(scope.ready.slice(index, index + 5).map(async (row) => {
+    for (let index = 0; index < scope.ready.length && eligible.length < max;) {
+      const batchRows = scope.ready.slice(index, index + Math.min(5, max - eligible.length));
+      index += batchRows.length;
+      const states = await Promise.all(batchRows.map(async (row) => {
         if (actsScanRequestResolvedIds.has(row.taskId)) {
           return { row, state: 'resolved-cache', error: '' };
         }
@@ -16006,7 +16036,7 @@ app.post('/api/maintenance/acts-scan-request-campaign', async (req, res) => {
         ok: true,
         dryRun: true,
         projectId: config.actsProjectId,
-        scope: 'September 2026; six approved task responsibles; except Archive and Scan exists',
+        scope: 'September 2026; six approved task creators; except Archive and Scan exists',
         found: scope.ready.length + scope.excluded.length,
         eligible: eligible.length,
         alreadySent: alreadySent.length,
