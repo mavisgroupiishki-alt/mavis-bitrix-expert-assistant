@@ -211,7 +211,9 @@ const config = {
   unassignedTestMinutes: Number(process.env.UNASSIGNED_TEST_MINUTES || 0),
   // Точный список экспертов, между которыми ИИгорь сравнивает текущую загрузку
   // при рекомендации распределения новой сделки. Сотрудники вне списка не участвуют.
-  distributionExpertIds: parseIdList(process.env.DISTRIBUTION_EXPERT_IDS),
+  distributionExpertIds: parseIdList(
+    process.env.DISTRIBUTION_EXPERT_IDS || '1960,2192,2262,2258,2266,2198'
+  ),
   // v85: если явный список не задан, кандидатов на распределение определяем только
   // по отделу Производства. Опорные эксперты нужны лишь чтобы автоматически найти ID отдела.
   distributionExpertSeedIds: parseIdList(process.env.DISTRIBUTION_EXPERT_SEED_IDS || '2052,1960,2192,2198'),
