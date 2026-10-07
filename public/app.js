@@ -976,6 +976,117 @@ async function moveDealStageSafely(deal, targetStageCode, reasonForLog) {
   }
 }
 
+function productionCategoryId() {
+  return Number(APP_CONFIG.productionCategoryId || 28);
+}
+
+function expectedCloseDateFieldCode() {
+  const match = Object.entries(state.fields || {}).find(([, meta]) => {
+    const labels = [meta && meta.title, meta && meta.formLabel, meta && meta.listLabel, meta && meta.name, meta && meta.NAME]
+      .filter(Boolean)
+      .join(' ')
+      .toLocaleLowerCase('ru-RU');
+    return /предполагаем\s+дата\s+закрытия\s+продукта/i.test(labels);
+  });
+  return match ? match[0] : '';
+}
+
+function inputDate(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : '';
+}
+
+function syncProductionTransitionControl() {
+  const group = document.getElementById('production-stage-transition-group');
+  if (!group) return;
+  const deal = state.selectedDeal;
+  const available = state.mode === 'dealTab'
+    && deal
+    && Number(deal.CATEGORY_ID) === productionCategoryId()
+    && Boolean(expectedCloseDateFieldCode());
+  group.classList.toggle('hidden', !available);
+}
+
+function stageTransitionError(message = '') {
+  const box = document.getElementById('stage-transition-error');
+  if (!box) return;
+  box.textContent = message;
+  box.classList.toggle('hidden', !message);
+}
+
+async function openProductionStageTransition() {
+  const deal = state.selectedDeal;
+  if (!deal || Number(deal.CATEGORY_ID) !== productionCategoryId()) return;
+  const fieldCode = expectedCloseDateFieldCode();
+  if (!fieldCode) {
+    alert('В карточке не найдено поле «Предполагаемая дата закрытия продукта».');
+    return;
+  }
+  const target = document.getElementById('stage-transition-target');
+  const date = document.getElementById('stage-transition-date');
+  const current = document.getElementById('stage-transition-current');
+  const dialog = document.getElementById('stage-transition-dialog');
+  const button = document.getElementById('production-stage-transition');
+  button.disabled = true;
+  stageTransitionError('');
+  try {
+    const stages = await fetchOrderedStagesForCategory(deal.CATEGORY_ID);
+    const options = stages.filter((stage) => stage.code !== String(deal.STAGE_ID || ''));
+    if (!options.length) throw new Error('Не удалось получить доступные стадии воронки Производства.');
+    target.innerHTML = options.map((stage) => `<option value="${escapeHtml(stage.code)}">${escapeHtml(stage.name || stage.code)}</option>`).join('');
+    date.value = inputDate(deal[fieldCode]);
+    current.textContent = `Сейчас: ${stageName(deal.STAGE_ID)}${date.value ? ` · текущий прогноз: ${date.value.split('-').reverse().join('.')}` : ''}`;
+    dialog.showModal();
+  } catch (error) {
+    alert(error.message || String(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function transitionAuth() {
+  const raw = BX24.getAuth && BX24.getAuth();
+  const accessToken = raw && (raw.access_token || raw.ACCESS_TOKEN);
+  const domain = raw && (raw.domain || raw.DOMAIN);
+  if (!accessToken) throw new Error('Не удалось подтвердить сессию Bitrix. Обновите вкладку и повторите переход.');
+  return { access_token: accessToken, domain: domain || 'mavisgroup.bitrix24.by' };
+}
+
+async function submitProductionStageTransition(event) {
+  event.preventDefault();
+  const deal = state.selectedDeal;
+  if (!deal) return;
+  const target = document.getElementById('stage-transition-target');
+  const date = document.getElementById('stage-transition-date');
+  const submit = document.getElementById('stage-transition-submit');
+  stageTransitionError('');
+  if (!date.value) return stageTransitionError('Укажите актуальную предполагаемую дату закрытия.');
+  submit.disabled = true;
+  submit.textContent = 'Сохраняем...';
+  try {
+    const response = await fetch('/api/production/transition', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dealId: String(deal.ID),
+        targetStageId: target.value,
+        expectedCloseDate: date.value,
+        auth: transitionAuth(),
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    document.getElementById('stage-transition-dialog').close();
+    await loadDealTab(String(deal.ID));
+  } catch (error) {
+    stageTransitionError(error.message || String(error));
+  } finally {
+    submit.disabled = false;
+    submit.textContent = 'Сохранить и перевести';
+  }
+}
+
 function getService(deal) {
   if (!deal) return '';
   if (state.fieldMap.service && deal[state.fieldMap.service] !== undefined) {
@@ -2224,6 +2335,7 @@ async function openDeal(id) {
   hideActionButtons();
   state.selectedDeadlineTasks = [];
   document.getElementById('deal-details').innerHTML = detailHtml(deal);
+  syncProductionTransitionControl();
   const dialog = document.getElementById('deal-dialog');
   if (state.mode === 'dealTab' || state.mode === 'signingDocumentsTab') {
     dialog.setAttribute('open', '');
@@ -6203,6 +6315,15 @@ document.getElementById('deals-table').addEventListener('click', (e) => {
 document.getElementById('close-dialog').addEventListener('click', () => { if (state.mode !== 'dealTab') document.getElementById('deal-dialog').close(); });
 document.getElementById('check-handoff').addEventListener('click', checkHandoff);
 document.getElementById('ai-analyze').addEventListener('click', analyzeDealWithAI);
+const productionStageTransitionBtn = document.getElementById('production-stage-transition');
+if (productionStageTransitionBtn) productionStageTransitionBtn.addEventListener('click', openProductionStageTransition);
+const stageTransitionForm = document.getElementById('stage-transition-form');
+if (stageTransitionForm) stageTransitionForm.addEventListener('submit', submitProductionStageTransition);
+document.querySelectorAll('[data-stage-transition-cancel]').forEach((button) => {
+  button.addEventListener('click', () => document.getElementById('stage-transition-dialog').close());
+});
+const stageTransitionClose = document.getElementById('stage-transition-cancel');
+if (stageTransitionClose) stageTransitionClose.addEventListener('click', () => document.getElementById('stage-transition-dialog').close());
 document.getElementById('deal-details').addEventListener('click', async (e) => {
   if (e.target.getAttribute('data-check-wazzup-webhook')) {
     const statusBox = document.getElementById('wazzup-webhook-status');

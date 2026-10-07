@@ -40,6 +40,7 @@ const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
 const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestCreatorId, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
+const { transitionFields, validateProductionTransition } = require('./production-stage-transition');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -92,6 +93,13 @@ const config = {
   adminUserIds: parseIdList(process.env.ADMIN_USER_IDS),
   ropUserIds: parseIdList(process.env.ROP_USER_IDS),
   productionCategoryId: process.env.PRODUCTION_CATEGORY_ID || '',
+  // Скрытый переход стадии Производства: сервер меняет дату и стадию одним
+  // crm.deal.update, а не создаёт задание БП. Список пользователей можно
+  // ограничить отдельной переменной Render; админы/руководители разрешены
+  // также для пилота.
+  productionTransitionAllowedUserIds: parseIdList(process.env.PRODUCTION_TRANSITION_ALLOWED_USER_IDS || ''),
+  productionExpectedCloseDateFieldCode: String(process.env.PRODUCTION_EXPECTED_CLOSE_DATE_FIELD_CODE || '').trim(),
+  bitrixPortalHost: String(process.env.BITRIX_PORTAL_HOST || 'mavisgroup.bitrix24.by').trim().toLowerCase(),
   // 0 or empty means: load all active deals via Bitrix pagination.
   maxDeals: Number(process.env.MAX_DEALS || 0),
   excludeClosedDeals: String(process.env.EXCLUDE_CLOSED_DEALS || 'true').toLowerCase() !== 'false',
@@ -479,6 +487,47 @@ async function bitrixRestList(method, params = {}, limit = 200, options = {}) {
     start += items.length;
   }
   return out.slice(0, limit);
+}
+
+function productionDateFieldLabel(field) {
+  return [field && field.EDIT_FORM_LABEL, field && field.LIST_COLUMN_LABEL, field && field.LABEL, field && field.TITLE, field && field.title]
+    .filter(Boolean)
+    .join(' ')
+    .toLocaleLowerCase('ru-RU');
+}
+
+async function productionExpectedCloseDateFieldCode() {
+  if (config.productionExpectedCloseDateFieldCode) return config.productionExpectedCloseDateFieldCode;
+  const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
+  const field = fields.find((item) => /предполагаем\s+дата\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
+  const code = String(field && (field.FIELD_NAME || field.fieldName || field.NAME || field.name) || '').trim();
+  if (!code) throw new Error('В Bitrix24 не найдено поле «Предполагаемая дата закрытия продукта».');
+  return code;
+}
+
+function productionTransitionUserAllowed(user) {
+  const userId = String(user && (user.ID || user.id) || '');
+  const configured = new Set(config.productionTransitionAllowedUserIds);
+  const leaders = new Set([...config.adminUserIds, ...config.leaderUserIds, ...config.ropUserIds]);
+  const isBitrixAdmin = ['Y', '1', 'true'].includes(String(user && (user.ADMIN || user.IS_ADMIN || user.admin) || '').toLowerCase());
+  return isBitrixAdmin || configured.has(userId) || leaders.has(userId);
+}
+
+async function productionTransitionUserFromClientAuth(rawAuth) {
+  const auth = rawAuth && typeof rawAuth === 'object' ? rawAuth : {};
+  const accessToken = String(auth.access_token || auth.ACCESS_TOKEN || '').trim();
+  const requestedHost = String(auth.domain || auth.DOMAIN || config.bitrixPortalHost).trim().toLowerCase();
+  if (!accessToken) throw new Error('Не удалось подтвердить пользователя Bitrix. Обновите вкладку и повторите переход.');
+  if (requestedHost !== config.bitrixPortalHost) throw new Error('Переход разрешён только из рабочего портала MAVIS GROUP.');
+
+  const response = await fetch(`https://${config.bitrixPortalHost}/rest/user.current.json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ auth: accessToken }).toString(),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error || !data.result) throw new Error('Сессия Bitrix истекла. Обновите вкладку и повторите переход.');
+  return data.result;
 }
 
 function signingDocumentsSearchTerms(companyName) {
@@ -1151,6 +1200,48 @@ app.get('/config.js', (_req, res) => {
   };
   res.type('application/javascript');
   res.send(`window.APP_CONFIG = ${JSON.stringify(publicConfig)};`);
+});
+
+// Скрытый переход стадии Производства. В отличие от робота/БП этот маршрут не
+// создаёт задание и не добавляет служебный комментарий: меняются только поле
+// прогноза и STAGE_ID одной сделки одним вызовом crm.deal.update.
+app.post('/api/production/transition', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const dealId = String(body.dealId || '').trim();
+    const targetStageId = String(body.targetStageId || '').trim();
+    const expectedCloseDate = String(body.expectedCloseDate || '').trim();
+    if (!/^\d+$/.test(dealId)) return res.status(400).json({ ok: false, error: 'Некорректная сделка.' });
+
+    const actor = await productionTransitionUserFromClientAuth(body.auth);
+    if (!productionTransitionUserAllowed(actor)) {
+      return res.status(403).json({ ok: false, error: 'У вас нет права переводить сделки Производства через этот сценарий.' });
+    }
+
+    const categoryId = Number(config.productionCategoryId || config.autopilotCategoryId || 28);
+    const [deal, stages, dateFieldCode] = await Promise.all([
+      bitrixRestCall('crm.deal.get', { id: dealId }),
+      bitrixRestCall('crm.dealcategory.stage.list', { id: categoryId }),
+      productionExpectedCloseDateFieldCode(),
+    ]);
+    const valid = validateProductionTransition({
+      deal, categoryId, dateFieldCode, targetStageId, expectedCloseDate,
+      stages: Array.isArray(stages) ? stages : [],
+    });
+    await bitrixRestCall('crm.deal.update', {
+      id: dealId,
+      fields: transitionFields({ ...valid, dateFieldCode }),
+    });
+    return res.json({
+      ok: true,
+      dealId,
+      stageId: valid.targetStageId,
+      expectedCloseDate: valid.expectedCloseDate,
+    });
+  } catch (error) {
+    const message = error && (error.message || String(error)) || 'Не удалось перевести сделку.';
+    return res.status(422).json({ ok: false, error: message });
+  }
 });
 
 

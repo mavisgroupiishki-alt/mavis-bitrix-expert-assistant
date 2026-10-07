@@ -140,6 +140,13 @@
       </div>
       <section id="signing-documents" class="signing-documents hidden" aria-live="polite"></section>
       <div class="dialog-actions workflow-actions">
+        <div id="production-stage-transition-group" class="workflow-group workflow-main hidden">
+          <div class="workflow-title"><span>0</span> Переход сделки</div>
+          <div class="workflow-buttons">
+            <button id="production-stage-transition" class="primary">Обновить срок и перевести сделку</button>
+          </div>
+          <p class="muted small-note">Без задач и бизнес-процессов: дата закрытия и стадия сохраняются одним действием.</p>
+        </div>
         <div class="workflow-group workflow-main">
           <div class="workflow-title"><span>1</span> Передача из продаж</div>
           <div class="workflow-buttons">
@@ -200,6 +207,32 @@
         </div>
       </div>
       <div id="analysis-result" class="analysis hidden"></div>
+    </dialog>
+
+    <dialog id="stage-transition-dialog" class="stage-transition-dialog">
+      <div class="dialog-header">
+        <div>
+          <h2>Перевести сделку</h2>
+          <p id="stage-transition-current" class="muted small-note"></p>
+        </div>
+        <button id="stage-transition-cancel" class="icon" type="button" aria-label="Закрыть">×</button>
+      </div>
+      <form id="stage-transition-form" class="stage-transition-form">
+        <label>
+          <span>Новая стадия</span>
+          <select id="stage-transition-target" required></select>
+        </label>
+        <label>
+          <span>Актуальная предполагаемая дата закрытия</span>
+          <input id="stage-transition-date" type="date" required />
+        </label>
+        <p class="muted small-note">После сохранения сделка будет переведена. Новые задачи, БП и комментарии не создаются.</p>
+        <div class="stage-transition-actions">
+          <button id="stage-transition-submit" class="primary" type="submit">Сохранить и перевести</button>
+          <button class="secondary" type="button" data-stage-transition-cancel>Отмена</button>
+        </div>
+        <div id="stage-transition-error" class="error hidden" role="alert"></div>
+      </form>
     </dialog>
   </div>
 
