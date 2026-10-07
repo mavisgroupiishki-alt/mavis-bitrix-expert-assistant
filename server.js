@@ -30,7 +30,7 @@ const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount
 const { actEmailSubject, canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
 const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
-const { authorizationMatchesToken, requestMatchesToken } = require('./request-auth');
+const { authorizationMatchesToken, requestMatchesToken, tokenMatches } = require('./request-auth');
 const { categoryForQuestion, exactLiveAnswer, isSourceQuestion, matchingSourceOptions, personName, selectLiveDeals, stageId, stageName } = require('./dashboard-live-bitrix');
 const { inspectAudioPayload, shouldTryAlternateAudioUrl } = require('./autopilot-audio-validation');
 const { createAutopilotRetryGate } = require('./autopilot-retry');
@@ -4281,7 +4281,12 @@ const DISTRIBUTION_START_MARKER = '[MAVIS_DISTRIBUTION_START]';
 const DISTRIBUTION_REMINDER_MARKER = '[MAVIS_DISTRIBUTION_REMINDER]';
 
 function distributionRobotAuthorized(req) {
-  return requestMatchesToken(req, config.distributionRobotToken);
+  // Some Bitrix24 webhook requests arrive through a proxy that removes the
+  // generic `token` query parameter. Keep standard auth for manual/API calls
+  // and use a distribution-specific parameter for the automation robot.
+  const robotToken = req && ((req.query && req.query.distribution_token) || (req.body && req.body.distribution_token));
+  return requestMatchesToken(req, config.distributionRobotToken)
+    || tokenMatches(config.distributionRobotToken, robotToken);
 }
 
 function distributionMovedKey(deal) {
