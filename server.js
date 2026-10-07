@@ -209,8 +209,8 @@ const config = {
   // Только для короткого теста блока 1. Например UNASSIGNED_TEST_MINUTES=2.
   // В бою удалить переменную: вернётся правило 4 рабочих часа по Минску.
   unassignedTestMinutes: Number(process.env.UNASSIGNED_TEST_MINUTES || 0),
-  // Опционально: точный список экспертов, между которыми ИИгорь сравнивает текущую загрузку
-  // при рекомендации распределения новой сделки. Пример: 2052,1960,2192,2198
+  // Точный список экспертов, между которыми ИИгорь сравнивает текущую загрузку
+  // при рекомендации распределения новой сделки. Сотрудники вне списка не участвуют.
   distributionExpertIds: parseIdList(process.env.DISTRIBUTION_EXPERT_IDS),
   // v85: если явный список не задан, кандидатов на распределение определяем только
   // по отделу Производства. Опорные эксперты нужны лишь чтобы автоматически найти ID отдела.
@@ -4012,6 +4012,9 @@ async function getDistributionTeamLoad() {
       if (String(d.STAGE_ID || '') === String(config.unassignedStageId || '')) continue;
       const id = String(d.ASSIGNED_BY_ID || '').trim();
       if (!id) continue;
+      // Ответственный может быть менеджером продаж или сотрудником другого отдела.
+      // В распределении учитываем только явно разрешённых экспертов.
+      if (!(await isProductionDistributionExpert(id))) continue;
       candidateIds.add(id);
       counts.set(id, (counts.get(id) || 0) + 1);
     }
