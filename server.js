@@ -401,6 +401,8 @@ async function bitrixRestCall(method, params = {}, options = {}) {
     // v77: эти задачи являются частью утверждённого CJM ИИ-ассистента и должны
     // создаваться независимо от общего SERVER_TASKS_ENABLED, иначе блоки 1–3 молча не работают.
     const isCoreAssistantTask = /^Распредели сделку:/i.test(title)
+      || /^Распределить новую сделку:/i.test(title)
+      || /^ПРОСРОЧЕНО: распределить сделку:/i.test(title)
       || /позвони клиенту.*4\+.*час/i.test(title)
       || /я отправил ход работы клиенту/i.test(title)
       || (/не смог отправить ход работы клиенту/i.test(title) && config.autopilotDeliveryFailureTasksEnabled);
@@ -4351,8 +4353,22 @@ function distributionRecommendation(teamLoad) {
     || 'Рекомендация не сформирована: в открытых сделках Производства пока нет назначенных экспертов.';
 }
 
+async function distributionTaskAlreadyCreated(dealId, titlePrefix) {
+  const tasks = await bitrixRestList('tasks.task.list', {
+    filter: { RESPONSIBLE_ID: TANYA_USER_ID, UF_CRM_TASK: `D_${dealId}` },
+    select: ['ID', 'TITLE'],
+    order: { ID: 'DESC' },
+  }, 50);
+  return tasks.some((task) => String(task.TITLE || '').startsWith(titlePrefix));
+}
+
+function distributionTaskId(created) {
+  return String(created && created.task && (created.task.id || created.task.ID) || '');
+}
+
 async function createDistributionInitialTask(deal) {
-  if (await distributionStartRecorded(deal)) {
+  const titlePrefix = 'Распределить новую сделку:';
+  if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
     return { ok: true, duplicate: true, dealId: String(deal.ID) };
   }
   const teamLoad = await getDistributionTeamLoad();
@@ -4376,12 +4392,14 @@ async function createDistributionInitialTask(deal) {
       PRIORITY: 2,
     },
   });
-  await recordDistributionStart(deal);
+  const taskId = distributionTaskId(created);
+  if (!taskId) throw new Error('Задача на распределение не была создана.');
+  if (!(await distributionStartRecorded(deal))) await recordDistributionStart(deal);
   return {
     ok: true,
     event: 'distribution_initial_task_created',
     dealId: String(deal.ID),
-    taskId: String(created && created.task && (created.task.id || created.task.ID) || ''),
+    taskId,
     recommendation,
   };
 }
@@ -4390,7 +4408,8 @@ async function createDistributionReminderTask(deal) {
   if (!(await distributionStartRecorded(deal))) {
     return { ok: false, skipped: true, message: 'Первичная задача по этому входу на этап не была создана.' };
   }
-  if (await distributionReminderRecorded(deal)) {
+  const titlePrefix = 'ПРОСРОЧЕНО: распределить сделку:';
+  if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
     return { ok: true, duplicate: true, dealId: String(deal.ID) };
   }
   const companyName = deal.TITLE || `Сделка ${deal.ID}`;
@@ -4410,12 +4429,14 @@ async function createDistributionReminderTask(deal) {
       PRIORITY: 2,
     },
   });
-  await recordDistributionReminder(deal);
+  const taskId = distributionTaskId(created);
+  if (!taskId) throw new Error('Задача-напоминание не была создана.');
+  if (!(await distributionReminderRecorded(deal))) await recordDistributionReminder(deal);
   return {
     ok: true,
     event: 'distribution_reminder_task_created',
     dealId: String(deal.ID),
-    taskId: String(created && created.task && (created.task.id || created.task.ID) || ''),
+    taskId,
   };
 }
 
