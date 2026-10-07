@@ -3933,31 +3933,36 @@ async function isProductionDistributionExpert(userId) {
 }
 
 async function getPreviousExpert(companyId, currentDealId) {
-  // v77: предыдущий эксперт = ответственный по последней УСПЕШНО закрытой
-  // производственной сделке компании, а не просто по последней изменённой сделке CRM.
+  // Приоритет распределения: последний разрешённый эксперт, который уже вёл
+  // эту компанию в воронке «Производство». Успешное закрытие не требуется:
+  // важен сам опыт работы с клиентом.
   if (!companyId) return null;
   try {
     const deals = await bitrixRestList('crm.deal.list', {
       filter: {
         COMPANY_ID: companyId,
         CATEGORY_ID: config.autopilotCategoryId || 28,
-        STAGE_SEMANTIC_ID: 'S',
       },
-      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'CLOSEDATE', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
-      order: { CLOSEDATE: 'DESC' },
-    }, 10);
-    const prev = deals.find((d) => String(d.ID) !== String(currentDealId || ''));
-    if (!prev || !prev.ASSIGNED_BY_ID) return null;
-    if (!(await isProductionDistributionExpert(prev.ASSIGNED_BY_ID))) return null;
-    const expertName = await getDistributionUserName(prev.ASSIGNED_BY_ID);
-    return {
-      dealId: prev.ID,
-      title: prev.TITLE || '',
-      service: detectServiceFromDeal(prev),
-      closeDate: prev.CLOSEDATE || '',
-      expertId: String(prev.ASSIGNED_BY_ID),
-      expertName,
-    };
+      select: ['ID', 'TITLE', 'ASSIGNED_BY_ID', 'STAGE_ID', 'MOVED_TIME', 'CLOSEDATE', process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071'],
+      order: { MOVED_TIME: 'DESC' },
+    }, 50);
+    for (const prev of deals) {
+      if (String(prev.ID) === String(currentDealId || '')) continue;
+      // На нераспределённой сделке может ещё оставаться менеджер продаж.
+      if (String(prev.STAGE_ID || '') === String(config.unassignedStageId || '')) continue;
+      if (!prev.ASSIGNED_BY_ID) continue;
+      if (!(await isProductionDistributionExpert(prev.ASSIGNED_BY_ID))) continue;
+      const expertName = await getDistributionUserName(prev.ASSIGNED_BY_ID);
+      return {
+        dealId: prev.ID,
+        title: prev.TITLE || '',
+        service: detectServiceFromDeal(prev),
+        closeDate: prev.CLOSEDATE || '',
+        expertId: String(prev.ASSIGNED_BY_ID),
+        expertName,
+      };
+    }
+    return null;
   } catch (_) {
     return null;
   }
@@ -4065,7 +4070,7 @@ function formatRoutingRecommendation({ isNew, activeDeals, previous, nps, teamLo
     if (lowNps) {
       return `Рекомендация: не возвращать автоматически прежнему эксперту. Ранее компанию вёл ${previous.expertName}, но NPS низкий (${nps.score}/10) — решение лучше принять вручную.`;
     }
-    return `Рекомендация: передать ${previous.expertName} — это последний эксперт, успешно работавший с компанией.`;
+    return `Рекомендация: передать ${previous.expertName} — это последний разрешённый эксперт, работавший с компанией в «Производстве».`;
   }
 
   const loadRecommendation = leastLoadedRecommendation(teamLoad);
@@ -4100,7 +4105,7 @@ async function notifyTanyaAboutUnassignedDeal(deal) {
   }
 
   if (previous) {
-    lines.push('', `Последняя успешная работа: ${previous.service || previous.title || `сделка ${previous.dealId}`} — ${previous.expertName || `эксперт ID ${previous.expertId}`}${previous.closeDate ? `, закрыта ${String(previous.closeDate).slice(0, 10)}` : ''}.`);
+    lines.push('', `Последняя работа в «Производстве»: ${previous.service || previous.title || `сделка ${previous.dealId}`} — ${previous.expertName || `эксперт ID ${previous.expertId}`}${previous.closeDate ? `, закрыта ${String(previous.closeDate).slice(0, 10)}` : ''}.`);
   }
 
   if (nps) {
@@ -4382,8 +4387,11 @@ async function createDistributionInitialTask(deal) {
     if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
       return { ok: true, duplicate: true, dealId: String(deal.ID) };
     }
-    const teamLoad = await getDistributionTeamLoad();
-    const recommendation = distributionRecommendation(teamLoad);
+    const previous = await getPreviousExpert(deal.COMPANY_ID, deal.ID);
+    const teamLoad = previous ? [] : await getDistributionTeamLoad();
+    const recommendation = previous
+      ? `Рекомендация: передать ${previous.expertName} — этот эксперт уже работал с компанией в воронке «Производство»${previous.service || previous.title ? `: ${previous.service || previous.title}` : ''}.`
+      : distributionRecommendation(teamLoad);
     const companyName = deal.TITLE || `Сделка ${deal.ID}`;
     const description = [
     DISTRIBUTION_START_MARKER,
@@ -4391,7 +4399,11 @@ async function createDistributionInitialTask(deal) {
     '',
     recommendation,
     '',
-    'В расчёт включены только сотрудники, которые являются ответственными в открытых сделках воронки «Производство»; этап «Не распределенные» не учитывается.',
+    previous
+      ? 'Приоритет отдан последнему разрешённому эксперту из истории сделок этой компании в «Производстве». '
+        + 'Алла Ягур и Роман Авсеенко в рекомендации не участвуют.'
+      : 'Истории работы с компанией у разрешённых экспертов нет, поэтому расчёт выполнен по текущей загрузке. '
+        + 'Учитываются только разрешённые эксперты в открытых сделках «Производства»; этап «Не распределенные» не учитывается.',
     `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
     ].join('\n');
     const created = await bitrixRestCall('tasks.task.add', {
