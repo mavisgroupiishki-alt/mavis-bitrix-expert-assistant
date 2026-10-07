@@ -4281,6 +4281,15 @@ async function checkUnassignedDeals() {
 // один сразу после входа в «Не распределенные», второй — через 4 рабочих часа.
 const DISTRIBUTION_START_MARKER = '[MAVIS_DISTRIBUTION_START]';
 const DISTRIBUTION_REMINDER_MARKER = '[MAVIS_DISTRIBUTION_REMINDER]';
+const distributionTaskLocks = new Map();
+
+async function withDistributionTaskLock(kind, dealId, work) {
+  const key = `${kind}:${dealId}`;
+  if (distributionTaskLocks.has(key)) return distributionTaskLocks.get(key);
+  const pending = Promise.resolve().then(work).finally(() => distributionTaskLocks.delete(key));
+  distributionTaskLocks.set(key, pending);
+  return pending;
+}
 
 function distributionRobotAuthorized(req) {
   // Some Bitrix24 webhook requests arrive through a proxy that removes the
@@ -4367,14 +4376,15 @@ function distributionTaskId(created) {
 }
 
 async function createDistributionInitialTask(deal) {
-  const titlePrefix = 'Распределить новую сделку:';
-  if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
-    return { ok: true, duplicate: true, dealId: String(deal.ID) };
-  }
-  const teamLoad = await getDistributionTeamLoad();
-  const recommendation = distributionRecommendation(teamLoad);
-  const companyName = deal.TITLE || `Сделка ${deal.ID}`;
-  const description = [
+  return withDistributionTaskLock('initial', deal.ID, async () => {
+    const titlePrefix = 'Распределить новую сделку:';
+    if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
+      return { ok: true, duplicate: true, dealId: String(deal.ID) };
+    }
+    const teamLoad = await getDistributionTeamLoad();
+    const recommendation = distributionRecommendation(teamLoad);
+    const companyName = deal.TITLE || `Сделка ${deal.ID}`;
+    const description = [
     DISTRIBUTION_START_MARKER,
     'Распределите новую сделку вручную.',
     '',
@@ -4382,8 +4392,8 @@ async function createDistributionInitialTask(deal) {
     '',
     'В расчёт включены только сотрудники, которые являются ответственными в открытых сделках воронки «Производство»; этап «Не распределенные» не учитывается.',
     `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
-  ].join('\n');
-  const created = await bitrixRestCall('tasks.task.add', {
+    ].join('\n');
+    const created = await bitrixRestCall('tasks.task.add', {
     fields: {
       TITLE: `Распределить новую сделку: ${companyName}`,
       DESCRIPTION: description,
@@ -4391,36 +4401,38 @@ async function createDistributionInitialTask(deal) {
       UF_CRM_TASK: [`D_${deal.ID}`],
       PRIORITY: 2,
     },
-  });
-  const taskId = distributionTaskId(created);
-  if (!taskId) throw new Error('Задача на распределение не была создана.');
-  if (!(await distributionStartRecorded(deal))) await recordDistributionStart(deal);
-  return {
+    });
+    const taskId = distributionTaskId(created);
+    if (!taskId) throw new Error('Задача на распределение не была создана.');
+    if (!(await distributionStartRecorded(deal))) await recordDistributionStart(deal);
+    return {
     ok: true,
     event: 'distribution_initial_task_created',
     dealId: String(deal.ID),
     taskId,
     recommendation,
-  };
+    };
+  });
 }
 
 async function createDistributionReminderTask(deal) {
-  if (!(await distributionStartRecorded(deal))) {
-    return { ok: false, skipped: true, message: 'Первичная задача по этому входу на этап не была создана.' };
-  }
-  const titlePrefix = 'ПРОСРОЧЕНО: распределить сделку:';
-  if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
-    return { ok: true, duplicate: true, dealId: String(deal.ID) };
-  }
-  const companyName = deal.TITLE || `Сделка ${deal.ID}`;
-  const description = [
+  return withDistributionTaskLock('reminder', deal.ID, async () => {
+    if (!(await distributionStartRecorded(deal))) {
+      return { ok: false, skipped: true, message: 'Первичная задача по этому входу на этап не была создана.' };
+    }
+    const titlePrefix = 'ПРОСРОЧЕНО: распределить сделку:';
+    if (await distributionTaskAlreadyCreated(deal.ID, titlePrefix)) {
+      return { ok: true, duplicate: true, dealId: String(deal.ID) };
+    }
+    const companyName = deal.TITLE || `Сделка ${deal.ID}`;
+    const description = [
     DISTRIBUTION_REMINDER_MARKER,
     'Сделка остаётся на этапе «Не распределенные» более 4 рабочих часов.',
     'Назначьте ответственного эксперта и переведите сделку на следующий этап.',
     '',
     `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
-  ].join('\n');
-  const created = await bitrixRestCall('tasks.task.add', {
+    ].join('\n');
+    const created = await bitrixRestCall('tasks.task.add', {
     fields: {
       TITLE: `ПРОСРОЧЕНО: распределить сделку: ${companyName}`,
       DESCRIPTION: description,
@@ -4428,16 +4440,17 @@ async function createDistributionReminderTask(deal) {
       UF_CRM_TASK: [`D_${deal.ID}`],
       PRIORITY: 2,
     },
-  });
-  const taskId = distributionTaskId(created);
-  if (!taskId) throw new Error('Задача-напоминание не была создана.');
-  if (!(await distributionReminderRecorded(deal))) await recordDistributionReminder(deal);
-  return {
+    });
+    const taskId = distributionTaskId(created);
+    if (!taskId) throw new Error('Задача-напоминание не была создана.');
+    if (!(await distributionReminderRecorded(deal))) await recordDistributionReminder(deal);
+    return {
     ok: true,
     event: 'distribution_reminder_task_created',
     dealId: String(deal.ID),
     taskId,
-  };
+    };
+  });
 }
 
 // Bitrix24 may invoke an outgoing-webhook robot with GET or POST depending on
