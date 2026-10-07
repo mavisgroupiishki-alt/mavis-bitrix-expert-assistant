@@ -215,6 +215,9 @@ const config = {
   // v85: если явный список не задан, кандидатов на распределение определяем только
   // по отделу Производства. Опорные эксперты нужны лишь чтобы автоматически найти ID отдела.
   distributionExpertSeedIds: parseIdList(process.env.DISTRIBUTION_EXPERT_SEED_IDS || '2052,1960,2192,2198'),
+  // Отдельный ключ для роботов распределения. Не используем ключи актов или прорабов,
+  // чтобы робот СПК имел доступ только к своему маршруту.
+  distributionRobotToken: process.env.DISTRIBUTION_ROBOT_TOKEN || '',
   // v85: CJM блоки 5–6 запускаются отдельно от старого STAGE_MONITORING_ENABLED.
   collectionControlEnabled: String(process.env.COLLECTION_CONTROL_ENABLED || 'true').toLowerCase() !== 'false',
   selectionControlEnabled: String(process.env.SELECTION_CONTROL_ENABLED || 'true').toLowerCase() !== 'false',
@@ -3991,7 +3994,9 @@ async function getActiveProductionDealsForCompany(companyId, currentDealId) {
 }
 
 async function getDistributionTeamLoad() {
-  // v85: в рекомендациях только эксперты отдела Производства.
+  // Кандидаты — только те, кто уже является ответственным в открытых сделках
+  // Производства. Этап «Не распределенные» исключаем: на нём ответственным
+  // может ещё оставаться менеджер продаж, а не эксперт.
   try {
     const deals = await bitrixRestList('crm.deal.list', {
       filter: { CATEGORY_ID: config.autopilotCategoryId || 28, CLOSED: 'N' },
@@ -4002,42 +4007,15 @@ async function getDistributionTeamLoad() {
     const counts = new Map();
     const candidateIds = new Set();
     for (const d of deals) {
+      if (String(d.STAGE_ID || '') === String(config.unassignedStageId || '')) continue;
       const id = String(d.ASSIGNED_BY_ID || '').trim();
-      if (!id || !(await isProductionDistributionExpert(id))) continue;
+      if (!id) continue;
       candidateIds.add(id);
       counts.set(id, (counts.get(id) || 0) + 1);
     }
 
-    const explicit = (config.distributionExpertIds || []).map(String);
-    for (const id of (explicit.length ? explicit : (config.distributionExpertSeedIds || []).map(String))) {
-      if (await isProductionDistributionExpert(id)) {
-        candidateIds.add(id);
-        if (!counts.has(id)) counts.set(id, 0);
-      }
-    }
-
-    if (!explicit.length) {
-      try {
-        const deptIds = await getProductionExpertDepartmentIds();
-        if (deptIds.size) {
-          const users = await bitrixRestList('user.get', { filter: { ACTIVE: 'Y' } }, 500);
-          for (const user of users) {
-            const id = String(user.ID || '').trim();
-            if (!id || id === String(TANYA_USER_ID)) continue;
-            if (!userDepartmentIds(user).some((dep) => deptIds.has(dep))) continue;
-            candidateIds.add(id);
-            if (!counts.has(id)) counts.set(id, 0);
-            distributionUserProfileCache.set(id, user);
-          }
-        }
-      } catch (e) {
-        console.warn(`[unassigned] Не удалось добавить экспертов с нулевой загрузкой: ${e.message || e}`);
-      }
-    }
-
     const rows = [];
     for (const expertId of candidateIds) {
-      if (!(await isProductionDistributionExpert(expertId))) continue;
       const expertName = await getDistributionUserName(expertId);
       rows.push({ expertId, expertName: expertName || `ID ${expertId}`, activeCount: counts.get(expertId) || 0 });
     }
@@ -4213,6 +4191,9 @@ async function getLastUnassignedNotificationAt(dealId) {
 }
 
 async function checkUnassignedDeals() {
+  // v152: первичная задача и напоминание запускаются роботами этапа.
+  // Старый polling выключен, чтобы не создавать дубли на уже существующих сделках.
+  return;
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
 
   try {
@@ -4293,6 +4274,175 @@ async function checkUnassignedDeals() {
     console.error('[unassigned] Ошибка проверки стадии «На распределении»:', e.message);
   }
 }
+
+// v152: распределение без ИИ. Роботы этапа вызывают эти два маршрута:
+// один сразу после входа в «Не распределенные», второй — через 4 рабочих часа.
+const DISTRIBUTION_START_MARKER = '[MAVIS_DISTRIBUTION_START]';
+const DISTRIBUTION_REMINDER_MARKER = '[MAVIS_DISTRIBUTION_REMINDER]';
+
+function distributionRobotAuthorized(req) {
+  return requestMatchesToken(req, config.distributionRobotToken);
+}
+
+function distributionMovedKey(deal) {
+  return String(deal.MOVED_TIME || deal.DATE_CREATE || '').trim();
+}
+
+async function distributionStageDeal(dealId) {
+  const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+  if (!deal || String(deal.CATEGORY_ID) !== String(config.autopilotCategoryId || 28)) {
+    return { ok: false, skipped: true, message: 'Сделка не относится к воронке Производство.' };
+  }
+  if (String(deal.STAGE_ID) !== String(config.unassignedStageId)) {
+    return { ok: false, skipped: true, message: 'Сделка уже вышла из этапа «Не распределенные».' };
+  }
+  return { ok: true, deal };
+}
+
+async function distributionStartRecorded(deal) {
+  const moved = distributionMovedKey(deal);
+  if (!moved) return false;
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT'],
+    order: { ID: 'DESC' },
+  }, 50);
+  return comments.some((comment) => String(comment.COMMENT || '').includes(`${DISTRIBUTION_START_MARKER}\nmoved=${moved}`));
+}
+
+async function recordDistributionStart(deal) {
+  await bitrixRestCall('crm.timeline.comment.add', {
+    fields: {
+      ENTITY_ID: deal.ID,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `${DISTRIBUTION_START_MARKER}\nmoved=${distributionMovedKey(deal)}`,
+    },
+  });
+}
+
+async function distributionReminderRecorded(deal) {
+  const moved = distributionMovedKey(deal);
+  if (!moved) return false;
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: deal.ID, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT'],
+    order: { ID: 'DESC' },
+  }, 50);
+  return comments.some((comment) => String(comment.COMMENT || '').includes(`${DISTRIBUTION_REMINDER_MARKER}\nmoved=${moved}`));
+}
+
+async function recordDistributionReminder(deal) {
+  await bitrixRestCall('crm.timeline.comment.add', {
+    fields: {
+      ENTITY_ID: deal.ID,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `${DISTRIBUTION_REMINDER_MARKER}\nmoved=${distributionMovedKey(deal)}`,
+    },
+  });
+}
+
+function distributionRecommendation(teamLoad) {
+  return leastLoadedRecommendation(teamLoad)
+    || 'Рекомендация не сформирована: в открытых сделках Производства пока нет назначенных экспертов.';
+}
+
+async function createDistributionInitialTask(deal) {
+  if (await distributionStartRecorded(deal)) {
+    return { ok: true, duplicate: true, dealId: String(deal.ID) };
+  }
+  const teamLoad = await getDistributionTeamLoad();
+  const recommendation = distributionRecommendation(teamLoad);
+  const companyName = deal.TITLE || `Сделка ${deal.ID}`;
+  const description = [
+    DISTRIBUTION_START_MARKER,
+    'Распределите новую сделку вручную.',
+    '',
+    recommendation,
+    '',
+    'В расчёт включены только сотрудники, которые являются ответственными в открытых сделках воронки «Производство»; этап «Не распределенные» не учитывается.',
+    `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
+  ].join('\n');
+  const created = await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: `Распределить новую сделку: ${companyName}`,
+      DESCRIPTION: description,
+      RESPONSIBLE_ID: TANYA_USER_ID,
+      UF_CRM_TASK: [`D_${deal.ID}`],
+      PRIORITY: 2,
+    },
+  });
+  await recordDistributionStart(deal);
+  return {
+    ok: true,
+    event: 'distribution_initial_task_created',
+    dealId: String(deal.ID),
+    taskId: String(created && created.task && (created.task.id || created.task.ID) || ''),
+    recommendation,
+  };
+}
+
+async function createDistributionReminderTask(deal) {
+  if (!(await distributionStartRecorded(deal))) {
+    return { ok: false, skipped: true, message: 'Первичная задача по этому входу на этап не была создана.' };
+  }
+  if (await distributionReminderRecorded(deal)) {
+    return { ok: true, duplicate: true, dealId: String(deal.ID) };
+  }
+  const companyName = deal.TITLE || `Сделка ${deal.ID}`;
+  const description = [
+    DISTRIBUTION_REMINDER_MARKER,
+    'Сделка остаётся на этапе «Не распределенные» более 4 рабочих часов.',
+    'Назначьте ответственного эксперта и переведите сделку на следующий этап.',
+    '',
+    `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
+  ].join('\n');
+  const created = await bitrixRestCall('tasks.task.add', {
+    fields: {
+      TITLE: `ПРОСРОЧЕНО: распределить сделку: ${companyName}`,
+      DESCRIPTION: description,
+      RESPONSIBLE_ID: TANYA_USER_ID,
+      UF_CRM_TASK: [`D_${deal.ID}`],
+      PRIORITY: 2,
+    },
+  });
+  await recordDistributionReminder(deal);
+  return {
+    ok: true,
+    event: 'distribution_reminder_task_created',
+    dealId: String(deal.ID),
+    taskId: String(created && created.task && (created.task.id || created.task.ID) || ''),
+  };
+}
+
+app.post('/api/distribution/robot-entered', async (req, res) => {
+  if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
+  if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
+  try {
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const state = await distributionStageDeal(dealId);
+    if (!state.ok) return res.status(state.skipped ? 200 : 422).json(state);
+    return res.status(200).json(await createDistributionInitialTask(state.deal));
+  } catch (error) {
+    console.error('[distribution-entered]', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
+app.post('/api/distribution/robot-reminder', async (req, res) => {
+  if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
+  if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
+  try {
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const state = await distributionStageDeal(dealId);
+    if (!state.ok) return res.status(state.skipped ? 200 : 422).json(state);
+    return res.status(200).json(await createDistributionReminderTask(state.deal));
+  } catch (error) {
+    console.error('[distribution-reminder]', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
 
 const AUTOPILOT_MARKER = '[MAVIS_AUTOPILOT_DONE]';
 const AUTOPILOT_ERROR_MARKER = '[MAVIS_AUTOPILOT_ERROR]';
