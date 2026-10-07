@@ -4414,7 +4414,9 @@ async function createDistributionReminderTask(deal) {
   };
 }
 
-app.post('/api/distribution/robot-entered', async (req, res) => {
+// Bitrix24 may invoke an outgoing-webhook robot with GET or POST depending on
+// the portal version. Both methods are protected by the per-robot token.
+app.all('/api/distribution/robot-entered', async (req, res) => {
   if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
   if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
   try {
@@ -4429,7 +4431,7 @@ app.post('/api/distribution/robot-entered', async (req, res) => {
   }
 });
 
-app.post('/api/distribution/robot-reminder', async (req, res) => {
+app.all('/api/distribution/robot-reminder', async (req, res) => {
   if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
   if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
   try {
