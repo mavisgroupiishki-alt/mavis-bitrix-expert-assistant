@@ -4032,12 +4032,8 @@ async function getDistributionTeamLoad() {
 function leastLoadedRecommendation(teamLoad) {
   const rows = Array.isArray(teamLoad) ? teamLoad : [];
   if (!rows.length) return null;
-  const min = rows[0].activeCount;
-  const leaders = rows.filter((x) => x.activeCount === min);
-  if (leaders.length === 1) {
-    return `Рекомендация: передать ${leaders[0].expertName} — сейчас у него/неё минимальная загрузка (${min} активных сделок).`;
-  }
-  return `Рекомендация: минимальная загрузка сейчас у ${leaders.map((x) => x.expertName).join(', ')} — по ${min} активных сделок. Можно распределить между ними.`;
+  const candidate = rows[0]; // rows are deterministically sorted by load, then name.
+  return `Рекомендация: передать ${candidate.expertName} — сейчас у него/неё минимальная загрузка (${candidate.activeCount} активных сделок).`;
 }
 
 function formatRoutingRecommendation({ isNew, activeDeals, previous, nps, teamLoad }) {
