@@ -49,6 +49,7 @@ const {
   dateAfterCalendarDays,
   firstContactAction,
   firstContactSchedule,
+  isSpkFirstContactService,
   spkChecklist,
 } = require('./spk-first-contact');
 
@@ -4611,10 +4612,6 @@ app.all('/api/distribution/robot-reminder', async (req, res) => {
   }
 });
 
-function isSpkService(service) {
-  return /спк|свидетельств.*техн|техн.*компетент/i.test(String(service || ''));
-}
-
 async function spkFirstContactTask(dealId) {
   const tasks = await bitrixRestList('tasks.task.list', {
     filter: { UF_CRM_TASK: `D_${dealId}` },
@@ -4644,7 +4641,7 @@ async function spkFirstContactMarkers(dealId) {
 async function createSpkFirstContactTask(deal) {
   return withSpkFirstContactLock('create', deal.ID, async () => {
     const service = detectServiceFromDeal(deal);
-    if (!isSpkService(service)) return { ok: true, skipped: true, reason: 'not-spk' };
+    if (!isSpkFirstContactService(service)) return { ok: true, skipped: true, reason: 'not-spk' };
     if (String(deal.CATEGORY_ID) !== String(config.autopilotCategoryId || 28)) {
       return { ok: true, skipped: true, reason: 'not-production' };
     }
@@ -17582,6 +17579,13 @@ app.listen(PORT, () => {
     // v60: первый цикл сразу после старта, а не через 2 минуты.
     setTimeout(() => runAutopilotPollingCycle(), 2000);
     setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
+
+    // Робот Bitrix создаёт задачу сразу; это резерв для недоставленного вебхука.
+    // Быстрая отдельная проверка нужна, чтобы новое назначение не ждало общий 10-минутный цикл.
+    const spkFirstContactFallbackMs = 60 * 1000;
+    console.log('[spk-first-contact] Резервный запуск включён: проверка новых назначений СПК и аттестации каждую минуту.');
+    setTimeout(() => checkRecentlyAssignedSpkDeals(), 5000);
+    setInterval(() => checkRecentlyAssignedSpkDeals(), spkFirstContactFallbackMs);
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
   }

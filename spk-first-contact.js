@@ -68,6 +68,10 @@ function needsLongCloseDate({ needsSelection, service }) {
   return Boolean(needsSelection) || /подбор|аттестация/i.test(String(service || ''));
 }
 
+function isSpkFirstContactService(service) {
+  return /спк|свидетельств.*техн|техн.*компетент|аттестаци/i.test(String(service || ''));
+}
+
 function closeDateDays(context) {
   return needsLongCloseDate(context) ? 21 : 14;
 }
@@ -112,6 +116,7 @@ module.exports = {
   dateAfterCalendarDays,
   firstContactAction,
   firstContactSchedule,
+  isSpkFirstContactService,
   needsLongCloseDate,
   spkChecklist,
 };
