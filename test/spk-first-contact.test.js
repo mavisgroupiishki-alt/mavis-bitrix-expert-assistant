@@ -16,9 +16,9 @@ test('uses 14 days for SPK with specialists and 21 days for selection or attesta
   assert.equal(closeDateDays({ needsSelection: false, service: 'СПК + аттестация специалиста' }), 21);
 });
 
-test('accepts SPK and attestation services for the first-contact scenario', () => {
+test('accepts only SPK services for the first-contact scenario', () => {
   assert.equal(isSpkFirstContactService('СПК'), true);
-  assert.equal(isSpkFirstContactService('Аттестация ОБ'), true);
+  assert.equal(isSpkFirstContactService('Аттестация ОБ'), false);
   assert.equal(isSpkFirstContactService('СУОТ'), false);
 });
 

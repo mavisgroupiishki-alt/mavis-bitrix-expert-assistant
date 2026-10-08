@@ -69,7 +69,7 @@ function needsLongCloseDate({ needsSelection, service }) {
 }
 
 function isSpkFirstContactService(service) {
-  return /спк|свидетельств.*техн|техн.*компетент|аттестаци/i.test(String(service || ''));
+  return /спк|свидетельств.*техн|техн.*компетент/i.test(String(service || ''));
 }
 
 function closeDateDays(context) {
