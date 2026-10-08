@@ -203,6 +203,9 @@ const config = {
   wazzupAiTestPhoneTail: normalizePhoneDigits(process.env.WAZZUP_AI_TEST_PHONE_TAIL || '5898').slice(-4),
   liveChatEnabled: String(process.env.LIVE_CHAT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotEnabled: String(process.env.AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
+  // Клиентский CJM-контур отправляет «ход работы», ставит задачу эксперту и может менять стадию.
+  // Он выключен по умолчанию: включать его можно только отдельным явным флагом после согласованного теста.
+  clientWorkAutopilotEnabled: String(process.env.CLIENT_WORK_AUTOPILOT_ENABLED || 'false').toLowerCase() === 'true',
   autopilotCategoryId: Number(process.env.AUTOPILOT_CATEGORY_ID || 28),
   // v79: anti-spam / resilient first-call processing.
   autopilotPollIntervalMinutes: Number(process.env.AUTOPILOT_POLL_INTERVAL_MINUTES || 10),
@@ -239,11 +242,11 @@ const config = {
   selectionTestMinutes: Number(process.env.SELECTION_TEST_MINUTES || 0),
   // v86: временный ускоренный тестовый контур только для ООО «Бобик» (deal 38072).
   // Позволяет прогнать CJM 1–6 с минимумом ручных действий, не ускоряя реальные сделки.
-  cjmTestMode: String(process.env.CJM_TEST_MODE || 'true').toLowerCase() !== 'false',
+  cjmTestMode: String(process.env.CJM_TEST_MODE || 'false').toLowerCase() === 'true',
   cjmTestDealId: String(process.env.CJM_TEST_DEAL_ID || '38072'),
   // v87: только в тестовом CJM-контуре Бобика разрешаем сформировать Ход работы без звонка.
   // Боевые сделки по-прежнему требуют содержательный звонок >=60 сек.
-  cjmTestAllowNoCall: String(process.env.CJM_TEST_ALLOW_NO_CALL || 'true').toLowerCase() !== 'false',
+  cjmTestAllowNoCall: String(process.env.CJM_TEST_ALLOW_NO_CALL || 'false').toLowerCase() === 'true',
 
   // v45: ИИгорь — диагностика воронки прорабов.
   foremanCategoryId: Number(process.env.FOREMAN_CATEGORY_ID || 32),
@@ -6052,6 +6055,10 @@ function buildNoCallTestWorkResult(deal, context, defaultDocDeadline) {
 async function runServerAutopilotForDeal(deal, stageId) {
   const dealId = deal.ID;
   const logPrefix = `[autopilot deal=${dealId}]`;
+  if (!config.clientWorkAutopilotEnabled) {
+    console.log(`${logPrefix} Клиентский CJM-контур выключен: не отправляю сообщения, не создаю задачи и не меняю стадию.`);
+    return;
+  }
   console.log(`${logPrefix} Запускаю автопилот для "${deal.TITLE}"`);
 
   try {
@@ -7793,6 +7800,9 @@ async function runAutopilotPollingCycle() {
 
   autopilotCycleRunning = true;
   try {
+    if (!config.clientWorkAutopilotEnabled) {
+      console.log('[autopilot] Клиентский CJM-контур выключен: «ход работы», письма, задачи и автоперевод стадий не запускаются.');
+    } else {
     const stageIds = await getAutopilotStageIds();
     if (!stageIds.length) {
       console.warn('[autopilot] Стадии не найдены в воронке — проверь AUTOPILOT_CATEGORY_ID.');
@@ -7872,6 +7882,7 @@ async function runAutopilotPollingCycle() {
       // Передаём первую стадию (Эксперт назначен) как эталон для поиска сопутствующих сделок.
       await runServerAutopilotForDeal(deal, deal.STAGE_ID);
       await new Promise((r) => setTimeout(r, 800));
+    }
     }
 
     // Проверяем ожидающие задачи-триггеры Этапа 4 (эксперт поставил галочку).
