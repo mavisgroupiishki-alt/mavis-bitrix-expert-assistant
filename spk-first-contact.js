@@ -110,6 +110,18 @@ function spkChecklist() {
   ];
 }
 
+function spkFirstContactHint({ closeDate, closeDays }) {
+  return [
+    'СПК — первое касание',
+    'Свяжитесь с клиентом и согласуйте ход работы.',
+    '',
+    'Что запросить:',
+    ...spkChecklist().map((line, index) => `${index + 1}. ${line}`),
+    '',
+    `Плановая дата закрытия: ${closeDate} (${closeDays} календарных дней).`,
+  ].join('\n');
+}
+
 function firstContactAction({ completed, elapsedWorkingHours, reminderSent, escalationSent }) {
   if (completed) return 'none';
   if (Number(elapsedWorkingHours || 0) >= 9 && !escalationSent) return 'escalate';
@@ -129,5 +141,6 @@ module.exports = {
   firstContactSchedule,
   isSpkFirstContactService,
   needsLongCloseDate,
+  spkFirstContactHint,
   spkChecklist,
 };

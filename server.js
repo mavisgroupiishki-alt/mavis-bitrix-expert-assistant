@@ -42,7 +42,6 @@ const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isS
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 const { transitionFields, validateProductionTransition } = require('./production-stage-transition');
 const {
-  SPK_FIRST_CONTACT_MARKER,
   SPK_FIRST_CONTACT_REMINDER_MARKER,
   SPK_FIRST_CONTACT_ESCALATION_MARKER,
   bitrixField,
@@ -51,7 +50,7 @@ const {
   firstContactAction,
   firstContactSchedule,
   isSpkFirstContactService,
-  spkChecklist,
+  spkFirstContactHint,
 } = require('./spk-first-contact');
 
 const app = express();
@@ -4635,18 +4634,34 @@ app.all('/api/distribution/robot-reminder', async (req, res) => {
   }
 });
 
-async function spkFirstContactTask(dealId) {
-  const tasks = await bitrixRestList('tasks.task.list', {
-    filter: { UF_CRM_TASK: `D_${dealId}` },
-    select: ['ID', 'TITLE', 'DESCRIPTION', 'RESPONSIBLE_ID', 'STATUS', 'REAL_STATUS', 'CREATED_DATE', 'START_DATE_PLAN', 'DEADLINE'],
-    order: { ID: 'DESC' },
-  }, 50);
-  return tasks.find((task) => {
-    const title = String(bitrixField(task, 'TITLE') || '');
-    const description = String(bitrixField(task, 'DESCRIPTION') || '');
-    return title === 'Связаться с клиентом и согласовать ход работы'
-      && description.includes('Свяжитесь с клиентом и согласуйте ход работы по СПК.');
-  }) || null;
+const SPK_FIRST_CONTACT_SENT_XML_ID = 'MAVIS_SPK_FIRST_CONTACT_SENT_AT';
+let spkFirstContactSentFieldCodeCache = null;
+
+async function spkFirstContactSentFieldCode() {
+  if (spkFirstContactSentFieldCodeCache) return spkFirstContactSentFieldCodeCache;
+  const find = (fields) => fields.find((field) => String(bitrixField(field, 'XML_ID') || '') === SPK_FIRST_CONTACT_SENT_XML_ID);
+  let fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
+  let field = find(fields);
+  if (!field) {
+    await bitrixRestCall('crm.deal.userfield.add', { fields: {
+      XML_ID: SPK_FIRST_CONTACT_SENT_XML_ID,
+      USER_TYPE_ID: 'datetime',
+      MULTIPLE: 'N',
+      MANDATORY: 'N',
+      SHOW_IN_LIST: 'N',
+      EDIT_IN_LIST: 'N',
+      LIST_SHOW_FILTER: 'N',
+      EDIT_FORM_LABEL: { ru: 'Служебная отметка первого касания СПК' },
+      LIST_COLUMN_LABEL: { ru: 'Служебная отметка первого касания СПК' },
+      LIST_FILTER_LABEL: { ru: 'Служебная отметка первого касания СПК' },
+    }});
+    fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
+    field = find(fields);
+  }
+  const code = String(bitrixField(field, 'FIELD_NAME') || '');
+  if (!code) throw new Error('Не удалось подготовить скрытую отметку первого касания СПК.');
+  spkFirstContactSentFieldCodeCache = code;
+  return code;
 }
 
 function spkTaskCompleted(task) {
@@ -4667,40 +4682,31 @@ async function createSpkFirstContactTask(deal) {
       return { ok: true, skipped: true, reason: 'expert-not-assigned' };
     }
 
-    const existing = await spkFirstContactTask(deal.ID);
-    if (existing) return { ok: true, duplicate: true, dealId: String(deal.ID), taskId: String(bitrixField(existing, 'ID') || '') };
+    const sentFieldCode = await spkFirstContactSentFieldCode();
+    const freshDeal = await bitrixRestCall('crm.deal.get', { id: deal.ID });
+    if (freshDeal[sentFieldCode]) {
+      return { ok: true, duplicate: true, dealId: String(deal.ID), source: 'hidden-deal-flag' };
+    }
 
-    const selection = await getSelectionContextV85(deal);
-    const assignedAt = new Date(deal.MOVED_TIME || deal.DATE_MODIFY || new Date());
+    const selection = await getSelectionContextV85(freshDeal);
+    const assignedAt = new Date(freshDeal.MOVED_TIME || freshDeal.DATE_MODIFY || new Date());
     const closeDays = closeDateDays({ needsSelection: selection.need, service });
     const closeDate = dateAfterCalendarDays(assignedAt, closeDays);
     const schedule = firstContactSchedule(assignedAt);
     const closeDateField = await productionExpectedCloseDateFieldCode();
-    await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: { [closeDateField]: closeDate } });
-
-    const taskDescription = [
-      'Свяжитесь с клиентом и согласуйте ход работы по СПК.',
-      '',
-      'Подсказка по копиям:',
-      ...spkChecklist().map((line, index) => `${index + 1}. ${line}`),
-      '',
-      `Плановая дата закрытия установлена: ${closeDate} (${closeDays} календарных дней).`,
-      `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
-    ].join('\n');
-    const created = await bitrixRestCall('tasks.task.add', {
-      fields: {
-        TITLE: 'Связаться с клиентом и согласовать ход работы',
-        DESCRIPTION: taskDescription,
-        RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
-        START_DATE_PLAN: toMinskLocalIso(schedule.startAt),
-        DEADLINE: toMinskLocalIso(schedule.deadlineAt),
-        UF_CRM_TASK: [`D_${deal.ID}`],
-        PRIORITY: 2,
-      },
+    const sentAt = new Date().toISOString();
+    await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: {
+      [closeDateField]: closeDate,
+      [sentFieldCode]: sentAt,
+    }});
+    const hint = `${spkFirstContactHint({ closeDate, closeDays })}\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`;
+    await bitrixRestCall('im.notify.personal.add', {
+      USER_ID: freshDeal.ASSIGNED_BY_ID,
+      MESSAGE: hint,
+      MESSAGE_OUT: hint,
+      TAG: `mavis-spk-first-contact-${deal.ID}-${String(freshDeal.MOVED_TIME || '')}`,
     });
-    const taskId = distributionTaskId(created);
-    if (!taskId) throw new Error('Задача первого касания СПК не была создана.');
-    return { ok: true, dealId: String(deal.ID), taskId, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt) };
+    return { ok: true, dealId: String(deal.ID), notification: true, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt), sentAt };
   });
 }
 
@@ -8110,8 +8116,8 @@ async function runAutopilotPollingCycle() {
     // Резервный запуск первого касания СПК для новых сделок на этапе назначения эксперта.
     await checkRecentlyAssignedSpkDeals();
 
-    // Контролируем задачи первого касания по СПК: напоминание эксперту и эскалация руководителю.
-    await checkSpkFirstContactTasks();
+    // Первое касание СПК теперь приходит эксперту персональной подсказкой,
+    // без постановки задачи и без фоновых напоминаний по задаче.
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
   } finally {

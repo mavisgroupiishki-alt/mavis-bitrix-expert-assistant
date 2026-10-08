@@ -8,6 +8,7 @@ const {
   firstContactAction,
   firstContactSchedule,
   isSpkFirstContactService,
+  spkFirstContactHint,
   spkChecklist,
 } = require('../spk-first-contact');
 
@@ -49,6 +50,13 @@ test('uses only the concise SPK document checklist', () => {
   assert.match(text, /Средства измерения/i);
   assert.match(text, /ИПС «Стройпрофи»/i);
   assert.doesNotMatch(text, /нивелирная рейка/i);
+});
+
+test('puts the complete SPK checklist into one expert hint', () => {
+  const hint = spkFirstContactHint({ closeDate: '2026-10-22', closeDays: 14 });
+  assert.match(hint, /Что запросить:/);
+  assert.match(hint, /Средства измерения/);
+  assert.match(hint, /2026-10-22/);
 });
 
 test('reminds after four working hours and escalates after one working day', () => {
