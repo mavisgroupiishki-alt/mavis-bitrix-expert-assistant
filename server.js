@@ -512,8 +512,20 @@ function productionDateFieldLabel(field) {
 
 async function productionExpectedCloseDateFieldCode() {
   if (config.productionExpectedCloseDateFieldCode) return config.productionExpectedCloseDateFieldCode;
+  const matchesExpectedCloseDate = (item) => /предполагаем\S*\s+дат\S*\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item));
   const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
-  const field = fields.find((item) => /предполагаем\S*\s+дат\S*\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
+  let field = fields.find(matchesExpectedCloseDate);
+
+  // Некоторые порталы не возвращают все пользовательские поля в
+  // crm.deal.userfield.list, хотя они доступны в карточке сделки. В таком
+  // случае crm.deal.fields — надёжный резервный источник с кодом поля.
+  if (!field) {
+    const dealFields = await bitrixRestCall('crm.deal.fields', {});
+    field = Object.entries(dealFields || {}).map(([fieldName, item]) => ({
+      ...(item || {}),
+      FIELD_NAME: fieldName,
+    })).find(matchesExpectedCloseDate);
+  }
   const code = String(field && (field.FIELD_NAME || field.fieldName || field.NAME || field.name) || '').trim();
   if (!code) throw new Error('В Bitrix24 не найдено поле «Предполагаемая дата закрытия продукта».');
   return code;
