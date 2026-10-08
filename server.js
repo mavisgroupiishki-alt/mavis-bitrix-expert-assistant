@@ -504,7 +504,16 @@ async function bitrixRestList(method, params = {}, limit = 200, options = {}) {
 }
 
 function productionDateFieldLabel(field) {
-  return [field && field.EDIT_FORM_LABEL, field && field.LIST_COLUMN_LABEL, field && field.LABEL, field && field.TITLE, field && field.title]
+  return [
+    field && field.EDIT_FORM_LABEL,
+    field && field.LIST_COLUMN_LABEL,
+    field && field.LABEL,
+    field && field.TITLE,
+    field && field.title,
+    field && field.formLabel,
+    field && field.listLabel,
+    field && field.filterLabel,
+  ]
     .filter(Boolean)
     .join(' ')
     .toLocaleLowerCase('ru-RU');
