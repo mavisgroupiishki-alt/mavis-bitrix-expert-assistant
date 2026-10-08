@@ -513,7 +513,7 @@ function productionDateFieldLabel(field) {
 async function productionExpectedCloseDateFieldCode() {
   if (config.productionExpectedCloseDateFieldCode) return config.productionExpectedCloseDateFieldCode;
   const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
-  const field = fields.find((item) => /предполагаем\s+дата\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
+  const field = fields.find((item) => /предполагаем\w*\s+дат\w*\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
   const code = String(field && (field.FIELD_NAME || field.fieldName || field.NAME || field.name) || '').trim();
   if (!code) throw new Error('В Bitrix24 не найдено поле «Предполагаемая дата закрытия продукта».');
   return code;
@@ -17583,7 +17583,7 @@ app.listen(PORT, () => {
     // Робот Bitrix создаёт задачу сразу; это резерв для недоставленного вебхука.
     // Быстрая отдельная проверка нужна, чтобы новое назначение не ждало общий 10-минутный цикл.
     const spkFirstContactFallbackMs = 60 * 1000;
-    console.log('[spk-first-contact] Резервный запуск включён: проверка новых назначений СПК и аттестации каждую минуту.');
+    console.log('[spk-first-contact] Резервный запуск включён: проверка новых назначений СПК каждую минуту.');
     setTimeout(() => checkRecentlyAssignedSpkDeals(), 5000);
     setInterval(() => checkRecentlyAssignedSpkDeals(), spkFirstContactFallbackMs);
   } else {
