@@ -513,7 +513,7 @@ function productionDateFieldLabel(field) {
 async function productionExpectedCloseDateFieldCode() {
   if (config.productionExpectedCloseDateFieldCode) return config.productionExpectedCloseDateFieldCode;
   const fields = await bitrixRestList('crm.deal.userfield.list', {}, 500);
-  const field = fields.find((item) => /предполагаем\w*\s+дат\w*\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
+  const field = fields.find((item) => /предполагаем\S*\s+дат\S*\s+закрытия\s+продукта/i.test(productionDateFieldLabel(item)));
   const code = String(field && (field.FIELD_NAME || field.fieldName || field.NAME || field.name) || '').trim();
   if (!code) throw new Error('В Bitrix24 не найдено поле «Предполагаемая дата закрытия продукта».');
   return code;
