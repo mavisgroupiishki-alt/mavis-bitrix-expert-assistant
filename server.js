@@ -4743,6 +4743,33 @@ async function checkSpkFirstContactTasks() {
   }
 }
 
+// Резерв к роботу Bitrix: если исходящий вебхук временно не доставлен,
+// забираем только сделки, переведённые на этап после запуска сервиса.
+// Уже находившиеся на этапе сделки не затрагиваем.
+async function checkRecentlyAssignedSpkDeals() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
+  try {
+    const deals = await bitrixRestList('crm.deal.list', {
+      filter: {
+        CATEGORY_ID: config.autopilotCategoryId || 28,
+        STAGE_ID: STAGE_IDS.expertAssigned,
+        '>=MOVED_TIME': AUTOPILOT_START_DATE.toISOString().slice(0, 19),
+      },
+      select: [
+        'ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'ASSIGNED_BY_ID',
+        'DATE_MODIFY', 'MOVED_TIME', 'COMPANY_ID', 'CONTACT_ID',
+        process.env.SERVICE_FIELD_CODE || 'UF_CRM_1765113071',
+      ],
+      order: { MOVED_TIME: 'DESC' },
+    }, 100);
+    for (const deal of deals) {
+      await createSpkFirstContactTask(deal);
+    }
+  } catch (error) {
+    console.error(`[spk-first-contact] Не удалось проверить новые назначенные сделки: ${error.message || error}`);
+  }
+}
+
 app.all('/api/production/spk-first-contact', async (req, res) => {
   if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
   if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
@@ -8069,6 +8096,9 @@ async function runAutopilotPollingCycle() {
 
     // Проверяем нераспределённые сделки — уведомляем Таню если висят 4+ рабочих часа.
     await checkUnassignedDeals();
+
+    // Резервный запуск первого касания СПК для новых сделок на этапе назначения эксперта.
+    await checkRecentlyAssignedSpkDeals();
 
     // Контролируем задачи первого касания по СПК: напоминание эксперту и эскалация руководителю.
     await checkSpkFirstContactTasks();
