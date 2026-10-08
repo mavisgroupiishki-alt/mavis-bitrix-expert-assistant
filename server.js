@@ -4655,6 +4655,7 @@ async function spkFirstContactMarkers(dealId) {
   }, 50);
   const text = comments.map((comment) => String(comment.COMMENT || '')).join('\n');
   return {
+    firstContactCreated: text.includes(SPK_FIRST_CONTACT_MARKER),
     reminderSent: text.includes(SPK_FIRST_CONTACT_REMINDER_MARKER),
     escalationSent: text.includes(SPK_FIRST_CONTACT_ESCALATION_MARKER),
   };
@@ -4674,8 +4675,15 @@ async function createSpkFirstContactTask(deal) {
       return { ok: true, skipped: true, reason: 'expert-not-assigned' };
     }
 
-    const existing = await spkFirstContactTask(deal.ID);
+    const [existing, markers] = await Promise.all([
+      spkFirstContactTask(deal.ID),
+      spkFirstContactMarkers(deal.ID),
+    ]);
     if (existing) return { ok: true, duplicate: true, dealId: String(deal.ID), taskId: String(existing.ID) };
+    // Bitrix может несколько раз почти одновременно вызвать робота этапа.
+    // Комментарий создаётся вместе с первой задачей и является постоянным
+    // идемпотентным маркером, независимым от полноты ответа tasks.task.list.
+    if (markers.firstContactCreated) return { ok: true, duplicate: true, dealId: String(deal.ID), source: 'timeline-marker' };
 
     const selection = await getSelectionContextV85(deal);
     const assignedAt = new Date(deal.MOVED_TIME || deal.DATE_MODIFY || new Date());
