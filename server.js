@@ -41,6 +41,16 @@ const { trustedBitrixFileUrl } = require('./acts-file-security');
 const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestCreatorId, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 const { transitionFields, validateProductionTransition } = require('./production-stage-transition');
+const {
+  SPK_FIRST_CONTACT_MARKER,
+  SPK_FIRST_CONTACT_REMINDER_MARKER,
+  SPK_FIRST_CONTACT_ESCALATION_MARKER,
+  closeDateDays,
+  dateAfterCalendarDays,
+  firstContactAction,
+  firstContactSchedule,
+  spkChecklist,
+} = require('./spk-first-contact');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4382,12 +4392,21 @@ async function checkUnassignedDeals() {
 const DISTRIBUTION_START_MARKER = '[MAVIS_DISTRIBUTION_START]';
 const DISTRIBUTION_REMINDER_MARKER = '[MAVIS_DISTRIBUTION_REMINDER]';
 const distributionTaskLocks = new Map();
+const spkFirstContactLocks = new Map();
 
 async function withDistributionTaskLock(kind, dealId, work) {
   const key = `${kind}:${dealId}`;
   if (distributionTaskLocks.has(key)) return distributionTaskLocks.get(key);
   const pending = Promise.resolve().then(work).finally(() => distributionTaskLocks.delete(key));
   distributionTaskLocks.set(key, pending);
+  return pending;
+}
+
+async function withSpkFirstContactLock(kind, dealId, work) {
+  const key = `${kind}:${dealId}`;
+  if (spkFirstContactLocks.has(key)) return spkFirstContactLocks.get(key);
+  const pending = Promise.resolve().then(work).finally(() => spkFirstContactLocks.delete(key));
+  spkFirstContactLocks.set(key, pending);
   return pending;
 }
 
@@ -4588,6 +4607,152 @@ app.all('/api/distribution/robot-reminder', async (req, res) => {
     return res.status(200).json(await createDistributionReminderTask(state.deal));
   } catch (error) {
     console.error('[distribution-reminder]', error.message || error);
+    return res.status(500).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
+function isSpkService(service) {
+  return /спк|свидетельств.*техн|техн.*компетент/i.test(String(service || ''));
+}
+
+async function spkFirstContactTask(dealId) {
+  const tasks = await bitrixRestList('tasks.task.list', {
+    filter: { UF_CRM_TASK: `D_${dealId}` },
+    select: ['ID', 'TITLE', 'DESCRIPTION', 'RESPONSIBLE_ID', 'STATUS', 'REAL_STATUS', 'CREATED_DATE', 'START_DATE_PLAN', 'DEADLINE'],
+    order: { ID: 'DESC' },
+  }, 50);
+  return tasks.find((task) => String(task.DESCRIPTION || '').includes(SPK_FIRST_CONTACT_MARKER)) || null;
+}
+
+function spkTaskCompleted(task) {
+  return String(task && (task.REAL_STATUS || task.STATUS) || '') === '5';
+}
+
+async function spkFirstContactMarkers(dealId) {
+  const comments = await bitrixRestList('crm.timeline.comment.list', {
+    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+    select: ['ID', 'COMMENT'],
+    order: { ID: 'DESC' },
+  }, 50);
+  const text = comments.map((comment) => String(comment.COMMENT || '')).join('\n');
+  return {
+    reminderSent: text.includes(SPK_FIRST_CONTACT_REMINDER_MARKER),
+    escalationSent: text.includes(SPK_FIRST_CONTACT_ESCALATION_MARKER),
+  };
+}
+
+async function createSpkFirstContactTask(deal) {
+  return withSpkFirstContactLock('create', deal.ID, async () => {
+    const service = detectServiceFromDeal(deal);
+    if (!isSpkService(service)) return { ok: true, skipped: true, reason: 'not-spk' };
+    if (String(deal.CATEGORY_ID) !== String(config.autopilotCategoryId || 28)) {
+      return { ok: true, skipped: true, reason: 'not-production' };
+    }
+    if (String(deal.STAGE_ID) !== String(STAGE_IDS.expertAssigned)) {
+      return { ok: true, skipped: true, reason: 'not-expert-assigned-stage' };
+    }
+    if (!deal.ASSIGNED_BY_ID || String(deal.ASSIGNED_BY_ID) === String(TANYA_USER_ID)) {
+      return { ok: true, skipped: true, reason: 'expert-not-assigned' };
+    }
+
+    const existing = await spkFirstContactTask(deal.ID);
+    if (existing) return { ok: true, duplicate: true, dealId: String(deal.ID), taskId: String(existing.ID) };
+
+    const selection = await getSelectionContextV85(deal);
+    const assignedAt = new Date(deal.MOVED_TIME || deal.DATE_MODIFY || new Date());
+    const closeDays = closeDateDays({ needsSelection: selection.need, service });
+    const closeDate = dateAfterCalendarDays(assignedAt, closeDays);
+    const schedule = firstContactSchedule(assignedAt);
+    const closeDateField = await productionExpectedCloseDateFieldCode();
+    await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: { [closeDateField]: closeDate } });
+
+    const taskDescription = [
+      SPK_FIRST_CONTACT_MARKER,
+      'Свяжитесь с клиентом и согласуйте ход работы по СПК.',
+      '',
+      'Подсказка по копиям:',
+      ...spkChecklist().map((line, index) => `${index + 1}. ${line}`),
+      '',
+      `Плановая дата закрытия установлена: ${closeDate} (${closeDays} календарных дней).`,
+      `Сделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`,
+    ].join('\n');
+    const created = await bitrixRestCall('tasks.task.add', {
+      fields: {
+        TITLE: 'Связаться с клиентом и согласовать ход работы',
+        DESCRIPTION: taskDescription,
+        RESPONSIBLE_ID: deal.ASSIGNED_BY_ID,
+        START_DATE_PLAN: toMinskLocalIso(schedule.startAt),
+        DEADLINE: toMinskLocalIso(schedule.deadlineAt),
+        UF_CRM_TASK: [`D_${deal.ID}`],
+        PRIORITY: 2,
+      },
+    });
+    const taskId = distributionTaskId(created);
+    if (!taskId) throw new Error('Задача первого касания СПК не была создана.');
+    await bitrixRestCall('crm.timeline.comment.add', { fields: {
+      ENTITY_ID: deal.ID,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `${SPK_FIRST_CONTACT_MARKER}\nСоздана задача первого касания СПК. Плановая дата закрытия: ${closeDate}.`,
+    }});
+    return { ok: true, dealId: String(deal.ID), taskId, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt) };
+  });
+}
+
+async function checkSpkFirstContactTasks() {
+  if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
+  let tasks = [];
+  try {
+    tasks = await bitrixRestList('tasks.task.list', {
+      // Ищем только недавние задачи: созданные этим сценарием до 60 дней назад.
+      // Так не сканируем всю историю задач портала на каждом цикле автопилота.
+      filter: { '>=CREATED_DATE': new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10) },
+      select: ['ID', 'TITLE', 'DESCRIPTION', 'RESPONSIBLE_ID', 'STATUS', 'REAL_STATUS', 'CREATED_DATE', 'START_DATE_PLAN', 'DEADLINE', 'UF_CRM_TASK'],
+      order: { ID: 'DESC' },
+    }, 1000);
+  } catch (error) {
+    console.error(`[spk-first-contact] Не удалось получить задачи: ${error.message || error}`);
+    return;
+  }
+
+  for (const task of tasks) {
+    if (!String(task.DESCRIPTION || '').includes(SPK_FIRST_CONTACT_MARKER)) continue;
+    const dealId = String((Array.isArray(task.UF_CRM_TASK) ? task.UF_CRM_TASK[0] : task.UF_CRM_TASK) || '').replace(/^D_/, '');
+    if (!dealId) continue;
+    const startedAt = new Date(task.START_DATE_PLAN || task.CREATED_DATE || Date.now());
+    const elapsedWorkingHours = workingHoursBetween(startedAt, new Date());
+    const markers = await spkFirstContactMarkers(dealId).catch(() => ({ reminderSent: false, escalationSent: false }));
+    const action = firstContactAction({ completed: spkTaskCompleted(task), elapsedWorkingHours, ...markers });
+    if (action === 'wait' || action === 'none') continue;
+
+    if (action === 'remind') {
+      const message = `Напоминание: по сделке «${task.TITLE || dealId}» задача первого касания СПК не закрыта уже 4 рабочих часа. Свяжитесь с клиентом и отметьте выполнение задачи.\n\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+      await bitrixRestCall('im.notify.personal.add', { USER_ID: task.RESPONSIBLE_ID, MESSAGE: message, MESSAGE_OUT: message });
+      await bitrixRestCall('crm.timeline.comment.add', { fields: {
+        ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+        COMMENT: `${SPK_FIRST_CONTACT_REMINDER_MARKER}\nЭксперту направлено напоминание: задача первого касания не закрыта через 4 рабочих часа.`,
+      }});
+      continue;
+    }
+
+    const message = `⚠️ Просрочено первое касание СПК\n\nСделка: ${dealId}\nЗадача эксперта не закрыта более одного рабочего дня.\n\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+    await bitrixRestCall('im.notify.personal.add', { USER_ID: TANYA_USER_ID, MESSAGE: message, MESSAGE_OUT: message });
+    await bitrixRestCall('crm.timeline.comment.add', { fields: {
+      ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
+      COMMENT: `${SPK_FIRST_CONTACT_ESCALATION_MARKER}\nРуководитель уведомлён: задача первого касания не закрыта более одного рабочего дня.`,
+    }});
+  }
+}
+
+app.all('/api/production/spk-first-contact', async (req, res) => {
+  if (!config.distributionRobotToken) return res.status(503).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is not configured.' });
+  if (!distributionRobotAuthorized(req)) return res.status(403).json({ ok: false, error: 'DISTRIBUTION_ROBOT_TOKEN is required.' });
+  try {
+    const dealId = fgReqDealId(req);
+    if (!dealId) return res.status(400).json({ ok: false, error: 'deal_id не передан' });
+    const deal = await bitrixRestCall('crm.deal.get', { id: dealId });
+    return res.status(200).json(await createSpkFirstContactTask(deal));
+  } catch (error) {
+    console.error('[spk-first-contact]', error.message || error);
     return res.status(500).json({ ok: false, error: error.message || String(error) });
   }
 });
@@ -7904,6 +8069,9 @@ async function runAutopilotPollingCycle() {
 
     // Проверяем нераспределённые сделки — уведомляем Таню если висят 4+ рабочих часа.
     await checkUnassignedDeals();
+
+    // Контролируем задачи первого касания по СПК: напоминание эксперту и эскалация руководителю.
+    await checkSpkFirstContactTasks();
   } catch (err) {
     console.error('[autopilot] Ошибка polling-цикла:', err.message || err);
   } finally {
