@@ -427,6 +427,7 @@ async function bitrixRestCall(method, params = {}, options = {}) {
     const isCoreAssistantTask = /^Распредели сделку:/i.test(title)
       || /^Распределить новую сделку:/i.test(title)
       || /^ПРОСРОЧЕНО: распределить сделку:/i.test(title)
+      || /^Связаться с клиентом и согласовать ход работы$/i.test(title)
       || /позвони клиенту.*4\+.*час/i.test(title)
       || /я отправил ход работы клиенту/i.test(title)
       || (/не смог отправить ход работы клиенту/i.test(title) && config.autopilotDeliveryFailureTasksEnabled);
