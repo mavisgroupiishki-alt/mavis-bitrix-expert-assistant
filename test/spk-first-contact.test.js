@@ -4,11 +4,19 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   closeDateDays,
+  bitrixField,
   firstContactAction,
   firstContactSchedule,
   isSpkFirstContactService,
   spkChecklist,
 } = require('../spk-first-contact');
+
+test('reads Bitrix task fields returned in either REST naming convention', () => {
+  const task = { id: '50134', description: 'тест', ufCrmTask: ['D_38072'] };
+  assert.equal(bitrixField(task, 'ID'), '50134');
+  assert.equal(bitrixField(task, 'DESCRIPTION'), 'тест');
+  assert.deepEqual(bitrixField(task, 'UF_CRM_TASK'), ['D_38072']);
+});
 
 test('uses 14 days for SPK with specialists and 21 days for selection or attestation', () => {
   assert.equal(closeDateDays({ needsSelection: false, service: 'СПК' }), 14);

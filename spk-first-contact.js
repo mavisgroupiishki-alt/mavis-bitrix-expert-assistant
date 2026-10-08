@@ -6,6 +6,16 @@ const SPK_FIRST_CONTACT_MARKER = '[MAVIS_SPK_FIRST_CONTACT]';
 const SPK_FIRST_CONTACT_REMINDER_MARKER = '[MAVIS_SPK_FIRST_CONTACT_REMINDER]';
 const SPK_FIRST_CONTACT_ESCALATION_MARKER = '[MAVIS_SPK_FIRST_CONTACT_ESCALATION]';
 
+// tasks.task.* и crm.timeline.comment.* отдают поля в camelCase, хотя в
+// запросах Bitrix используются верхние имена. Принимаем оба формата, чтобы
+// проверка дублей не зависела от конкретного REST-метода.
+function bitrixField(record, name) {
+  if (!record || typeof record !== 'object') return undefined;
+  const upper = String(name || '');
+  const camel = upper.toLowerCase().replace(/_([a-z0-9])/g, (_match, char) => char.toUpperCase());
+  return record[upper] ?? record[camel] ?? record[upper.toLowerCase()];
+}
+
 function minskParts(date) {
   const shifted = new Date(new Date(date).getTime() + MINSK_OFFSET_MS);
   return {
@@ -112,6 +122,7 @@ module.exports = {
   SPK_FIRST_CONTACT_REMINDER_MARKER,
   SPK_FIRST_CONTACT_ESCALATION_MARKER,
   addWorkingHours,
+  bitrixField,
   closeDateDays,
   dateAfterCalendarDays,
   firstContactAction,

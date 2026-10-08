@@ -45,6 +45,7 @@ const {
   SPK_FIRST_CONTACT_MARKER,
   SPK_FIRST_CONTACT_REMINDER_MARKER,
   SPK_FIRST_CONTACT_ESCALATION_MARKER,
+  bitrixField,
   closeDateDays,
   dateAfterCalendarDays,
   firstContactAction,
@@ -4640,25 +4641,16 @@ async function spkFirstContactTask(dealId) {
     select: ['ID', 'TITLE', 'DESCRIPTION', 'RESPONSIBLE_ID', 'STATUS', 'REAL_STATUS', 'CREATED_DATE', 'START_DATE_PLAN', 'DEADLINE'],
     order: { ID: 'DESC' },
   }, 50);
-  return tasks.find((task) => String(task.DESCRIPTION || '').includes(SPK_FIRST_CONTACT_MARKER)) || null;
+  return tasks.find((task) => {
+    const title = String(bitrixField(task, 'TITLE') || '');
+    const description = String(bitrixField(task, 'DESCRIPTION') || '');
+    return title === 'Связаться с клиентом и согласовать ход работы'
+      && description.includes('Свяжитесь с клиентом и согласуйте ход работы по СПК.');
+  }) || null;
 }
 
 function spkTaskCompleted(task) {
-  return String(task && (task.REAL_STATUS || task.STATUS) || '') === '5';
-}
-
-async function spkFirstContactMarkers(dealId) {
-  const comments = await bitrixRestList('crm.timeline.comment.list', {
-    filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
-    select: ['ID', 'COMMENT'],
-    order: { ID: 'DESC' },
-  }, 50);
-  const text = comments.map((comment) => String(comment.COMMENT || '')).join('\n');
-  return {
-    firstContactCreated: text.includes(SPK_FIRST_CONTACT_MARKER),
-    reminderSent: text.includes(SPK_FIRST_CONTACT_REMINDER_MARKER),
-    escalationSent: text.includes(SPK_FIRST_CONTACT_ESCALATION_MARKER),
-  };
+  return String(task && (bitrixField(task, 'REAL_STATUS') || bitrixField(task, 'STATUS')) || '') === '5';
 }
 
 async function createSpkFirstContactTask(deal) {
@@ -4675,15 +4667,8 @@ async function createSpkFirstContactTask(deal) {
       return { ok: true, skipped: true, reason: 'expert-not-assigned' };
     }
 
-    const [existing, markers] = await Promise.all([
-      spkFirstContactTask(deal.ID),
-      spkFirstContactMarkers(deal.ID),
-    ]);
-    if (existing) return { ok: true, duplicate: true, dealId: String(deal.ID), taskId: String(existing.ID) };
-    // Bitrix может несколько раз почти одновременно вызвать робота этапа.
-    // Комментарий создаётся вместе с первой задачей и является постоянным
-    // идемпотентным маркером, независимым от полноты ответа tasks.task.list.
-    if (markers.firstContactCreated) return { ok: true, duplicate: true, dealId: String(deal.ID), source: 'timeline-marker' };
+    const existing = await spkFirstContactTask(deal.ID);
+    if (existing) return { ok: true, duplicate: true, dealId: String(deal.ID), taskId: String(bitrixField(existing, 'ID') || '') };
 
     const selection = await getSelectionContextV85(deal);
     const assignedAt = new Date(deal.MOVED_TIME || deal.DATE_MODIFY || new Date());
@@ -4694,7 +4679,6 @@ async function createSpkFirstContactTask(deal) {
     await bitrixRestCall('crm.deal.update', { id: deal.ID, fields: { [closeDateField]: closeDate } });
 
     const taskDescription = [
-      SPK_FIRST_CONTACT_MARKER,
       'Свяжитесь с клиентом и согласуйте ход работы по СПК.',
       '',
       'Подсказка по копиям:',
@@ -4716,11 +4700,6 @@ async function createSpkFirstContactTask(deal) {
     });
     const taskId = distributionTaskId(created);
     if (!taskId) throw new Error('Задача первого касания СПК не была создана.');
-    await bitrixRestCall('crm.timeline.comment.add', { fields: {
-      ENTITY_ID: deal.ID,
-      ENTITY_TYPE: 'deal',
-      COMMENT: `${SPK_FIRST_CONTACT_MARKER}\nСоздана задача первого касания СПК. Плановая дата закрытия: ${closeDate}.`,
-    }});
     return { ok: true, dealId: String(deal.ID), taskId, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt) };
   });
 }
@@ -4742,45 +4721,49 @@ async function checkSpkFirstContactTasks() {
   }
 
   for (const task of tasks) {
-    if (!String(task.DESCRIPTION || '').includes(SPK_FIRST_CONTACT_MARKER)) continue;
-    const dealId = String((Array.isArray(task.UF_CRM_TASK) ? task.UF_CRM_TASK[0] : task.UF_CRM_TASK) || '').replace(/^D_/, '');
+    const description = String(bitrixField(task, 'DESCRIPTION') || '');
+    if (!description.includes('Свяжитесь с клиентом и согласуйте ход работы по СПК.')) continue;
+    const crmTask = bitrixField(task, 'UF_CRM_TASK');
+    const dealId = String((Array.isArray(crmTask) ? crmTask[0] : crmTask) || '').replace(/^D_/, '');
     if (!dealId) continue;
-    const startedAt = new Date(task.START_DATE_PLAN || task.CREATED_DATE || Date.now());
+    const startedAt = new Date(bitrixField(task, 'START_DATE_PLAN') || bitrixField(task, 'CREATED_DATE') || Date.now());
     const elapsedWorkingHours = workingHoursBetween(startedAt, new Date());
-    const markers = await spkFirstContactMarkers(dealId).catch(() => ({ reminderSent: false, escalationSent: false }));
-    const action = firstContactAction({ completed: spkTaskCompleted(task), elapsedWorkingHours, ...markers });
+    const action = firstContactAction({
+      completed: spkTaskCompleted(task),
+      elapsedWorkingHours,
+      reminderSent: description.includes(SPK_FIRST_CONTACT_REMINDER_MARKER),
+      escalationSent: description.includes(SPK_FIRST_CONTACT_ESCALATION_MARKER),
+    });
     if (action === 'wait' || action === 'none') continue;
 
     if (action === 'remind') {
-      const message = `Напоминание: по сделке «${task.TITLE || dealId}» задача первого касания СПК не закрыта уже 4 рабочих часа. Свяжитесь с клиентом и отметьте выполнение задачи.\n\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
-      await bitrixRestCall('im.notify.personal.add', { USER_ID: task.RESPONSIBLE_ID, MESSAGE: message, MESSAGE_OUT: message });
-      await bitrixRestCall('crm.timeline.comment.add', { fields: {
-        ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-        COMMENT: `${SPK_FIRST_CONTACT_REMINDER_MARKER}\nЭксперту направлено напоминание: задача первого касания не закрыта через 4 рабочих часа.`,
-      }});
+      const message = `Напоминание: по сделке «${bitrixField(task, 'TITLE') || dealId}» задача первого касания СПК не закрыта уже 4 рабочих часа. Свяжитесь с клиентом и отметьте выполнение задачи.\n\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
+      await bitrixRestCall('im.notify.personal.add', { USER_ID: bitrixField(task, 'RESPONSIBLE_ID'), MESSAGE: message, MESSAGE_OUT: message });
+      await bitrixRestCall('tasks.task.update', { taskId: bitrixField(task, 'ID'), fields: { DESCRIPTION: `${description}\n\n${SPK_FIRST_CONTACT_REMINDER_MARKER}` } });
       continue;
     }
 
     const message = `⚠️ Просрочено первое касание СПК\n\nСделка: ${dealId}\nЗадача эксперта не закрыта более одного рабочего дня.\n\nhttps://mavisgroup.bitrix24.by/crm/deal/details/${dealId}/`;
     await bitrixRestCall('im.notify.personal.add', { USER_ID: TANYA_USER_ID, MESSAGE: message, MESSAGE_OUT: message });
-    await bitrixRestCall('crm.timeline.comment.add', { fields: {
-      ENTITY_ID: dealId, ENTITY_TYPE: 'deal',
-      COMMENT: `${SPK_FIRST_CONTACT_ESCALATION_MARKER}\nРуководитель уведомлён: задача первого касания не закрыта более одного рабочего дня.`,
-    }});
+    await bitrixRestCall('tasks.task.update', { taskId: bitrixField(task, 'ID'), fields: { DESCRIPTION: `${description}\n\n${SPK_FIRST_CONTACT_ESCALATION_MARKER}` } });
   }
 }
 
 // Резерв к роботу Bitrix: если исходящий вебхук временно не доставлен,
-// забираем только сделки, переведённые на этап после запуска сервиса.
-// Уже находившиеся на этапе сделки не затрагиваем.
+// забираем только сделки, назначенные совсем недавно. Без верхней границы
+// каждая минутная проверка повторно обрабатывала одну и ту же сделку на этапе.
 async function checkRecentlyAssignedSpkDeals() {
   if (!config.bitrixWebhookUrl || !config.autopilotEnabled) return;
   try {
+    const fallbackSince = new Date(Math.max(
+      AUTOPILOT_START_DATE.getTime(),
+      Date.now() - 15 * 60 * 1000,
+    ));
     const deals = await bitrixRestList('crm.deal.list', {
       filter: {
         CATEGORY_ID: config.autopilotCategoryId || 28,
         STAGE_ID: STAGE_IDS.expertAssigned,
-        '>=MOVED_TIME': AUTOPILOT_START_DATE.toISOString().slice(0, 19),
+        '>=MOVED_TIME': fallbackSince.toISOString().slice(0, 19),
       },
       select: [
         'ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'ASSIGNED_BY_ID',
