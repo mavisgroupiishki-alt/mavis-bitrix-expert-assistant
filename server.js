@@ -4699,14 +4699,12 @@ async function createSpkFirstContactTask(deal) {
       [closeDateField]: closeDate,
       [sentFieldCode]: sentAt,
     }});
-    const hint = `${spkFirstContactHint({ closeDate, closeDays })}\n\nСделка: https://mavisgroup.bitrix24.by/crm/deal/details/${deal.ID}/`;
-    await bitrixRestCall('im.notify.personal.add', {
-      USER_ID: freshDeal.ASSIGNED_BY_ID,
-      MESSAGE: hint,
-      MESSAGE_OUT: hint,
-      TAG: `mavis-spk-first-contact-${deal.ID}-${String(freshDeal.MOVED_TIME || '')}`,
-    });
-    return { ok: true, dealId: String(deal.ID), notification: true, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt), sentAt };
+    await bitrixRestCall('crm.timeline.comment.add', { fields: {
+      ENTITY_ID: deal.ID,
+      ENTITY_TYPE: 'deal',
+      COMMENT: `Подсказка для эксперта — СПК\n\n${spkFirstContactHint({ closeDate, closeDays })}`,
+    }});
+    return { ok: true, dealId: String(deal.ID), hint: true, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt), sentAt };
   });
 }
 
