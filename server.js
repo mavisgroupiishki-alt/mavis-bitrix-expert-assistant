@@ -4644,6 +4644,7 @@ async function spkFirstContactSentFieldCode() {
   let field = find(fields);
   if (!field) {
     await bitrixRestCall('crm.deal.userfield.add', { fields: {
+      FIELD_NAME: 'UF_CRM_MAVIS_SPK_FIRST_CONTACT_SENT_AT',
       XML_ID: SPK_FIRST_CONTACT_SENT_XML_ID,
       USER_TYPE_ID: 'datetime',
       MULTIPLE: 'N',
