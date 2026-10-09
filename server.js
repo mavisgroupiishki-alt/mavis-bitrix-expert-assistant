@@ -17598,12 +17598,10 @@ app.listen(PORT, () => {
     setTimeout(() => runAutopilotPollingCycle(), 2000);
     setInterval(runAutopilotPollingCycle, AUTOPILOT_POLL_INTERVAL_MS);
 
-    // Робот Bitrix создаёт задачу сразу; это резерв для недоставленного вебхука.
-    // Быстрая отдельная проверка нужна, чтобы новое назначение не ждало общий 10-минутный цикл.
-    const spkFirstContactFallbackMs = 60 * 1000;
-    console.log('[spk-first-contact] Резервный запуск включён: проверка новых назначений СПК каждую минуту.');
-    setTimeout(() => checkRecentlyAssignedSpkDeals(), 5000);
-    setInterval(() => checkRecentlyAssignedSpkDeals(), spkFirstContactFallbackMs);
+    // Подсказку СПК запускает только робот входа на этап «Эксперт назначен».
+    // Резервный минутный опрос отключён: при одновременном запуске с роботом
+    // он мог создать второй одинаковый комментарий.
+    console.log('[spk-first-contact] Подсказку создаёт только робот входа на этап «Эксперт назначен».');
   } else {
     console.log('[autopilot] Фоновый автопилот выключен. Для включения задай AUTOPILOT_ENABLED=true и BITRIX_WEBHOOK_URL в Render.');
   }
