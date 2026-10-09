@@ -4703,7 +4703,7 @@ async function createSpkFirstContactTask(deal) {
     await bitrixRestCall('crm.timeline.comment.add', { fields: {
       ENTITY_ID: deal.ID,
       ENTITY_TYPE: 'deal',
-      COMMENT: `Подсказка для эксперта — СПК\n\n${spkFirstContactHint({ closeDate, closeDays })}`,
+      COMMENT: `[SIZE=12pt][B]ПОДСКАЗКА: ПЕРВЫЙ ЗВОНОК\n\n${spkFirstContactHint({ closeDate, closeDays })}[/B][/SIZE]`,
     }});
     return { ok: true, dealId: String(deal.ID), hint: true, closeDate, closeDays, startAt: toMinskLocalIso(schedule.startAt), sentAt };
   });
