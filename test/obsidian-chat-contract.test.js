@@ -14,3 +14,13 @@ test('exposes a dedicated token-protected Obsidian chat endpoint', () => {
   assert.match(source, /OBSIDIAN_CHAT_MAX_CONTEXT_CHARS/);
   assert.match(source, /Obsidian Mavis Knowledge/);
 });
+
+test('isolates Obsidian chat capacity and bounds the upstream AI wait', () => {
+  assert.match(source, /function beginObsidianChatRequest\(\)/);
+  assert.match(source, /OBSIDIAN_CHAT_MAX_IN_FLIGHT/);
+  assert.match(source, /OBSIDIAN_CHAT_MAX_REQUESTS_PER_MINUTE/);
+  assert.match(source, /OBSIDIAN_CHAT_AI_TIMEOUT_MS/);
+  assert.match(source, /const finishRequest = beginObsidianChatRequest\(\);/);
+  assert.match(source, /timeoutMs: OBSIDIAN_CHAT_AI_TIMEOUT_MS/);
+  assert.match(source, /AbortSignal\.timeout\(timeoutMs\)/);
+});

@@ -1520,7 +1520,7 @@ function aiScenarioConfig(scenarioRaw) {
   return { scenario, ...(map[scenario] || map.deal_analyze) };
 }
 
-async function callAiChatCompletion({ model, temperature, messages }) {
+async function callAiChatCompletion({ model, temperature, messages, timeoutMs = 120000 }) {
   const ai = resolveAiProvider();
   if (!ai.apiKey) {
     if (ai.provider === 'vibe') throw new Error('AI_API_KEY не задан. Для VibeCode вставь vibe_api... в Render Environment как AI_API_KEY.');
@@ -1529,6 +1529,7 @@ async function callAiChatCompletion({ model, temperature, messages }) {
 
   const response = await fetch(`${ai.baseUrl}/chat/completions`, {
     method: 'POST',
+    signal: AbortSignal.timeout(timeoutMs),
     headers: {
       ...ai.authHeader,
       'Content-Type': 'application/json',
@@ -1634,8 +1635,13 @@ const DASHBOARD_LIVE_REQUEST_TIMEOUT_MS = 16 * 1000;
 const DASHBOARD_CHAT_MAX_IN_FLIGHT = 2;
 const DASHBOARD_CHAT_MAX_REQUESTS_PER_MINUTE = 12;
 const OBSIDIAN_CHAT_MAX_CONTEXT_CHARS = 32000;
+const OBSIDIAN_CHAT_MAX_IN_FLIGHT = 1;
+const OBSIDIAN_CHAT_MAX_REQUESTS_PER_MINUTE = 6;
+const OBSIDIAN_CHAT_AI_TIMEOUT_MS = 45 * 1000;
 let dashboardChatInFlight = 0;
 let dashboardChatRequestTimes = [];
+let obsidianChatInFlight = 0;
+let obsidianChatRequestTimes = [];
 
 function beginDashboardChatRequest() {
   const now = Date.now();
@@ -1646,6 +1652,17 @@ function beginDashboardChatRequest() {
   dashboardChatInFlight += 1;
   dashboardChatRequestTimes.push(now);
   return () => { dashboardChatInFlight = Math.max(0, dashboardChatInFlight - 1); };
+}
+
+function beginObsidianChatRequest() {
+  const now = Date.now();
+  obsidianChatRequestTimes = obsidianChatRequestTimes.filter((time) => now - time < 60 * 1000);
+  if (obsidianChatInFlight >= OBSIDIAN_CHAT_MAX_IN_FLIGHT || obsidianChatRequestTimes.length >= OBSIDIAN_CHAT_MAX_REQUESTS_PER_MINUTE) {
+    return null;
+  }
+  obsidianChatInFlight += 1;
+  obsidianChatRequestTimes.push(now);
+  return () => { obsidianChatInFlight = Math.max(0, obsidianChatInFlight - 1); };
 }
 
 async function dashboardLiveUsers(options) {
@@ -1814,7 +1831,7 @@ app.post('/api/obsidian-chat', async (req, res) => {
   if (!obsidianChatAuthorized(req)) {
     return res.status(403).json({ ok: false, error: 'MAVIS_OBSIDIAN_TOKEN is required.' });
   }
-  const finishRequest = beginDashboardChatRequest();
+  const finishRequest = beginObsidianChatRequest();
   if (!finishRequest) {
     return res.status(429).json({ ok: false, error: 'Слишком много запросов к помощнику. Попробуйте через минуту.' });
   }
@@ -1847,6 +1864,7 @@ app.post('/api/obsidian-chat', async (req, res) => {
     const rawText = await callAiChatCompletion({
       model: config.aiModel,
       temperature: Number.isFinite(config.aiTemperature) ? Math.min(0.35, config.aiTemperature) : 0.2,
+      timeoutMs: OBSIDIAN_CHAT_AI_TIMEOUT_MS,
       messages: [
         { role: 'system', content: system },
         ...history,
