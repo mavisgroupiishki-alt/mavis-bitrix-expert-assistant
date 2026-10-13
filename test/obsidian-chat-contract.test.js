@@ -24,3 +24,8 @@ test('isolates Obsidian chat capacity and bounds the upstream AI wait', () => {
   assert.match(source, /timeoutMs: OBSIDIAN_CHAT_AI_TIMEOUT_MS/);
   assert.match(source, /AbortSignal\.timeout\(timeoutMs\)/);
 });
+
+test('uses VibeCode API-key authentication for the Vibe provider', () => {
+  assert.match(source, /provider: 'vibe'/);
+  assert.match(source, /authHeader: \{ 'X-Api-Key': apiKey \}/);
+});

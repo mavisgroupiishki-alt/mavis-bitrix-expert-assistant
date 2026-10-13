@@ -1348,7 +1348,8 @@ function resolveAiProvider() {
       label: 'VibeCode AI Router',
       apiKey,
       baseUrl: (config.aiBaseUrl || process.env.VIBE_BASE_URL || 'https://vibecode.bitrix24.tech/v1').replace(/\/$/, ''),
-      authHeader: { Authorization: `Bearer ${apiKey}` },
+      // VibeCode accepts its API key in X-Api-Key (not an OpenAI Bearer token).
+      authHeader: { 'X-Api-Key': apiKey },
     };
   }
   return {
