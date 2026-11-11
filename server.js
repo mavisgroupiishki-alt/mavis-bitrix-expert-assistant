@@ -328,6 +328,8 @@ const config = {
   actsSignatureAnchorText: process.env.ACTS_SIGNATURE_ANCHOR_TEXT || 'М.П.',
   // Одноразовый адрес внутренней проверки. Пустое значение означает обычную отправку клиенту.
   actsSignatureTestRecipient: String(process.env.ACTS_SIGNATURE_TEST_RECIPIENT || '').trim().toLowerCase(),
+  // Одноразовый ключ для закрытого тестового вызова. Без него маршрут проверки отключён.
+  actsSignatureTestTriggerToken: process.env.ACTS_SIGNATURE_TEST_TRIGGER_TOKEN || '',
   // v60: резервный polling стадии «Сделано/Сделаны», чтобы отправка акта не зависела
   // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
   actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
@@ -641,6 +643,15 @@ function obsidianChatAuthorized(req) {
 
 function actsRobotAuthorized(req) {
   return requestMatchesToken(req, process.env.ACTS_ROBOT_TOKEN);
+}
+
+function actsSignatureTestAuthorized(req) {
+  return Boolean(
+    config.actsSignatureEnabled &&
+    actsSignatureTestRecipient() &&
+    config.actsSignatureTestTriggerToken &&
+    requestMatchesToken(req, config.actsSignatureTestTriggerToken),
+  );
 }
 
 function rabotaByWebhookMatches(value) {
@@ -14092,6 +14103,27 @@ app.post('/api/acts/task-done', async (req, res) => {
 
 app.get('/api/acts/task-done', async (req, res) => {
   res.status(405).json({ ok: false, error: 'Используйте POST с ACTS_ROBOT_TOKEN.' });
+});
+
+// Временная проверка подписанного PDF. Маршрут существует только пока одновременно
+// заданы тестовый адрес и отдельный секрет; после проверки обе переменные очищаются.
+app.post('/api/acts/test-signed-pdf', async (req, res) => {
+  if (!config.actsSignatureEnabled || !actsSignatureTestRecipient() || !config.actsSignatureTestTriggerToken) {
+    return res.status(404).json({ ok: false, error: 'Тестовый маршрут отключён.' });
+  }
+  if (!actsSignatureTestAuthorized(req)) {
+    return res.status(403).json({ ok: false, error: 'ACTS_SIGNATURE_TEST_TRIGGER_TOKEN is required.' });
+  }
+  try {
+    const taskId = actsReqTaskId(req);
+    if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
+    console.log(`[acts-signature-test] Запуск task=${taskId}; recipient=${actsSignatureTestRecipient()}.`);
+    const result = await actsHandleTaskDone(taskId, 'signed-pdf-test');
+    res.status(result.ok ? 200 : 422).json(result);
+  } catch (e) {
+    console.error('[acts-signature-test]', e.message || e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
 });
 
 function actsMaintenanceTokenMatches(req) {
