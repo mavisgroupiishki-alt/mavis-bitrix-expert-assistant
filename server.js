@@ -28,6 +28,7 @@ const { isRecruitingAutomationPaused, recruitingStageTaskMarker, recruitingStage
 const { CRITERIA, analysisComment, clarificationMessage, hasCompleteNumericScores, normalizeScorecard, professionalResumeContext, rejectionMessage } = require('./recruiting-scorecard');
 const { rabotaAuthorType, rabotaAwaitingApplicantReply, rabotaClarificationCount, rabotaMessageText, rabotaMessages } = require('./recruiting-triage-state');
 const { actEmailSubject, canUseEmailFallbackAfterWazzupError, createInFlightLock, deliveryChannelPlan, isTechnicalProductionComment, isWazzupRepeatedCrmMessageError, shouldCreateAutopilotDeliveryFailureTask } = require('./acts-delivery');
+const { createSignedActPdf } = require('./acts-signed-pdf');
 const { bitrixEmailSenderSettings, bitrixOutgoingEmailActivityFields } = require('./bitrix-email');
 const { markMailProcessedAndUnread, unreadUnprocessedMailSearch } = require('./mail-processing');
 const { authorizationMatchesToken, requestMatchesToken, tokenMatches } = require('./request-auth');
@@ -320,6 +321,13 @@ const config = {
   actsTelegramEnabled: String(process.env.ACTS_TELEGRAM_ENABLED || 'false').toLowerCase() === 'true',
   actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
   actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
+  // Визуальная печать и подпись: только DOCX с якорем «М.П.» преобразуется в PDF.
+  // По умолчанию контур выключен до установки LibreOffice в Render.
+  actsSignatureEnabled: String(process.env.ACTS_SIGNATURE_ENABLED || 'false').toLowerCase() === 'true',
+  actsSignatureSofficePath: process.env.ACTS_SIGNATURE_SOFFICE_PATH || 'soffice',
+  actsSignatureAnchorText: process.env.ACTS_SIGNATURE_ANCHOR_TEXT || 'М.П.',
+  // Одноразовый адрес внутренней проверки. Пустое значение означает обычную отправку клиенту.
+  actsSignatureTestRecipient: String(process.env.ACTS_SIGNATURE_TEST_RECIPIENT || '').trim().toLowerCase(),
   // v60: резервный polling стадии «Сделано/Сделаны», чтобы отправка акта не зависела
   // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
   actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
@@ -6078,6 +6086,27 @@ async function actsResolveDeliveryRecipients(deal) {
   return { ok: true, recipients };
 }
 
+function actsSignatureTestRecipient() {
+  const email = String(config.actsSignatureTestRecipient || '').trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '';
+}
+
+async function actsResolveActDeliveryRecipients(deal) {
+  const testEmail = config.actsSignatureEnabled && actsSignatureTestRecipient();
+  if (!testEmail) return actsResolveDeliveryRecipients(deal);
+  return {
+    ok: true,
+    testMode: true,
+    recipients: [{
+      entityId: 'signature-test',
+      entityTypeId: 0,
+      entity: { EMAIL: [{ VALUE: testEmail }] },
+      label: 'внутренняя проверка подписи',
+      source: 'signature-test-recipient',
+    }],
+  };
+}
+
 function actsEntityPhone(candidate) {
   return actsContactPhone(candidate && candidate.entity);
 }
@@ -8407,6 +8436,29 @@ async function fgTimelineHasMarker(dealId, marker, limit = 50) {
   }
 }
 
+// Для подписанного акта отсутствие ответа Bitrix нельзя трактовать как
+// отсутствие записи: иначе при временном сбое чтения можно повторить SMTP.
+async function actsSignedDeliveryState(dealId, sentMarker, pendingMarker, retryAllowedMarker, limit = 10000) {
+  try {
+    const comments = await bitrixRestList('crm.timeline.comment.list', {
+      filter: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal' },
+      order: { ID: 'DESC' },
+      select: ['ID', 'COMMENT'],
+    }, limit);
+    if (comments.some((c) => String(c.COMMENT || '').includes(sentMarker))) {
+      return { state: 'sent', unreadable: false };
+    }
+    for (const comment of comments) {
+      const text = String(comment.COMMENT || '');
+      if (text.includes(pendingMarker)) return { state: 'pending', unreadable: false };
+      if (text.includes(retryAllowedMarker)) return { state: 'retry-allowed', unreadable: false };
+    }
+    return { state: 'none', unreadable: false };
+  } catch (e) {
+    return { state: 'unknown', unreadable: true, error: e.message || String(e) };
+  }
+}
+
 async function fgAddCommentOnce(dealId, marker, comment) {
   if (await fgTimelineHasMarker(dealId, marker)) return false;
   await bitrixRestCall('crm.timeline.comment.add', { fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: `${marker}\n${comment}` } });
@@ -8986,6 +9038,10 @@ app.get('/api/acts/robot-closed', async (req, res) => {
 const ACTS_TASK_DONE_MARKER = '[MAVIS_ACTS_TASK_DONE]';
 const ACTS_TASK_SENT_MARKER = '[MAVIS_ACTS_SENT]';
 const ACTS_TASK_SEND_FAILED_MARKER = '[MAVIS_ACTS_SEND_FAILED]';
+// Запись создаётся строго до передачи подписанного PDF в SMTP. Если процесс
+// оборвался после SMTP, следующий polling не повторит потенциально отправленное письмо.
+const ACTS_TASK_SEND_PENDING_MARKER = '[MAVIS_ACTS_SEND_PENDING]';
+const ACTS_TASK_SEND_RETRY_ALLOWED_MARKER = '[MAVIS_ACTS_SEND_RETRY_ALLOWED]';
 
 function actsReqTaskId(req) {
   const src = Object.assign({}, req.query || {}, req.body || {});
@@ -13539,9 +13595,11 @@ async function sendActEmailThroughBitrix(deal, contactId, toEmail, text, file, r
 // контроль возврата оригиналов. Этот fallback включается только ДО попытки
 // Bitrix-отправки, поэтому не может создать дубль после неопределённого ответа
 // crm.activity.add.
-async function sendActEmailThroughSmtp({ deal, taskId, contactId, contactLabel, toEmail, text, file, downloaded }) {
+async function sendActEmailThroughSmtp({ deal, taskId, contactId, contactLabel, toEmail, text, file, downloaded, messageId, allowInternalTestRecipient = false }) {
   const smtpResult = await docReturnSendViaSmtp({
     taskId: `act-${String(taskId || 'unknown')}-deal-${String(deal && deal.ID || 'unknown')}`,
+    messageId,
+    allowInternalTestRecipient,
     recipient: {
       email: String(toEmail || '').trim(),
       source: 'crm-recipient',
@@ -13559,8 +13617,35 @@ async function sendActEmailThroughSmtp({ deal, taskId, contactId, contactLabel, 
   };
 }
 
+const ACTS_SIGNATURE_STAMP_PATH = path.join(__dirname, 'assets', 'mavis-signature-stamp.png');
 
-async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
+async function actsCreateSignedPdfForDelivery(file) {
+  if (!/\.docx$/i.test(String(file && file.name || ''))) {
+    throw new Error('Для отправки с визуальной печатью нужен акт в формате DOCX. Исходный файл клиенту не отправлен.');
+  }
+  let stampBuffer;
+  try {
+    stampBuffer = fs.readFileSync(ACTS_SIGNATURE_STAMP_PATH);
+  } catch (_) {
+    throw new Error('Не найден утверждённый файл визуальной печати и подписи. Исходный файл клиенту не отправлен.');
+  }
+  const downloaded = await actsDownloadRealFile(file);
+  const signed = await createSignedActPdf({
+    sourceBuffer: downloaded.buffer,
+    sourceFileName: downloaded.fileName || file.name,
+    stampBuffer,
+    sofficePath: config.actsSignatureSofficePath,
+    anchorText: config.actsSignatureAnchorText,
+  });
+  console.log(`[acts-signature] Подготовлен подписанный PDF: source=${file.name}; output=${signed.fileName}; bytes=${signed.buffer.length}.`);
+  return {
+    file: { ...file, name: signed.fileName, url: '', id: '', attachedId: '' },
+    downloaded: signed,
+  };
+}
+
+
+async function actsSendActToClientByPreferredChannel({ deal, task, file, preparedSignedPdf = null, preparedRecipients = null }) {
   if (!config.actsSendToClientEnabled) {
     return { skipped: true, message: 'ACTS_SEND_TO_CLIENT_ENABLED=false' };
   }
@@ -13571,11 +13656,10 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
     return { ok: false, skipped: true, message: 'В задаче не найден файл акта. Автоотправка полностью заблокирована: пустое сообщение клиенту не отправляю.' };
   }
 
-  const text = actsBuildClientMessage(deal, task, file);
   const taskId = String(actsTaskField(task, ['id','ID']) || '');
   // Предпочтительный канал сделки не участвует в юридически значимой отправке акта.
   const preferredChannel = 'email';
-  const recipientsResult = await actsResolveDeliveryRecipients(deal);
+  const recipientsResult = preparedRecipients || await actsResolveActDeliveryRecipients(deal);
   if (!recipientsResult.ok) {
     return { ok: false, skipped: true, message: recipientsResult.reason };
   }
@@ -13586,12 +13670,28 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
   let emailValidated = false;
   let downloadedEmailFile = null;
   let uncertainDelivery = null;
+  let signedPdf = preparedSignedPdf;
+
+  if (config.actsSignatureEnabled && !signedPdf) {
+    try {
+      signedPdf = await actsCreateSignedPdfForDelivery(file);
+    } catch (e) {
+      return {
+        ok: false,
+        skipped: true,
+        message: `Подписанный PDF не сформирован: ${e.message || e}`,
+      };
+    }
+  }
+
+  const deliveryFile = signedPdf ? signedPdf.file : file;
+  const text = actsBuildClientMessage(deal, task, deliveryFile);
 
   const tryEmail = async () => {
-    const storageIds = actsBuildEmailStorageElementIds(file);
+    const storageIds = signedPdf ? [] : actsBuildEmailStorageElementIds(file);
     if (!emailValidated) {
       try {
-        downloadedEmailFile = await actsDownloadRealFile(file);
+        downloadedEmailFile = signedPdf ? signedPdf.downloaded : await actsDownloadRealFile(file);
         emailValidated = true;
       } catch (e) {
         attempts.push({ channel: 'email', error: `файл не прошёл проверку: ${e.message || e}` });
@@ -13611,8 +13711,12 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
             contactLabel: recipient.label,
             toEmail: email,
             text,
-            file,
+            file: deliveryFile,
             downloaded: downloadedEmailFile,
+            // Стабильный Message-ID позволяет SMTP-серверу распознать повтор той же
+            // попытки, а не создавать новое письмо из-за случайного таймстемпа.
+            messageId: signedPdf ? `<mavis-acts-signed-${taskId}-${String(deal.ID)}@mail.ru>` : '',
+            allowInternalTestRecipient: Boolean(recipientsResult.testMode),
           });
         console.log(
           `[acts-email] deal=${deal.ID}; task=${taskId}; transport=${delivery.smtp ? 'smtp-fallback' : 'bitrix'}; ` +
@@ -13622,7 +13726,10 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
           ok: true, channel: 'Email', contactId: recipient.entityId, contactLabel: recipient.label,
           recipientSource: recipient.source, email: maskEmailForLog(email), recipientEntityType: recipient.entityTypeId,
           activityId: delivery.activityId, sender: delivery.sender,
-          note: delivery.smtp ? 'Файл был только в чате задачи, поэтому письмо отправлено через SMTP и сохранено в «Отправленные».' : '',
+          file: { name: deliveryFile.name, id: deliveryFile.id || '', attachedId: deliveryFile.attachedId || '' },
+          note: signedPdf
+            ? `К письму приложен PDF с визуальной печатью и подписью.${delivery.sentCopySaved ? ' Копия сохранена в «Отправленные».' : ' Копию в «Отправленные» сохранить не удалось.'}`
+            : (delivery.smtp ? 'Файл был только в чате задачи, поэтому письмо отправлено через SMTP и сохранено в «Отправленные».' : ''),
         };
       } catch (e) {
         attempts.push({
@@ -13630,6 +13737,14 @@ async function actsSendActToClientByPreferredChannel({ deal, task, file }) {
           recipient: recipient.label,
           error: `${storageIds.length ? 'Bitrix e-mail' : 'SMTP fallback'}: ${e.message || e}`,
         });
+        if (e && e.possiblyDelivered) {
+          uncertainDelivery = {
+            channel: 'email',
+            recipient: recipient.label,
+            message: 'SMTP вернул неопределённый статус. Автоматический повтор отключён, чтобы не отправить акт дважды.',
+          };
+          return null;
+        }
       }
     }
     attempts.push({ channel: 'email', error: 'нет доступного адреса у контактов и компании' });
@@ -13788,6 +13903,8 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
   const doneMarker = `${ACTS_TASK_DONE_MARKER} task=${taskId}`;
   const sentMarker = `${ACTS_TASK_SENT_MARKER} task=${taskId}`;
   const failedMarker = `${ACTS_TASK_SEND_FAILED_MARKER} task=${taskId}`;
+  const pendingMarker = `${ACTS_TASK_SEND_PENDING_MARKER} task=${taskId}`;
+  const retryAllowedMarker = `${ACTS_TASK_SEND_RETRY_ALLOWED_MARKER} task=${taskId}`;
 
   if (!dealIds.length) {
     return { ok: false, skipped: true, taskId: String(taskId), title, files, message: 'Не нашёл ID сделки производства в задаче. Проверь, что задача создана ИИгорем или в описании есть ссылка/ID сделки.' };
@@ -13809,12 +13926,6 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
 
   const results = [];
   for (const dealId of allowedDealIds) {
-    const alreadySent = await fgTimelineHasMarker(dealId, sentMarker, 50);
-    if (alreadySent) {
-      results.push({ dealId: String(dealId), duplicate: true, message: 'Этот акт уже был успешно отправлен ранее, повторно клиенту не отправляю.' });
-      continue;
-    }
-
     const releaseDeliveryLock = actsDeliveryLock.acquire(`${taskId}:${dealId}`);
     if (!releaseDeliveryLock) {
       results.push({ dealId: String(dealId), duplicate: true, inFlight: true, message: 'Отправка этого акта уже выполняется другим обработчиком. Повторно клиенту не отправляю.' });
@@ -13822,6 +13933,34 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
     }
 
     try {
+    if (config.actsSignatureEnabled) {
+      const deliveryState = await actsSignedDeliveryState(dealId, sentMarker, pendingMarker, retryAllowedMarker);
+      if (deliveryState.unreadable) {
+        results.push({
+          dealId: String(dealId),
+          ok: false,
+          skipped: true,
+          message: `Не удалось прочитать историю отправки подписанного акта. Автоотправка заблокирована: ${deliveryState.error}`,
+        });
+        continue;
+      }
+      if (deliveryState.state === 'sent') {
+        results.push({ dealId: String(dealId), duplicate: true, message: 'Этот акт уже был успешно отправлен ранее, повторно клиенту не отправляю.' });
+        continue;
+      }
+      if (deliveryState.state === 'pending') {
+        results.push({
+          dealId: String(dealId),
+          duplicate: true,
+          pending: true,
+          message: 'Подписанный PDF уже был передан в SMTP или его статус не удалось подтвердить. Автоповтор заблокирован, чтобы не отправить акт дважды.',
+        });
+        continue;
+      }
+    } else if (await fgTimelineHasMarker(dealId, sentMarker, 50)) {
+      results.push({ dealId: String(dealId), duplicate: true, message: 'Этот акт уже был успешно отправлен ранее, повторно клиенту не отправляю.' });
+      continue;
+    }
     let deal = null;
     try {
       deal = await bitrixRestCall('crm.deal.get', { id: dealId });
@@ -13831,6 +13970,9 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
     }
 
     let sendResult = null;
+    let preparedSignedPdf = null;
+    let preparedRecipients = null;
+    let signedSmtpPending = false;
     if (!fileForClient && fileResolution.diskErrors && fileResolution.diskErrors.some((x) => /insufficient_scope/i.test(x))) {
       sendResult = {
         ok: false,
@@ -13843,9 +13985,44 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
         skipped: true,
         error: 'Bitrix-вебхуку не хватает scope IM/Чаты для чтения файла из task chat. Если файл есть в «Результате задачи», v66 сначала попробует его через task+disk; иначе добавь право Чаты и уведомления (IM) во входящий вебхук.',
       };
-    } else {
+    } else if (config.actsSignatureEnabled && !config.actsSendToClientEnabled) {
+      sendResult = { ok: false, skipped: true, error: 'ACTS_SEND_TO_CLIENT_ENABLED=false' };
+    } else if (config.actsSignatureEnabled) {
       try {
-        sendResult = await actsSendActToClientByPreferredChannel({ deal, task, file: fileForClient });
+        const recipients = await actsResolveActDeliveryRecipients(deal);
+        if (!recipients.ok) {
+          sendResult = { ok: false, skipped: true, error: recipients.reason };
+        } else {
+          preparedRecipients = recipients;
+          // Сначала формируем PDF. Если преобразование не удалось, pending-маркер
+          // не появится и после исправления причины задачу можно обработать заново.
+          preparedSignedPdf = await actsCreateSignedPdfForDelivery(fileForClient);
+          await bitrixRestCall('crm.timeline.comment.add', {
+            fields: {
+              ENTITY_ID: dealId,
+              ENTITY_TYPE: 'deal',
+              COMMENT: `${pendingMarker}\nПодписанный PDF подготовлен и передаётся в SMTP. До ручной проверки автоматический повтор запрещён.`,
+            },
+          });
+          signedSmtpPending = true;
+        }
+      } catch (e) {
+        sendResult = {
+          ok: false,
+          skipped: true,
+          error: `Подписанный PDF не передан в SMTP: ${e.message || e}`,
+        };
+      }
+    }
+    if (!sendResult) {
+      try {
+        sendResult = await actsSendActToClientByPreferredChannel({
+          deal,
+          task,
+          file: fileForClient,
+          preparedSignedPdf,
+          preparedRecipients,
+        });
       } catch (e) {
         sendResult = { ok: false, error: e.message || String(e), possiblyDelivered: Boolean(e.possiblyDelivered) };
       }
@@ -13862,20 +14039,27 @@ async function actsHandleTaskDone(taskId, source = 'task-done-robot', options = 
       : 'Файлы в задаче через API не увидел. Проверь вложения в задаче вручную.';
     const sendLines = sendResult && sendResult.ok
       ? `✅ Акт отправлен клиенту по e-mail.\nФайл: ${sendResult.file && sendResult.file.name ? sendResult.file.name : (fileForClient && fileForClient.name || 'акт')}\nКонтакт: ${sendResult.contactLabel || 'не определён'} (#${sendResult.contactId || '?'}) — ${sendResult.email || 'скрыт'}\nID исходящего e-mail в Bitrix: ${sendResult.activityId || 'не получен'}${sendResult.note ? `\nПримечание: ${sendResult.note}` : ''}`
+      : sendResult && sendResult.possiblyDelivered
+        ? `⚠️ SMTP не подтвердил статус письма. Оно могло быть доставлено; автоматические повторы заблокированы, чтобы не создать дубль. Проверь ящик клиента и «Отправленные» вручную.`
       : `⚠️ Клиенту НЕ отправлено автоматически.\nПричина: ${(sendResult && (sendResult.message || sendResult.error)) || 'неизвестная ошибка'}\nЧто проверить: e-mail контакта/компании, доступность файла акта и подключение ящика ${config.emailFrom || 'отправителя'} в Bitrix.`;
 
     const pushStateLine = sendResult && sendResult.ok
       ? `\n${ACTS_PUSH_STATE_MARKER} task=${taskId} channel=${actsNormalizeChannelKey(sendResult.channel)} contactId=${sendResult.contactId || ''} sentAt=${new Date().toISOString()} wazzupChatId=${sendResult.wazzupChatId || ''} wazzupChannelId=${sendResult.wazzupChannelId || ''} wazzupMessageId=${sendResult.wazzupMessageId || ''} wazzupFileMessageId=${sendResult.wazzupFileMessageId || ''}`
       : '';
+    const retryAllowedLine = signedSmtpPending && sendResult && !sendResult.ok && !sendResult.possiblyDelivered
+      ? `\n${retryAllowedMarker}\nSMTP не принял письмо; после устранения причины автоповтор разрешён.`
+      : '';
     // Одна итоговая запись на исход задачи. Повтор polling-а после ошибки не должен
     // каждый раз плодить одинаковые технические комментарии в сделке.
     const outcomeMarker = sendResult && sendResult.ok ? sentMarker : failedMarker;
-    if (!await fgTimelineHasMarker(dealId, outcomeMarker, 100)) {
+    const outcomeAlreadyRecorded = await fgTimelineHasMarker(dealId, outcomeMarker, 100);
+    const retryAlreadyAllowed = retryAllowedLine && await fgTimelineHasMarker(dealId, retryAllowedMarker, 100);
+    if (!outcomeAlreadyRecorded || (retryAllowedLine && !retryAlreadyAllowed)) {
       await bitrixRestCall('crm.timeline.comment.add', {
         fields: {
           ENTITY_ID: dealId,
           ENTITY_TYPE: 'deal',
-          COMMENT: `${outcomeMarker}\n${doneMarker}${pushStateLine}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
+          COMMENT: `${outcomeMarker}\n${doneMarker}${pushStateLine}${retryAllowedLine}\nЗадача по акту в проекте «Акты счета» перешла на стадию «Сделано».\n\nЗадача: ${title || taskId}\nСсылка на задачу: ${actsTaskUrl(taskId)}\n\nФайлы, которые нашёл в задаче:\n${fileLines}\n\n${sendLines}`,
         },
       });
     }
@@ -16074,7 +16258,7 @@ async function docReturnBuildRawMail(ctx, subject, body) {
   }
 
   const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
-  const messageId =
+  const messageId = String(ctx && ctx.messageId || '').trim() ||
     `<mavis-doc-return-${String(ctx.taskId || 'task')}-${Date.now()}@mail.ru>`;
 
   const mail = {
@@ -16152,16 +16336,48 @@ async function docReturnBuildRawMail(ctx, subject, body) {
   };
 }
 
+function docReturnSmtpErrorPossiblyDelivered(error) {
+  const code = String(error && error.code || '').toUpperCase();
+  const command = String(error && error.command || '').toUpperCase();
+  // Эти ошибки возникают до передачи тела письма SMTP-серверу и безопасно
+  // повторяются после восстановления настроек/сети.
+  if (['EAUTH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNECTION', 'EENVELOPE', 'EMESSAGE'].includes(code)) {
+    return false;
+  }
+  if (['CONN', 'AUTH', 'MAIL FROM', 'RCPT TO'].includes(command)) return false;
+  // Обрыв или отсутствие ответа именно после DATA уже не позволяет узнать,
+  // принял ли сервер письмо, поэтому такой случай обрабатываем вручную.
+  return command === 'DATA' || !command;
+}
+
 async function docReturnSendViaSmtp(ctx, subject, body) {
-  docReturnAssertExternalRecipient(ctx && ctx.recipient && ctx.recipient.email, ctx && ctx.taskId);
+  const recipient = String(ctx && ctx.recipient && ctx.recipient.email || '').trim().toLowerCase();
+  const allowedSignatureTestRecipient = Boolean(
+    ctx && ctx.allowInternalTestRecipient &&
+    config.actsSignatureEnabled &&
+    actsSignatureTestRecipient() &&
+    recipient === actsSignatureTestRecipient(),
+  );
+  if (!allowedSignatureTestRecipient) {
+    docReturnAssertExternalRecipient(recipient, ctx && ctx.taskId);
+  }
 
   const transporter = docReturnGetSmtpTransport();
   const built = await docReturnBuildRawMail(ctx, subject, body);
 
-  const info = await transporter.sendMail({
-    envelope: built.envelope,
-    raw: built.raw,
-  });
+  let info;
+  try {
+    info = await transporter.sendMail({
+      envelope: built.envelope,
+      raw: built.raw,
+    });
+  } catch (e) {
+    // При обрыве соединения после DATA SMTP может уже принять письмо. Такой
+    // результат нельзя автоматически повторять: выше по контуру он помечается
+    // как possiblyDelivered и требует проверки вместо нового письма.
+    e.possiblyDelivered = docReturnSmtpErrorPossiblyDelivered(e);
+    throw e;
+  }
 
   const accepted = Array.isArray(info && info.accepted)
     ? info.accepted.map((x) => String(x || '').toLowerCase())
