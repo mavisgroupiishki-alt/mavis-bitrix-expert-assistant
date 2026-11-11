@@ -15,4 +15,7 @@ test('builds the attestation confirmation email with the supplied UTM link', () 
   assert.match(email.text, new RegExp(ATTESTATION_CONFIRMATION_URL.replace(/[.?]/g, '\\$&')));
   assert.match(email.html, new RegExp(`href="${ATTESTATION_CONFIRMATION_URL.replace(/[.?]/g, '\\$&')}"`));
   assert.match(email.text, /с 1 по 31 декабря/);
+  assert.match(email.text, /📑 проведём анализ/);
+  assert.match(email.html, />📌<\/td>/);
+  assert.doesNotMatch(email.html, /<ul>/);
 });
