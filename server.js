@@ -14118,7 +14118,7 @@ app.post('/api/acts/test-signed-pdf', async (req, res) => {
     const taskId = actsReqTaskId(req);
     if (!taskId) return res.status(400).json({ ok: false, error: 'task_id не передан' });
     console.log(`[acts-signature-test] Запуск task=${taskId}; recipient=${actsSignatureTestRecipient()}.`);
-    const result = await actsHandleTaskDone(taskId, 'signed-pdf-test');
+    const result = await actsHandleTaskDone(taskId, 'signed-pdf-test', { allowHistoricalDone: true });
     res.status(result.ok ? 200 : 422).json(result);
   } catch (e) {
     console.error('[acts-signature-test]', e.message || e);
