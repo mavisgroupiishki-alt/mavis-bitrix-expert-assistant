@@ -8,11 +8,11 @@
 
 ```text
 ACTS_SIGNATURE_ENABLED=true
-ACTS_SIGNATURE_SOFFICE_PATH=/usr/bin/soffice
+ACTS_SIGNATURE_SOFFICE_PATH=/opt/render/project/src/.local-libreoffice/opt/libreoffice25.8/program/soffice
 ACTS_SIGNATURE_ANCHOR_TEXT=М.П.
 ```
 
-На сервере Render должен быть установлен LibreOffice Writer (`soffice`). Для текущего сервиса это обеспечено `Dockerfile`: он устанавливает LibreOffice при сборке образа. До успешного Docker-развёртывания включать `ACTS_SIGNATURE_ENABLED` нельзя: контур безопасно остановит отправку с понятной причиной, но PDF создать не сможет.
+На сервере Render LibreOffice Writer (`soffice`) устанавливается в рабочую папку скриптом `scripts/install-libreoffice.sh` из официального архива The Document Foundation. Переменная `ACTS_SIGNATURE_SOFFICE_PATH` указывает на этот локальный исполняемый файл. До успешного развёртывания контур безопасно остановит отправку с понятной причиной, но PDF создать не сможет.
 
 Для разовой проверки вместо клиента можно временно добавить:
 
