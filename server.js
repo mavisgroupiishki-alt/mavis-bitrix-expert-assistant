@@ -40,6 +40,7 @@ const { injectPlacementOptions, parsePlacementOptions } = require('./placement-c
 const { docReturnNextAction } = require('./doc-return-workflow');
 const { trustedBitrixFileUrl } = require('./acts-file-security');
 const { canRetryScanRequestLegacyRecipientBlock, isScanRequestExcludedStage, isScanRequestSeptember2026, normalizeScanRequestText, scanRequestBlockedMarker, scanRequestCreatorId, scanRequestPendingMarker, scanRequestSentMarker, scanRequestStageTitle, scanRequestState, selectScanRequestActFile } = require('./scan-request-campaign');
+const { attestationConfirmationCampaignEmail } = require('./attestation-confirmation-campaign');
 const { VISION_MAX_DOCUMENT_BYTES, visionInputPolicy } = require('./vision-input-policy');
 const { transitionFields, validateProductionTransition } = require('./production-stage-transition');
 const {
@@ -330,6 +331,8 @@ const config = {
   actsSignatureTestRecipient: String(process.env.ACTS_SIGNATURE_TEST_RECIPIENT || '').trim().toLowerCase(),
   // Одноразовый ключ для закрытого тестового вызова. Без него маршрут проверки отключён.
   actsSignatureTestTriggerToken: process.env.ACTS_SIGNATURE_TEST_TRIGGER_TOKEN || '',
+  // Одноразовая проверка письма о подтверждении аттестата. Пустой ключ отключает маршрут.
+  attestationCampaignTestToken: process.env.ATTESTATION_CAMPAIGN_TEST_TOKEN || '',
   // v60: резервный polling стадии «Сделано/Сделаны», чтобы отправка акта не зависела
   // только от срабатывания робота Bitrix. В пилоте обрабатываем только EXECUTOR_TEST_DEAL_ID.
   actsDonePollEnabled: String(process.env.ACTS_DONE_POLL_ENABLED || 'true').toLowerCase() !== 'false',
@@ -14126,6 +14129,25 @@ app.post('/api/acts/test-signed-pdf', async (req, res) => {
   }
 });
 
+// Только для согласованной проверки текста рассылки. Получатель зашит в код,
+// поэтому этот маршрут не может использоваться для массовой или произвольной отправки.
+app.post('/api/attestation-confirmation/test-email', async (req, res) => {
+  if (!config.attestationCampaignTestToken) {
+    return res.status(404).json({ ok: false, error: 'Тестовый маршрут отключён.' });
+  }
+  if (!requestMatchesToken(req, config.attestationCampaignTestToken)) {
+    return res.status(403).json({ ok: false, error: 'ATTESTATION_CAMPAIGN_TEST_TOKEN is required.' });
+  }
+  try {
+    const result = await attestationCampaignSendTestEmail();
+    console.log(`[attestation-campaign] Test email accepted by SMTP: recipient=${ATTESTATION_CAMPAIGN_TEST_RECIPIENT}; messageId=${result.messageId}.`);
+    res.json({ ok: true, recipient: ATTESTATION_CAMPAIGN_TEST_RECIPIENT, ...result });
+  } catch (error) {
+    console.error('[attestation-campaign] Test email failed:', error.message || error);
+    res.status(502).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
 function actsMaintenanceTokenMatches(req) {
   return authorizationMatchesToken(req, process.env.ACTS_MAINTENANCE_TOKEN);
 }
@@ -16469,6 +16491,55 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
     sentFolder: sentCopy && sentCopy.folder || '',
     sentUid: sentCopy && sentCopy.uid || null,
   };
+}
+
+const ATTESTATION_CAMPAIGN_TEST_RECIPIENT = 'mavis.group@mail.ru';
+
+async function attestationCampaignSendTestEmail() {
+  const email = attestationConfirmationCampaignEmail();
+  const fromAddress = String(DOC_RETURN_SMTP_USER || '').trim();
+  if (!fromAddress) throw new Error('MAIL_SMTP_USER не задан — тестовое письмо не отправлено.');
+
+  const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
+  const messageId = `<mavis-attestation-confirmation-test-${Date.now()}@mail.ru>`;
+  const compiler = nodemailer.createTransport({ streamTransport: true, buffer: true, newline: 'unix' });
+  const built = await compiler.sendMail({
+    from: `${senderName} <${fromAddress}>`,
+    to: ATTESTATION_CAMPAIGN_TEST_RECIPIENT,
+    replyTo: fromAddress,
+    subject: email.subject,
+    text: email.text,
+    html: email.html,
+    date: new Date(),
+    messageId,
+  });
+  const raw = Buffer.isBuffer(built.message) ? built.message : Buffer.from(built.message);
+  const transporter = docReturnGetSmtpTransport();
+  const info = await transporter.sendMail({
+    envelope: { from: fromAddress, to: [ATTESTATION_CAMPAIGN_TEST_RECIPIENT] },
+    raw,
+  });
+  const accepted = Array.isArray(info && info.accepted)
+    ? info.accepted.map((x) => String(x || '').toLowerCase())
+    : [];
+  const rejected = Array.isArray(info && info.rejected)
+    ? info.rejected.map((x) => String(x || '').toLowerCase())
+    : [];
+
+  if (!accepted.includes(ATTESTATION_CAMPAIGN_TEST_RECIPIENT) || rejected.includes(ATTESTATION_CAMPAIGN_TEST_RECIPIENT)) {
+    throw new Error(
+      `SMTP не подтвердил тестового получателя. accepted=${accepted.join(',') || 'нет'}; ` +
+      `rejected=${rejected.join(',') || 'нет'}.`
+    );
+  }
+
+  try {
+    const sentCopy = await docReturnAppendToSent(raw);
+    return { messageId, accepted, sentCopySaved: true, sentFolder: sentCopy.folder || '' };
+  } catch (error) {
+    console.warn(`[attestation-campaign] SMTP accepted test email, but Sent copy was not saved: ${error.message || error}`);
+    return { messageId, accepted, sentCopySaved: false, sentCopyError: error.message || String(error) };
+  }
 }
 
 // Разовая сентябрьская рассылка запроса подписанных сканов. Это отдельный контур:
