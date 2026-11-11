@@ -39,7 +39,7 @@ function sourceDocx(bodyText) {
 }
 
 function docxWithDrawingNearSignature() {
-  const zip = new AdmZip(sourceDocx('М.П.'));
+  const zip = new AdmZip(sourceDocx('В.А. Клепицкая'));
   const xml = zip.readAsText('word/document.xml').replace(
     '<w:body>',
     '<w:body><w:p><w:r><w:drawing/></w:r></w:p>',
@@ -49,7 +49,7 @@ function docxWithDrawingNearSignature() {
 }
 
 function docxWithDrawingAfterSignature() {
-  const zip = new AdmZip(sourceDocx('М.П.'));
+  const zip = new AdmZip(sourceDocx('В.А. Клепицкая'));
   const xml = zip.readAsText('word/document.xml').replace(
     '<w:sectPr/>',
     '<w:p><w:r><w:drawing/></w:r></w:p><w:sectPr/>',
@@ -59,7 +59,7 @@ function docxWithDrawingAfterSignature() {
 }
 
 function docxWithStampRelationshipIdAlreadyUsed() {
-  const zip = new AdmZip(sourceDocx('М.П.'));
+  const zip = new AdmZip(sourceDocx('В.А. Клепицкая'));
   zip.updateFile('word/_rels/document.xml.rels', Buffer.from([
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
@@ -70,7 +70,7 @@ function docxWithStampRelationshipIdAlreadyUsed() {
 }
 
 function docxWithSingleQuotedStampRelationshipIdAlreadyUsed() {
-  const zip = new AdmZip(sourceDocx('М.П.'));
+  const zip = new AdmZip(sourceDocx('В.А. Клепицкая'));
   zip.updateFile('word/_rels/document.xml.rels', Buffer.from([
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>",
@@ -80,9 +80,9 @@ function docxWithSingleQuotedStampRelationshipIdAlreadyUsed() {
   return zip.toBuffer();
 }
 
-test('adds the visual stamp as a floating image to the М.П. paragraph', () => {
+test('adds the visual stamp as a floating image to the Клепицкая signature paragraph', () => {
   const stamped = addVisualStampToDocx({
-    sourceBuffer: sourceDocx('М.П.'),
+    sourceBuffer: sourceDocx('В.А. Клепицкая'),
     stampBuffer,
   });
   const zip = new AdmZip(stamped);
@@ -109,7 +109,7 @@ test('fails closed instead of placing a second stamp next to an existing signatu
   );
 });
 
-test('fails closed when a signature graphic follows the М.П. paragraph', () => {
+test('fails closed when a signature graphic follows the Клепицкая signature paragraph', () => {
   assert.throws(
     () => addVisualStampToDocx({ sourceBuffer: docxWithDrawingAfterSignature(), stampBuffer }),
     { code: 'ACTS_SIGNATURE_ALREADY_STAMPED' },

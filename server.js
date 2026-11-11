@@ -321,11 +321,11 @@ const config = {
   actsTelegramEnabled: String(process.env.ACTS_TELEGRAM_ENABLED || 'false').toLowerCase() === 'true',
   actsDoneStageId: process.env.ACTS_DONE_STAGE_ID || '',
   actsClientMessage: process.env.ACTS_CLIENT_MESSAGE || '',
-  // Визуальная печать и подпись: только DOCX с якорем «М.П.» преобразуется в PDF.
+  // Визуальная печать и подпись: только DOCX с строкой «Клепицкая» преобразуется в PDF.
   // По умолчанию контур выключен до установки LibreOffice в Render.
   actsSignatureEnabled: String(process.env.ACTS_SIGNATURE_ENABLED || 'false').toLowerCase() === 'true',
   actsSignatureSofficePath: process.env.ACTS_SIGNATURE_SOFFICE_PATH || 'soffice',
-  actsSignatureAnchorText: process.env.ACTS_SIGNATURE_ANCHOR_TEXT || 'М.П.',
+  actsSignatureAnchorText: process.env.ACTS_SIGNATURE_ANCHOR_TEXT || 'Клепицкая',
   // Одноразовый адрес внутренней проверки. Пустое значение означает обычную отправку клиенту.
   actsSignatureTestRecipient: String(process.env.ACTS_SIGNATURE_TEST_RECIPIENT || '').trim().toLowerCase(),
   // Одноразовый ключ для закрытого тестового вызова. Без него маршрут проверки отключён.

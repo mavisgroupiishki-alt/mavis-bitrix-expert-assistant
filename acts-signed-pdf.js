@@ -10,12 +10,12 @@ const path = require('node:path');
 const execFileAsync = promisify(execFile);
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const PDF_HEADER = Buffer.from('%PDF-');
-const DEFAULT_ANCHOR_TEXT = 'М.П.';
+const DEFAULT_ANCHOR_TEXT = 'Клепицкая';
 const STAMP_ENTRY = 'word/media/mavis-visual-signature-stamp.png';
 const STAMP_REL_ID = 'rIdMavisVisualSignature';
 const STAMP_WIDTH_EMU = 2172929;
 const STAMP_HEIGHT_EMU = 1593606;
-// Штамп из утверждённого шаблона расположен так, что «М.П.» остаётся у нижнего левого края.
+// Штамп из утверждённого шаблона расположен в нижнем блоке у строки «В.А. Клепицкая».
 const STAMP_VERTICAL_OFFSET_EMU = -750000;
 
 function signedActError(code, message) {
