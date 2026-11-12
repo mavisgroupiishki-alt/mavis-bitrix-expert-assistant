@@ -14148,6 +14148,32 @@ app.post('/api/attestation-confirmation/test-email', async (req, res) => {
   }
 });
 
+// Временный закрытый маршрут для согласованной разовой рассылки. Каждый вызов
+// отправляет письмо ровно на один внешний адрес: это позволяет фиксировать
+// результат отдельно для каждой строки клиентской базы и не раскрывать адреса.
+app.post('/api/attestation-confirmation/send', async (req, res) => {
+  if (!config.attestationCampaignTestToken) {
+    return res.status(404).json({ ok: false, error: 'Маршрут рассылки отключён.' });
+  }
+  if (!requestMatchesToken(req, config.attestationCampaignTestToken)) {
+    return res.status(403).json({ ok: false, error: 'ATTESTATION_CAMPAIGN_TEST_TOKEN is required.' });
+  }
+
+  const recipient = attestationCampaignExternalRecipient(req.body && req.body.recipient);
+  if (!recipient) {
+    return res.status(400).json({ ok: false, error: 'Нужен один корректный внешний адрес в поле recipient.' });
+  }
+
+  try {
+    const result = await attestationCampaignSendEmail(recipient, 'campaign');
+    console.log(`[attestation-campaign] Email accepted by SMTP: recipient=${docReturnMaskEmail(recipient)}; messageId=${result.messageId}.`);
+    res.json({ ok: true, recipient, ...result });
+  } catch (error) {
+    console.error(`[attestation-campaign] Email failed: recipient=${docReturnMaskEmail(recipient)}; ${error.message || error}`);
+    res.status(502).json({ ok: false, error: error.message || String(error) });
+  }
+});
+
 function actsMaintenanceTokenMatches(req) {
   return authorizationMatchesToken(req, process.env.ACTS_MAINTENANCE_TOKEN);
 }
@@ -16495,17 +16521,30 @@ async function docReturnSendViaSmtp(ctx, subject, body) {
 
 const ATTESTATION_CAMPAIGN_TEST_RECIPIENT = 'mavis.group@mail.ru';
 
-async function attestationCampaignSendTestEmail() {
+function attestationCampaignExternalRecipient(value) {
+  const source = String(value || '').trim().toLowerCase();
+  const matches = docReturnExtractEmailsFromText(source);
+  if (matches.length !== 1 || matches[0] !== source) return '';
+
+  try {
+    docReturnAssertExternalRecipient(matches[0], 'attestation-campaign');
+    return matches[0];
+  } catch (_) {
+    return '';
+  }
+}
+
+async function attestationCampaignSendEmail(recipient, messageType) {
   const email = attestationConfirmationCampaignEmail();
   const fromAddress = String(DOC_RETURN_SMTP_USER || '').trim();
-  if (!fromAddress) throw new Error('MAIL_SMTP_USER не задан — тестовое письмо не отправлено.');
+  if (!fromAddress) throw new Error('MAIL_SMTP_USER не задан — письмо не отправлено.');
 
   const senderName = String(config.emailSenderName || 'MAVIS GROUP').trim();
-  const messageId = `<mavis-attestation-confirmation-test-${Date.now()}@mail.ru>`;
+  const messageId = `<mavis-attestation-confirmation-${messageType}-${crypto.randomUUID()}@mail.ru>`;
   const compiler = nodemailer.createTransport({ streamTransport: true, buffer: true, newline: 'unix' });
   const built = await compiler.sendMail({
     from: `${senderName} <${fromAddress}>`,
-    to: ATTESTATION_CAMPAIGN_TEST_RECIPIENT,
+    to: recipient,
     replyTo: fromAddress,
     subject: email.subject,
     text: email.text,
@@ -16516,7 +16555,7 @@ async function attestationCampaignSendTestEmail() {
   const raw = Buffer.isBuffer(built.message) ? built.message : Buffer.from(built.message);
   const transporter = docReturnGetSmtpTransport();
   const info = await transporter.sendMail({
-    envelope: { from: fromAddress, to: [ATTESTATION_CAMPAIGN_TEST_RECIPIENT] },
+    envelope: { from: fromAddress, to: [recipient] },
     raw,
   });
   const accepted = Array.isArray(info && info.accepted)
@@ -16526,9 +16565,9 @@ async function attestationCampaignSendTestEmail() {
     ? info.rejected.map((x) => String(x || '').toLowerCase())
     : [];
 
-  if (!accepted.includes(ATTESTATION_CAMPAIGN_TEST_RECIPIENT) || rejected.includes(ATTESTATION_CAMPAIGN_TEST_RECIPIENT)) {
+  if (!accepted.includes(recipient) || rejected.includes(recipient)) {
     throw new Error(
-      `SMTP не подтвердил тестового получателя. accepted=${accepted.join(',') || 'нет'}; ` +
+      `SMTP не подтвердил получателя. accepted=${accepted.join(',') || 'нет'}; ` +
       `rejected=${rejected.join(',') || 'нет'}.`
     );
   }
@@ -16540,6 +16579,10 @@ async function attestationCampaignSendTestEmail() {
     console.warn(`[attestation-campaign] SMTP accepted test email, but Sent copy was not saved: ${error.message || error}`);
     return { messageId, accepted, sentCopySaved: false, sentCopyError: error.message || String(error) };
   }
+}
+
+async function attestationCampaignSendTestEmail() {
+  return attestationCampaignSendEmail(ATTESTATION_CAMPAIGN_TEST_RECIPIENT, 'test');
 }
 
 // Разовая сентябрьская рассылка запроса подписанных сканов. Это отдельный контур:
